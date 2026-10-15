@@ -480,6 +480,207 @@ test(
 );
 
 test(
+  "a bot discovers only its live coding grants across Code Mode, deletion, and restart",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-agent-directory-"),
+    );
+    let runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const coder = (id, name) => ({
+      id,
+      name,
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, id),
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const bot = {
+      id: "directory-bot",
+      name: "bot",
+      role: "bot",
+      environment: "local",
+      allowedAgents: ["granted-coder"],
+      model: { provider: "faux", id: "faux-1" },
+    };
+    for (const config of [
+      coder("granted-coder", "project-albatross"),
+      coder("ungranted-coder", "project-bee"),
+    ])
+      assert.equal(
+        (await runner.request(`/v1/workspaces/${config.id}`, "PUT", config))
+          .status,
+        200,
+      );
+    const registration = await runner.request(
+      `/v1/workspaces/${bot.id}`,
+      "PUT",
+      bot,
+    );
+    assert.equal(registration.status, 200);
+    assert.ok(registration.body.tools.includes("listAgents"));
+    assert.ok(registration.body.tools.includes("monitorAgent"));
+    assert.ok(registration.body.tools.includes("promptAgent"));
+
+    let cursor = 0;
+    async function call(tool, args, requestId, code = false) {
+      const calls = code
+        ? [
+            {
+              tool: "codemode",
+              args: {
+                code: `return await tools.${tool}(${JSON.stringify(args)})`,
+              },
+            },
+          ]
+        : [{ tool, args }];
+      await runner.request(`/v1/workspaces/${bot.id}/input`, "POST", {
+        message:
+          "/faux " +
+          JSON.stringify({ calls, answer: "Private directory result." }),
+        requestId,
+      });
+      const event = await nextEvent(
+        runner,
+        bot.id,
+        (value) =>
+          value.kind === "tool" &&
+          value.data.name === (code ? "codemode" : tool),
+        cursor,
+        true,
+      );
+      cursor = event.seq;
+      return event.data;
+    }
+    function toolText(result) {
+      return result.text;
+    }
+
+    const listed = JSON.parse(toolText(await call("listAgents", {}, "list")));
+    assert.deepEqual(listed, {
+      agents: [
+        { id: "granted-coder", name: "project-albatross", status: "idle" },
+      ],
+      unavailable: [],
+      message: "",
+    });
+    const codeModeText = toolText(
+      await call("listAgents", {}, "list-codemode", true),
+    );
+    assert.match(codeModeText, /\"id\":\"granted-coder\"/);
+    assert.match(codeModeText, /\"name\":\"project-albatross\"/);
+    assert.doesNotMatch(codeModeText, /ungranted-coder|project-bee/);
+
+    const monitored = JSON.parse(
+      toolText(
+        await call("monitorAgent", { agentId: listed.agents[0].id }, "monitor"),
+      ),
+    );
+    assert.equal(monitored.id, "granted-coder");
+    await call(
+      "promptAgent",
+      { agentId: listed.agents[0].id, message: "Report your status." },
+      "prompt",
+    );
+    await nextEvent(
+      runner,
+      "granted-coder",
+      (event) =>
+        event.kind === "assistant" &&
+        event.data.text.includes("Report your status."),
+    );
+
+    const ungranted = await call(
+      "monitorAgent",
+      { agentId: "ungranted-coder" },
+      "monitor-ungranted",
+    );
+    assert.equal(ungranted.isError, true);
+    const deniedCodeMode = await call(
+      "monitorAgent",
+      { agentId: "ungranted-coder" },
+      "monitor-ungranted-codemode",
+      true,
+    );
+    assert.equal(deniedCodeMode.isError, true);
+
+    assert.equal(
+      (await runner.request("/v1/workspaces/granted-coder", "DELETE")).status,
+      200,
+    );
+    const afterDelete = JSON.parse(
+      toolText(await call("listAgents", {}, "list-deleted")),
+    );
+    assert.deepEqual(afterDelete.agents, []);
+    assert.deepEqual(afterDelete.unavailable, ["granted-coder"]);
+    assert.match(afterDelete.message, /unavailable/i);
+
+    assert.equal(
+      (
+        await runner.request(
+          "/v1/workspaces/replacement-coder",
+          "PUT",
+          coder("replacement-coder", "project-albatross"),
+        )
+      ).status,
+      200,
+    );
+    const afterReuse = JSON.parse(
+      toolText(await call("listAgents", {}, "list-reused-name")),
+    );
+    assert.deepEqual(afterReuse.agents, []);
+    assert.deepEqual(afterReuse.unavailable, ["granted-coder"]);
+
+    await runner.stop();
+    runner = await startRunner(directory);
+    const afterRestart = await runner.request(`/v1/workspaces/${bot.id}`);
+    assert.equal(afterRestart.status, 200);
+    const persisted = JSON.parse(
+      toolText(await call("listAgents", {}, "list-after-restart")),
+    );
+    assert.deepEqual(persisted.agents, []);
+    assert.deepEqual(persisted.unavailable, ["granted-coder"]);
+
+    const emptyBot = {
+      ...bot,
+      id: "empty-directory-bot",
+      allowedAgents: [],
+    };
+    assert.equal(
+      (await runner.request(`/v1/workspaces/${emptyBot.id}`, "PUT", emptyBot))
+        .status,
+      200,
+    );
+    const emptyRequest = await runner.request(
+      `/v1/workspaces/${emptyBot.id}/input`,
+      "POST",
+      {
+        message:
+          "/faux " +
+          JSON.stringify({
+            calls: [{ tool: "listAgents", args: {} }],
+            answer: "Private empty directory result.",
+          }),
+        requestId: "list-empty-grants",
+      },
+    );
+    assert.equal(emptyRequest.status, 202);
+    const emptyResult = await nextEvent(
+      runner,
+      emptyBot.id,
+      (event) => event.kind === "tool" && event.data.name === "listAgents",
+      0,
+      true,
+    );
+    const emptyListing = JSON.parse(toolText(emptyResult.data));
+    assert.deepEqual(emptyListing.agents, []);
+    assert.deepEqual(emptyListing.unavailable, []);
+    assert.match(emptyListing.message, /no coding agents are assigned/i);
+  },
+);
+
+test(
   "a bot-owned goal and scheduled loop recover without a client and deletion cancels future work",
   { timeout: 20000 },
   async (t) => {

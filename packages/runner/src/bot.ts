@@ -5,7 +5,7 @@ import {
   defineTool,
 } from "@earendil-works/pi-durable";
 import type { Workspace } from "./workspace.ts";
-import type { WorkspaceConfig } from "./types.ts";
+import { ApiError, type WorkspaceConfig } from "./types.ts";
 
 const MessageReceipts = defineDoc<{ receipts: Record<string, number> }>({
   kind: "adm.bot-messages",
@@ -33,6 +33,66 @@ export function botExtension(
   return defineExtension({
     name: "bot-supervision",
     tools: [
+      defineTool({
+        name: "listAgents",
+        description:
+          "List live coding agents this bot is explicitly permitted to supervise, with their immutable IDs, names, and status.",
+        parameters: Type.Object({}),
+        replay: "safe",
+        execute: async () => {
+          await assertActive();
+          const agents: { id: string; name: string; status: string }[] = [];
+          const unavailable: string[] = [];
+          for (const id of config.allowedAgents ?? []) {
+            try {
+              const agent = await lookup(id);
+              if (
+                agent.config.role !== "coding" ||
+                agent.closed ||
+                agent.passive
+              ) {
+                unavailable.push(id);
+                continue;
+              }
+              const status = await agent.status();
+              if (status.status === "deleted") {
+                unavailable.push(id);
+                continue;
+              }
+              agents.push({
+                id,
+                name: agent.config.name,
+                status: status.status,
+              });
+            } catch (error) {
+              if (
+                error instanceof ApiError &&
+                [404, 410].includes(error.status)
+              ) {
+                unavailable.push(id);
+                continue;
+              }
+              throw error;
+            }
+          }
+          return {
+            output: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  agents,
+                  unavailable,
+                  message: unavailable.length
+                    ? `Permitted agents unavailable: ${unavailable.join(", ")}`
+                    : agents.length
+                      ? ""
+                      : "No coding agents are assigned to this bot.",
+                }),
+              },
+            ],
+          };
+        },
+      }),
       defineTool({
         name: "sendMessage",
         description:
