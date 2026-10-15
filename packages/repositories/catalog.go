@@ -431,7 +431,9 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 	server.mu.Unlock()
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.command != nil {
+	// path is set only after the view is mounted. A failed attempt leaves it
+	// empty so the same repository can be acquired again.
+	if runtime.path != "" {
 		return runtime.path, nil
 	}
 	config := server.config

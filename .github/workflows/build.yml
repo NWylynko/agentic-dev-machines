@@ -84,6 +84,7 @@ jobs:
           file: image/Dockerfile
           load: true
           push: false
+          provenance: false
           platforms: linux/amd64
           tags: adm-dev:ci
           cache-from: type=gha
