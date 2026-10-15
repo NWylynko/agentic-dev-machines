@@ -141,6 +141,116 @@ else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exi
 }
 
 #[test]
+fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
+    let root = fixture();
+
+    let empty = adm(root.path(), &["list"]);
+    assert!(
+        empty.status.success(),
+        "{}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&empty.stdout).trim(),
+        "No workspaces"
+    );
+    assert_eq!(
+        assert_ok(adm(root.path(), &["list", "--json"])),
+        serde_json::json!([])
+    );
+
+    let coding = assert_ok(adm(
+        root.path(),
+        &["create", "coding-agent", "--no-agent", "--no-repositories"],
+    ));
+    let shell = assert_ok(adm(
+        root.path(),
+        &["create", "shell-only", "--no-agent", "--no-repositories"],
+    ));
+    let bot = assert_ok(adm(
+        root.path(),
+        &["create", "observer", "--role", "bot", "--no-agent"],
+    ));
+
+    let table = adm(root.path(), &["list"]);
+    assert!(
+        table.status.success(),
+        "{}",
+        String::from_utf8_lossy(&table.stderr)
+    );
+    let table = String::from_utf8_lossy(&table.stdout);
+    assert!(
+        table.contains("NAME")
+            && table.contains("ROLE")
+            && table.contains("PHASE")
+            && table.contains("AGENT")
+            && table.contains("ID"),
+        "{table}"
+    );
+    for (name, role, agent, record) in [
+        ("coding-agent", "coding", "disabled", &coding),
+        ("shell-only", "coding", "disabled", &shell),
+        ("observer", "bot", "disabled", &bot),
+    ] {
+        assert!(table.contains(name), "{table}");
+        assert!(table.contains(role), "{table}");
+        assert!(table.contains(agent), "{table}");
+        assert!(
+            table.contains(record["id"].as_str().unwrap()),
+            "full immutable ID missing from table: {table}"
+        );
+        assert!(table.contains(record["phase"].as_str().unwrap()), "{table}");
+    }
+
+    let listed = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(listed.as_array().unwrap().len(), 3);
+    assert_eq!(listed[0]["id"], coding["id"]);
+    assert_eq!(listed[1]["id"], shell["id"]);
+    assert_eq!(listed[2]["id"], bot["id"]);
+    assert!(
+        listed[0].get("namespace").is_some(),
+        "--json keeps the existing complete record shape"
+    );
+
+    assert_eq!(
+        assert_ok(adm(root.path(), &["destroy", "shell-only"]))["phase"],
+        "deleted"
+    );
+    let active = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(active.as_array().unwrap().len(), 2);
+    assert_eq!(
+        assert_ok(adm(root.path(), &["list", "--json", "--all"]))
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Listing is local even when both external dependencies are unavailable.
+    let marker = root.path().join("kubectl-contacted");
+    let kubectl = root.path().join("kubectl");
+    fs::write(
+        &kubectl,
+        format!(
+            "#!/bin/sh\nprintf contacted >> '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let offline = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .arg("--kubectl")
+        .arg(&kubectl)
+        .args(["--runner-url", "http://127.0.0.1:1", "list", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(assert_ok(offline).as_array().unwrap().len(), 2);
+    assert!(!marker.exists(), "list must not contact kubectl");
+}
+
+#[test]
 fn public_cli_rejects_unsafe_names_before_touching_the_cluster() {
     let root = tempfile::tempdir().unwrap();
     for name in ["../escape", "UPPER", "a/b", "", "bad name"] {
@@ -178,7 +288,10 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
     ));
     assert_eq!(first["name"], "demo");
     assert_eq!(first["phase"], "ready");
-    assert_eq!(assert_ok(adm(root.path(), &["list"]))[0]["id"], first["id"]);
+    assert_eq!(
+        assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"],
+        first["id"]
+    );
     let duplicate = adm(
         root.path(),
         &["create", "demo", "--no-agent", "--no-repositories"],
@@ -196,11 +309,11 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
         "deleted"
     );
     assert_eq!(
-        assert_ok(adm(root.path(), &["list"])),
+        assert_ok(adm(root.path(), &["list", "--json"])),
         serde_json::json!([])
     );
     assert_eq!(
-        assert_ok(adm(root.path(), &["list", "--all"]))[0]["phase"],
+        assert_ok(adm(root.path(), &["list", "--json", "--all"]))[0]["phase"],
         "deleted"
     );
     let second = assert_ok(adm(
@@ -225,7 +338,7 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&first.stderr)
     );
-    let failed = assert_ok(adm(root.path(), &["list"]));
+    let failed = assert_ok(adm(root.path(), &["list", "--json"]));
     assert!(
         failed.as_array().is_some_and(|items| !items.is_empty()),
         "creation failed before being recorded: {}",
@@ -240,7 +353,10 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     ));
     assert_eq!(retried["phase"], "ready");
     assert_eq!(retried["id"], original_id);
-    assert_eq!(assert_ok(adm(root.path(), &["list"]))[0]["id"], original_id);
+    assert_eq!(
+        assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"],
+        original_id
+    );
 }
 
 #[test]
@@ -252,7 +368,7 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
         &["create", "retry-safe", "--no-agent", "--no-repositories"],
     );
     assert!(!first.status.success());
-    let failed = assert_ok(adm(root.path(), &["list"]));
+    let failed = assert_ok(adm(root.path(), &["list", "--json"]));
     let namespace = failed[0]["namespace"].as_str().unwrap();
     let cluster_path = root.path().join("cluster.json");
     let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
@@ -290,7 +406,10 @@ fn destruction_refuses_a_namespace_whose_immutable_ownership_changed() {
     let output = adm(root.path(), &["destroy", "safe"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("ownership"));
-    assert_eq!(assert_ok(adm(root.path(), &["list"]))[0]["phase"], "ready");
+    assert_eq!(
+        assert_ok(adm(root.path(), &["list", "--json"]))[0]["phase"],
+        "ready"
+    );
 }
 
 #[test]
@@ -415,7 +534,7 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let remaining = assert_ok(adm(root.path(), &["list"]));
+    let remaining = assert_ok(adm(root.path(), &["list", "--json"]));
     assert_eq!(remaining.as_array().unwrap().len(), 1);
     assert_eq!(remaining[0]["id"], stale_workspace["id"]);
     assert_eq!(remaining[0]["phase"], "ready");
@@ -512,7 +631,7 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     assert!(stdout.contains("\"phase\":\"deleted\""), "{stdout}");
     assert!(!journal.exists() || fs::read(&journal).unwrap().is_empty());
     assert_eq!(
-        assert_ok(adm(root.path(), &["list"])),
+        assert_ok(adm(root.path(), &["list", "--json"])),
         serde_json::json!([])
     );
 }
@@ -730,7 +849,7 @@ fn missing_replicated_storage_points_at_the_deploy_note() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("deploy/storage.md"), "{stderr}");
     assert_eq!(
-        assert_ok(adm(root.path(), &["list"]))
+        assert_ok(adm(root.path(), &["list", "--json"]))
             .as_array()
             .unwrap()
             .len(),

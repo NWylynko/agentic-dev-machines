@@ -294,7 +294,7 @@ async function startHttp(binary, state, kubectl, workspace, marker) {
 async function cleanup(binary, state, kubectl, workspaceName, id) {
   if (!id) return;
   const entries = json(
-    (await adm(binary, state, kubectl, ["list", "--all"])).stdout,
+    (await adm(binary, state, kubectl, ["list", "--json", "--all"])).stdout,
     "adm list --all",
   );
   const entry = entries.find(
@@ -354,7 +354,7 @@ test(
         return created;
       } catch (error) {
         const entries = json(
-          (await adm(binary, state, kubectl, ["list", "--all"])).stdout,
+          (await adm(binary, state, kubectl, ["list", "--json", "--all"])).stdout,
           "adm list --all after failed create",
         );
         const partial = entries.find(

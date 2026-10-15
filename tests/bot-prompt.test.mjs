@@ -72,8 +72,8 @@ const ready = new Promise((resolve, reject) => {
 
 try {
   const { url } = await ready;
-  const cli = async (args) => {
-    const { stdout } = await exec(
+  const runCli = async (args, runnerUrl = url) =>
+    exec(
       binary,
       [
         "--state-dir",
@@ -81,7 +81,7 @@ try {
         "--kubectl",
         kubectl,
         "--runner-url",
-        url,
+        runnerUrl,
         ...args,
       ],
       {
@@ -89,8 +89,7 @@ try {
         env: { ...process.env, XDG_CONFIG_HOME: join(root, "config") },
       },
     );
-    return JSON.parse(stdout);
-  };
+  const cli = async (args) => JSON.parse((await runCli(args)).stdout);
   const bot = await cli([
     "create",
     "fixture-bot",
@@ -99,6 +98,13 @@ try {
     "--model",
     "faux/faux-1",
   ]);
+  const table = (await runCli(["list"], "http://127.0.0.1:1")).stdout;
+  assert.match(table, /NAME\s+ROLE\s+PHASE\s+AGENT\s+ID/);
+  assert.match(
+    table,
+    new RegExp(`fixture-bot\\s+bot\\s+ready\\s+enabled\\s+${bot.id}`),
+    "default list shows the configured agent state and full immutable ID without contacting the runner",
+  );
   const watch = await fetch(`${url}/v1/workspaces/${bot.id}/events`, {
     signal: AbortSignal.timeout(10_000),
   });

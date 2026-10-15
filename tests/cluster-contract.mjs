@@ -164,7 +164,7 @@ if (!enabled) {
     await assertOwnedNamespace(first);
 
     const list = json(
-      (await adm(state, ["list", "--all"])).stdout,
+      (await adm(state, ["list", "--json", "--all"])).stdout,
       "adm list --all",
     );
     assert.equal(list.length, 1);
@@ -210,7 +210,7 @@ if (!enabled) {
       }) + "\n";
     await adm(state, ["herdr", "events"], event);
     const afterClose = json(
-      (await adm(state, ["list", "--all"])).stdout,
+      (await adm(state, ["list", "--json", "--all"])).stdout,
       "adm list after close",
     );
     assert.equal(

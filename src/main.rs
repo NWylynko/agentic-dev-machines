@@ -43,6 +43,9 @@ pub enum Action {
     List {
         #[arg(long)]
         all: bool,
+        /// Print complete workspace records as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect a workspace's local, cluster, and agent state.
     Status { name: String },
@@ -196,11 +199,66 @@ pub fn print_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
+fn print_workspace_list(items: &[workspaces::Workspace]) {
+    if items.is_empty() {
+        println!("No workspaces");
+        return;
+    }
+
+    let rows = items
+        .iter()
+        .map(|workspace| {
+            [
+                workspace.name.as_str(),
+                workspace.role.as_str(),
+                workspace.phase.as_str(),
+                if workspace.agent_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                workspace.id.as_str(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let headers = ["NAME", "ROLE", "PHASE", "AGENT", "ID"];
+    let widths = std::array::from_fn::<_, 5, _>(|column| {
+        rows.iter()
+            .map(|row| row[column].len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[column].len())
+    });
+
+    for row in std::iter::once(headers.as_slice()).chain(rows.iter().map(|row| row.as_slice())) {
+        println!(
+            "{:<name$}  {:<role$}  {:<phase$}  {:<agent$}  {}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            name = widths[0],
+            role = widths[1],
+            phase = widths[2],
+            agent = widths[3],
+        );
+    }
+}
+
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Action::Create(options) => print_json(&workspaces::create(cli, options)?),
         Action::Manifest(options) => print_json(&workspaces::manifest(&options.workspace()?)?),
-        Action::List { all } => print_json(&cli.store()?.list(*all)?),
+        Action::List { all, json } => {
+            let items = cli.store()?.list(*all)?;
+            if *json {
+                print_json(&items)
+            } else {
+                print_workspace_list(&items);
+                Ok(())
+            }
+        }
         Action::Status { name } => {
             let workspace = cli.store()?.find(name)?;
             let cluster = if workspace.role == "coding" && workspace.phase != "deleted" {

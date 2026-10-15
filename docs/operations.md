@@ -82,6 +82,8 @@ adm attach supervisor
 
 Use immutable IDs from `adm list` for supervision grants. A bot can use `listAgents` to discover the names and status of its live permitted coding agents, then observe and prompt those targets. Deleted or missing grants are reported as unavailable and never transfer to a workspace that reuses the same name. The bot can also manage goals and loops and publish through `sendMessage`. It has no coding filesystem, shell, or development browser, including through Code Mode. Ordinary model text stays in diagnostics. `adm attach supervisor --diagnostics` explicitly opts in to seeing those records.
 
+`adm list` prints the workspace name, role, persisted lifecycle phase, agent configuration, and full immutable ID from local state. It works without contacting Kubernetes or the runner. Use `adm list --json` to get the complete stored records as a JSON array; add `--all` to include deleted workspaces.
+
 ## Errors and recovery
 
 The terminal supports `/status`, `/resume`, `/reconnect`, `/abort`, `/abort all`, `/newgoal DESCRIPTION`, and `/loop SECONDS PROMPT`. See the [terminal controls](../packages/terminal/README.md).

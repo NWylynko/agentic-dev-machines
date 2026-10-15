@@ -405,6 +405,7 @@ fn configured_model_is_used_explicit_model_wins_and_no_agent_disables_the_defaul
     assert_eq!(disabled["agent_enabled"], false);
     assert!(disabled["model"].is_null());
     let owned: Value =
-        serde_json::from_slice(&assert_ok(adm(root.path(), &["list"], "")).stdout).unwrap();
+        serde_json::from_slice(&assert_ok(adm(root.path(), &["list", "--json"], "")).stdout)
+            .unwrap();
     assert_eq!(owned.as_array().unwrap().len(), 3);
 }
