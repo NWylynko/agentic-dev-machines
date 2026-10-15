@@ -169,6 +169,14 @@ import json, pathlib, sys
 path = pathlib.Path(__file__).parent / 'cluster.json'
 state = json.loads(path.read_text()) if path.exists() else {}
 args = sys.argv[1:]
+def wait_for_release(stage):
+    if not (pathlib.Path(__file__).parent / ('delay-'+stage)).exists(): return
+    entered=pathlib.Path(__file__).parent / ('entered-'+stage)
+    release=pathlib.Path(__file__).parent / ('release-'+stage)
+    if release.exists(): return
+    entered.write_text('waiting')
+    while not release.exists():
+        __import__('time').sleep(0.01)
 if args[:2] == ['get', 'storageclass']:
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
 elif args[0] == 'apply':
@@ -182,8 +190,10 @@ elif args[:2] == ['get','namespace']:
     if args[2] in state: print(json.dumps(state[args[2]]))
     else: print('Error from server (NotFound): namespaces not found',file=sys.stderr);sys.exit(1)
 elif args[:2] == ['delete','namespace']:
+    wait_for_release('delete')
     state.pop(args[2],None);path.write_text(json.dumps(state)); print('deleted')
 elif args[0] == 'wait':
+    wait_for_release('readiness')
     failure = pathlib.Path(__file__).parent / 'fail-wait-once'
     if failure.exists():
         failure.unlink(); print('deployment did not become available',file=sys.stderr); sys.exit(1)
@@ -202,6 +212,156 @@ else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exi
 "##).unwrap();
     fs::set_permissions(kubectl, fs::Permissions::from_mode(0o755)).unwrap();
     root
+}
+
+#[test]
+fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_json_or_cleanup() {
+    use std::{
+        io::{BufRead, BufReader},
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    fn launch(
+        root: &Path,
+        args: &[&str],
+    ) -> (
+        std::process::Child,
+        mpsc::Receiver<String>,
+        std::thread::JoinHandle<String>,
+    ) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .arg("--state-dir")
+            .arg(root.join("state"))
+            .arg("--kubectl")
+            .arg(root.join("kubectl"))
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start public CLI");
+        let stderr = child.stderr.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            for line in BufReader::new(stderr).lines() {
+                let line = line.unwrap();
+                let _ = sender.send(line.clone());
+                text.push_str(&line);
+                text.push('\n');
+            }
+            text
+        });
+        (child, receiver, reader)
+    }
+
+    fn wait_for_file(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            path.exists(),
+            "fixture never reached delayed dependency: {}",
+            path.display()
+        );
+    }
+
+    fn wait_for_stage(receiver: &mpsc::Receiver<String>, stage: &str) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match receiver.recv_timeout(remaining) {
+                Ok(line) if line.contains(stage) => return Some(line),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    let root = fixture();
+    fs::write(root.path().join("delay-readiness"), "delay").unwrap();
+    let readiness = root.path().join("release-readiness");
+    let (create, create_progress, create_stderr) = launch(
+        root.path(),
+        &["create", "progress-demo", "--no-agent", "--no-repositories"],
+    );
+    wait_for_file(&root.path().join("entered-readiness"));
+    let active_create_stage =
+        wait_for_stage(&create_progress, "waiting for deployment readiness started");
+    let during_create = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(during_create[0]["phase"], "provisioning");
+    fs::write(&readiness, "continue").unwrap();
+    let created = create.wait_with_output().unwrap();
+    let create_diagnostics = create_stderr.join().unwrap();
+    assert!(
+        active_create_stage
+            .as_ref()
+            .is_some_and(|line| line
+                .contains("create progress-demo: waiting for deployment readiness started")),
+        "no active readiness diagnostic arrived while kubectl was blocked: {active_create_stage:?}; remaining={create_diagnostics}"
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let ready: Value =
+        serde_json::from_slice(&created.stdout).expect("create JSON remains on stdout");
+    assert_eq!(ready["phase"], "ready");
+    assert!(
+        create_diagnostics.contains("waiting for deployment readiness completed in"),
+        "{create_diagnostics}"
+    );
+    assert!(
+        create_diagnostics.contains("create progress-demo: ready in"),
+        "{create_diagnostics}"
+    );
+
+    let removal = root.path().join("release-delete");
+    fs::write(root.path().join("delay-delete"), "delay").unwrap();
+    let (destroy, destroy_progress, destroy_stderr) =
+        launch(root.path(), &["destroy", "progress-demo"]);
+    wait_for_file(&root.path().join("entered-delete"));
+    let active_destroy_stage =
+        wait_for_stage(&destroy_progress, "waiting for namespace removal started");
+    let during_destroy = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(during_destroy[0]["phase"], "deleting");
+    let cluster: Value =
+        serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
+    assert!(
+        cluster.get(ready["namespace"].as_str().unwrap()).is_some(),
+        "namespace must remain until confirmed removal"
+    );
+    fs::write(&removal, "continue").unwrap();
+    let deleted = destroy.wait_with_output().unwrap();
+    let destroy_diagnostics = destroy_stderr.join().unwrap();
+    assert!(
+        active_destroy_stage
+            .as_ref()
+            .is_some_and(|line| line
+                .contains("destroy progress-demo: waiting for namespace removal started")),
+        "no active removal diagnostic arrived while kubectl was blocked: {active_destroy_stage:?}; remaining={destroy_diagnostics}"
+    );
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    let deleted: Value =
+        serde_json::from_slice(&deleted.stdout).expect("destroy JSON remains on stdout");
+    assert_eq!(deleted["phase"], "deleted");
+    assert!(
+        destroy_diagnostics.contains("waiting for namespace removal completed in"),
+        "{destroy_diagnostics}"
+    );
+    let cluster: Value =
+        serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
+    assert!(
+        cluster.get(ready["namespace"].as_str().unwrap()).is_none(),
+        "successful destroy must remove the namespace"
+    );
 }
 
 #[test]

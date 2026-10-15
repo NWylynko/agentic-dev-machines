@@ -9,11 +9,40 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
 pub const MANAGED_BY: &str = "adm";
+
+fn lifecycle_stage<T>(
+    operation: &str,
+    name: &str,
+    stage: &str,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    eprintln!("adm: {operation} {name}: {stage} started");
+    let started = Instant::now();
+    let result = action();
+    let outcome = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    eprintln!(
+        "adm: {operation} {name}: {stage} {outcome} in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    result
+}
+
+fn lifecycle_complete(operation: &str, name: &str, outcome: &str, started: Instant) {
+    eprintln!(
+        "adm: {operation} {name}: {outcome} in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -280,6 +309,7 @@ pub fn verify_ownership(cli: &Cli, w: &Workspace) -> Result<()> {
 }
 
 pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
+    let started = Instant::now();
     ensure!(
         options.no_agent || options.model.is_some(),
         "agent workspaces require an explicit --model PROVIDER/MODEL_ID; use --no-agent to create a workspace without an agent"
@@ -304,14 +334,30 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
         None => requested,
     };
     if w.role == "coding" {
-        let storage:Value=serde_json::from_slice(&kubectl(cli,&["get","storageclass",&w.storage_class,"-o","json"],None).context("portable storage class unavailable; create StorageClass adm-replicated as described in deploy/storage.md, or pass --storage-class")?)?;
-        ensure!(
-            options.allow_node_local_storage || storage["provisioner"] != "rancher.io/local-path",
-            "node-local storage cannot recover on another node; select replicated storage or explicitly acknowledge --allow-node-local-storage"
-        );
+        lifecycle_stage("create", &w.name, "checking storage class", || {
+            let storage: Value = serde_json::from_slice(
+                &kubectl(
+                    cli,
+                    &["get", "storageclass", &w.storage_class, "-o", "json"],
+                    None,
+                )
+                .context("portable storage class unavailable; create StorageClass adm-replicated as described in deploy/storage.md, or pass --storage-class")?,
+            )?;
+            ensure!(
+                options.allow_node_local_storage
+                    || storage["provisioner"] != "rancher.io/local-path",
+                "node-local storage cannot recover on another node; select replicated storage or explicitly acknowledge --allow-node-local-storage"
+            );
+            Ok(())
+        })?;
     }
-    if resuming && let Err(error) = verify_ownership(cli, &w) {
-        ensure!(format!("{error:#}").contains("NotFound"), "{error:#}");
+    if resuming {
+        lifecycle_stage("create", &w.name, "checking namespace ownership", || {
+            if let Err(error) = verify_ownership(cli, &w) {
+                ensure!(format!("{error:#}").contains("NotFound"), "{error:#}");
+            }
+            Ok(())
+        })?;
     }
     if resuming {
         w.phase = "provisioning".into();
@@ -322,27 +368,40 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
     }
     let provision = (|| -> Result<()> {
         let manifest = manifest(&w)?;
-        kubectl(
-            cli,
-            &["apply", "-f", "-"],
-            Some(&serde_json::to_vec(&manifest)?),
-        )?;
-        if w.role == "coding" {
+        lifecycle_stage("create", &w.name, "applying workspace resources", || {
             kubectl(
                 cli,
-                &[
-                    "wait",
-                    "--for=condition=available",
-                    "deployment/workspace",
-                    "-n",
-                    &w.namespace,
-                    "--timeout=180s",
-                ],
-                None,
+                &["apply", "-f", "-"],
+                Some(&serde_json::to_vec(&manifest)?),
+            )?;
+            Ok(())
+        })?;
+        if w.role == "coding" {
+            lifecycle_stage(
+                "create",
+                &w.name,
+                "waiting for deployment readiness",
+                || {
+                    kubectl(
+                        cli,
+                        &[
+                            "wait",
+                            "--for=condition=available",
+                            "deployment/workspace",
+                            "-n",
+                            &w.namespace,
+                            "--timeout=180s",
+                        ],
+                        None,
+                    )?;
+                    Ok(())
+                },
             )?;
         }
         if w.agent_enabled {
-            runner::ensure_started(cli)?;
+            lifecycle_stage("create", &w.name, "starting agent runner", || {
+                runner::ensure_started(cli)
+            })?;
             let mut registration = json!({"id":w.id,"name":w.name,"role":w.role,"environment":"kubernetes","allowedAgents":w.allowed_agents});
             if w.role == "coding" {
                 registration["namespace"] = w.namespace.clone().into();
@@ -353,11 +412,14 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
             if let Some(model) = &w.model {
                 registration["model"] = model.clone();
             }
-            cli.request(
-                "PUT",
-                &format!("/v1/workspaces/{}", w.id),
-                Some(&registration),
-            )?;
+            lifecycle_stage("create", &w.name, "registering agent workspace", || {
+                cli.request(
+                    "PUT",
+                    &format!("/v1/workspaces/{}", w.id),
+                    Some(&registration),
+                )?;
+                Ok(())
+            })?;
         }
         Ok(())
     })();
@@ -372,6 +434,7 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
     }
     w.phase = "ready".into();
     store.save(&w)?;
+    lifecycle_complete("create", &w.name, "ready", started);
     Ok(w)
 }
 
@@ -391,19 +454,24 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
 }
 
 pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
+    let started = Instant::now();
     let store = cli.store()?;
     let mut w = store.find(name)?;
     if w.phase == "deleted" {
+        lifecycle_complete("destroy", &w.name, "already deleted", started);
         return Ok(w);
     }
-    match verify_ownership(cli, &w) {
-        Ok(()) => {}
-        Err(error) => {
-            if !format!("{error:#}").contains("NotFound") {
-                return Err(error);
+    lifecycle_stage("destroy", &w.name, "checking namespace ownership", || {
+        match verify_ownership(cli, &w) {
+            Ok(()) => {}
+            Err(error) => {
+                if !format!("{error:#}").contains("NotFound") {
+                    return Err(error);
+                }
             }
         }
-    }
+        Ok(())
+    })?;
     w.phase = "deleting".into();
     store.save(&w)?;
     let directory = cli.state_path().join("runner/tombstones");
@@ -419,24 +487,31 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
         fs::File::open(&directory)?.sync_all()?;
     }
     if w.agent_enabled {
-        runner::ensure_started(cli)?;
-        cli.request("DELETE", &format!("/v1/workspaces/{}", w.id), None)?;
+        lifecycle_stage("destroy", &w.name, "cancelling agent activity", || {
+            runner::ensure_started(cli)?;
+            cli.request("DELETE", &format!("/v1/workspaces/{}", w.id), None)?;
+            Ok(())
+        })?;
     }
-    kubectl(
-        cli,
-        &[
-            "delete",
-            "namespace",
-            &w.namespace,
-            "--ignore-not-found=true",
-            "--wait=true",
-            "--timeout=180s",
-        ],
-        None,
-    )?;
+    lifecycle_stage("destroy", &w.name, "waiting for namespace removal", || {
+        kubectl(
+            cli,
+            &[
+                "delete",
+                "namespace",
+                &w.namespace,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=180s",
+            ],
+            None,
+        )?;
+        Ok(())
+    })?;
     w.phase = "deleted".into();
     w.last_error = None;
     store.save(&w)?;
+    lifecycle_complete("destroy", &w.name, "deleted", started);
     Ok(w)
 }
 
