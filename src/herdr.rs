@@ -204,15 +204,12 @@ impl HerdrApi {
         if let Some(event) = self.queued_events.pop_front() {
             return Ok(event);
         }
-        let result = self.request(
-            "events.wait",
-            json!({"match_event":{"event":"workspace_closed"}}),
-        )?;
+        let result = self.next_message()?;
         ensure!(
-            result["type"] == "wait_matched",
-            "Herdr returned an invalid events.wait response: {result}"
+            is_event(&result),
+            "unexpected Herdr message while waiting for a subscribed event: {result}"
         );
-        Ok(result["event"].clone())
+        Ok(result)
     }
 }
 
@@ -238,7 +235,7 @@ fn watch(cli: &Cli, socket: &Path) -> Result<()> {
         json!({"subscriptions":[{"type":"workspace.closed"}]}),
     )?;
     ensure!(
-        subscription["type"] == "ok",
+        subscription["type"] == "subscription_started",
         "Herdr did not confirm the workspace.closed subscription: {subscription}"
     );
 

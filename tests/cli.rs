@@ -302,6 +302,10 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
         root.path(),
         &["create", "herdr-owned", "--no-agent", "--no-repositories"],
     ));
+    let other_workspace = assert_ok(adm(
+        root.path(),
+        &["create", "herdr-other", "--no-agent", "--no-repositories"],
+    ));
     let stale_workspace = assert_ok(adm(
         root.path(),
         &["create", "herdr-stale", "--no-agent", "--no-repositories"],
@@ -309,6 +313,10 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
     assert_ok(adm(
         root.path(),
         &["herdr", "bind", "herdr-owned", "space-123"],
+    ));
+    assert_ok(adm(
+        root.path(),
+        &["herdr", "bind", "herdr-other", "space-456"],
     ));
     assert_ok(adm(
         root.path(),
@@ -330,32 +338,55 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
             subscribe["params"]["subscriptions"][0]["type"],
             "workspace.closed"
         );
-        writeln!(
-            writer,
-            "{}",
-            serde_json::json!({"id":subscribe["id"],"result":{"type":"ok"}})
-        )
-        .unwrap();
-        line.clear();
-        reader.read_line(&mut line).unwrap();
-        let wait: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(wait["method"], "events.wait");
-        assert_eq!(wait["params"]["match_event"]["event"], "workspace_closed");
-
-        writeln!(
+        // A notification can arrive before the subscribe response; subsequent closes
+        // arrive as event envelopes on the same subscribed connection.
+        let _ = writeln!(
             writer,
             "{}",
             serde_json::json!({
-                "id":wait["id"],
-                "result":{"type":"wait_matched","event":{
-                    "event":"workspace.closed",
-                    "data":{"type":"workspace_closed","workspace_id":"space-123"}
-                }}
+                "event":"workspace_closed",
+                "data":{"type":"workspace_closed","workspace_id":"space-123"}
             })
-        )
-        .unwrap();
-        writer.flush().unwrap();
-        // Closing the connection makes watch exit after processing the event.
+        );
+        let _ = writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id":subscribe["id"],"result":{"type":"subscription_started"}
+            })
+        );
+        let _ = writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "event":"workspace_closed",
+                "data":{"type":"workspace_closed","workspace_id":"unbound-space"}
+            })
+        );
+        let _ = writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "event":"workspace_closed",
+                "data":{"type":"workspace_closed","workspace_id":"space-456"}
+            })
+        );
+        reader
+            .get_mut()
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {}
+            Ok(_) => panic!("watcher sent an unexpected request: {line}"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("failed while checking for unexpected requests: {error}"),
+        }
+        // Closing the subscribed connection makes watch exit after processing events.
         expected_workspace
     });
 
@@ -376,7 +407,7 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
     assert!(stdout.contains(&expected_workspace), "{stdout}");
     assert_eq!(
         stdout.matches("\"phase\":\"deleted\"").count(),
-        1,
+        2,
         "{stdout}"
     );
     assert!(
@@ -388,6 +419,11 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
     assert_eq!(remaining.as_array().unwrap().len(), 1);
     assert_eq!(remaining[0]["id"], stale_workspace["id"]);
     assert_eq!(remaining[0]["phase"], "ready");
+    assert_eq!(
+        assert_ok(adm(root.path(), &["status", "herdr-other"]))["workspace"]["phase"],
+        "deleted"
+    );
+    assert_ne!(workspace["id"], other_workspace["id"]);
 }
 
 #[test]
@@ -404,32 +440,21 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
             reader.read_line(&mut line).unwrap();
             let subscribe: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(subscribe["method"], "events.subscribe");
-            writeln!(
+            let _ = writeln!(
                 writer,
                 "{}",
-                serde_json::json!({"id":subscribe["id"],"result":{"type":"ok"}})
-            )
-            .unwrap();
+                serde_json::json!({"id":subscribe["id"],"result":{"type":"subscription_started"}})
+            );
             if let Some(space) = close_space {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                let wait: Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(wait["method"], "events.wait");
-                assert_eq!(wait["params"]["match_event"]["event"], "workspace_closed");
-                writeln!(
+                let _ = writeln!(
                     writer,
                     "{}",
                     serde_json::json!({
-                        "id":wait["id"],
-                        "result":{"type":"wait_matched","event":{
-                            "event":"workspace.closed",
+                        "event":"workspace_closed",
                             "data":{"type":"workspace_closed","workspace_id":space}
-                        }}
                     })
-                )
-                .unwrap();
+                );
             }
-            writer.flush().unwrap();
         })
     }
 
