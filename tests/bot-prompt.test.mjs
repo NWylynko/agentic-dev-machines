@@ -123,7 +123,11 @@ try {
           .find((line) => line.startsWith("data: "));
         if (data) {
           const event = JSON.parse(data.slice(6));
-          if (event.kind === "message") return event;
+          if (
+            event.kind === "message" &&
+            event.data.text === "Prompt without request ID was delivered."
+          )
+            return event;
         }
       }
     }

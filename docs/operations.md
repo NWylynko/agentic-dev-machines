@@ -88,7 +88,29 @@ adm create supervisor --role bot --model PROVIDER/MODEL_ID --allow-agent CODING_
 adm attach supervisor
 ```
 
-Use immutable IDs from `adm list` for supervision grants. A bot can use `listAgents` to discover the names and status of its live permitted coding agents, then observe and prompt those targets. Deleted or missing grants are reported as unavailable and never transfer to a workspace that reuses the same name. The bot can also manage goals and loops and publish through `sendMessage`. It has no coding filesystem, shell, or development browser, including through Code Mode. Ordinary model text stays in diagnostics. `adm attach supervisor --diagnostics` explicitly opts in to seeing those records.
+New bot conversations start one durable setup turn. The bot asks for an identity and purpose and publishes the setup question through `sendMessage`; its saved profile appears in future model instructions and survives runner restarts. Existing bot conversations without a profile are left unchanged during upgrade. Ordinary model output remains private in diagnostics.
+
+MCP access is configured by the host with a nonsecret JSON file that grants exact stdio server tools. Environment values are looked up by reference in the runner process and passed only to that MCP server; the runner does not pass its other environment through.
+
+```json
+[
+  {
+    "id": "notes",
+    "command": "/usr/bin/node",
+    "args": ["/opt/notes-mcp.mjs"],
+    "tools": ["search_notes"],
+    "secretEnv": { "NOTES_TOKEN": "MCP_NOTES_TOKEN" }
+  }
+]
+```
+
+```sh
+adm create supervisor --role bot --model PROVIDER/MODEL_ID --mcp-config /etc/adm/supervisor-mcp.json
+```
+
+The config stores only the environment reference name, never its value. Only listed tools are registered for the bot and Code Mode. Read-only MCP tools may replay after recovery when the server marks them read-only; other calls are not replayed after interruption. Unsupported transports or malformed grants fail registration, while connection failures remain visible in status.
+
+Use immutable IDs from `adm list` for supervision grants. A bot can use `listAgents` to discover the names and status of its live permitted coding agents, then observe and prompt those targets. Deleted or missing grants are reported as unavailable and never transfer to a workspace that reuses the same name. The bot can also manage goals and loops and publish through `sendMessage`. It has no coding filesystem, shell, or development browser, including through Code Mode. `adm attach supervisor --diagnostics` explicitly opts in to seeing diagnostics.
 
 `adm list` prints the workspace name, role, persisted lifecycle phase, agent configuration, and full immutable ID from local state. It works without contacting Kubernetes or the runner. Use `adm list --json` to get the complete stored records as a JSON array; add `--all` to include deleted workspaces. `adm status NAME` summarizes local phase, current Pod readiness/state, agent state, and node, with dependency failures shown below the row. Bot workspaces have no Pod and identify the management host as their location. Use `adm status NAME --json` to preserve the complete status records, or `adm inspect NAME` for labeled human-readable diagnostics. `adm inspect NAME --json` returns the same complete payload as status JSON.
 

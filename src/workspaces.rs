@@ -67,6 +67,8 @@ pub struct Workspace {
     pub catalog: Value,
     pub model: Option<Value>,
     pub allowed_agents: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: Option<Value>,
     pub herdr_space: Option<String>,
     pub created_at: u64,
     pub last_error: Option<String>,
@@ -108,6 +110,9 @@ pub struct CreateOptions {
     pub herdr_space: Option<String>,
     #[arg(long)]
     pub allow_agent: Vec<String>,
+    /// JSON file containing host-configured stdio MCP servers and exact tool grants.
+    #[arg(long)]
+    pub mcp_config: Option<std::path::PathBuf>,
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -135,6 +140,10 @@ impl CreateOptions {
             !(self.role == "bot" && self.catalog.is_some()),
             "--catalog is only supported for coding workspaces"
         );
+        ensure!(
+            self.role == "bot" || self.mcp_config.is_none(),
+            "--mcp-config is only supported for bot workspaces"
+        );
         let id = Uuid::new_v4().simple().to_string();
         let model = match &self.model {
             Some(model) => {
@@ -150,6 +159,20 @@ impl CreateOptions {
                 &fs::read(path).with_context(|| format!("read catalog {}", path.display()))?,
             )?,
             None => json!({"repositories":[]}),
+        };
+        let mcp_servers = match &self.mcp_config {
+            Some(path) => {
+                let value: Value = serde_json::from_slice(
+                    &fs::read(path)
+                        .with_context(|| format!("read MCP config {}", path.display()))?,
+                )?;
+                ensure!(
+                    value.is_array(),
+                    "MCP config file must contain a JSON array"
+                );
+                Some(value)
+            }
+            None => None,
         };
         Ok(Workspace {
             id: id.clone(),
@@ -167,6 +190,7 @@ impl CreateOptions {
             catalog,
             model,
             allowed_agents: self.allow_agent.clone(),
+            mcp_servers,
             herdr_space: self.herdr_space.clone(),
             created_at: now(),
             last_error: None,
@@ -412,6 +436,9 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
             if let Some(model) = &w.model {
                 registration["model"] = model.clone();
             }
+            if let Some(mcp_servers) = &w.mcp_servers {
+                registration["mcpServers"] = mcp_servers.clone();
+            }
             lifecycle_stage("create", &w.name, "registering agent workspace", || {
                 cli.request(
                     "PUT",
@@ -450,6 +477,7 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.catalog == requested.catalog
         && existing.model == requested.model
         && existing.allowed_agents == requested.allowed_agents
+        && existing.mcp_servers == requested.mcp_servers
         && existing.herdr_space == requested.herdr_space
 }
 
@@ -513,6 +541,45 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
     store.save(&w)?;
     lifecycle_complete("destroy", &w.name, "deleted", started);
     Ok(w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn bot_creation_reads_nonsecret_mcp_grants_for_runner_registration() {
+        let path = std::env::temp_dir().join(format!("adm-mcp-config-{}.json", Uuid::new_v4()));
+        let config = json!([{
+            "id": "notes",
+            "command": "/usr/bin/node",
+            "args": ["/opt/notes-server.mjs"],
+            "tools": ["search"],
+            "secretEnv": {"TOKEN": "MCP_NOTES_TOKEN"}
+        }]);
+        fs::write(&path, config.to_string()).unwrap();
+        let parsed = Cli::try_parse_from([
+            "adm",
+            "--project-dir",
+            ".",
+            "create",
+            "helper",
+            "--role",
+            "bot",
+            "--model",
+            "faux/faux-1",
+            "--mcp-config",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let workspace = match parsed.command {
+            crate::Action::Create(options) => options.workspace().unwrap(),
+            _ => unreachable!(),
+        };
+        fs::remove_file(path).unwrap();
+        assert_eq!(workspace.mcp_servers, Some(config));
+    }
 }
 
 pub fn cluster_status(cli: &Cli, w: &Workspace) -> Result<Value> {
