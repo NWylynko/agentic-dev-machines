@@ -309,10 +309,14 @@ fn run(cli: &Cli) -> Result<()> {
             let workspace = cli.store()?.active(name)?;
             anyhow::ensure!(workspace.agent_enabled, "workspace has no agent");
             runner::ensure_started(cli)?;
+            let body = match request_id {
+                Some(request_id) => json!({"message":message,"requestId":request_id}),
+                None => json!({"message":message}),
+            };
             print_json(&cli.request(
                 "POST",
                 &format!("/v1/workspaces/{}/input", workspace.id),
-                Some(&json!({"message":message,"requestId":request_id})),
+                Some(&body),
             )?)
         }
         Action::Abort { name, background } => {

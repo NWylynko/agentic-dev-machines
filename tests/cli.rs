@@ -45,6 +45,22 @@ fn fresh_runner_start_returns_and_daemon_survives_cli_exit() {
     );
 }
 
+#[test]
+fn prompt_omits_absent_request_id_and_preserves_explicit_id_deduplication() {
+    let output = Command::new("node")
+        .arg("tests/bot-prompt.test.mjs")
+        .arg(env!("CARGO_BIN_EXE_adm"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run CLI-to-runner prompt scenario");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn adm(root: &Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_adm"))
         .env("XDG_CONFIG_HOME", root.join("config"))
