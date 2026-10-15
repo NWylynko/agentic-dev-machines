@@ -30,7 +30,7 @@ install -m 755 adm-linux-amd64 "$HOME/.local/bin/adm"
 install -m 755 adm-repositories-linux-amd64 "$HOME/.local/bin/adm-repositories"
 ```
 
-Run `adm` from this checkout, or pass `--project-dir` / `ADM_PROJECT_DIR`. A push to `main` publishes those binaries as a workflow artifact. A version tag such as `v0.1.0` also attaches them to a GitHub release.
+Run `adm` from this checkout, or pass `--project-dir` / `ADM_PROJECT_DIR`. A push to `main` that changes the build publishes those binaries as a workflow artifact. A Markdown-only push does not. A version tag such as `v0.1.0` also attaches them to a GitHub release.
 
 To build the same binaries on the management host, use Rust for the CLI and Go 1.26 for the repository helper:
 

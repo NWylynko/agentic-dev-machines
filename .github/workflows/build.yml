@@ -1,14 +1,19 @@
 # Verifies the CLI, runner, and terminal, then publishes the linux/amd64
-# management-host binaries and the workspace image. FUSE repository tests stay
-# local: this runner does not provide a usable /dev/fuse mount.
+# management-host binaries and the workspace image. Markdown-only pushes and
+# pull requests do not run this workflow. FUSE repository tests stay local:
+# this runner does not provide a usable /dev/fuse mount.
 
 name: Build
 
 on:
   pull_request:
+    paths-ignore:
+      - "**/*.md"
   push:
     branches: [main]
     tags: ["v[0-9]*"]
+    paths-ignore:
+      - "**/*.md"
   workflow_dispatch:
 
 concurrency:

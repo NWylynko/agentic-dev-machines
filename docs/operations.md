@@ -32,14 +32,14 @@ The default state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm`
 
 ## Published builds
 
-`.github/workflows/build.yml` checks the CLI, runner, and terminal on pull requests and on `main`. FUSE repository tests stay on a machine with `/dev/fuse`. Pull requests build and smoke the workspace image, then stop. Pushes to `main`, version tags (`v*`), and manual runs from `main` publish the `linux/amd64` image to `ghcr.io/nwylynko/agentic-dev-machines`:
+`.github/workflows/build.yml` checks the CLI, runner, and terminal on pull requests and on `main`. Markdown-only changes skip that workflow. FUSE repository tests stay on a machine with `/dev/fuse`. Pull requests that change the build smoke the workspace image, then stop. Pushes to `main` that change the build, version tags (`v*`), and manual runs from `main` publish the `linux/amd64` image to `ghcr.io/nwylynko/agentic-dev-machines`:
 
 | Git ref | Image tags |
 | --- | --- |
 | `main` | `latest`, `sha-<commit>` |
 | `v0.1.0` | `0.1.0`, `v0.1.0`, `latest`, `sha-<commit>` |
 
-A version tag creates a GitHub release with `adm-linux-amd64` and `adm-repositories-linux-amd64`. Pushes to `main` upload those same binaries as a workflow artifact. The release CLI still needs this checkout and `npm ci`, because it launches the runner and terminal from the source tree. Run it from the checkout, or pass `--project-dir` / `ADM_PROJECT_DIR`. A binary built on the management host with `cargo install --path .` keeps using that checkout while the path exists.
+A version tag creates a GitHub release with `adm-linux-amd64` and `adm-repositories-linux-amd64`. Pushes to `main` that change the build upload those same binaries as a workflow artifact. The release CLI still needs this checkout and `npm ci`, because it launches the runner and terminal from the source tree. Run it from the checkout, or pass `--project-dir` / `ADM_PROJECT_DIR`. A binary built on the management host with `cargo install --path .` keeps using that checkout while the path exists.
 
 ```sh
 install -m 755 adm-linux-amd64 "$HOME/.local/bin/adm"
