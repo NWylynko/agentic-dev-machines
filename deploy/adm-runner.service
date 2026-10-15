@@ -1,4 +1,5 @@
 # Copy to ~/.config/systemd/user/adm-runner.service after replacing both paths.
+# `adm` can be a GitHub release binary or `cargo install --path .`.
 # Enable with: systemctl --user enable --now adm-runner.service
 # Persistent user services after logout also require operator-configured lingering.
 [Unit]

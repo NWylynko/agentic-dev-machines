@@ -48,7 +48,7 @@ fn command(cli: &Cli) -> Result<Command> {
     command
         .current_dir(&cli.project_dir)
         .args(["--import", "tsx"])
-        .arg(cli.project_dir.join("packages/runner/src/main.ts"))
+        .arg(cli.checkout_file("packages/runner/src/main.ts")?)
         .args(["--host", host, "--port", &port.to_string(), "--state-dir"])
         .arg(cli.state_path().join("runner"));
     Ok(command)

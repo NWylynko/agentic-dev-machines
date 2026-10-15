@@ -30,13 +30,32 @@ The default state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm`
 
 `adm stop` stops the runner while preserving recoverable work. Restart it with `adm start`, or let the service supervise it. Workspace deletion uses `adm destroy`, which has different semantics.
 
+## Published builds
+
+`.github/workflows/build.yml` checks the CLI, runner, and terminal on pull requests and on `main`. FUSE repository tests stay on a machine with `/dev/fuse`. Pull requests build and smoke the workspace image, then stop. Pushes to `main`, version tags (`v*`), and manual runs from `main` publish the `linux/amd64` image to `ghcr.io/nwylynko/agentic-dev-machines`:
+
+| Git ref | Image tags |
+| --- | --- |
+| `main` | `latest`, `sha-<commit>` |
+| `v0.1.0` | `0.1.0`, `v0.1.0`, `latest`, `sha-<commit>` |
+
+A version tag creates a GitHub release with `adm-linux-amd64` and `adm-repositories-linux-amd64`. Pushes to `main` upload those same binaries as a workflow artifact. The release CLI still needs this checkout and `npm ci`, because it launches the runner and terminal from the source tree. Run it from the checkout, or pass `--project-dir` / `ADM_PROJECT_DIR`. A binary built on the management host with `cargo install --path .` keeps using that checkout while the path exists.
+
+```sh
+install -m 755 adm-linux-amd64 "$HOME/.local/bin/adm"
+install -m 755 adm-repositories-linux-amd64 "$HOME/.local/bin/adm-repositories"
+adm create my-project --image ghcr.io/nwylynko/agentic-dev-machines:0.1.0 --model PROVIDER/MODEL_ID
+```
+
+The workflow token needs package write access; the first push creates the GHCR package. If that package is private, the cluster needs a pull credential. A node that cannot pull from GHCR still needs the image imported locally.
+
 ## Workspace image and storage
 
 ```sh
 docker build -f image/Dockerfile -t adm-dev:0.1.0 .
 ```
 
-Distribute that exact image to the cluster's nodes, or publish it through your approved image registry and pass its reference with `--image`. Building it on the management host does not make it available to Kubernetes. ADM does not install node helpers or change container-runtime configuration.
+Distribute that exact image to the cluster's nodes, or use the published GHCR reference with `--image`. Building it on the management host does not make it available to Kubernetes. ADM does not install node helpers or change container-runtime configuration.
 
 Configure a replicated StorageClass as described in [storage.md](../deploy/storage.md). The default is `adm-replicated`; this repository does not install a storage backend. The filesystem must support the required mount behavior, and the runner's management-host SQLite store needs a WAL-compatible filesystem. Keep management-host state in the backup plan as well as workspace volumes.
 

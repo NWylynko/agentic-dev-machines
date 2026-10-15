@@ -656,6 +656,27 @@ fn repository_catalog_options_must_match_the_workspace_role() {
 }
 
 #[test]
+fn start_rejects_a_checkout_without_the_runner() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .arg("--state-dir")
+        .arg(root.path())
+        .arg("--project-dir")
+        .arg(root.path())
+        .arg("--runner-url")
+        .arg("http://127.0.0.1:9")
+        .arg("start")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--project-dir"),
+        "a published binary must say how to point at the checkout: {stderr}"
+    );
+}
+
+#[test]
 fn missing_replicated_storage_points_at_the_deploy_note() {
     let root = tempfile::tempdir().unwrap();
     let kubectl = root.path().join("kubectl");

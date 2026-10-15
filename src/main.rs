@@ -25,7 +25,9 @@ pub struct Cli {
     pub kubectl: String,
     #[arg(long, global = true, default_value = "http://127.0.0.1:7432")]
     pub runner_url: String,
-    #[arg(long, global=true, default_value=env!("CARGO_MANIFEST_DIR"))]
+    /// Checkout that contains the runner and terminal. A binary built elsewhere
+    /// does not keep the build machine's path; pass this or ADM_PROJECT_DIR.
+    #[arg(long, global = true, env = "ADM_PROJECT_DIR", default_value_os_t = default_project_dir())]
     pub project_dir: PathBuf,
     #[command(subcommand)]
     pub command: Action,
@@ -117,7 +119,35 @@ pub enum Action {
     },
 }
 
+fn default_project_dir() -> PathBuf {
+    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if compiled.join("packages/runner/src/main.ts").is_file() {
+        return compiled;
+    }
+    if let Ok(mut current) = std::env::current_dir() {
+        loop {
+            if current.join("packages/runner/src/main.ts").is_file() {
+                return current;
+            }
+            if !current.pop() {
+                break;
+            }
+        }
+    }
+    compiled
+}
+
 impl Cli {
+    pub fn checkout_file(&self, relative: &str) -> Result<PathBuf> {
+        let path = self.project_dir.join(relative);
+        anyhow::ensure!(
+            path.is_file(),
+            "missing {relative} under {}; pass --project-dir pointing at the ADM checkout",
+            self.project_dir.display()
+        );
+        Ok(path)
+    }
+
     pub fn state_path(&self) -> PathBuf {
         self.state_dir.clone().unwrap_or_else(|| {
             std::env::var_os("XDG_DATA_HOME")
@@ -179,7 +209,7 @@ fn run(cli: &Cli) -> Result<()> {
             command
                 .current_dir(&cli.project_dir)
                 .args(["--import", "tsx"])
-                .arg(cli.project_dir.join("packages/terminal/src/main.ts"))
+                .arg(cli.checkout_file("packages/terminal/src/main.ts")?)
                 .args(["--url", &cli.runner_url, "--workspace", &workspace.id]);
             if *diagnostics {
                 command.arg("--diagnostics");
