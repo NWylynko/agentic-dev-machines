@@ -89,7 +89,7 @@ The need to handle non-cooperative code is source-verified: closing joins active
 
 **Verified caveat:** ConversationView includes the active transcript, whose head changes with reset/compaction; entries can also carry an application-specific kind without model content. [View implementation][view]; [entry definitions][entries]. **Proposal:** maintain the bot's published timeline from all of its published entries or a durable projection, rather than rendering the raw active view. A model handoff must not erase earlier delivered messages from the user-facing conversation.
 
-**Verified:** the current Pi providers implement subscription OAuth paths for ChatGPT/Codex and Claude; the model layer accepts a credential store. This is implementation support, not a live verification of Nick's accounts or provider terms. [OpenAI provider][openai]; [legacy Codex provider][openai-codex]; [Anthropic provider][anthropic]; [model runtime][model-runtime].
+**Verified:** the current Pi providers implement subscription OAuth paths for ChatGPT/Codex and Claude; the model layer accepts a credential store. This establishes implementation support; live account compatibility and provider terms require separate validation. [OpenAI provider][openai]; [legacy Codex provider][openai-codex]; [Anthropic provider][anthropic]; [model runtime][model-runtime].
 
 **Proposal:** reuse that account/provider plumbing where compatible, expose authentication/allowance failures clearly, and preserve pending work. Do not silently substitute an API key, billing method, or provider. Account compatibility, unattended refresh, provider choice, and numeric limits still require validation and user decisions.
 
@@ -97,14 +97,14 @@ Credential placement is also unresolved. A colocated runner is the minimum recov
 
 ## Local behavioral checks
 
-The research team ran credential-free checks against the published @earendil-works/pi-durable 1.2.0 package on Node v24.18.0: **6 passed, 0 failed across two suites**. The scripts remain temporary research artifacts, not a repository test suite.
+Credential-free checks against the published @earendil-works/pi-durable 1.2.0 package on Node v24.18.0 reported **6 passed, 0 failed across two suites**. The scripts were temporary research artifacts and are not included in this repository.
 
-The process/task suite ran with node behavior.test.mjs in /tmp/adm-pi-durable-probe: **2 passed, 0 failed**. Sources: [local test](/tmp/adm-pi-durable-probe/behavior.test.mjs) and [child process](/tmp/adm-pi-durable-probe/checkpoint-child.mjs).
+The process/task suite reported **2 passed, 0 failed** using a real child process and local SQLite storage.
 
 - A real SIGKILL during a task effect followed by a fresh SQLite open preserved the checkpoint and memo, changed running to pending, and did no work before resume. Recovery repeated the unfinished effect; the earlier phase ran once. A third open observed the terminal receipt without rerunning it. This matches the source's checkpoint/effect boundary and demonstrates why external effects need reconciliation or idempotency. [Task scheduler][scheduler]; [effect contract][spec].
 - Ordinary conversation abort stopped foreground work while preserving its background task. Close/reopen preserved that task for resume. Abort with background: true stopped it durably; another reopen did not run it. [Abort options][harness-types]; [scheduler abort][scheduler].
 
-The tool-policy suite ran with node tool-replay.test.mjs in the same directory: **4 passed, 0 failed**. It used the built-in synthetic fauxProvider and graceful harness close/reopen around an interrupted tool. Default/default policy executed once and returned an interruption result retaining partial output/details; safe/safe executed twice and succeeded; safe-to-unsafe and unsafe-to-safe changes each executed once and returned interruption. These cases verify that both stored and current policies must permit replay. Source: [local tool test](/tmp/adm-pi-durable-probe/tool-replay.test.mjs); [upstream replay implementation][tool].
+The tool-policy suite reported **4 passed, 0 failed**. It used the built-in synthetic fauxProvider and graceful harness close/reopen around an interrupted tool. Default/default policy executed once and returned an interruption result retaining partial output/details; safe/safe executed twice and succeeded; safe-to-unsafe and unsafe-to-safe changes each executed once and returned interruption. These cases verify that both stored and current policies must permit replay. [Upstream replay implementation][tool].
 
 Only the custom-task case used a real SIGKILL. These checks used one host and local SQLite/database-WAL state. They did not test SIGKILL during model generation or tool execution, Kubernetes, TUI attachment, real providers, node loss, power failure, storage replication, or competing owners.
 
@@ -123,7 +123,7 @@ These are the remaining integration gates. The local checks above establish task
 | Isolation | Two coding workspaces edit main independently; attempts at another workspace's files fail. A bot cannot invoke coding tools directly, through Code Mode, tool discovery, or child conversations. |
 | Silent bot | Ordinary responses, thinking, and tools never appear in its chat. sendMessage appears once, including disconnect/restart around delivery. |
 | Storage loss | Test planned drain separately from abrupt node loss; measure repository/history divergence, interruption, and recent loss on the chosen storage. |
-| Browser and ports | Browser automation uses the intended workspace, MacBooks open its site/port, replacement resolves the current runtime, and destruction removes access. |
+| Browser and ports | Browser automation uses the intended workspace, client laptops open its site/port, replacement resolves the current runtime, and destruction removes access. |
 | Authentication | Use the actual selected account flow, refresh after restart, and expose expired/exhausted authentication without losing queued work or changing billing. |
 
 ## Remaining decisions and limits

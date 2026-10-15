@@ -1,6 +1,6 @@
 # Installation and updates
 
-ADM installs on the Debian Linux x86_64 management host. MacBooks connect through Herdr/SSH; the installer does not install a macOS runtime.
+ADM installs on the Debian Linux x86_64 management host. Client laptops connect through Herdr/SSH; the installer runs on the management host.
 
 The host needs Node.js 24+, `curl`, GNU `tar`, `sha256sum`, and `flock`. Running coding workspaces also needs `kubectl` configured for your cluster, Git, and a suitable [StorageClass](../deploy/storage.md). Repository discovery needs authenticated `gh`. The installer does not install system packages or change cluster resources.
 

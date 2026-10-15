@@ -97,6 +97,7 @@ jobs:
           cache-to: type=gha,mode=max
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
             org.opencontainers.image.title=adm-dev
             org.opencontainers.image.description=ADM development workspace
 
@@ -235,6 +236,7 @@ jobs:
             --notes-file release-notes.md \
             dist/adm-linux-amd64.tar.gz \
             dist/install.sh \
+            dist/LICENSE \
             dist/adm-linux-amd64 \
             dist/adm-repositories-linux-amd64 \
             dist/SHA256SUMS

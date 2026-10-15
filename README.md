@@ -32,3 +32,7 @@ adm attach my-project
 Choose a default model during setup, or pass `--model PROVIDER/MODEL_ID` when creating a workspace. `--no-agent` creates a shell-only workspace. Provider credentials stay on the management host.
 
 See [operations](docs/operations.md) for commands, Herdr integration, bots, and verification; [the implementation contract](docs/implementation-contract.md) for APIs; and [product requirements](docs/product-requirements.md) for the design and open decisions.
+
+## License
+
+[MIT](LICENSE). Bundled dependencies retain their own licenses.

@@ -8,7 +8,7 @@ Install the standalone release with the command in the [README](../README.md), t
 
 Make sure `$HOME/.local/bin` is on your shell's PATH. `adm doctor` reports tool availability, cluster readiness, the default StorageClass, runner health, and the selected local state directory. It preserves storage and runner error causes instead of treating every failure as a stopped service. Use `adm doctor --storage-class NAME` to inspect another class; node-local storage is labeled explicitly. Diagnostics do not allocate a workspace or install missing prerequisites.
 
-Run `adm login` on the management host and use its `/login` command to configure the provider you intend to use. ADM uses the pinned Pi model runtime and its normal authentication store. Subscription compatibility depends on that provider integration; it has not been validated for every account. API keys follow the home-level `SECRETS.md`: inject them from Infisical into the runner's process, and never create a project `.env` containing values. Do not copy provider authentication into a workspace.
+Run `adm login` on the management host and use its `/login` command to configure the provider you intend to use. ADM uses the pinned Pi model runtime and its normal authentication store. Subscription compatibility depends on that provider integration; it has not been validated for every account. Keep API keys in Infisical and inject them into the runner's process; commit schema only and never create a project `.env` containing real values. Do not copy provider authentication into a workspace.
 
 Choose a default model in `adm setup`, or select one explicitly with `--model PROVIDER/MODEL_ID` when creating an agent workspace. `faux/faux-1` is a deterministic local test provider and is available only when explicitly selected. It does not call an external model.
 
@@ -65,7 +65,7 @@ adm status my-project
 Use `--no-agent` for a shell-only workspace. By default `/repos` is an ordinary writable directory, so normal cloning works. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. To seed the catalog without cloning repository contents:
 
 ```sh
-adm-repositories discover --owner nwylynko > /tmp/adm-catalog.json
+adm-repositories discover --owner example-owner > /tmp/adm-catalog.json
 adm create my-project --catalog /tmp/adm-catalog.json --model PROVIDER/MODEL_ID
 ```
 
@@ -95,7 +95,7 @@ adm port my-project 3000 --local-port 3000
 adm browser my-project http://127.0.0.1:3000 --screenshot /workspace/preview.png
 ```
 
-From a MacBook, forward that management-host port over your normal SSH connection: `ssh -L 3000:127.0.0.1:3000 MANAGEMENT_HOST`. Open `http://127.0.0.1:3000` on the MacBook. Port forwarding binds to loopback. A failed forward reports interruption; rerunning it resolves the current runtime.
+From your laptop, forward that management-host port over your normal SSH connection: `ssh -L 3000:127.0.0.1:3000 MANAGEMENT_HOST`. Open `http://127.0.0.1:3000` in your laptop's browser. Port forwarding binds to loopback. A failed forward reports interruption; rerunning it resolves the current runtime.
 
 ## Herdr ownership and deletion
 
@@ -140,4 +140,4 @@ cargo build
 ADM_LIVE_CLUSTER=1 ADM_LIVE_IMAGE=adm-dev:0.1.0 npm run test:cluster
 ```
 
-The suite checks that this image is present on every schedulable node before creating anything. Ordinary `npm test` does not mutate the cluster. Passing the local-path experiment does not prove cross-node storage durability, a sudden-node-failure loss window, live account refresh, or MacBook connectivity.
+The suite checks that this image is present on every schedulable node before creating anything. Ordinary `npm test` does not mutate the cluster. Passing the local-path experiment does not prove cross-node storage durability, a sudden-node-failure loss window, live account refresh, or connectivity from client laptops.

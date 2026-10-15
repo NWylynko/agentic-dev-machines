@@ -108,6 +108,10 @@ test(
     );
     const adm = join(environment.HOME, ".local/bin/adm");
     const installed = dirname(dirname(await realpath(adm)));
+    assert.match(
+      await readFile(join(installed, "LICENSE"), "utf8"),
+      /^MIT License\n[\s\S]*Copyright \(c\) 2026 Nick Wylynko[\s\S]*The above copyright notice and this permission notice/,
+    );
     assert.equal(
       await readFile(join(installed, "VERSION"), "utf8"),
       "v9.8.7\n",

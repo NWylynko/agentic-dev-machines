@@ -12,12 +12,12 @@ These notes distinguish confirmed requirements, implemented local behavior, and 
 - Use Pi-style terminal interaction inside Herdr for development work and bot conversations.
 - Bots have no repository access or coding tools. They can monitor and prompt coding agents, use Code Mode to compose permitted tools, and manage their own goals and recurring work.
 - Bot model output stays private unless it calls `sendMessage` to publish a message in the terminal conversation.
-- Support browser automation and a way to access development sites and ports from a MacBook.
+- Support browser automation and a way to access development sites and ports from client laptops.
 - Leave conversation retention after removal undecided; configurability is an acceptable proposal rather than a blocker.
 
 ## The experience
 
-Herdr runs on a long-running Debian management box. MacBooks connect to that box over SSH. Disconnecting a laptop leaves Herdr, its spaces, and the agents running. The management box may have its own custom image and resource allocation; it has a separate lifetime from individual development workspaces.
+Herdr runs on a long-running Debian management host. Client laptops connect to that host over SSH. Disconnecting a laptop leaves Herdr, its spaces, and the agents running. The management host may have its own custom image and resource allocation; it has a separate lifetime from individual development workspaces.
 
 Creating a new Herdr space should give you a ready-to-use shell somewhere in the cluster without choosing a node, finding a Pod, or managing Kubernetes resources by hand.
 
@@ -25,14 +25,14 @@ A typical session should look like this:
 
 1. Create a workspace from the CLI or Herdr.
 2. Attach to its shell.
-3. Open a repository under `/repos/nwylynko/<repo>` or clone one normally.
+3. Open a repository under `/repos/example-owner/<repo>` or clone one normally.
 4. Make changes yourself or run a coding agent through the Pi-style terminal interface. Optionally use a bot to monitor and prompt the agent.
 5. Disconnect while agents continue working, then return to the same named workspace later.
 6. Remove the Herdr space when finished; its owned activity stops and its development runtime and private files are destroyed.
 
 Workspaces are quick to allocate and disposable when finished, but may run unattended for as long as their spaces exist. The development image is built from `image/Dockerfile`. The published linux/amd64 copy is `ghcr.io/nwylynko/agentic-dev-machines:latest`.
 
-The storage constraint is roughly **256 GB per node**, so creating more workspaces should avoid multiplying complete repository checkouts, Git history, and machine images.
+Nodes may have constrained storage, so creating more workspaces should avoid multiplying complete repository checkouts, Git history, and machine images.
 
 ## Workspace model
 
@@ -97,7 +97,7 @@ Autonomous execution and durable scheduling are core requirements. They need an 
 
 ```mermaid
 flowchart TD
-    M[MacBooks over SSH] --> H[Herdr on long-running Debian box]
+    M[Client laptops over SSH] --> H[Herdr on long-running Debian host]
     H --> C[CLI / workspace manager]
     C --> K[Kubernetes API]
     K --> D[Deployment per workspace]
@@ -127,7 +127,7 @@ This diagram shows the proposed container implementation. Persisting the whole o
 | Agent runner / backend       | Execute unattended with role-specific tools, persist history and goals, schedule work, and recover independently of attachments |
 | Bot control interface        | Expose permitted monitoring and prompting operations without development filesystem or shell access                             |
 | Terminal message adapter     | Deliver explicit bot messages to its Pi-style conversation in Herdr                                                             |
-| Preview access               | Route MacBook connections to development sites and selected ports in the current runtime                                        |
+| Preview access               | Route client connections to development sites and selected ports in the current runtime                                         |
 
 An initial implementation could use one single-replica Deployment per workspace, identified by labels and annotations, plus storage resources where needed. There is no initial requirement for a custom cluster scheduler, database, Kubernetes operator, or Workspace CRD. Reuse the chosen agent backend's durable execution and scheduling where suitable.
 
@@ -160,7 +160,7 @@ The old shell process does not move to the new runtime. An interrupted tool comm
 
 ### Browser automation and development ports
 
-Development workspaces must support browser automation and let Nick open their running sites or selected ports from a MacBook. The browser location, automation integration, and port transport are implementation choices; Docker builds and other additional workloads have not been selected as requirements.
+Development workspaces must support browser automation and access to their running sites or selected ports from client laptops. The browser location, automation integration, and port transport are implementation choices; Docker builds and other additional workloads have not been selected as requirements.
 
 Preview connections should resolve the workspace's current runtime so replacement does not require finding a new Pod address. Exact URLs and reconnection behavior depend on the chosen transport. Removing a workspace must remove its routes or forwards too. Preview access does not grant access to another workspace's files. Browser capabilities for bots are not implied by this development-workspace requirement.
 
@@ -170,7 +170,7 @@ The desired filesystem exposes the accessible GitHub repository catalog inside e
 
 ```text
 /repos/
-└── nwylynko/
+└── example-owner/
     ├── project-alpha/
     ├── project-beta/
     └── project-gamma/
@@ -220,7 +220,7 @@ For a planned drain, the proposed behavior is to checkpoint repository and agent
 
 ## Durable coding agents
 
-Pi is the preferred terminal experience; OpenCode was also discussed as a harness candidate. Unattended execution is essential: retain the conversation, tasks, and progress while allowing the execution environment to be replaced, and resume work without requiring a person to reconnect.
+Pi provides the preferred terminal experience; OpenCode is another harness candidate. Unattended execution is essential: retain the conversation, tasks, and progress while allowing the execution environment to be replaced, and resume work without requiring a person to reconnect.
 
 Ordinary Pi automatically saves resumable sessions under `~/.pi/agent/sessions/`, grouped by working directory. `--continue` resumes the latest session for that directory and `--resume` opens a picker. Its [session documentation](https://pi.dev/docs/latest/sessions) and [file format reference](https://pi.dev/docs/latest/session-format) describe JSONL histories and explicit session deletion. These files live separately from the repository; this project must choose their persistent location and retention policy.
 
@@ -252,7 +252,7 @@ Coding agents and bots can reuse durable execution infrastructure, but have diff
 | Coding agent | Normal visible Pi-style terminal interaction in Herdr                                      | Its own repositories and development tools; works unattended                                                           |
 | Bot          | Pi-style terminal conversation in Herdr; only `sendMessage` publishes AI-authored messages | No repository access or coding tools; can monitor and prompt permitted agents, use Code Mode, and maintain goals/loops |
 
-The optional bot is a supervisor and general assistant inspired by the requested Grok-bot-like behavior. It is not a coding agent with its output hidden. It does not imply using a particular model provider or recreating another product's implementation.
+The optional bot acts as a supervisor and general assistant with explicitly permitted monitoring, prompting, messaging, and goal/loop tools. This role does not select a particular model provider.
 
 In bot mode, streaming tokens, ordinary responses, intermediate notes, and raw tool results are not automatically forwarded to the user. Finishing a model turn does not itself send a chat message. The agent must explicitly call `sendMessage` when it decides there is something to communicate.
 
@@ -272,7 +272,7 @@ Bot activity must have an explicit owning Herdr space. Removing its owning space
 
 ### Providers and unattended limits
 
-Nick currently uses Codex through a Plus subscription and is considering Claude. Keep model/provider authentication configurable; no provider migration, API billing arrangement, or numeric spending limit has been selected. Validate the supported account/authentication path with the chosen harness instead of assuming a subscription works through every integration.
+Keep model/provider authentication configurable; no provider migration, API billing arrangement, or numeric spending limit has been selected. Validate the supported account/authentication path with the chosen harness instead of assuming a subscription works through every integration.
 
 Rate limits, exhausted allowances, and expired authentication appear in session status and diagnostics. After correcting credentials or capacity, `/resume` retries the latest failed turn only if no tool ran; otherwise an explicit follow-up is required to reconcile possible side effects. The failed conversation remains inspectable after restart. There is no provider or billing switch, automatic retry loop, or claim that live subscription refresh has been verified.
 
@@ -280,7 +280,7 @@ Rate limits, exhausted allowances, and expired authentication appear in session 
 
 The experience overlaps with exe.dev: provision a Linux environment quickly, reconnect later, and avoid managing its physical host. exe.dev documents persistent VMs, shared compute pools, stable proxy routing, and local disks replicated to another machine. See its [architecture](https://exe.dev/docs/architecture) and [persistence rationale](https://blog.exe.dev/persistent).
 
-This project explores a personal Kubernetes workspace service with Herdr as its interface, lazy Git access, and autonomous durable agents. Its persistence boundary is repository work and agent state attached to replaceable compute. Full-machine persistence is outside the current requirements; installed tools are temporary or supplied by the image.
+This project explores a homelab Kubernetes workspace service with Herdr as its interface, lazy Git access, and autonomous durable agents. Its persistence boundary is repository work and agent state attached to replaceable compute. Full-machine persistence is outside the current requirements; installed tools are temporary or supplied by the image.
 
 The useful ideas to borrow are stable identity, compute-independent state, and convenient reconnection. Reproducing exe.dev's hypervisor stack, disk replication engine, or public hosting platform is outside the initial scope.
 
@@ -289,8 +289,8 @@ The useful ideas to borrow are stable identity, compute-independent state, and c
 These are investigation targets, not selected dependencies:
 
 - [ArtifactFS](https://github.com/cloudflare/artifact-fs) is the lazy filesystem behind `/repos`. The pinned build is in `packages/repositories/ARTIFACTFS`. A local FUSE test checks that unused repositories stay unhydrated and that two workspaces do not see each other's commits. Cross-node recovery is not demonstrated.
-- **LunarFS** was mentioned as another filesystem candidate. Its suitability and guarantees need separate investigation.
-- **Shared or replicated persistent storage**, including the Longhorn or NFS approaches discussed, needs testing for capacity, filesystem compatibility, and node failure behavior.
+- **LunarFS** is another filesystem candidate. Its suitability and guarantees need separate investigation.
+- **Shared or replicated persistent storage**, including Longhorn or NFS, needs testing for capacity, filesystem compatibility, and node failure behavior.
 - **Pi / OpenCode with celld or another durable backend** needs an end-to-end compatibility and recovery experiment.
 
 ## First implementation and validation
@@ -303,7 +303,7 @@ Build in small stages, proving each through real CLI, shell, and cluster behavio
 4. **Lazy repositories and isolation:** expose a catalog and verify that unused repositories do not hydrate. Open the same repository on `main` in two spaces; edits, branch changes, and local commits must stay private, and attempts to access the other space's files must fail. Measure actual disk use.
 5. **Unattended agent recovery:** disconnect every client while a real agent works, replace its runtime, and demonstrate automatic recovery of its conversation and pending work without blindly repeating a partially completed action.
 6. **Bot role:** verify that normal model output produces no terminal chat delivery, `sendMessage` delivers an explicit message, and a self-created goal and loop survive replacement. Verify permitted monitoring/prompting works while direct and Code Mode access to coding tools and repositories is unavailable. Remove the owning space and verify that queued or future work cannot recreate it or a deliberately removed target.
-7. **Browser and preview access:** automate a real browser against a workspace's development site and open its exposed site/port from a MacBook. Verify routing after replacement and cleanup on removal.
+7. **Browser and preview access:** automate a real browser against a workspace's development site and open its exposed site/port from a client laptop. Verify routing after replacement and cleanup on removal.
 8. **Custom image:** bake in the tools that the proven workflows need. Allow image and resource configuration for the management box and development workspaces independently.
 
 Use end-to-end tests first for implementation changes. Provisioning, scheduling, storage, hydration, and recovery failures should be visible through CLI status and logs with the workspace identity and failure cause. Check cleanup for leaked Pods, volumes, overlays, and backend state.
@@ -320,7 +320,7 @@ Use end-to-end tests first for implementation changes. Provisioning, scheduling,
 | Bot ownership, permitted agents, and control-tool interface | A bot supervises only the agent ids it was given. Whether it has its own Herdr space is still open                                     |
 | Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop        |
 | Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                |
-| Browser automation and development-port transport           | Determines how browsers run and how MacBooks reach development sites and ports                                                         |
+| Browser automation and development-port transport           | Determines how browsers run and how client laptops reach development sites and ports                                                   |
 | Provider authentication and allowance handling              | Determines supported account connections and how unattended work waits when capacity or authentication is unavailable                  |
 | Image, resource, and cache configuration                    | Determines available tools, concurrent workloads, and capacity use                                                                     |
 

@@ -48,6 +48,7 @@ try {
     await chmod(destination, 0o755);
   }
   for (const file of [
+    "LICENSE",
     "package.json",
     "package-lock.json",
     "packages/runner/package.json",
@@ -87,8 +88,13 @@ try {
   ];
   for (const [name, artifact] of binaries)
     await copyFile(join(staging, "bin", name), join(output, artifact));
+  await copyFile(join(staging, "LICENSE"), join(output, "LICENSE"));
   const sums = [];
-  for (const name of [archive, ...binaries.map(([, artifact]) => artifact)]) {
+  for (const name of [
+    archive,
+    "LICENSE",
+    ...binaries.map(([, artifact]) => artifact),
+  ]) {
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(join(output, name)))
       hash.update(chunk);

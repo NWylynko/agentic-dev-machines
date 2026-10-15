@@ -20,6 +20,7 @@ COPY packages/runner packages/runner
 RUN npx esbuild packages/runner/src/remote-env-server.ts --bundle --platform=node --format=esm --outfile=/out/workspace-env.mjs
 
 FROM node:24.18.0-bookworm
+COPY LICENSE /usr/share/licenses/adm/LICENSE
 RUN apt-get update \
  && apt-get install -y --no-install-recommends bash ca-certificates git tini fuse3 chromium \
  && rm -rf /var/lib/apt/lists/*

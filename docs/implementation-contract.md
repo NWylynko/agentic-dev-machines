@@ -1,6 +1,6 @@
 # Implementation contract
 
-This is the shared contract for the initial implementation. Nick authorized autonomous implementation and sensible decisions on 2026-10-14. Public tests exercise the real CLI, the runner HTTP API/SQLite recovery, terminal attachment, and isolated Kubernetes resources. No confirmation is needed for these test seams.
+This is the shared contract for the initial implementation. Public tests exercise the real CLI, the runner HTTP API/SQLite recovery, terminal attachment, and isolated Kubernetes resources.
 
 ## Components
 
@@ -55,5 +55,3 @@ The remote environment helper cancels active requests and cleans up detached com
 ## Validation
 
 Use faux models to exercise real Durable work without needing credentials. Run actual subprocess-kill/restart tests, streaming disconnection/reconnect, bot tool exclusion including Code Mode, explicit messaging, durable goals/loops and deletion. Cluster tests create only uniquely owned test namespaces and remove only their own resources. Browser/port tests use those resources. Do not drain the user's physical nodes; move only our test workload through node selectors when testing placement changes.
-
-The requested Sonnet 5.5 CLI cannot authenticate (expired OAuth, refresh failed). Available coding agents are being used transparently; do not claim Sonnet performed work.
