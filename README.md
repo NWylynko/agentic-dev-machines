@@ -6,7 +6,81 @@ Create a space, get a Debian shell, and run coding agents. An optional autonomou
 
 **Status: implemented local workflows, cluster validation pending.** `adm`, the durable runner, the Pi-style terminal, and the lazy repository catalog have end-to-end tests using real HTTP, SQLite recovery, terminal processes, Chromium, Git, and FUSE. `image/Dockerfile` builds the `adm-dev:0.1.0` workspace image. The build workflow publishes that image and linux/amd64 CLI binaries. A real cluster create, cross-node recovery, and the loss window after an unexpected node failure have not been demonstrated. Storage remains an operator choice; see [storage requirements](deploy/storage.md).
 
-Start with the [operating instructions](docs/operations.md) for installation, provider setup, workspace commands, Herdr ownership, and verification. The [implementation contract](docs/implementation-contract.md) specifies the current public interfaces. The sections below retain the product requirements and proposals so unverified infrastructure guarantees stay explicit.
+Install and setup are below. The [operating instructions](docs/operations.md) cover day-to-day commands, Herdr ownership, bots, and verification. The [implementation contract](docs/implementation-contract.md) specifies the current public interfaces. The later sections retain the product requirements and proposals so unverified infrastructure guarantees stay explicit.
+
+## Install
+
+ADM runs on the Debian management host. The published CLI and workspace image are linux/amd64. The runner and terminal stay in this checkout, so clone the repository and install its Node dependencies even when you use the published `adm` binary.
+
+```sh
+git clone https://github.com/NWylynko/agentic-dev-machines.git
+cd agentic-dev-machines
+npm ci
+```
+
+Node 24 or newer is required. `kubectl`, Git, and `gh` need to be on `PATH`, and so does `$HOME/.local/bin`.
+
+Download the CLI and the repository helper from the latest successful Build run:
+
+```sh
+gh run download -R NWylynko/agentic-dev-machines -n adm-linux-amd64 -D /tmp/adm-binaries
+cd /tmp/adm-binaries
+sha256sum -c SHA256SUMS
+install -m 755 adm-linux-amd64 "$HOME/.local/bin/adm"
+install -m 755 adm-repositories-linux-amd64 "$HOME/.local/bin/adm-repositories"
+```
+
+Run `adm` from this checkout, or pass `--project-dir` / `ADM_PROJECT_DIR`. A push to `main` publishes those binaries as a workflow artifact. A version tag such as `v0.1.0` also attaches them to a GitHub release.
+
+To build the same binaries on the management host, use Rust for the CLI and Go 1.26 for the repository helper:
+
+```sh
+cargo install --path . --root "$HOME/.local"
+go build -C packages/repositories -o "$HOME/.local/bin/adm-repositories" .
+```
+
+A binary built with `cargo install --path .` keeps using this checkout while that path exists.
+
+The workspace image published from `main` is `ghcr.io/nwylynko/agentic-dev-machines:latest`, alongside `sha-<commit>`. A version tag also publishes that version. The CLI default is still `adm-dev:0.1.0`, the tag produced by `docker build -f image/Dockerfile -t adm-dev:0.1.0 .`. Pass the GHCR reference when creating a workspace:
+
+```sh
+adm create my-project --image ghcr.io/nwylynko/agentic-dev-machines:latest --model PROVIDER/MODEL_ID
+```
+
+If the GHCR package is private, the cluster needs a pull credential. Import the image onto each node when that node cannot pull from GHCR. A local `docker build` stays on the management host until the image is imported onto the nodes or pulled from GHCR.
+
+## Setup
+
+Log the model provider in on the management host. Credentials stay on that host.
+
+```sh
+npm exec -- pi
+```
+
+Use `/login` in that Pi session. `faux/faux-1` is a local test model and runs only when you select it explicitly.
+
+Check the host and cluster before creating a workspace:
+
+```sh
+adm doctor
+```
+
+`adm doctor` reports Node, Git, `gh`, cluster nodes, the `adm-replicated` StorageClass, and whether the runner is up. Create that StorageClass as described in [deploy/storage.md](deploy/storage.md) before the first coding workspace. `adm doctor --storage-class local-path` inspects the node-local class. Creating a workspace on it requires `--allow-node-local-storage`, and that volume stays on one node.
+
+Start the runner:
+
+```sh
+adm start
+```
+
+It listens on `http://127.0.0.1:7432`. State goes in `$HOME/.local/share/adm`, or under `$XDG_DATA_HOME` when that is set. `--state-dir` and `--runner-url` select different values. To keep the runner up after logout, install [deploy/adm-runner.service](deploy/adm-runner.service) as a user service and replace both placeholder paths. `adm stop` stops the runner and keeps its state. `adm destroy` deletes a workspace.
+
+```sh
+adm create my-project --image ghcr.io/nwylynko/agentic-dev-machines:latest --model PROVIDER/MODEL_ID
+adm attach my-project
+```
+
+`--no-agent` creates a shell-only workspace. Without `--catalog`, `/repos` is a normal writable directory.
 
 ## Confirmed behavior
 
@@ -36,7 +110,7 @@ A typical session should look like this:
 5. Disconnect while agents continue working, then return to the same named workspace later.
 6. Remove the Herdr space when finished; its owned activity stops and its development runtime and private files are destroyed.
 
-Workspaces are quick to allocate and disposable when finished, but may run unattended for as long as their spaces exist. The development image is `adm-dev:0.1.0` from `image/Dockerfile`.
+Workspaces are quick to allocate and disposable when finished, but may run unattended for as long as their spaces exist. The development image is built from `image/Dockerfile`. The published linux/amd64 copy is `ghcr.io/nwylynko/agentic-dev-machines:latest`.
 
 The storage constraint is roughly **256 GB per node**, so creating more workspaces should avoid multiplying complete repository checkouts, Git history, and machine images.
 
@@ -85,7 +159,7 @@ adm status my-project
 adm destroy my-project
 ```
 
-Agent workspaces require an explicitly selected model. `--no-agent` creates a shell-only workspace. Without `--catalog`, `/repos` is an ordinary writable directory. Supplying a catalog opts in to lazy repository mounts; discovery and scoped private-repository fetch credentials are separate prerequisites.
+Agent workspaces require an explicitly selected model. `--no-agent` creates a shell-only workspace. Pass `--image ghcr.io/nwylynko/agentic-dev-machines:latest` to use the published workspace image. The default image is `adm-dev:0.1.0`. Without `--catalog`, `/repos` is an ordinary writable directory. Supplying a catalog opts in to lazy repository mounts; discovery and scoped private-repository fetch credentials are separate prerequisites.
 
 Creation and attachment are separate operations. Losing an attachment must not delete the workspace. Reattaching should resolve the current runtime from the workspace identity instead of remembering a particular Pod name.
 

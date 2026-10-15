@@ -2,7 +2,7 @@ keep this file up to date
 
 # Project notes
 
-- Read `README.md` for the product, `docs/operations.md` to run it, and `docs/implementation-contract.md` for the implemented API. Storage backend, the node-failure loss window, and live Herdr installation remain open.
+- Read `README.md` for the product and for install/setup, `docs/operations.md` for day-to-day commands, Herdr ownership, and verification, and `docs/implementation-contract.md` for the implemented API. Storage backend, the node-failure loss window, and live Herdr installation remain open.
 - `adm` is the Rust CLI. The runner and terminal are the npm workspaces `@adm/runner` and `@adm/terminal`. Repository catalog code is `packages/repositories`. The workspace image is `image/Dockerfile` (`adm-dev:0.1.0`).
 - Tests: `cargo test`, `npm test`, and `npm run test:repositories`. The repository test needs `/dev/fuse` and `artifact-fs` on `PATH` (pin in `packages/repositories/ARTIFACTFS`). It skips without `/dev/fuse` and fails if the binary is missing while FUSE is present.
 - `.github/workflows/build.yml` verifies the CLI, runner, and terminal, then publishes `linux/amd64` `adm`, `adm-repositories`, and the workspace image to GHCR. `main` tags the image `latest` and `sha-<commit>`; a `v*` tag also publishes that version and a GitHub release. FUSE tests stay outside this workflow. The release CLI still needs the checkout (`--project-dir` or `ADM_PROJECT_DIR` when the binary was not built there).
