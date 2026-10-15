@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/
 
 This downloads the release binaries, runner, terminal, and their dependencies. No clone, Rust, Go, or npm install is needed. Add `~/.local/bin` to your PATH. Rerun the same command to update; settings and workspace state are preserved.
 
-The download requires a published GitHub release containing the runtime bundle. See [installation details](docs/installation.md) for pinned versions, prerequisites, and updates.
+Successful `main` builds publish a release automatically. See [installation details](docs/installation.md) for pinned versions, prerequisites, and updates.
 
 ## Setup
 

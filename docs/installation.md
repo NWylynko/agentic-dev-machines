@@ -10,7 +10,7 @@ The host needs Node.js 24+, `curl`, GNU `tar`, `sha256sum`, and `flock`. Running
 curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/install.sh | sh
 ```
 
-The script downloads `adm-linux-amd64.tar.gz` and verifies its checksum from the release's `SHA256SUMS`. It includes the CLI, repository helper, compiled runner and terminal, and pinned production Node dependencies. No checkout or build toolchain is needed.
+The script downloads `adm-linux-amd64.tar.gz` and verifies its checksum from the release's `SHA256SUMS`. Successful `main` builds automatically publish a release containing the CLI, repository helper, compiled runner and terminal, and pinned production Node dependencies. No checkout or build toolchain is needed.
 
 The commands are installed in `$HOME/.local/bin`. Add that directory to your PATH if needed. The installation lives under `$XDG_DATA_HOME/adm/install`, or `$HOME/.local/share/adm/install` when XDG_DATA_HOME is unset. Versioned runtime files are separate from workspace and runner state.
 
@@ -29,7 +29,9 @@ adm attach my-project
 
 ## Update or pin a version
 
-Rerun the install command to get the latest release. Updates validate the download before changing the active installation, retain previous runtime directories, and preserve configuration, workspace metadata, conversations, and provider login. An active `adm-runner.service` restarts after the switch. Its restart failure is reported; inspect `systemctl --user status adm-runner.service` before continuing. Existing workspaces retain their image and storage settings.
+Rerun the install command to get the latest successful `main` release. Each build has its own `sha-<commit>` release and matching workspace image; updating does not require a manual version tag. Markdown-only pushes skip the build. Optional `v*` tags publish pinned versions without changing the installer's default release.
+
+Updates validate the download before changing the active installation, retain previous runtime directories, and preserve configuration, workspace metadata, conversations, and provider login. An active `adm-runner.service` restarts after the switch. Its restart failure is reported; inspect `systemctl --user status adm-runner.service` before continuing. Existing workspaces retain their image and storage settings.
 
 For a runner started with `adm start`, stop it before updating and start it afterward. Closing terminal attachments detaches; it does not delete workspaces. Use the same `--state-dir` and `--runner-url` for custom runners. The installer recognizes the default state directory or `ADM_STATE_DIR`; custom runner locations remain operator-managed.
 
@@ -46,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/
 sh /tmp/adm-install.sh --version v0.1.0 --no-setup
 ```
 
-`v0.1.0` is an example: choose a published release that contains the runtime bundle. No such release was published when this installer was introduced. `--base-url URL` selects an explicit alternative release asset directory. There is no source-build or provider fallback when a download or prerequisite fails.
+`v0.1.0` is an example: choose an existing version or `sha-<commit>` tag from [Releases](https://github.com/NWylynko/agentic-dev-machines/releases). `--base-url URL` selects an explicit alternative release asset directory. There is no source-build or provider fallback when a download or prerequisite fails.
 
 The installer refuses to overwrite an existing unmanaged `adm` or `adm-repositories` command. For an older manual installation, stop its runner, move those executables aside, install, then run `adm setup` to replace any checkout-based service. Keep the existing state directory. This migrates the runtime without moving your workspaces.
 

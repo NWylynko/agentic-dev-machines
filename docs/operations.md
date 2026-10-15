@@ -32,9 +32,9 @@ The default state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm`
 | `main`   | `latest`, `sha-<commit>`                    |
 | `v0.1.0` | `0.1.0`, `v0.1.0`, `latest`, `sha-<commit>` |
 
-A version tag creates a GitHub release with `install.sh`, `adm-linux-amd64.tar.gz`, compatibility binaries, and `SHA256SUMS`. The archive contains the CLI, repository helper, compiled runner/terminal, and their pinned production Node dependencies. Pushes to `main` that change the build upload the same files as a workflow artifact. Installation needs no checkout. The bundle records its matching `sha-<commit>` workspace image reference; setup can select a different image.
+After verification, image publishing, and runtime packaging pass, a `main` build automatically creates a GitHub release under `sha-<commit>` and marks it latest. Each release has its own assets, so a newer build does not overwrite files being downloaded. The release includes `install.sh`, `LICENSE`, `adm-linux-amd64.tar.gz`, compatibility binaries, and `SHA256SUMS`. The archive contains the CLI, repository helper, compiled runner/terminal, and their pinned production Node dependencies. The same files remain available as a workflow artifact. Installation needs no checkout. The bundle records its matching `sha-<commit>` workspace image reference; setup can select a different image.
 
-The installer consumes tagged GitHub release assets. Until the first release with the new bundle is published, use the workflow artifact or a source checkout to validate it. A main-branch artifact alone does not populate the installer's `latest` URL.
+The installer consumes the latest successful `main` release automatically. Optional `v*` tags also publish pinned releases; they do not change the installer's latest release. Rerunning the same build preserves published assets. An older or unrelated main build is published under its own tag and is not promoted over a newer published build. A draft left by a failed publish is not reused; delete that draft before rerunning the build. Markdown-only pushes skip publication; a manual Build run on `main` can publish that commit when needed.
 
 The workflow token needs package write access; the first push creates the GHCR package. If that package is private, the cluster needs a pull credential. A node that cannot pull from GHCR still needs the image imported locally.
 
@@ -119,6 +119,7 @@ cargo test
 npm run check
 npm test
 npm run test:install
+npm run test:publish
 cargo build --bin adm
 npm run test:release
 npm run test:repositories

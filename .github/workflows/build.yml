@@ -1,7 +1,7 @@
 # Verifies the CLI, runner, and terminal, then publishes the linux/amd64
-# management-host distribution and the workspace image. Markdown-only pushes and
-# pull requests do not run this workflow. FUSE repository tests stay local:
-# this runner does not provide a usable /dev/fuse mount.
+# management-host distribution, its GitHub release, and the workspace image.
+# Markdown-only pushes and pull requests do not run this workflow. FUSE
+# repository tests stay local: this runner does not provide a usable /dev/fuse mount.
 
 name: Build
 
@@ -67,6 +67,7 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run test:install
+      - run: npm run test:publish
 
   image:
     needs: verify
@@ -190,7 +191,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [image, binaries]
     runs-on: ubuntu-24.04
     permissions:
@@ -206,34 +207,94 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          version="${GITHUB_REF_NAME#v}"
+          repo="${GITHUB_REPOSITORY:?}"
+          image="ghcr.io/$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')"
+          sha_tag="sha-${GITHUB_SHA::12}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${sha_tag}"
+          fi
+          api_error=$(mktemp)
+          trap 'rm -f "$api_error"' EXIT
+
+          set +e
+          draft=$(gh api "repos/${repo}/releases/tags/${tag}" --jq .draft 2>"$api_error")
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            if [ "$draft" = "true" ]; then
+              echo "Release ${tag} is a draft, so it is not the published download." >&2
+              exit 1
+            fi
+            echo "Release ${tag} already exists; leaving its assets unchanged."
+            exit 0
+          fi
+          if ! grep -q "HTTP 404" "$api_error"; then
+            cat "$api_error" >&2
+            exit "$status"
+          fi
+
+          # A main build becomes the installer's default only when this commit is
+          # ahead of the current latest release tag, or is that same commit.
+          # Compare the tag, not its recorded target: that target may be a moving
+          # branch name. Version tags stay pinned. An older or unrelated rerun
+          # keeps its own assets.
+          latest=false
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            set +e
+            latest_tag=$(gh api "repos/${repo}/releases/latest" --jq .tag_name 2>"$api_error")
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ]; then
+              comparison=$(gh api "repos/${repo}/compare/${latest_tag}...${GITHUB_SHA}" --jq .status)
+              case "$comparison" in
+                ahead|identical) latest=true ;;
+                behind|diverged) latest=false ;;
+                *)
+                  echo "Unexpected compare status '${comparison}' between ${latest_tag} and ${GITHUB_SHA}." >&2
+                  exit 1
+                  ;;
+              esac
+            elif grep -q "HTTP 404" "$api_error"; then
+              latest=true
+            else
+              cat "$api_error" >&2
+              exit "$status"
+            fi
+          fi
+
           cat > release-notes.md <<EOF
           ## Install or update
 
-          Complete linux/amd64 distribution for the Debian management host, including the runner, terminal and pinned Node dependencies. Requires Node.js 24 or newer; no checkout, Rust, Go or npm install is needed.
+          Complete linux/amd64 distribution for the Debian management host, including the runner, terminal, and pinned Node dependencies. Requires Node.js 24 or newer. No checkout, Rust, Go, or npm install is needed.
 
           \`\`\`sh
-          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh | sh -s -- --version ${GITHUB_REF_NAME}
+          curl -fsSL https://github.com/${repo}/releases/download/${tag}/install.sh | sh -s -- --version ${tag}
           \`\`\`
 
-          Omit \`--version\` to install or update to the latest release while preserving settings and workspace state. First installation offers \`adm setup\`. The archive's default workspace image is pinned to this build.
+          Omit \`--version\` to install or update to the latest successful main release while preserving settings and workspace state. First installation offers \`adm setup\`. The archive's default workspace image is pinned to this build.
 
           ## Workspace image
 
-          \`${image}:${version}\`
+          \`${image}:${sha_tag}\`
 
-          Also published as \`${image}:${GITHUB_REF_NAME}\`, \`${image}:latest\`, and \`sha-<commit>\`. linux/amd64.
+          linux/amd64.
 
           \`\`\`sh
-          adm create my-project --image ${image}:${version} --model PROVIDER/MODEL_ID
+          adm create my-project --image ${image}:${sha_tag} --model PROVIDER/MODEL_ID
           \`\`\`
 
           If the GHCR package is private, the cluster needs a pull credential before Kubernetes can fetch it.
           EOF
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
+
+          echo "Publishing ${tag} at ${GITHUB_SHA} (latest=${latest})."
+          gh release create "$tag" \
+            --repo "$repo" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
             --notes-file release-notes.md \
+            --latest="$latest" \
             dist/adm-linux-amd64.tar.gz \
             dist/install.sh \
             dist/LICENSE \

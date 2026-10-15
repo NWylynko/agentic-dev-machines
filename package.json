@@ -16,6 +16,7 @@
     "test:terminal": "node --import tsx --test packages/terminal/test/*.test.ts",
     "test:install": "node --test tests/install.test.mjs",
     "test:release": "node --test tests/release.test.mjs",
+    "test:publish": "node --test tests/publish.test.mjs",
     "test:repositories": "PATH=\"$(go env GOPATH)/bin:$PATH\" go test -C packages/repositories -count=1 -timeout 180s",
     "test:cluster": "node tests/live-cluster.mjs",
     "test:cluster-contract": "node tests/cluster-contract.mjs",
@@ -38,6 +39,7 @@
     "esbuild": "0.28.2",
     "prettier": "3.8.2",
     "tsx": "4.21.0",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "yaml": "2.9.0"
   }
 }
