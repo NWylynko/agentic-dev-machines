@@ -1,0 +1,20 @@
+# Copy to ~/.config/systemd/user/adm-runner.service after replacing both paths.
+# Enable with: systemctl --user enable --now adm-runner.service
+# Persistent user services after logout also require operator-configured lingering.
+[Unit]
+Description=ADM durable coding and bot runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/PATH/TO/agentic-dev-machines
+ExecStart=%h/.local/bin/adm --project-dir /ABSOLUTE/PATH/TO/agentic-dev-machines serve
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=60
+UMask=0077
+
+[Install]
+WantedBy=default.target

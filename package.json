@@ -1,0 +1,40 @@
+{
+  "name": "agentic-dev-machines",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test packages/runner/test/*.test.mjs image/browser.test.mjs && node --import tsx --test packages/terminal/test/*.test.ts",
+    "test:runner": "node --test packages/runner/test/*.test.mjs",
+    "test:terminal": "node --import tsx --test packages/terminal/test/*.test.ts",
+    "test:repositories": "PATH=\"$(go env GOPATH)/bin:$PATH\" go test -C packages/repositories -count=1 -timeout 180s",
+    "test:cluster": "node tests/live-cluster.mjs",
+    "test:cluster-contract": "node tests/cluster-contract.mjs",
+    "test:image": "node image/smoke.mjs",
+    "check": "tsc --noEmit",
+    "format": "prettier --write .",
+    "runner": "node --import tsx packages/runner/src/main.ts"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.2.0",
+    "@earendil-works/pi-ai": "1.2.0",
+    "@earendil-works/pi-codemode": "1.2.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@earendil-works/pi-durable": "1.2.0",
+    "@earendil-works/pi-tui": "1.2.0",
+    "typebox": "1.3.27"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "esbuild": "0.28.2",
+    "prettier": "3.8.2",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}

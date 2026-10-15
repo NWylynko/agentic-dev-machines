@@ -1,0 +1,15 @@
+#!/bin/sh
+# The development container stays up after the terminal detaches.
+# Kubernetes replaces this command; `exec` lets the runtime signal the wait directly.
+set -eu
+if [ "${1:-}" = "--check" ]; then
+  test "$(readlink /repos)" = "/workspace/.adm/catalog"
+  test -f /opt/adm/workspace-env.mjs
+  test -f /opt/adm/browser.mjs
+  test -x /usr/local/bin/adm-repositories
+  test -x /usr/local/bin/artifact-fs
+  test -x /usr/local/bin/adm-init-workspace
+  test -x /usr/local/lib/adm-repositories/git
+  exit 0
+fi
+exec sleep infinity

@@ -1,0 +1,5 @@
+#!/bin/sh
+# This file must be installed root-owned in the image, never on a writable
+# workspace volume. Mutable repository configuration may execute Git helpers;
+# those helpers must never acquire the sidecar's mount authority.
+exec /usr/bin/setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all /usr/bin/git "$@"

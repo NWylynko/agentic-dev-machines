@@ -1,0 +1,13 @@
+{
+  "name": "@adm/terminal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "1.2.0"
+  }
+}

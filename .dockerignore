@@ -1,0 +1,12 @@
+.git
+node_modules
+target
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+dist
+coverage
+.adm
+.env*
+!.env.schema
+.dev.vars

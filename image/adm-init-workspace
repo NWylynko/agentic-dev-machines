@@ -1,0 +1,13 @@
+#!/bin/sh
+# Prepare the private workspace volume before the development container starts.
+# /repos in the image is a symlink to /workspace/.adm/catalog.
+set -eu
+mode=${1:-plain}
+case "$mode" in
+  plain|repositories) ;;
+  *) echo "adm-init-workspace: expected plain or repositories" >&2; exit 1 ;;
+esac
+mkdir -p /workspace/.adm/catalog /workspace/.adm/repositories /workspace/.adm/git /workspace/.adm/views
+chown -R 1000:1000 /workspace
+chmod 755 /workspace /workspace/.adm /workspace/.adm/catalog /workspace/.adm/git
+chmod 700 /workspace/.adm/repositories /workspace/.adm/views

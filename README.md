@@ -4,7 +4,9 @@ On-demand development workspaces for a homelab Kubernetes cluster, controlled th
 
 Create a space, get a Debian shell, and run coding agents. An optional autonomous bot can monitor and prompt coding agents through a separate, restricted tool set. Kubernetes handles where development workspaces run. Agents keep working without an attached human. Removing the Herdr space ends its owned activity and deletes its development runtime and private files.
 
-**Status: design stage.** The behavior below includes the confirmed product decisions and a proposed implementation. There is no implementation or installation procedure yet. Command names, storage technology, and agent backends remain proposals.
+**Status: implemented local workflows, cluster validation pending.** `adm`, the durable runner, the Pi-style terminal, and the lazy repository catalog have end-to-end tests using real HTTP, SQLite recovery, terminal processes, Chromium, Git, and FUSE. `image/Dockerfile` builds the `adm-dev:0.1.0` workspace image. A real cluster create, cross-node recovery, and the loss window after an unexpected node failure have not been demonstrated. Storage remains an operator choice; see [storage requirements](deploy/storage.md).
+
+Start with the [operating instructions](docs/operations.md) for installation, provider setup, workspace commands, Herdr ownership, and verification. The [implementation contract](docs/implementation-contract.md) specifies the current public interfaces. The sections below retain the product requirements and proposals so unverified infrastructure guarantees stay explicit.
 
 ## Confirmed behavior
 
@@ -34,7 +36,7 @@ A typical session should look like this:
 5. Disconnect while agents continue working, then return to the same named workspace later.
 6. Remove the Herdr space when finished; its owned activity stops and its development runtime and private files are destroyed.
 
-Workspaces are quick to allocate and disposable when finished, but may run unattended for as long as their spaces exist. A custom Debian development image can come later; it should not block proving the workflow.
+Workspaces are quick to allocate and disposable when finished, but may run unattended for as long as their spaces exist. The development image is `adm-dev:0.1.0` from `image/Dockerfile`.
 
 The storage constraint is roughly **256 GB per node**, so creating more workspaces should avoid multiplying complete repository checkouts, Git history, and machine images.
 
@@ -52,23 +54,23 @@ A **coding agent** executes development work inside that workspace. A **bot** is
 
 There are several separate recovery goals:
 
-| State | Intended behavior | Design status |
-| --- | --- | --- |
-| Workspace identity and configuration | Survive terminal disconnection and runtime replacement | Core requirement |
-| Repository edits, untracked work, local commits, and Git state | Recover after replacement, subject to the accepted failure-loss window | Required; storage implementation remains open |
-| Agent history, goals, pending work, and loop definitions | Recover and continue automatically without a human reconnecting | Required; backend compatibility needs proving |
-| Installed tools and changes outside persisted paths | Temporary; shared tools belong in the base image | Confirmed persistence boundary |
-| Running processes and shell commands | Stop when their runtime dies | Transparent process recovery is outside the initial scope |
+| State                                                          | Intended behavior                                                      | Design status                                             |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------- |
+| Workspace identity and configuration                           | Survive terminal disconnection and runtime replacement                 | Core requirement                                          |
+| Repository edits, untracked work, local commits, and Git state | Recover after replacement, subject to the accepted failure-loss window | Required; storage implementation remains open             |
+| Agent history, goals, pending work, and loop definitions       | Recover and continue automatically without a human reconnecting        | Required; backend compatibility needs proving             |
+| Installed tools and changes outside persisted paths            | Temporary; shared tools belong in the base image                       | Confirmed persistence boundary                            |
+| Running processes and shell commands                           | Stop when their runtime dies                                           | Transparent process recovery is outside the initial scope |
 
 Some recent work loss is acceptable after an unexpected node failure. Availability after a drain does not imply instant recovery. Storage, scheduling capacity, failure detection, and the agent backend determine the actual recovery time and loss window.
 
-## Proposed CLI
+## CLI
 
-The examples use `adm` as a placeholder executable name. These commands describe the intended interface; they do not run yet.
+The executable is `adm`. Lifecycle commands below are implemented. `create` still needs a cluster and the `adm-replicated` StorageClass from `deploy/storage.md`; the CLI tests drive them through a fake kubectl.
 
 ```sh
 # Allocate a named workspace and wait until it can accept a shell.
-adm create my-project
+adm create my-project --model PROVIDER/MODEL_ID
 
 # Open another connection to an existing workspace.
 adm attach my-project
@@ -82,6 +84,8 @@ adm status my-project
 # Destroy the workspace, equivalent to removing its Herdr space.
 adm destroy my-project
 ```
+
+Agent workspaces require an explicitly selected model. `--no-agent` creates a shell-only workspace. Without `--catalog`, `/repos` is an ordinary writable directory. Supplying a catalog opts in to lazy repository mounts; discovery and scoped private-repository fetch credentials are separate prerequisites.
 
 Creation and attachment are separate operations. Losing an attachment must not delete the workspace. Reattaching should resolve the current runtime from the workspace identity instead of remembering a particular Pod name.
 
@@ -119,17 +123,17 @@ flowchart TD
 
 This diagram shows the proposed container implementation. Persisting the whole operating system is outside the current requirements.
 
-| Component | Responsibility |
-| --- | --- |
-| CLI / workspace manager | Create, inspect, attach, destroy, and resolve stable workspace identities |
-| Herdr / terminal integration | Present Pi-style coding and bot conversations, map ownership, launch attachments, and propagate manual space removal |
-| Kubernetes | Schedule runtimes and reconcile their desired existence |
-| Repository filesystem | Discover repositories, fetch contents on demand, and enforce private writable views and Git state |
-| Persistent storage | Make selected workspace state recoverable on another node |
-| Agent runner / backend | Execute unattended with role-specific tools, persist history and goals, schedule work, and recover independently of attachments |
-| Bot control interface | Expose permitted monitoring and prompting operations without development filesystem or shell access |
-| Terminal message adapter | Deliver explicit bot messages to its Pi-style conversation in Herdr |
-| Preview access | Route MacBook connections to development sites and selected ports in the current runtime |
+| Component                    | Responsibility                                                                                                                  |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| CLI / workspace manager      | Create, inspect, attach, destroy, and resolve stable workspace identities                                                       |
+| Herdr / terminal integration | Present Pi-style coding and bot conversations, map ownership, launch attachments, and propagate manual space removal            |
+| Kubernetes                   | Schedule runtimes and reconcile their desired existence                                                                         |
+| Repository filesystem        | Discover repositories, fetch contents on demand, and enforce private writable views and Git state                               |
+| Persistent storage           | Make selected workspace state recoverable on another node                                                                       |
+| Agent runner / backend       | Execute unattended with role-specific tools, persist history and goals, schedule work, and recover independently of attachments |
+| Bot control interface        | Expose permitted monitoring and prompting operations without development filesystem or shell access                             |
+| Terminal message adapter     | Deliver explicit bot messages to its Pi-style conversation in Herdr                                                             |
+| Preview access               | Route MacBook connections to development sites and selected ports in the current runtime                                        |
 
 An initial implementation could use one single-replica Deployment per workspace, identified by labels and annotations, plus storage resources where needed. There is no initial requirement for a custom cluster scheduler, database, Kubernetes operator, or Workspace CRD. Reuse the chosen agent backend's durable execution and scheduling where suitable.
 
@@ -206,13 +210,13 @@ Normal Git workflows need to work, including status, diff, branching, commits, a
 
 The proposed split keeps recoverable caches separate from state that cannot be recreated from GitHub or the image:
 
-| Data | Proposed treatment |
-| --- | --- |
-| Debian tools and base OS | Reproduce from a container image |
-| Repository catalog and downloaded upstream Git objects | Cache and reconstruct as needed |
-| Workspace edits, untracked source files, local commits, and Git state | Persist independently of the current node |
-| Agent history, goals, pending work, loop definitions, and delivery state | Persist through the selected agent backend |
-| Dependencies, build outputs, and temporary files | Disposable where safe; bound their storage use |
+| Data                                                                     | Proposed treatment                             |
+| ------------------------------------------------------------------------ | ---------------------------------------------- |
+| Debian tools and base OS                                                 | Reproduce from a container image               |
+| Repository catalog and downloaded upstream Git objects                   | Cache and reconstruct as needed                |
+| Workspace edits, untracked source files, local commits, and Git state    | Persist independently of the current node      |
+| Agent history, goals, pending work, loop definitions, and delivery state | Persist through the selected agent backend     |
+| Dependencies, build outputs, and temporary files                         | Disposable where safe; bound their storage use |
 
 No storage backend has been selected. A candidate must support recovery on a different node and the filesystem's consistency requirements. A volume tied to one node alone cannot deliver that recovery. Evaluate shared or replicated storage against actual homelab capacity, write performance, failure behavior, and operational cost.
 
@@ -226,7 +230,7 @@ Pi is the preferred terminal experience; OpenCode was also discussed as a harnes
 
 Ordinary Pi automatically saves resumable sessions under `~/.pi/agent/sessions/`, grouped by working directory. `--continue` resumes the latest session for that directory and `--resume` opens a picker. Its [session documentation](https://pi.dev/docs/latest/sessions) and [file format reference](https://pi.dev/docs/latest/session-format) describe JSONL histories and explicit session deletion. These files live separately from the repository; this project must choose their persistent location and retention policy.
 
-The experimental [Pi Durable framework](https://earendil.com/posts/pi-durable/) is a candidate for automatic recovery: it checkpoints work and recovers unfinished tasks when its storage is reopened. Ordinary Pi session resumption alone does not provide that unattended execution model. Terminal integration, compatible storage, and remote tool execution still need an end-to-end experiment.
+The initial implementation uses the experimental [Pi Durable framework](https://earendil.com/posts/pi-durable/) version 1.2.0. Local end-to-end tests reopen its SQLite store after a process kill, resume pending work independently of terminal attachments, and execute coding tools through a Kubernetes transport adapter. The Kubernetes adapter is tested against a process boundary fixture; it still needs the opt-in real-cluster experiment. Ordinary Pi session resumption alone does not provide this unattended execution model.
 
 The [Pi Durable investigation](docs/pi-durable-research.md) examines published version 1.2.0 and a pinned source revision. The recommended direction to validate is a supervised Durable owner for each Herdr-owned store, with reconnectable terminal clients and separate coding/bot tool profiles. For the smallest proof, the coding runner can live beside its runtime; a central runner with remote execution is a later placement option rather than an initial requirement.
 
@@ -237,7 +241,7 @@ Important integration findings:
 - Reopening a store must be followed by scheduling/resume. Closing the harness preserves recoverable work; ordinary abort excludes background tasks. Space destruction needs explicit admission revocation and cancellation including background work.
 - SQLite is a starting backend, not cluster replication or ownership fencing. Its WAL requirements rule out treating an arbitrary NFS mount as a ready solution. See the report for storage constraints and locally verified recovery behavior.
 
-These findings recommend a proof, not an implemented or finalized dependency choice. Test the Durable-to-terminal experience before building the rest of the cluster integration around it.
+The runner and terminal now implement this local proof. The runner lives on the management host, while coding tools run in the selected workspace environment. These tests do not establish cross-node filesystem durability or compatibility with every real provider account.
 
 [celld](https://github.com/denoland/celld) provides self-hosted, distributed Durable Objects and is a candidate for durable application state. Its role here would need to be demonstrated with the chosen agent harness. It does not establish recovery guarantees for this project's Linux filesystem or shell processes.
 
@@ -249,10 +253,10 @@ An agent continues processing its work and goals while the workspace exists. Wai
 
 Coding agents and bots can reuse durable execution infrastructure, but have different capabilities:
 
-| Role | User interaction | Tools and access |
-| --- | --- | --- |
-| Coding agent | Normal visible Pi-style terminal interaction in Herdr | Its own repositories and development tools; works unattended |
-| Bot | Pi-style terminal conversation in Herdr; only `sendMessage` publishes AI-authored messages | No repository access or coding tools; can monitor and prompt permitted agents, use Code Mode, and maintain goals/loops |
+| Role         | User interaction                                                                           | Tools and access                                                                                                       |
+| ------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| Coding agent | Normal visible Pi-style terminal interaction in Herdr                                      | Its own repositories and development tools; works unattended                                                           |
+| Bot          | Pi-style terminal conversation in Herdr; only `sendMessage` publishes AI-authored messages | No repository access or coding tools; can monitor and prompt permitted agents, use Code Mode, and maintain goals/loops |
 
 The optional bot is a supervisor and general assistant inspired by the requested Grok-bot-like behavior. It is not a coding agent with its output hidden. It does not imply using a particular model provider or recreating another product's implementation.
 
@@ -276,7 +280,7 @@ Bot activity must have an explicit owning Herdr space. Removing its owning space
 
 Nick currently uses Codex through a Plus subscription and is considering Claude. Keep model/provider authentication configurable; no provider migration, API billing arrangement, or numeric spending limit has been selected. Validate the supported account/authentication path with the chosen harness instead of assuming a subscription works through every integration.
 
-Rate limits, exhausted allowances, and expired authentication must appear in session status and diagnostics, with pending work preserved. Unattended operation must not silently switch providers or billing methods. Exact waiting/resumption behavior remains to be designed.
+Rate limits, exhausted allowances, and expired authentication appear in session status and diagnostics. After correcting credentials or capacity, `/resume` retries the latest failed turn only if no tool ran; otherwise an explicit follow-up is required to reconcile possible side effects. The failed conversation remains inspectable after restart. There is no provider or billing switch, automatic retry loop, or claim that live subscription refresh has been verified.
 
 ## Relationship to exe.dev
 
@@ -290,7 +294,7 @@ The useful ideas to borrow are stable identity, compute-independent state, and c
 
 These are investigation targets, not selected dependencies:
 
-- [ArtifactFS](https://github.com/cloudflare/artifact-fs) mounts Git repositories through FUSE, hydrates contents on demand, and uses a writable overlay. Its documented design is a starting point to test; repository catalog discovery, sharing across workspaces, and cross-node recovery still need validating for this product.
+- [ArtifactFS](https://github.com/cloudflare/artifact-fs) is the lazy filesystem behind `/repos`. The pinned build is in `packages/repositories/ARTIFACTFS`. A local FUSE test checks that unused repositories stay unhydrated and that two workspaces do not see each other's commits. Cross-node recovery is not demonstrated.
 - **LunarFS** was mentioned as another filesystem candidate. Its suitability and guarantees need separate investigation.
 - **Shared or replicated persistent storage**, including the Longhorn or NFS approaches discussed, needs testing for capacity, filesystem compatibility, and node failure behavior.
 - **Pi / OpenCode with celld or another durable backend** needs an end-to-end compatibility and recovery experiment.
@@ -312,18 +316,18 @@ Use end-to-end tests first for implementation changes. Provisioning, scheduling,
 
 ## Decisions still open
 
-| Decision | Effect on the user |
-| --- | --- |
-| Exact recovery time and recent-work loss window | Determines how long a failure interrupts work and how much recent progress may be lost |
-| Storage and lazy-filesystem implementation | Determines startup time, disk use, Git compatibility, and recovery behavior |
-| Agent backend and location of the supervised runner | Determines recovery support, unattended scheduling, and operational requirements |
-| Attach transport and exact Herdr integration | Determines reconnection behavior and reliable handling of explicit space removal |
-| Pi-style terminal adapter and inbound message transport | Determines how the selected durable backend connects to conversations inside Herdr |
-| Bot ownership, permitted agents, and control-tool interface | Determines which coding agents a bot can supervise and how their lifetimes relate |
-| Goal/loop tool interface and missed-trigger policy | Determines how bots manage recurring work and resume after downtime |
-| Default and configurable conversation archive retention | Determines whether old conversations remain inspectable after execution and workspace files are removed |
-| Browser automation and development-port transport | Determines how browsers run and how MacBooks reach development sites and ports |
-| Provider authentication and allowance handling | Determines supported account connections and how unattended work waits when capacity or authentication is unavailable |
-| Image, resource, and cache configuration | Determines available tools, concurrent workloads, and capacity use |
+| Decision                                                    | Effect on the user                                                                                                                     |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact recovery time and recent-work loss window             | Determines how long a failure interrupts work and how much recent progress may be lost                                                 |
+| Storage and lazy-filesystem implementation                  | Determines startup time, disk use, Git compatibility, and recovery behavior                                                            |
+| Agent backend and location of the supervised runner         | The runner is Pi Durable 1.2.0 on the management host, with coding tools sent into the workspace. Moving that owner has not been tried |
+| Attach transport and exact Herdr integration                | `adm herdr` consumes explicit removal events. A live Herdr plugin install is not part of the tests                                     |
+| Pi-style terminal adapter and inbound message transport     | The terminal client speaks the runner HTTP API. Herdr pane wiring beyond `adm attach` is still local to the management box             |
+| Bot ownership, permitted agents, and control-tool interface | A bot supervises only the agent ids it was given. Whether it has its own Herdr space is still open                                     |
+| Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop        |
+| Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                |
+| Browser automation and development-port transport           | Determines how browsers run and how MacBooks reach development sites and ports                                                         |
+| Provider authentication and allowance handling              | Determines supported account connections and how unattended work waits when capacity or authentication is unavailable                  |
+| Image, resource, and cache configuration                    | Determines available tools, concurrent workloads, and capacity use                                                                     |
 
 The first useful milestone is an isolated workspace whose agents keep working unattended, recover after replacement, and stop permanently when its Herdr space is removed.

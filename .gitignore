@@ -1,0 +1,13 @@
+/target/
+/node_modules/
+**/node_modules/
+/dist/
+/.adm/
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env*
+!.env.schema
+.dev.vars
+coverage/
