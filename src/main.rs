@@ -317,7 +317,15 @@ fn run(cli: &Cli) -> Result<()> {
             }
             child.arg("--");
             if command.is_empty() {
-                child.args(["bash", "-l"]);
+                let working_directory = "/repos";
+                child.args([
+                    "bash",
+                    "-l",
+                    "-c",
+                    "cd -- \"$1\" && export PWD=\"$1\" && exec bash -l",
+                    "adm-shell",
+                    working_directory,
+                ]);
             } else {
                 child.args(command);
             }

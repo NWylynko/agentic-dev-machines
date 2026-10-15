@@ -64,6 +64,8 @@ adm status my-project
 
 Use `--no-agent` for a shell-only workspace. By default `/repos` is an ordinary writable directory, so normal cloning works. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. To seed the catalog without cloning repository contents:
 
+`adm shell NAME` opens a login shell at the public `/repos` path. For a catalog workspace, `pwd -P` may show its backing storage path under `/workspace/.adm`; that is the same directory through the `/repos` view. Commands supplied to `adm shell NAME -- COMMAND...` or `adm exec` run as given and keep their own working-directory behavior.
+
 ```sh
 adm-repositories discover --owner example-owner > /tmp/adm-catalog.json
 adm create my-project --catalog /tmp/adm-catalog.json --model PROVIDER/MODEL_ID

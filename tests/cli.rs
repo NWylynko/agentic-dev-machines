@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::{
     fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     os::unix::net::UnixListener,
     path::Path,
     process::{Command, Output, Stdio},
@@ -134,6 +134,8 @@ elif args[0] == 'wait':
     print('condition met')
 elif args[:2] == ['get','pods']:
     print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':{'phase':'Running'}}]}))
+elif args and args[0] == 'exec':
+    (pathlib.Path(__file__).parent / 'exec-args.json').write_text(json.dumps(args))
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
 "##).unwrap();
     fs::set_permissions(kubectl, fs::Permissions::from_mode(0o755)).unwrap();
@@ -248,6 +250,96 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
         .unwrap();
     assert_eq!(assert_ok(offline).as_array().unwrap().len(), 2);
     assert!(!marker.exists(), "list must not contact kubectl");
+}
+
+#[test]
+fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
+    let root = fixture();
+    assert_ok(adm(
+        root.path(),
+        &["create", "shell-cwd", "--no-agent", "--no-repositories"],
+    ));
+
+    let shell = adm(root.path(), &["shell", "shell-cwd"]);
+    assert!(shell.status.success(), "{shell:?}");
+    let args: Value =
+        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
+    let kubectl_args = args.as_array().unwrap();
+    let command_start = kubectl_args.iter().position(|arg| arg == "--").unwrap() + 1;
+    let mut command: Vec<_> = kubectl_args[command_start..]
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(&command[..3], ["bash", "-l", "-c"]);
+    assert_eq!(command.last().map(String::as_str), Some("/repos"));
+
+    let backing = root.path().join("workspace/.adm/catalog");
+    let public = root.path().join("public view with spaces");
+    let home = root.path().join("home");
+    fs::create_dir_all(&backing).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    symlink(&backing, &public).unwrap();
+    *command.last_mut().unwrap() = public.to_string_lossy().into_owned();
+    let mut runtime = Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(&public)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("TERM", "dumb")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the Bash argv emitted by adm shell");
+    runtime
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"printf 'PWD=%s\\n' \"$PWD\"; printf 'pwd=%s\\n' \"$(pwd)\"; printf 'physical=%s\\n' \"$(pwd -P)\"; PS1='\\w'; printf 'prompt=%s\\n' \"${PS1@P}\"\n",
+        )
+        .unwrap();
+    let runtime = runtime.wait_with_output().unwrap();
+    assert!(
+        runtime.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr)
+    );
+    let output = String::from_utf8_lossy(&runtime.stdout);
+    let public = public.to_string_lossy();
+    let backing = backing.to_string_lossy();
+    assert!(output.contains(&format!("PWD={public}\n")), "{output}");
+    assert!(output.contains(&format!("pwd={public}\n")), "{output}");
+    assert!(output.contains(&format!("prompt={public}\n")), "{output}");
+    assert!(
+        output.contains(&format!("physical={backing}\n")),
+        "{output}"
+    );
+
+    let explicit = adm(
+        root.path(),
+        &[
+            "shell",
+            "shell-cwd",
+            "--",
+            "bash",
+            "-lc",
+            "printf '%s' \"$PWD\"",
+        ],
+    );
+    assert!(explicit.status.success(), "{explicit:?}");
+    let args: Value =
+        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
+    let actual: Vec<_> = args.as_array().unwrap()[args.as_array().unwrap().len() - 3..]
+        .iter()
+        .map(Value::as_str)
+        .collect();
+    assert_eq!(
+        actual,
+        [Some("bash"), Some("-lc"), Some("printf '%s' \"$PWD\""),]
+    );
 }
 
 #[test]
