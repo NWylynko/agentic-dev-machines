@@ -340,11 +340,19 @@ async function body(request: IncomingMessage) {
     if (text.length > 1024 * 1024)
       throw new ApiError(413, "BODY_TOO_LARGE", "Request body exceeds 1 MiB");
   }
+  let value: unknown;
   try {
-    return text ? JSON.parse(text) : {};
+    value = text ? JSON.parse(text) : {};
   } catch {
     throw new ApiError(400, "INVALID_JSON", "Request body must be JSON");
   }
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new ApiError(
+      400,
+      "INVALID_BODY",
+      "Request body must be a JSON object",
+    );
+  return value as Record<string, unknown>;
 }
 function json(response: ServerResponse, status: number, value: unknown) {
   response.writeHead(status, {
@@ -494,21 +502,26 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "POST" && action === "input") {
       const data = await body(request);
-      if (typeof data.message !== "string" || !data.message.trim())
+      const message = data.message,
+        requestId = data.requestId,
+        whenBusy = data.whenBusy;
+      if (typeof message !== "string" || !message.trim())
         throw new ApiError(
           400,
           "INVALID_MESSAGE",
           "Input requires a nonempty message",
         );
-      if (data.requestId !== undefined && typeof data.requestId !== "string")
+      if (requestId !== undefined && typeof requestId !== "string")
         throw new ApiError(
           400,
           "INVALID_REQUEST_ID",
           "requestId must be a string",
         );
       if (
-        data.whenBusy &&
-        !["steer", "followUp", "reject"].includes(data.whenBusy)
+        whenBusy !== undefined &&
+        whenBusy !== "steer" &&
+        whenBusy !== "followUp" &&
+        whenBusy !== "reject"
       )
         throw new ApiError(400, "INVALID_QUEUE_MODE", "Invalid whenBusy");
       return await serialized(async () => {
@@ -516,7 +529,7 @@ const server = createServer(async (request, response) => {
         return json(
           response,
           202,
-          await workspace.input(data.message, data.requestId, data.whenBusy),
+          await workspace.input(message, requestId, whenBusy),
         );
       });
     }
@@ -584,8 +597,24 @@ const server = createServer(async (request, response) => {
               more = page.hasMore;
             }
           }
-        } catch {
-          response.end();
+        } catch (error) {
+          process.stderr.write(
+            `${JSON.stringify({
+              event: "workspace_events_failed",
+              workspaceId: id,
+              cursor: after,
+              error: (error instanceof Error
+                ? `${error.name}: ${error.message}`
+                : String(error)
+              ).slice(0, 2000),
+            })}\n`,
+          );
+          if (!ended && !response.destroyed) {
+            response.write(
+              'event: error\ndata: {"error":"Unable to read workspace event history"}\n\n',
+            );
+            response.end();
+          }
         } finally {
           pumping = false;
         }

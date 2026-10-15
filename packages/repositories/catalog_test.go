@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -70,6 +71,7 @@ func TestRepositoryFilesystem(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(a.State, "example", "untouched")); !os.IsNotExist(err) {
 		t.Fatalf("unused repository acquired: %v", err)
 	}
+	logRepositoryDiskUse(t, "after catalog listing, before repository open", a, b)
 	projectA, projectB := filepath.Join(a.Mount, "example", "project"), filepath.Join(b.Mount, "example", "project")
 	var projectInode uint64
 	for lookup := range 10 {
@@ -84,6 +86,7 @@ func TestRepositoryFilesystem(t *testing.T) {
 		projectInode = inode
 	}
 	assertFile(t, filepath.Join(projectA, "README.md"), "upstream\n")
+	logRepositoryDiskUse(t, "after first small file read in workspace A", a, b)
 	assertFile(t, filepath.Join(projectB, "README.md"), "upstream\n")
 	parallelA := filepath.Join(a.Mount, "example", "parallel")
 	assertFile(t, filepath.Join(parallelA, "README.md"), "upstream\n")
@@ -163,6 +166,41 @@ func TestRepositoryFilesystem(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(a.State, "example", "untouched")); !os.IsNotExist(err) {
 		t.Fatalf("unused repository acquired after replacement: %v", err)
 	}
+	logRepositoryDiskUse(t, "after workspace B open, private changes, and workspace A remount", a, b)
+}
+
+// logRepositoryDiskUse reports physical allocation of repository-owned state
+// and private Git directories. It intentionally excludes views and FUSE mount
+// paths so measuring disk use cannot open or hydrate catalog entries.
+func logRepositoryDiskUse(t *testing.T, stage string, configs ...Config) {
+	t.Helper()
+	var total int64
+	for _, config := range configs {
+		var workspace int64
+		for _, path := range []string{config.State, config.GitRoot} {
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				t.Fatalf("stat disk-use path %q: %v", path, err)
+			}
+			output, err := exec.Command("du", "-sk", path).CombinedOutput()
+			if err != nil {
+				t.Fatalf("measure allocated disk use for %q: %v\n%s", path, err, output)
+			}
+			fields := strings.Fields(string(output))
+			if len(fields) < 2 {
+				t.Fatalf("unexpected du output for %q: %q", path, output)
+			}
+			allocated, err := strconv.ParseInt(fields[0], 10, 64)
+			if err != nil {
+				t.Fatalf("parse du allocation for %q: %v", path, err)
+			}
+			workspace += allocated
+		}
+		t.Logf("disk use stage=%q workspace=%s private_state_and_git=%d KiB", stage, filepath.Base(filepath.Dir(config.State)), workspace)
+		total += workspace
+	}
+	t.Logf("disk use stage=%q total_private_state_and_git=%d KiB", stage, total)
 }
 
 func TestCatalogValidationRejectsUnsafeNamespaces(t *testing.T) {

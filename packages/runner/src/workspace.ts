@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import type { Context } from "@earendil-works/chord";
 import {
   createRegistry,
   defineExtension,
@@ -24,9 +25,9 @@ import { botExtension } from "./bot.ts";
 import {
   applyGoal,
   applyLoop,
+  createScheduleExtension,
   publicSchedule,
   scheduleDocument,
-  scheduleExtension,
 } from "./schedule.ts";
 import { ApiError, type RunnerEvent, type WorkspaceConfig } from "./types.ts";
 
@@ -115,6 +116,9 @@ export class Workspace {
   private accepting = true;
   private admissions = Promise.resolve();
   private readonly assertActive: () => Promise<void>;
+  private readonly loopTask: ReturnType<
+    typeof createScheduleExtension
+  >["loopTask"];
   private unsubscribe: () => void;
   private sandbox?: CodemodeSandbox;
   private constructor(
@@ -122,11 +126,13 @@ export class Workspace {
     harness: Workspace["harness"],
     conversation: Workspace["conversation"],
     assertActive: () => Promise<void>,
+    loopTask: Workspace["loopTask"],
   ) {
     this.config = config;
     this.harness = harness;
     this.conversation = conversation;
     this.assertActive = assertActive;
+    this.loopTask = loopTask;
     this.unsubscribe = harness.subscribeCommits(() =>
       this.events.emit("change"),
     );
@@ -154,7 +160,20 @@ export class Workspace {
       if (openedWorkspace) openedWorkspace.lastError = reportedError;
     };
     const registry = createRegistry();
-    registry.install(scheduleExtension);
+    const schedule = createScheduleExtension(
+      (message, requestId, loopId, generation, call) => {
+        if (!openedWorkspace)
+          throw new Error("Workspace is not ready to admit scheduled input");
+        return openedWorkspace.admitLoopInput(
+          message,
+          requestId,
+          loopId,
+          generation,
+          call,
+        );
+      },
+    );
+    registry.install(schedule.extension);
     let localEnv: NodeExecutionEnv | undefined;
     let kubeEnv: KubernetesExecutionEnv | undefined;
     let sandbox: CodemodeSandbox | undefined;
@@ -233,6 +252,7 @@ export class Workspace {
       harness,
       conversation,
       assertActive,
+      schedule.loopTask,
     );
     openedWorkspace = workspace;
     workspace.lastError = reportedError;
@@ -322,7 +342,38 @@ export class Workspace {
   }
 
   saveLoop(input: unknown) {
-    return this.withAdmission(() => applyLoop(this.conversation, input));
+    return this.withAdmission(() =>
+      applyLoop(this.conversation, input, this.loopTask),
+    );
+  }
+
+  admitLoopInput(
+    message: string,
+    requestId: string,
+    loopId: string,
+    generation: number,
+    call: Context,
+  ) {
+    return this.withAdmission(async () => {
+      const schedule = await this.harness.snapshot(
+        scheduleDocument,
+        this.conversation.id,
+        call,
+      );
+      const loop = schedule?.loops.find((entry) => entry.id === loopId);
+      if (
+        !loop ||
+        loop.status !== "active" ||
+        (loop.generation ?? 1) !== generation ||
+        loop.pendingRequestId !== requestId
+      )
+        return false;
+      await this.conversation.submit(
+        { type: "input", content: message, requestId, whenBusy: "followUp" },
+        call,
+      );
+      return true;
+    });
   }
 
   async resume() {

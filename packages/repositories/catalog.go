@@ -30,19 +30,27 @@ type catalogServer struct {
 	server    *fuse.Server
 	lock      *os.File
 	mu        sync.Mutex
+	acquireMu sync.Mutex
 	repos     map[string]*repositoryRuntime
+	daemon    *artifactDaemon
 	closed    bool
 	closeOnce sync.Once
 	failures  chan error
 }
 
 type repositoryRuntime struct {
-	mu      sync.Mutex
-	repo    Repository
-	server  *catalogServer
-	path    string
+	mu     sync.Mutex
+	repo   Repository
+	server *catalogServer
+	path   string
+}
+
+type artifactDaemon struct {
 	command *exec.Cmd
-	done    chan error
+	done    chan struct{}
+	err     error
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 type catalogDirectory struct {
@@ -125,22 +133,18 @@ func (server *catalogServer) Close() error {
 			result = err
 		}
 		server.cancel()
-		server.mu.Lock()
-		runtimes := make([]*repositoryRuntime, 0, len(server.repos))
-		for _, runtime := range server.repos {
-			runtimes = append(runtimes, runtime)
-		}
-		server.mu.Unlock()
-		for _, runtime := range runtimes {
-			runtime.mu.Lock()
-			if runtime.command != nil {
-				if err := runtime.command.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		server.acquireMu.Lock()
+		if daemon := server.daemon; daemon != nil {
+			select {
+			case <-daemon.done:
+			default:
+				if err := daemon.command.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 					result = errors.Join(result, err)
 				}
-				<-runtime.done
+				<-daemon.done
 			}
-			runtime.mu.Unlock()
 		}
+		server.acquireMu.Unlock()
 		if err := server.lock.Close(); err != nil {
 			result = errors.Join(result, err)
 		}
@@ -406,6 +410,13 @@ func (node *repositoryView) Setattr(ctx context.Context, handle fs.FileHandle, i
 }
 
 func (server *catalogServer) acquire(repo Repository) (string, error) {
+	// ArtifactFS runs one daemon per workspace state/view root. Its daemon
+	// watches the shared registry and mounts every registered repository.
+	// Serializing acquisition prevents concurrent repo registrations from
+	// starting competing daemons against the same SQLite state and FUSE mounts.
+	server.acquireMu.Lock()
+	defer server.acquireMu.Unlock()
+
 	key := repo.Owner + "/" + repo.Name
 	server.mu.Lock()
 	if server.closed {
@@ -512,6 +523,17 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 	if config.GitWrapper != "" {
 		env = append(env, "PATH="+filepath.Dir(config.GitWrapper)+":"+os.Getenv("PATH"))
 	}
+	// Subscribe before registering a repository: an already-running daemon can
+	// notice the new registry entry and mount it before add-repo returns.
+	mounts, err := openMountNotifications()
+	if err != nil {
+		return "", err
+	}
+	defer mounts.Close()
+	previousMountID, err := fuseMountID(view)
+	if err != nil {
+		return "", fmt.Errorf("inspect existing ArtifactFS mount: %w", err)
+	}
 	marker := filepath.Join(state, "registered")
 	if _, err := os.Stat(marker); os.IsNotExist(err) {
 		command := exec.CommandContext(ctx, config.Artifact, "add-repo", "--name", repo.Name, "--remote", repo.Remote, "--ref", repo.Ref, "--mount-root", viewRoot, "--git-dir", gitDir, "--refresh", "never")
@@ -526,30 +548,41 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 	} else if err != nil {
 		return "", err
 	}
-	// Open mount notifications before starting the child so an immediate mount
-	// cannot occur between the readiness check and subscription.
-	mounts, err := openMountNotifications()
+	daemon, err := server.ensureArtifactDaemon(env, key)
 	if err != nil {
 		return "", err
 	}
-	defer mounts.Close()
-	previousMountID, err := fuseMountID(view)
-	if err != nil {
-		return "", fmt.Errorf("inspect existing ArtifactFS mount: %w", err)
+	if err := waitMounted(ctx, daemon.ctx, mounts, view, previousMountID); err != nil {
+		return "", fmt.Errorf("ArtifactFS mount unavailable: %w", err)
 	}
-	daemonCtx, daemonCancel := context.WithCancel(server.ctx)
-	command := exec.Command(config.Artifact, "daemon", "--root", viewRoot)
+	runtime.path = view
+	slog.Info("repository ready", "repository", key, "gitDir", gitDir, "view", view, "sharedBase", repo.UpstreamGitDir != "")
+	return view, nil
+}
+
+func (server *catalogServer) ensureArtifactDaemon(env []string, key string) (*artifactDaemon, error) {
+	if daemon := server.daemon; daemon != nil {
+		select {
+		case <-daemon.done:
+			return nil, fmt.Errorf("ArtifactFS daemon exited for %s: %w", key, daemon.err)
+		default:
+			return daemon, nil
+		}
+	}
+	ctx, cancel := context.WithCancel(server.ctx)
+	command := exec.Command(server.config.Artifact, "daemon", "--root", server.config.Views)
 	command.Env = env
 	stderr, err := command.StderrPipe()
 	if err != nil {
-		daemonCancel()
-		return "", err
+		cancel()
+		return nil, err
 	}
 	if err := command.Start(); err != nil {
-		daemonCancel()
-		return "", err
+		cancel()
+		return nil, err
 	}
-	done := make(chan error, 1)
+	daemon := &artifactDaemon{command: command, done: make(chan struct{}), ctx: ctx, cancel: cancel}
+	server.daemon = daemon
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
@@ -557,30 +590,20 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 		}
 	}()
 	go func() {
-		err := command.Wait()
-		done <- err
-		close(done)
-		daemonCancel()
+		daemon.err = command.Wait()
+		close(daemon.done)
+		daemon.cancel()
 		server.mu.Lock()
 		closing := server.closed
 		server.mu.Unlock()
 		if !closing {
 			select {
-			case server.failures <- fmt.Errorf("ArtifactFS exited for %s: %w", key, err):
+			case server.failures <- fmt.Errorf("ArtifactFS exited for %s: %w", key, daemon.err):
 			default:
 			}
 		}
 	}()
-	if err := waitMounted(ctx, daemonCtx, mounts, view, previousMountID); err != nil {
-		_ = command.Process.Signal(syscall.SIGTERM)
-		<-done
-		return "", fmt.Errorf("ArtifactFS mount unavailable: %w", err)
-	}
-	runtime.path = view
-	runtime.command = command
-	runtime.done = done
-	slog.Info("repository ready", "repository", key, "gitDir", gitDir, "view", view, "sharedBase", repo.UpstreamGitDir != "")
-	return view, nil
+	return daemon, nil
 }
 
 func openMountNotifications() (*os.File, error) {

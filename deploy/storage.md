@@ -18,3 +18,5 @@ allowVolumeExpansion: true
 ```
 
 Point `adm create --storage-class` at a different class when the default name is wrong. Destroying a workspace deletes its namespace and claim; it does not delete the StorageClass.
+
+Run `adm doctor` to inspect `adm-replicated`, or `adm doctor --storage-class local-path` to inspect the existing class without creating a workspace. A reported class is not proof of replication; the diagnostic names its provisioner and flags the known node-local provisioner explicitly.

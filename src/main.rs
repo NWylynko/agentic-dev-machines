@@ -1,3 +1,4 @@
+mod diagnostics;
 mod herdr;
 mod runner;
 mod workspaces;
@@ -98,7 +99,10 @@ pub enum Action {
     /// Stop only the runner process, preserving recoverable work.
     Stop,
     /// Check prerequisites, cluster access, storage, and runner health.
-    Doctor,
+    Doctor {
+        #[arg(long, default_value = "adm-replicated")]
+        storage_class: String,
+    },
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
     Herdr {
         #[command(subcommand)]
@@ -283,24 +287,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Action::Serve => runner::serve(cli),
         Action::Stop => runner::stop(cli),
-        Action::Doctor => {
-            let versions = ["node", "git", "gh"].map(|name| {
-                (
-                    name,
-                    Command::new(name)
-                        .arg("--version")
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false),
-                )
-            });
-            let cluster = workspaces::kubectl(cli, &["get", "nodes", "-o", "json"], None)
-                .map(|v| serde_json::from_slice::<Value>(&v).unwrap_or(json!(null)));
-            let nodes=cluster.as_ref().ok().and_then(|v|v["items"].as_array()).map(|items|items.iter().map(|v|json!({"name":v["metadata"]["name"],"ready":v["status"]["conditions"].as_array().map(|conditions|conditions.iter().any(|c|c["type"]=="Ready" && c["status"]=="True")).unwrap_or(false)})).collect::<Vec<_>>());
-            print_json(
-                &json!({"tools":versions,"cluster":nodes,"clusterError":cluster.err().map(|e|e.to_string()),"runner":cli.request("GET","/health",None).unwrap_or(json!({"status":"not-running"})),"state":cli.state_path()}),
-            )
-        }
+        Action::Doctor { storage_class } => diagnostics::doctor(cli, storage_class),
         Action::Herdr { command } => herdr::run(cli, command),
         Action::Browser {
             name,

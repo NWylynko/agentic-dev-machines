@@ -71,8 +71,12 @@ async function nextEvent(
   predicate,
   after = 0,
   diagnostics = false,
+  timeoutMs = 0,
 ) {
   const controller = new AbortController();
+  const timeout = timeoutMs
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : undefined;
   const response = await fetch(
     `${runner.url}/v1/workspaces/${id}/events?after=${after}&diagnostics=${diagnostics}`,
     { signal: controller.signal },
@@ -98,6 +102,7 @@ async function nextEvent(
     }
     throw new Error("Event stream ended before the expected event");
   } finally {
+    if (timeout) clearTimeout(timeout);
     controller.abort();
   }
 }
@@ -573,5 +578,225 @@ test(
       (await runner.request("/v1/workspaces/fresh-scheduled-bot")).body.loops,
       [],
     );
+  },
+);
+
+test(
+  "reactivating a loop after its canceled task settles schedules it again",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-loop-reactivate-"),
+    );
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const id = "reactivated-loop",
+      path = `/v1/workspaces/${id}`;
+    await runner.request(path, "PUT", {
+      id,
+      name: "reactivated-loop",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const prompt = "reactivation occurrence";
+    const loop = await runner.request(path + "/loops", "POST", {
+      prompt,
+      intervalMs: 1000,
+      nextAt: Date.now() + 1000,
+    });
+    assert.equal(loop.status, 200);
+    const first = await nextEvent(
+      runner,
+      id,
+      (event) => event.kind === "user" && event.data.text === prompt,
+      0,
+      false,
+      5000,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/loops", "POST", {
+          id: loop.body.id,
+          status: "cancelled",
+        })
+      ).status,
+      200,
+    );
+    const cancelledState = await runner.request(path);
+    const cancelledLoop = cancelledState.body.loops.find(
+      (entry) => entry.id === loop.body.id,
+    );
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.max(0, cancelledLoop.nextAt - Date.now() + 100)),
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/loops", "POST", {
+          id: loop.body.id,
+          status: "active",
+        })
+      ).status,
+      200,
+    );
+    const second = await nextEvent(
+      runner,
+      id,
+      (event) => event.kind === "user" && event.data.text === prompt,
+      first.seq,
+      false,
+      5000,
+    );
+    assert.ok(second.seq > first.seq);
+  },
+);
+
+test(
+  "reactivating before cancellation settles reuses the scheduled loop task",
+  { timeout: 10000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-loop-reuse-"));
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const id = "reused-loop-task",
+      path = `/v1/workspaces/${id}`;
+    await runner.request(path, "PUT", {
+      id,
+      name: "reused-loop-task",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const loop = await runner.request(path + "/loops", "POST", {
+      prompt: "one active schedule task",
+      intervalMs: 1000,
+      nextAt: Date.now() + 1000,
+    });
+    for (const status of ["cancelled", "active"]) {
+      assert.equal(
+        (
+          await runner.request(path + "/loops", "POST", {
+            id: loop.body.id,
+            status,
+          })
+        ).status,
+        200,
+      );
+    }
+    await nextEvent(
+      runner,
+      id,
+      (event) =>
+        event.kind === "user" && event.data.text === "one active schedule task",
+      0,
+      false,
+      5000,
+    );
+    const status = await runner.request(path);
+    const loopTasks = status.body.tasks.filter(
+      (task) =>
+        task.record.kind === "adm.loop" &&
+        task.record.input.loopId === loop.body.id &&
+        task.record.state.status !== "terminal",
+    );
+    assert.equal(loopTasks.length, 1);
+  },
+);
+
+test(
+  "a due loop cannot add input after its workspace is deleted",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-loop-delete-race-"),
+    );
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const id = "deleted-due-loop",
+      path = `/v1/workspaces/${id}`;
+    await runner.request(path, "PUT", {
+      id,
+      name: "deleted-due-loop",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const loop = await runner.request(path + "/loops", "POST", {
+      prompt: "must not be admitted after deletion",
+      intervalMs: 1000,
+      nextAt: Date.now(),
+    });
+    assert.equal(loop.status, 200);
+    assert.equal((await runner.request(path, "DELETE")).status, 200);
+    const deletedHistory = await runner.request(path + "/history?limit=1000");
+    const cursorAfterDelete = deletedHistory.body.nextAfter;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const laterHistory = await runner.request(
+      `${path}/history?after=${cursorAfterDelete}&limit=1000`,
+    );
+    assert.deepEqual(laterHistory.body.events, []);
+  },
+);
+
+test(
+  "HTTP and model-created loops enforce the same interval and safe timestamp bounds",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-loop-bounds-"));
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const id = "loop-bounds",
+      path = `/v1/workspaces/${id}`;
+    await runner.request(path, "PUT", {
+      id,
+      name: "loop-bounds",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    });
+    for (const invalid of [
+      { prompt: "too short", intervalMs: 999 },
+      { prompt: "too long", intervalMs: 366 * 24 * 60 * 60 * 1000 + 1 },
+      {
+        prompt: "unsafe timestamp",
+        intervalMs: 1000,
+        nextAt: Number.MAX_SAFE_INTEGER + 1,
+      },
+    ]) {
+      assert.equal(
+        (await runner.request(path + "/loops", "POST", invalid)).status,
+        400,
+      );
+    }
+    const invalidTool =
+      "/faux " +
+      JSON.stringify({
+        calls: [
+          {
+            tool: "saveLoop",
+            args: {
+              prompt: "outside the HTTP bounds",
+              intervalMs: 366 * 24 * 60 * 60 * 1000 + 1,
+              nextAt: Number.MAX_SAFE_INTEGER + 1,
+            },
+          },
+        ],
+        answer: "The invalid loop was rejected.",
+      });
+    await runner.request(path + "/input", "POST", {
+      message: invalidTool,
+      requestId: "invalid-model-loop",
+    });
+    const rejectedTool = await nextEvent(
+      runner,
+      id,
+      (event) => event.kind === "tool" && event.data.name === "saveLoop",
+      0,
+      true,
+      5000,
+    );
+    assert.equal(rejectedTool.data.isError, true);
+    const status = await runner.request(path);
+    assert.deepEqual(status.body.loops, []);
   },
 );

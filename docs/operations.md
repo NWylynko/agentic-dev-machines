@@ -13,7 +13,7 @@ go build -C packages/repositories -o "$HOME/.local/bin/adm-repositories" .
 adm doctor
 ```
 
-Make sure `$HOME/.local/bin` is on your shell's PATH. `adm doctor` reports tool availability, cluster readiness, runner health, and the selected local state directory. It does not install missing prerequisites.
+Make sure `$HOME/.local/bin` is on your shell's PATH. `adm doctor` reports tool availability, cluster readiness, the default StorageClass, runner health, and the selected local state directory. It preserves storage and runner error causes instead of treating every failure as a stopped service. Use `adm doctor --storage-class NAME` to inspect another class; node-local storage is labeled explicitly. Diagnostics do not allocate a workspace or install missing prerequisites.
 
 Run `npm exec -- pi` on the management host and use its `/login` command to configure the provider you intend to use. ADM uses the pinned Pi model runtime and its normal authentication store. Subscription compatibility depends on that provider integration; it has not been validated for every account. API keys follow the home-level `SECRETS.md`: inject them from Infisical into the runner's process, and never create a project `.env` containing values. Do not copy provider authentication into a workspace.
 
