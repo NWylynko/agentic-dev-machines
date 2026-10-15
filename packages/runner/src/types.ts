@@ -11,6 +11,13 @@ export type WorkspaceConfig = {
   remoteEnv?: string;
   model?: { provider: string; id: string };
   allowedAgents?: string[];
+  mcpServers?: {
+    id: string;
+    command: string;
+    args?: string[];
+    tools: string[];
+    secretEnv?: Record<string, string>;
+  }[];
 };
 export type RunnerEvent = {
   seq: number;

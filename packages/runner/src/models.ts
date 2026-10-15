@@ -47,6 +47,28 @@ export async function workspaceModels(
           "Authentication credentials are invalid (faux injected failure)",
       });
     }
+    if (text.startsWith("ADM bot onboarding:")) {
+      if (turns === 0)
+        return fauxAssistantMessage(
+          fauxToolCall("sendMessage", {
+            text: "What identity and purpose would you like me to have?",
+          }),
+          { stopReason: "toolUse" },
+        );
+      return fauxAssistantMessage("I am ready for setup details.");
+    }
+    if (text === "/faux-inspect-system-prompt")
+      return fauxAssistantMessage(
+        JSON.stringify(
+          transcript.messages.map((message) => ({
+            role: message.role,
+            content:
+              typeof message.content === "string"
+                ? message.content
+                : JSON.stringify(message.content),
+          })),
+        ),
+      );
     if (failAfterTools && turns > 0) {
       return fauxAssistantMessage([], {
         stopReason: "error",

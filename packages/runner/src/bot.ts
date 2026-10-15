@@ -16,6 +16,27 @@ const MessageReceipts = defineDoc<{ receipts: Record<string, number> }>({
   initial: () => ({ receipts: {} }),
 });
 
+export type BotProfile = {
+  state: "needs_setup" | "collecting" | "ready";
+  identity: string;
+  purpose: string;
+  approvedToolGrants: string[];
+};
+
+export const BotProfileDocument = defineDoc<BotProfile>({
+  kind: "adm.bot-profile",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({
+    state: "needs_setup",
+    identity: "",
+    purpose: "",
+    approvedToolGrants: [],
+  }),
+});
+
 export function botExtension(
   config: WorkspaceConfig,
   assertActive: () => Promise<void>,
@@ -32,7 +53,49 @@ export function botExtension(
   }
   return defineExtension({
     name: "bot-supervision",
+    sections: [
+      {
+        key: "bot-profile",
+        render: async (input, context) => {
+          const profile = await input.read.snapshot(
+            BotProfileDocument,
+            input.conversationId,
+            context,
+          );
+          if (!profile || profile.state !== "ready")
+            return "You are a bot being set up. Ask the user for your identity and purpose. Publish setup questions and confirmations only by calling sendMessage. Save a confirmed identity and purpose with saveProfile before acting on them. The host controls MCP grants: you may ask the user to grant a tool, but cannot grant it yourself or claim to have access before it is available.";
+          return `You are ${profile.identity}. Your purpose is: ${profile.purpose}\nApproved MCP tools: ${profile.approvedToolGrants.length ? profile.approvedToolGrants.join(", ") : "none"}. The host controls these grants: you may ask the user to grant an additional tool, but cannot grant it yourself or claim to have access before it is available. Publish user-facing messages only with sendMessage.`;
+        },
+      },
+    ],
     tools: [
+      defineTool({
+        name: "saveProfile",
+        description:
+          "Save the identity and purpose confirmed by the user during bot setup.",
+        parameters: Type.Object({
+          identity: Type.String({ minLength: 1, maxLength: 160 }),
+          purpose: Type.String({ minLength: 1, maxLength: 2000 }),
+        }),
+        replay: "safe",
+        execute: async ({ identity, purpose }, api, context) => {
+          await assertActive();
+          if (!identity.trim() || !purpose.trim())
+            throw new Error("Bot identity and purpose must not be blank");
+          await api.commit(async (tx) => {
+            const profile = await tx.doc(
+              BotProfileDocument,
+              api.conversationId,
+            );
+            profile.state = "ready";
+            profile.identity = identity.trim();
+            profile.purpose = purpose.trim();
+          }, context);
+          return {
+            output: [{ type: "text", text: "Bot profile saved." }],
+          };
+        },
+      }),
       defineTool({
         name: "listAgents",
         description:

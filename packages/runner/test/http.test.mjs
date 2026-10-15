@@ -9,7 +9,7 @@ import { test } from "node:test";
 
 const main = new URL("../src/main.ts", import.meta.url);
 
-async function startRunner(directory) {
+async function startRunner(directory, env = {}) {
   const child = spawn(
     process.execPath,
     [
@@ -21,7 +21,7 @@ async function startRunner(directory) {
       "--provider",
       "faux",
     ],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } },
   );
   let errors = "";
   child.stderr.on("data", (chunk) => {
@@ -355,6 +355,364 @@ test("a stale legacy PID-only owner lock is reclaimed after its process exits", 
 export { startRunner, nextEvent };
 
 test(
+  "bot onboarding is admitted once, publishes setup through sendMessage, and keeps its profile after restart",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-bot-onboarding-"),
+    );
+    let runner = await startRunner(directory);
+    t.after(async () => runner.stop());
+    const bot = {
+      id: "onboarding-bot",
+      name: "watcher",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    };
+    const path = `/v1/workspaces/${bot.id}`;
+    assert.equal((await runner.request(path, "PUT", bot)).status, 200);
+    await runner.request(path, "PUT", bot);
+    const onboarding = await nextEvent(
+      runner,
+      bot.id,
+      (event) =>
+        event.kind === "user" && event.data.text.includes("onboarding"),
+    );
+    const published = await nextEvent(
+      runner,
+      bot.id,
+      (event) =>
+        event.kind === "message" &&
+        event.data.text.includes("identity and purpose"),
+      onboarding.seq,
+    );
+    await runner.stop("SIGKILL");
+    runner = await startRunner(directory);
+    assert.equal((await runner.request(path, "PUT", bot)).status, 200);
+    assert.equal((await runner.request(path)).body.profile.state, "collecting");
+    const interruptedHistory = await runner.request(
+      path + "/history?limit=1000",
+    );
+    assert.equal(
+      interruptedHistory.body.events.filter(
+        (event) =>
+          event.kind === "user" && event.data.text.includes("onboarding"),
+      ).length,
+      1,
+    );
+    const setup = {
+      calls: [
+        {
+          tool: "saveProfile",
+          args: {
+            identity: "Build monitor",
+            purpose: "Track build health and report failures.",
+          },
+        },
+      ],
+      answer: "Setup saved.",
+    };
+    await runner.request(path + "/input", "POST", {
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            {
+              tool: "saveProfile",
+              args: { identity: "  ", purpose: "   " },
+            },
+          ],
+          answer: "Invalid profile rejected.",
+        }),
+      requestId: "reject-empty-profile",
+    });
+    const invalidProfile = await nextEvent(
+      runner,
+      bot.id,
+      (event) => event.kind === "tool" && event.data.name === "saveProfile",
+      interruptedHistory.body.nextAfter,
+      true,
+    );
+    assert.equal(invalidProfile.data.isError, true);
+    assert.equal((await runner.request(path)).body.profile.state, "collecting");
+    await runner.request(path + "/input", "POST", {
+      message: "/faux " + JSON.stringify(setup),
+      requestId: "finish-onboarding",
+    });
+    const saved = await nextEvent(
+      runner,
+      bot.id,
+      (event) => event.kind === "tool" && event.data.name === "saveProfile",
+      invalidProfile.seq,
+      true,
+    );
+    assert.equal(saved.data.isError, false);
+    const ready = await runner.request(path);
+    assert.equal(ready.body.profile.state, "ready");
+    assert.equal(ready.body.profile.identity, "Build monitor");
+    assert.equal(
+      ready.body.profile.purpose,
+      "Track build health and report failures.",
+    );
+
+    await runner.stop("SIGKILL");
+    runner = await startRunner(directory);
+    assert.equal((await runner.request(path, "PUT", bot)).status, 200);
+    const history = await runner.request(path + "/history?limit=1000");
+    assert.equal(
+      history.body.events.filter(
+        (event) =>
+          event.kind === "user" && event.data.text.includes("onboarding"),
+      ).length,
+      1,
+    );
+    assert.ok(history.body.events.some((event) => event.seq === published.seq));
+    assert.deepEqual(
+      (await runner.request(path)).body.profile,
+      ready.body.profile,
+    );
+    const beforePromptCheck = await runner.request(
+      path + "/history?limit=1000&diagnostics=true",
+    );
+    await runner.request(path + "/input", "POST", {
+      message: "/faux-inspect-system-prompt",
+      requestId: "inspect-saved-profile",
+    });
+    const prompt = await nextEvent(
+      runner,
+      bot.id,
+      (event) =>
+        event.kind === "assistant" && event.data.text.includes("Build monitor"),
+      beforePromptCheck.body.nextAfter,
+      true,
+      5000,
+    );
+    assert.ok(
+      prompt.data.text.includes("Track build health and report failures."),
+      prompt.data.text,
+    );
+  },
+);
+
+test(
+  "a bot can call only host-granted stdio MCP tools with referenced secrets through Durable and Code Mode",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-mcp-"));
+    const fixture = join(directory, "mcp-fixture.mjs");
+    const starts = join(directory, "mcp-starts.txt");
+    await writeFile(
+      fixture,
+      `import { appendFileSync } from "node:fs";
+appendFileSync(process.argv[2], "start\\n");
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const end = buffer.indexOf("\\n");
+    if (end < 0) break;
+    const message = JSON.parse(buffer.slice(0, end));
+    buffer = buffer.slice(end + 1);
+    if (!("id" in message)) continue;
+    let result;
+    if (message.method === "initialize") result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } };
+    else if (message.method === "tools/list") result = { tools: [
+      { name: "allowed_lookup", description: "Read an allowed fixture value", annotations: { readOnlyHint: true }, inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+      { name: "denied_write", description: "Must stay unavailable", inputSchema: { type: "object", properties: {} } },
+      { name: "drop_connection", description: "Ends the fixture process", inputSchema: { type: "object", properties: {} } }
+    ] };
+    else if (message.method === "tools/call" && message.params.name === "allowed_lookup") result = { content: [{ type: "text", text: JSON.stringify({ query: message.params.arguments.query, injected: process.env.MCP_TOKEN === "fixture-secret", providerSecretForwarded: process.env.PROVIDER_SECRET !== undefined }) }] };
+    else if (message.method === "tools/call" && message.params.name === "drop_connection") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "Connection is closing." }] } }) + "\\n", () => process.exit(0));
+      return;
+    }
+    else result = { content: [{ type: "text", text: "unexpected tool" }], isError: true };
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
+  }
+});
+`,
+    );
+    const runnerEnv = {
+      INJECTED_MCP_SECRET: "fixture-secret",
+      PROVIDER_SECRET: "must-not-forward",
+    };
+    let runner = await startRunner(directory, runnerEnv);
+    t.after(async () => runner.stop());
+    const bot = {
+      id: "mcp-bot",
+      name: "lookup bot",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+      mcpServers: [
+        {
+          id: "fixture",
+          command: process.execPath,
+          args: [fixture, starts],
+          tools: ["allowed_lookup"],
+          secretEnv: { MCP_TOKEN: "INJECTED_MCP_SECRET" },
+        },
+      ],
+    };
+    const path = `/v1/workspaces/${bot.id}`;
+    const registration = await runner.request(path, "PUT", bot);
+    assert.equal(registration.status, 200);
+    assert.equal((await readFile(starts, "utf8")).trim().split("\n").length, 1);
+    assert.ok(registration.body.tools.includes("mcp_fixture_allowed_lookup"));
+    assert.ok(!registration.body.tools.includes("mcp_fixture_denied_write"));
+    const registry = await readFile(join(directory, "workspaces.json"), "utf8");
+    assert.ok(registry.includes("INJECTED_MCP_SECRET"));
+    assert.ok(!registry.includes("fixture-secret"));
+
+    await runner.request(path + "/input", "POST", {
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            {
+              tool: "mcp_fixture_allowed_lookup",
+              args: { query: "status" },
+            },
+          ],
+          answer: "Lookup complete.",
+        }),
+      requestId: "mcp-direct-call",
+    });
+    const allowed = await nextEvent(
+      runner,
+      bot.id,
+      (event) =>
+        event.kind === "tool" &&
+        event.data.name === "mcp_fixture_allowed_lookup",
+      0,
+      true,
+    );
+    assert.equal(allowed.data.isError, false);
+    const mcpResult = JSON.parse(JSON.parse(allowed.data.text)[0].text);
+    assert.deepEqual(mcpResult, {
+      query: "status",
+      injected: true,
+      providerSecretForwarded: false,
+    });
+
+    await runner.request(path + "/input", "POST", {
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [{ tool: "mcp_fixture_denied_write", args: {} }],
+          answer: "Denied direct call complete.",
+        }),
+      requestId: "mcp-denied-direct-call",
+    });
+    const deniedDirect = await nextEvent(
+      runner,
+      bot.id,
+      (event) =>
+        event.kind === "tool" && event.data.name === "mcp_fixture_denied_write",
+      allowed.seq,
+      true,
+    );
+    assert.equal(deniedDirect.data.isError, true);
+
+    await runner.request(path + "/input", "POST", {
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            {
+              tool: "codemode",
+              args: {
+                code: "return await tools.mcp_fixture_denied_write({})",
+              },
+            },
+          ],
+          answer: "Denied call complete.",
+        }),
+      requestId: "mcp-denied-code-call",
+    });
+    const denied = await nextEvent(
+      runner,
+      bot.id,
+      (event) => event.kind === "tool" && event.data.name === "codemode",
+      deniedDirect.seq,
+      true,
+    );
+    assert.equal(denied.data.isError, true);
+    await runner.stop("SIGKILL");
+    runner = await startRunner(directory, runnerEnv);
+    const restored = await runner.request(path, "PUT", bot);
+    assert.equal(restored.status, 200);
+    assert.ok(restored.body.tools.includes("mcp_fixture_allowed_lookup"));
+    assert.ok(!restored.body.tools.includes("mcp_fixture_denied_write"));
+    assert.equal((await readFile(starts, "utf8")).trim().split("\n").length, 2);
+    assert.equal((await runner.request(path, "DELETE")).status, 200);
+    assert.equal((await readFile(starts, "utf8")).trim().split("\n").length, 2);
+
+    const disconnectBot = {
+      ...bot,
+      id: "disconnect-bot",
+      mcpServers: [
+        {
+          ...bot.mcpServers[0],
+          id: "disconnect",
+          tools: ["drop_connection"],
+        },
+      ],
+    };
+    const disconnectPath = `/v1/workspaces/${disconnectBot.id}`;
+    const disconnectRegistration = await runner.request(
+      disconnectPath,
+      "PUT",
+      disconnectBot,
+    );
+    assert.equal(disconnectRegistration.status, 200);
+    await runner.request(disconnectPath + "/input", "POST", {
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [{ tool: "mcp_disconnect_drop_connection", args: {} }],
+          answer: "This answer follows a lost MCP connection.",
+        }),
+      requestId: "disconnect-mcp",
+    });
+    const disconnected = await nextEvent(
+      runner,
+      disconnectBot.id,
+      (event) =>
+        event.kind === "tool" &&
+        event.data.name === "mcp_disconnect_drop_connection",
+      0,
+      true,
+    );
+    assert.equal(disconnected.data.isError, false);
+    assert.match(
+      (await runner.request(disconnectPath)).body.error,
+      /disconnected/i,
+    );
+    const laterInput = await runner.request(disconnectPath + "/input", "POST", {
+      message: "later work",
+      requestId: "after-mcp-disconnect",
+    });
+    assert.equal(laterInput.status, 202);
+    await nextEvent(
+      runner,
+      disconnectBot.id,
+      (event) =>
+        event.kind === "assistant" && event.data.text.includes("Echo: later work"),
+      disconnected.seq,
+      true,
+      5000,
+    );
+    assert.match(
+      (await runner.request(disconnectPath)).body.error,
+      /disconnected/i,
+    );
+  },
+);
+
+test(
   "a bot publishes only explicit messages, cannot use coding tools through Code Mode, and supervises only permitted agents",
   { timeout: 20000 },
   async (t) => {
@@ -402,7 +760,8 @@ test(
     const published = await nextEvent(
       runner,
       bot.id,
-      (event) => event.kind === "message",
+      (event) =>
+        event.kind === "message" && event.data.text === "The agent is ready.",
     );
     assert.equal(published.data.text, "The agent is ready.");
     const denied = {
@@ -474,7 +833,7 @@ test(
     );
     assert.equal(
       history.body.events.filter((event) => event.kind === "message").length,
-      1,
+      2,
     );
   },
 );
@@ -749,10 +1108,10 @@ test(
     assert.equal(history.status, 200);
     assert.equal(
       history.body.events.filter((event) => event.kind === "message").length,
-      1,
+      2,
     );
     assert.equal(
-      history.body.events.find((event) => event.kind === "message").seq,
+      history.body.events.find((event) => event.seq === notification.seq).seq,
       notification.seq,
     );
     assert.equal(

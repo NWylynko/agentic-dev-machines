@@ -259,6 +259,108 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
       "BOT_ENVIRONMENT_FORBIDDEN",
       "Bots cannot have coding filesystems or runtime namespaces",
     );
+  if (config.mcpServers !== undefined) {
+    if (config.role !== "bot" || !Array.isArray(config.mcpServers))
+      throw new ApiError(
+        400,
+        "INVALID_MCP_SERVERS",
+        "MCP servers can only be configured for bots",
+      );
+    const serverIds = new Set<string>();
+    for (const server of config.mcpServers) {
+      const keys = Object.keys(server ?? {})
+        .sort()
+        .join(",");
+      if (
+        keys !== "args,command,id,secretEnv,tools" &&
+        keys !== "command,id,tools" &&
+        keys !== "args,command,id,tools"
+      )
+        throw new ApiError(
+          400,
+          "INVALID_MCP_SERVER",
+          "MCP config supports only id, stdio command, args, exact tool grants, and secretEnv references",
+        );
+      if (
+        typeof server.id !== "string" ||
+        !/^[A-Za-z][A-Za-z0-9_-]{0,39}$/.test(server.id) ||
+        serverIds.has(server.id)
+      )
+        throw new ApiError(
+          400,
+          "INVALID_MCP_SERVER_ID",
+          "Invalid or duplicate MCP server id",
+        );
+      serverIds.add(server.id);
+      if (
+        typeof server.command !== "string" ||
+        !/^(?:[A-Za-z0-9_.+-]+|\/[A-Za-z0-9_./+-]+)$/.test(server.command) ||
+        server.command.includes("..")
+      )
+        throw new ApiError(
+          400,
+          "INVALID_MCP_COMMAND",
+          "MCP servers require a command name or absolute executable path",
+        );
+      if (
+        server.args !== undefined &&
+        (!Array.isArray(server.args) ||
+          server.args.length > 64 ||
+          server.args.some(
+            (arg) => typeof arg !== "string" || arg.length > 4096,
+          ))
+      )
+        throw new ApiError(
+          400,
+          "INVALID_MCP_ARGS",
+          "MCP args must be up to 64 strings of at most 4096 characters",
+        );
+      if (
+        !Array.isArray(server.tools) ||
+        server.tools.length === 0 ||
+        server.tools.length > 128 ||
+        server.tools.some(
+          (tool) =>
+            typeof tool !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(tool),
+        ) ||
+        new Set(server.tools).size !== server.tools.length
+      )
+        throw new ApiError(
+          400,
+          "INVALID_MCP_TOOLS",
+          "MCP config requires exact, unique tool names",
+        );
+      if (server.secretEnv !== undefined) {
+        if (
+          !server.secretEnv ||
+          typeof server.secretEnv !== "object" ||
+          Array.isArray(server.secretEnv)
+        )
+          throw new ApiError(
+            400,
+            "INVALID_MCP_ENV",
+            "secretEnv must map MCP variable names to runner environment references",
+          );
+        for (const [name, reference] of Object.entries(server.secretEnv))
+          if (
+            !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ||
+            typeof reference !== "string" ||
+            !/^[A-Za-z_][A-Za-z0-9_]*$/.test(reference)
+          )
+            throw new ApiError(
+              400,
+              "INVALID_MCP_ENV",
+              "MCP env names and references must be environment variable identifiers",
+            );
+          else if (process.env[reference] === undefined)
+            throw new ApiError(
+              400,
+              "MCP_SECRET_NOT_INJECTED",
+              `MCP environment reference ${reference} is not injected into the runner`,
+            );
+      }
+    }
+  }
   if (
     config.role === "coding" &&
     config.environment === "local" &&
@@ -429,9 +531,16 @@ const server = createServer(async (request, response) => {
             "Workspace role and environment identity cannot change",
           );
         if (!previous) {
-          configs.set(id, config);
-          await atomicJson(registryPath, [...configs.values()]);
           await openWorkspace(config);
+          configs.set(id, config);
+          try {
+            await atomicJson(registryPath, [...configs.values()]);
+          } catch (error) {
+            configs.delete(id);
+            await workspaces.get(id)?.close(true);
+            workspaces.delete(id);
+            throw error;
+          }
         }
         return json(response, 200, await workspaces.get(id)!.status());
       });

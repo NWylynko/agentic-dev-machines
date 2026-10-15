@@ -21,7 +21,8 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { workspaceModels } from "./models.ts";
-import { botExtension } from "./bot.ts";
+import { BotProfileDocument, botExtension } from "./bot.ts";
+import { openMcpExtension } from "./mcp.ts";
 import {
   applyGoal,
   applyLoop,
@@ -111,6 +112,7 @@ export class Workspace {
   closed = false;
   passive = false;
   lastError?: string;
+  mcpError?: string;
   localEnv?: NodeExecutionEnv;
   kubeEnv?: KubernetesExecutionEnv;
   private accepting = true;
@@ -121,18 +123,21 @@ export class Workspace {
   >["loopTask"];
   private unsubscribe: () => void;
   private sandbox?: CodemodeSandbox;
+  private mcpClose?: () => Promise<void>;
   private constructor(
     config: WorkspaceConfig,
     harness: Workspace["harness"],
     conversation: Workspace["conversation"],
     assertActive: () => Promise<void>,
     loopTask: Workspace["loopTask"],
+    mcpClose?: () => Promise<void>,
   ) {
     this.config = config;
     this.harness = harness;
     this.conversation = conversation;
     this.assertActive = assertActive;
     this.loopTask = loopTask;
+    this.mcpClose = mcpClose;
     this.unsubscribe = harness.subscribeCommits(() =>
       this.events.emit("change"),
     );
@@ -151,6 +156,7 @@ export class Workspace {
     await chmod(directory, 0o700);
     let openedWorkspace: Workspace | undefined;
     let reportedError: string | undefined;
+    let mcpError: string | undefined;
     const recordError = (error: unknown) => {
       reportedError = (
         error instanceof Error
@@ -158,6 +164,14 @@ export class Workspace {
           : String(error)
       ).slice(0, 2000);
       if (openedWorkspace) openedWorkspace.lastError = reportedError;
+    };
+    const recordMcpError = (error: unknown) => {
+      mcpError = (
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : String(error)
+      ).slice(0, 2000);
+      if (openedWorkspace) openedWorkspace.mcpError = mcpError;
     };
     const registry = createRegistry();
     const schedule = createScheduleExtension(
@@ -177,6 +191,7 @@ export class Workspace {
     let localEnv: NodeExecutionEnv | undefined;
     let kubeEnv: KubernetesExecutionEnv | undefined;
     let sandbox: CodemodeSandbox | undefined;
+    let mcp: Awaited<ReturnType<typeof openMcpExtension>> | undefined;
     if (config.role === "coding") {
       registry.install(CodingTools);
       if (config.environment === "local") {
@@ -193,6 +208,10 @@ export class Workspace {
       }
     }
     if (config.role === "bot") {
+      if (!passive && config.mcpServers?.length) {
+        mcp = await openMcpExtension(config, assertActive, recordMcpError);
+        registry.install(mcp.extension);
+      }
       sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });
       registry.install(botExtension(config, assertActive, lookup!));
       registry.install(createCodemodeExtension({ sandbox, models: false }));
@@ -246,6 +265,16 @@ export class Workspace {
             },
           }
         : {},
+      init:
+        config.role === "bot"
+          ? async (tx, conversationId) => {
+              const profile = await tx.doc(BotProfileDocument, conversationId);
+              profile.state = "collecting";
+              profile.approvedToolGrants = (config.mcpServers ?? []).flatMap(
+                (server) => server.tools.map((tool) => `${server.id}:${tool}`),
+              );
+            }
+          : undefined,
     });
     const workspace = new Workspace(
       config,
@@ -253,13 +282,16 @@ export class Workspace {
       conversation,
       assertActive,
       schedule.loopTask,
+      mcp?.close,
     );
     openedWorkspace = workspace;
     workspace.lastError = reportedError;
+    workspace.mcpError = mcpError;
     workspace.localEnv = localEnv;
     workspace.kubeEnv = kubeEnv;
     workspace.sandbox = sandbox;
     workspace.passive = passive;
+    if (config.role === "bot" && !passive) await workspace.admitOnboarding();
     if (passive) workspace.accepting = false;
     if (!passive) harness.resume();
     return workspace;
@@ -288,7 +320,15 @@ export class Workspace {
       latestAssistant?.role === "assistant" &&
       latestAssistant.stopReason === "error"
         ? (latestAssistant.errorMessage ?? "The provider request failed")
-        : this.lastError;
+        : (this.mcpError ?? this.lastError);
+    const profile =
+      this.config.role === "bot"
+        ? await this.harness.snapshot(
+            BotProfileDocument,
+            this.conversation.id,
+            context,
+          )
+        : undefined;
     const status =
       this.passive || this.closed
         ? "deleted"
@@ -301,6 +341,7 @@ export class Workspace {
               : "idle";
     return {
       ...this.config,
+      ...(profile ? { profile } : {}),
       status,
       goals: schedule.goals,
       loops: schedule.loops,
@@ -334,6 +375,28 @@ export class Workspace {
         context,
       );
       return { submissionId: Number(submission.id), status: "admitted" };
+    });
+  }
+
+  private async admitOnboarding() {
+    await this.withAdmission(async () => {
+      await this.assertActive();
+      const profile = await this.harness.snapshot(
+        BotProfileDocument,
+        this.conversation.id,
+        context,
+      );
+      if (!profile || profile.state === "ready") return;
+      await this.conversation.submit(
+        {
+          type: "input",
+          content:
+            "ADM bot onboarding: ask the user to choose your identity and purpose. Use sendMessage to publish the setup question, then wait for the user's answer. Save confirmed details with saveProfile.",
+          requestId: `onboarding:${this.config.id}`,
+          whenBusy: "followUp",
+        },
+        context,
+      );
     });
   }
 
@@ -509,6 +572,7 @@ export class Workspace {
     await this.localEnv?.cleanup(context);
     await this.harness.close(context);
     await this.sandbox?.close();
+    await this.mcpClose?.();
     this.events.emit("close");
   }
 }
