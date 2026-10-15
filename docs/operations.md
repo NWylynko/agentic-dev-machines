@@ -60,6 +60,7 @@ adm shell my-project
 adm prompt my-project 'Inspect the repository and describe its current state.'
 adm list
 adm status my-project
+adm inspect my-project
 ```
 
 Use `--no-agent` for a shell-only workspace. By default `/repos` is an ordinary writable directory, so normal cloning works. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. To seed the catalog without cloning repository contents:
@@ -84,7 +85,7 @@ adm attach supervisor
 
 Use immutable IDs from `adm list` for supervision grants. A bot can use `listAgents` to discover the names and status of its live permitted coding agents, then observe and prompt those targets. Deleted or missing grants are reported as unavailable and never transfer to a workspace that reuses the same name. The bot can also manage goals and loops and publish through `sendMessage`. It has no coding filesystem, shell, or development browser, including through Code Mode. Ordinary model text stays in diagnostics. `adm attach supervisor --diagnostics` explicitly opts in to seeing those records.
 
-`adm list` prints the workspace name, role, persisted lifecycle phase, agent configuration, and full immutable ID from local state. It works without contacting Kubernetes or the runner. Use `adm list --json` to get the complete stored records as a JSON array; add `--all` to include deleted workspaces.
+`adm list` prints the workspace name, role, persisted lifecycle phase, agent configuration, and full immutable ID from local state. It works without contacting Kubernetes or the runner. Use `adm list --json` to get the complete stored records as a JSON array; add `--all` to include deleted workspaces. `adm status NAME` summarizes local phase, current Pod readiness/state, agent state, and node, with dependency failures shown below the row. Bot workspaces have no Pod and identify the management host as their location. Use `adm status NAME --json` to preserve the complete status records, or `adm inspect NAME` for labeled human-readable diagnostics. `adm inspect NAME --json` returns the same complete payload as status JSON.
 
 ## Errors and recovery
 

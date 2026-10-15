@@ -171,8 +171,8 @@ if (!enabled) {
     assert.equal(list[0].id, first.id);
     assert.equal(list[0].namespace, first.namespace);
     const status = json(
-      (await adm(state, ["status", first.id])).stdout,
-      "adm status",
+      (await adm(state, ["status", first.id, "--json"])).stdout,
+      "adm status --json",
     );
     assert.equal(status.workspace.id, first.id);
     assert.equal(status.agent.status, "disabled");

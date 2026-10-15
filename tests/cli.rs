@@ -1,7 +1,8 @@
 use serde_json::Value;
 use std::{
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpListener,
     os::unix::fs::{PermissionsExt, symlink},
     os::unix::net::UnixListener,
     path::Path,
@@ -73,6 +74,61 @@ fn adm(root: &Path, arguments: &[&str]) -> Output {
         .expect("run public CLI")
 }
 
+fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .arg("--state-dir")
+        .arg(root.join("state"))
+        .arg("--kubectl")
+        .arg(root.join("kubectl"))
+        .arg("--runner-url")
+        .arg(runner_url)
+        .args(arguments)
+        .output()
+        .expect("run public CLI with runner fixture")
+}
+
+fn serve_runner_status_fixture(listener: TcpListener) {
+    for _ in 0..3 {
+        let (stream, _) = listener.accept().unwrap();
+        let mut request = BufReader::new(stream);
+        let mut line = String::new();
+        request.read_line(&mut line).unwrap();
+        let path = line.split_whitespace().nth(1).unwrap().to_owned();
+        let mut content_length = 0;
+        loop {
+            line.clear();
+            request.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("content-length: ") {
+                content_length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut body = vec![0; content_length];
+        request.read_exact(&mut body).unwrap();
+        let response = match path.as_str() {
+            "/health" => r#"{"status":"ok"}"#,
+            path if path.starts_with("/v1/workspaces/") => {
+                if content_length > 0 {
+                    "{}"
+                } else {
+                    r#"{"status":"error","error":"provider token expired"}"#
+                }
+            }
+            _ => panic!("unexpected runner path: {path}"),
+        };
+        let mut stream = request.into_inner();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+            response.len()
+        )
+        .unwrap();
+    }
+}
+
 fn adm_with_input(root: &Path, arguments: &[&str], input: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -133,7 +189,13 @@ elif args[0] == 'wait':
         failure.unlink(); print('deployment did not become available',file=sys.stderr); sys.exit(1)
     print('condition met')
 elif args[:2] == ['get','pods']:
-    print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':{'phase':'Running'}}]}))
+    ready = (pathlib.Path(__file__).parent / 'ready-pod').exists()
+    init_waiting = (pathlib.Path(__file__).parent / 'init-waiting').exists()
+    condition = {'type':'Ready','status':'True' if ready else 'False','reason':'ContainersNotReady'}
+    status = {'phase':'Running','conditions':[condition], 'containerStatuses':[{'name':'dev','ready':ready}]}
+    if init_waiting:
+        status['initContainerStatuses']=[{'name':'setup','ready':False,'state':{'waiting':{'reason':'ImagePullBackOff','message':'could not pull setup image'}}}]
+    print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':status}]}))
 elif args and args[0] == 'exec':
     (pathlib.Path(__file__).parent / 'exec-args.json').write_text(json.dumps(args))
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
@@ -393,7 +455,7 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
         "duplicate names must be explicit errors"
     );
     assert_eq!(
-        assert_ok(adm(root.path(), &["status", "demo"]))["workspace"]["id"],
+        assert_ok(adm(root.path(), &["status", "demo", "--json"]))["workspace"]["id"],
         first["id"]
     );
     assert_eq!(
@@ -413,6 +475,208 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
         &["create", "demo", "--no-agent", "--no-repositories"],
     ));
     assert_ne!(first["id"], second["id"]);
+}
+
+#[test]
+fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
+    let root = fixture();
+    let coding = assert_ok(adm(
+        root.path(),
+        &["create", "demo", "--no-agent", "--no-repositories"],
+    ));
+    let bot = assert_ok(adm(
+        root.path(),
+        &["create", "supervisor", "--role", "bot", "--no-agent"],
+    ));
+
+    let status = adm(root.path(), &["status", "demo"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.contains("NAME")
+            && status.contains("ROLE")
+            && status.contains("PHASE")
+            && status.contains("POD")
+            && status.contains("AGENT")
+            && status.contains("NODE"),
+        "{status}"
+    );
+    assert!(
+        status.contains("demo")
+            && status.contains("coding")
+            && status.contains("NotReady (Running)")
+            && status.contains("disabled")
+            && status.contains("node-a")
+            && status.contains("ContainersNotReady"),
+        "{status}"
+    );
+    assert!(
+        !status.contains("\"workspace\""),
+        "status should be a concise human summary: {status}"
+    );
+
+    fs::write(root.path().join("ready-pod"), "ready").unwrap();
+    let ready = adm(root.path(), &["status", "demo"]);
+    assert!(
+        ready.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let ready = String::from_utf8_lossy(&ready.stdout);
+    let pod_row = ready.lines().nth(1).unwrap_or("");
+    assert!(
+        pod_row.contains("Ready") && !pod_row.contains("NotReady"),
+        "{ready}"
+    );
+
+    fs::remove_file(root.path().join("ready-pod")).unwrap();
+    fs::write(root.path().join("init-waiting"), "waiting").unwrap();
+    let init_waiting = adm(root.path(), &["status", "demo"]);
+    assert!(
+        init_waiting.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init_waiting.stderr)
+    );
+    let init_waiting = String::from_utf8_lossy(&init_waiting.stdout);
+    assert!(
+        init_waiting.contains("ImagePullBackOff")
+            && init_waiting.contains("could not pull setup image"),
+        "{init_waiting}"
+    );
+
+    let full = assert_ok(adm(root.path(), &["status", "demo", "--json"]));
+    assert_eq!(full["workspace"]["id"], coding["id"]);
+    assert_eq!(full["cluster"]["pods"][0]["status"]["phase"], "Running");
+    assert_eq!(full["agent"]["status"], "disabled");
+    assert_eq!(
+        assert_ok(adm(root.path(), &["inspect", "demo", "--json"])),
+        full
+    );
+
+    let inspect = adm(root.path(), &["inspect", "demo"]);
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspect = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        inspect.contains("Workspace")
+            && inspect.contains("Namespace")
+            && inspect.contains("Pod")
+            && inspect.contains("workspace-123")
+            && inspect.contains("Agent"),
+        "{inspect}"
+    );
+    assert!(
+        !inspect.contains("\"workspace\""),
+        "inspect should label details for people: {inspect}"
+    );
+
+    let bot_status = adm(root.path(), &["status", "supervisor"]);
+    assert!(
+        bot_status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bot_status.stderr)
+    );
+    let bot_status = String::from_utf8_lossy(&bot_status.stdout);
+    assert!(
+        bot_status.contains("bot")
+            && bot_status.contains("n/a")
+            && bot_status.contains("management host")
+            && bot_status.contains("disabled"),
+        "{bot_status}"
+    );
+    assert_eq!(
+        assert_ok(adm(root.path(), &["status", "supervisor", "--json"]))["workspace"]["id"],
+        bot["id"]
+    );
+    let bot_inspect = adm(root.path(), &["inspect", "supervisor"]);
+    assert!(
+        bot_inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bot_inspect.stderr)
+    );
+    let bot_inspect = String::from_utf8_lossy(&bot_inspect.stdout);
+    assert!(
+        bot_inspect.contains("Location: management host (no workspace Pod)"),
+        "{bot_inspect}"
+    );
+
+    assert_eq!(
+        assert_ok(adm(root.path(), &["destroy", "demo"]))["phase"],
+        "deleted"
+    );
+    let deleted = adm(root.path(), &["status", "demo"]);
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(String::from_utf8_lossy(&deleted.stdout).contains("deleted"));
+    let deleted_inspect = adm(root.path(), &["inspect", "demo"]);
+    assert!(
+        deleted_inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted_inspect.stderr)
+    );
+    let deleted_inspect = String::from_utf8_lossy(&deleted_inspect.stdout);
+    assert!(
+        deleted_inspect.contains("Runtime: destroyed")
+            && !deleted_inspect.contains("Location: management host"),
+        "{deleted_inspect}"
+    );
+    let missing = adm(root.path(), &["status", "never-created"]);
+    assert!(
+        !missing.status.success(),
+        "missing resources must remain distinguishable from tombstones"
+    );
+}
+
+#[test]
+fn status_distinguishes_agent_provider_errors_from_unavailable_runner() {
+    let root = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || serve_runner_status_fixture(listener));
+
+    let created = adm_with_runner(
+        root.path(),
+        &runner_url,
+        &[
+            "create",
+            "supervisor",
+            "--role",
+            "bot",
+            "--model",
+            "faux/faux-1",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let status = adm_with_runner(root.path(), &runner_url, &["status", "supervisor"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.contains("AGENT")
+            && status.contains("error")
+            && status.contains("Agent failure: provider token expired"),
+        "{status}"
+    );
+    assert!(!status.contains("Agent unavailable"), "{status}");
+    server.join().unwrap();
 }
 
 #[test]
@@ -631,7 +895,7 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
     assert_eq!(remaining[0]["id"], stale_workspace["id"]);
     assert_eq!(remaining[0]["phase"], "ready");
     assert_eq!(
-        assert_ok(adm(root.path(), &["status", "herdr-other"]))["workspace"]["phase"],
+        assert_ok(adm(root.path(), &["status", "herdr-other", "--json"]))["workspace"]["phase"],
         "deleted"
     );
     assert_ne!(workspace["id"], other_workspace["id"]);
@@ -770,7 +1034,7 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        assert_ok(adm(root.path(), &["status", "herdr-owned"]))["workspace"]["phase"],
+        assert_ok(adm(root.path(), &["status", "herdr-owned", "--json"]))["workspace"]["phase"],
         "deleted"
     );
     let cluster: Value =
@@ -796,7 +1060,21 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
     ));
     fs::write(root.path().join("fail-status"), "offline").unwrap();
 
-    let status = assert_ok(adm(root.path(), &["status", "offline-status"]));
+    let human = adm(root.path(), &["status", "offline-status"]);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human.contains("offline-status")
+            && human.contains("unavailable")
+            && human.contains("connection refused"),
+        "{human}"
+    );
+
+    let status = assert_ok(adm(root.path(), &["status", "offline-status", "--json"]));
     assert_eq!(status["workspace"]["id"], workspace["id"]);
     assert!(status["cluster"]["status"] == "unavailable");
     assert!(

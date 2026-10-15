@@ -500,8 +500,8 @@ test(
     children.delete(after.child);
 
     const status = json(
-      (await adm(binary, state, kubectl, ["status", workspace])).stdout,
-      "adm status",
+      (await adm(binary, state, kubectl, ["status", workspace, "--json"])).stdout,
+      "adm status --json",
     );
     assert.equal(status.cluster.pods[0].spec.nodeName, oldNode);
 

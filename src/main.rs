@@ -47,8 +47,20 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect a workspace's local, cluster, and agent state.
-    Status { name: String },
+    /// Show a concise local, cluster, and agent summary.
+    Status {
+        name: String,
+        /// Print the complete local, cluster, and agent records as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show detailed local, cluster, and agent diagnostics.
+    Inspect {
+        name: String,
+        /// Print the complete local, cluster, and agent records as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Permanently stop a workspace and remove its owned resources.
     Destroy { name: String },
     /// Open the reconnectable Pi-style terminal client.
@@ -246,6 +258,270 @@ fn print_workspace_list(items: &[workspaces::Workspace]) {
     }
 }
 
+fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
+    let workspace = cli.store()?.find(name)?;
+    let cluster = if workspace.role == "coding" && workspace.phase != "deleted" {
+        match workspaces::cluster_status(cli, &workspace) {
+            Ok(value) => value,
+            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
+        }
+    } else {
+        Value::Null
+    };
+    let agent = if workspace.agent_enabled && workspace.phase != "deleted" {
+        match cli.request("GET", &format!("/v1/workspaces/{}", workspace.id), None) {
+            Ok(value) => value,
+            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
+        }
+    } else {
+        json!({"status":"disabled"})
+    };
+    Ok(json!({"workspace":workspace,"cluster":cluster,"agent":agent}))
+}
+
+fn pod_summary(status: &Value) -> (String, String) {
+    let Some(pod) = status["cluster"]["pods"]
+        .as_array()
+        .and_then(|pods| pods.first())
+    else {
+        return ("missing".into(), "—".into());
+    };
+    let phase = pod["status"]["phase"].as_str().unwrap_or("Unknown");
+    let ready_condition = pod["status"]["conditions"]
+        .as_array()
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition["type"] == "Ready")
+        });
+    let containers = pod["status"]["containerStatuses"].as_array();
+    let containers_ready = containers.is_none_or(|containers| {
+        containers
+            .iter()
+            .all(|container| container["ready"] == true)
+    });
+    let readiness = if ready_condition.is_some_and(|condition| condition["status"] == "True")
+        && containers_ready
+    {
+        "Ready".to_owned()
+    } else if ready_condition.is_some_and(|condition| condition["status"] == "False")
+        || containers.is_some_and(|_| !containers_ready)
+    {
+        format!("NotReady ({phase})")
+    } else if phase == "Pending" {
+        "Pending".to_owned()
+    } else {
+        format!("Unknown ({phase})")
+    };
+    let node = pod["spec"]["nodeName"]
+        .as_str()
+        .filter(|node| !node.is_empty())
+        .unwrap_or("—");
+    (readiness, node.to_owned())
+}
+
+fn status_row(status: &Value) -> [String; 6] {
+    let workspace = &status["workspace"];
+    let role = workspace["role"].as_str().unwrap_or("unknown");
+    let phase = workspace["phase"].as_str().unwrap_or("unknown");
+    let (pod, node) = if phase == "deleted" {
+        ("deleted".into(), "—".into())
+    } else if role == "bot" {
+        ("n/a".into(), "management host".into())
+    } else if status["cluster"]["status"] == "unavailable" {
+        ("unavailable".into(), "—".into())
+    } else if status["cluster"].is_null() {
+        ("n/a".into(), "—".into())
+    } else {
+        pod_summary(status)
+    };
+    let agent = status["agent"]["status"].as_str().unwrap_or("unknown");
+    [
+        workspace["name"].as_str().unwrap_or("unknown").into(),
+        role.into(),
+        phase.into(),
+        pod,
+        agent.into(),
+        node,
+    ]
+}
+
+fn print_status(status: &Value) {
+    let headers = ["NAME", "ROLE", "PHASE", "POD", "AGENT", "NODE"];
+    let row = status_row(status);
+    let widths =
+        std::array::from_fn::<_, 6, _>(|column| row[column].len().max(headers[column].len()));
+    println!(
+        "{:<name$}  {:<role$}  {:<phase$}  {:<pod$}  {:<agent$}  {}",
+        headers[0],
+        headers[1],
+        headers[2],
+        headers[3],
+        headers[4],
+        headers[5],
+        name = widths[0],
+        role = widths[1],
+        phase = widths[2],
+        pod = widths[3],
+        agent = widths[4]
+    );
+    println!(
+        "{:<name$}  {:<role$}  {:<phase$}  {:<pod$}  {:<agent$}  {}",
+        row[0],
+        row[1],
+        row[2],
+        row[3],
+        row[4],
+        row[5],
+        name = widths[0],
+        role = widths[1],
+        phase = widths[2],
+        pod = widths[3],
+        agent = widths[4]
+    );
+    if let Some(error) = status["cluster"]["error"].as_str() {
+        println!("Cluster unavailable: {error}");
+    }
+    if let Some(error) = status["agent"]["error"].as_str() {
+        match status["agent"]["status"].as_str() {
+            Some("unavailable") => println!("Agent unavailable: {error}"),
+            Some("error") => println!("Agent failure: {error}"),
+            _ => println!("Agent error: {error}"),
+        }
+    }
+    if let Some(error) = status["workspace"]["last_error"].as_str() {
+        println!("Workspace failure: {error}");
+    }
+    if let Some(pod) = status["cluster"]["pods"]
+        .as_array()
+        .and_then(|pods| pods.first())
+    {
+        let readiness_reason = pod["status"]["conditions"]
+            .as_array()
+            .and_then(|conditions| {
+                conditions
+                    .iter()
+                    .find(|condition| condition["type"] == "Ready")
+            })
+            .filter(|condition| condition["status"] != "True")
+            .and_then(|condition| {
+                condition["message"]
+                    .as_str()
+                    .or_else(|| condition["reason"].as_str())
+            });
+        if let Some(reason) = readiness_reason {
+            println!("Pod readiness: {reason}");
+        }
+        for (kind, key) in [
+            ("Container", "containerStatuses"),
+            ("Init container", "initContainerStatuses"),
+        ] {
+            let Some(containers) = pod["status"][key].as_array() else {
+                continue;
+            };
+            for container in containers
+                .iter()
+                .filter(|container| container["ready"] == false)
+            {
+                let Some((state, detail)) = container["state"]
+                    .as_object()
+                    .and_then(|states| states.iter().next())
+                else {
+                    continue;
+                };
+                let reason = detail["reason"].as_str();
+                let message = detail["message"].as_str();
+                let description = match (reason, message) {
+                    (Some(reason), Some(message)) => format!("{reason}: {message}"),
+                    (Some(reason), None) => reason.to_owned(),
+                    (None, Some(message)) => message.to_owned(),
+                    (None, None) => continue,
+                };
+                println!(
+                    "{kind} {} {state}: {description}",
+                    container["name"].as_str().unwrap_or("unknown")
+                );
+            }
+        }
+    }
+}
+
+fn print_inspect(status: &Value) -> Result<()> {
+    let workspace = &status["workspace"];
+    println!("Workspace");
+    for (label, key) in [
+        ("Name", "name"),
+        ("ID", "id"),
+        ("Role", "role"),
+        ("Local phase", "phase"),
+        ("Namespace", "namespace"),
+        ("Image", "image"),
+        ("Storage class", "storage_class"),
+        ("Storage size", "storage_size"),
+        ("CPU", "cpu"),
+        ("Memory", "memory"),
+        ("Agent enabled", "agent_enabled"),
+        ("Repositories", "repositories"),
+        ("Model", "model"),
+        ("Herdr space", "herdr_space"),
+        ("Created at", "created_at"),
+        ("Last error", "last_error"),
+    ] {
+        let value = &workspace[key];
+        let rendered = match value {
+            Value::Null => "—".to_owned(),
+            Value::String(text) => text.clone(),
+            _ => serde_json::to_string(value)?,
+        };
+        println!("  {label}: {rendered}");
+    }
+
+    let cluster = &status["cluster"];
+    println!("Cluster");
+    if cluster.is_null() {
+        if workspace["role"] == "bot" {
+            println!("  Location: management host (no workspace Pod)");
+        } else if workspace["phase"] == "deleted" {
+            println!("  Runtime: destroyed (workspace deleted)");
+        } else {
+            println!("  Pod: not queried");
+        }
+    } else if let Some(error) = cluster["error"].as_str() {
+        println!("  Unavailable: {error}");
+    } else {
+        println!(
+            "  Namespace: {}",
+            cluster["namespace"].as_str().unwrap_or("unknown")
+        );
+        if let Some(pods) = cluster["pods"].as_array() {
+            if pods.is_empty() {
+                println!("  Pods: none");
+            }
+            for pod in pods {
+                let name = pod["metadata"]["name"].as_str().unwrap_or("unnamed");
+                let phase = pod["status"]["phase"].as_str().unwrap_or("Unknown");
+                let (readiness, node) = pod_summary(&json!({"cluster":{"pods":[pod]}}));
+                println!("  Pod {name}: {readiness}; phase {phase}; node {node}");
+                println!("    Details: {}", serde_json::to_string(&pod["status"])?);
+            }
+        }
+    }
+    println!("Agent");
+    if let Some(object) = status["agent"].as_object() {
+        for (key, value) in object {
+            let rendered = match value {
+                Value::Null => "—".to_owned(),
+                Value::String(text) => text.clone(),
+                _ => serde_json::to_string(value)?,
+            };
+            println!("  {key}: {rendered}");
+        }
+    } else {
+        println!("  {}", status["agent"]);
+    }
+    Ok(())
+}
+
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Action::Create(options) => print_json(&workspaces::create(cli, options)?),
@@ -259,25 +535,22 @@ fn run(cli: &Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Action::Status { name } => {
-            let workspace = cli.store()?.find(name)?;
-            let cluster = if workspace.role == "coding" && workspace.phase != "deleted" {
-                match workspaces::cluster_status(cli, &workspace) {
-                    Ok(value) => value,
-                    Err(error) => json!({"status":"unavailable","error":error.to_string()}),
-                }
+        Action::Status { name, json } => {
+            let status = workspace_status(cli, name)?;
+            if *json {
+                print_json(&status)
             } else {
-                json!(null)
-            };
-            let agent = if workspace.agent_enabled && workspace.phase != "deleted" {
-                match cli.request("GET", &format!("/v1/workspaces/{}", workspace.id), None) {
-                    Ok(value) => value,
-                    Err(error) => json!({"status":"unavailable","error":error.to_string()}),
-                }
+                print_status(&status);
+                Ok(())
+            }
+        }
+        Action::Inspect { name, json } => {
+            let status = workspace_status(cli, name)?;
+            if *json {
+                print_json(&status)
             } else {
-                json!({"status":"disabled"})
-            };
-            print_json(&json!({"workspace":workspace,"cluster":cluster,"agent":agent}))
+                print_inspect(&status)
+            }
         }
         Action::Destroy { name } => print_json(&workspaces::destroy(cli, name)?),
         Action::Attach { name, diagnostics } => {
