@@ -1,5 +1,5 @@
 # Verifies the CLI, runner, and terminal, then publishes the linux/amd64
-# management-host binaries and the workspace image. Markdown-only pushes and
+# management-host distribution and the workspace image. Markdown-only pushes and
 # pull requests do not run this workflow. FUSE repository tests stay local:
 # this runner does not provide a usable /dev/fuse mount.
 
@@ -66,6 +66,7 @@ jobs:
       - run: cargo test
       - run: npm run check
       - run: npm test
+      - run: npm run test:install
 
   image:
     needs: verify
@@ -141,6 +142,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+          cache: npm
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -150,18 +156,30 @@ jobs:
           go-version-file: packages/repositories/go.mod
           cache-dependency-path: packages/repositories/go.sum
 
+      - run: npm ci --ignore-scripts
+
       - name: Build release binaries
         run: |
           set -eu
-          mkdir -p dist
           cargo build --release --locked
-          cp target/release/adm dist/adm-linux-amd64
-          CGO_ENABLED=0 go build -C packages/repositories -trimpath -ldflags='-s -w' -o "$PWD/dist/adm-repositories-linux-amd64" .
-          chmod 755 dist/adm-linux-amd64 dist/adm-repositories-linux-amd64
-          (
-            cd dist
-            sha256sum adm-linux-amd64 adm-repositories-linux-amd64 > SHA256SUMS
-          )
+          CGO_ENABLED=0 go build -C packages/repositories -trimpath -ldflags='-s -w' -o /tmp/adm-repositories .
+
+      - name: Package standalone management-host release
+        run: |
+          set -eu
+          version="sha-${GITHUB_SHA::12}"
+          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]'):sha-${GITHUB_SHA::12}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; fi
+          node scripts/build-release.mjs \
+            --version "$version" --image "$image" \
+            --adm target/release/adm --repositories /tmp/adm-repositories \
+            --output dist
+          cp install.sh dist/install.sh
+
+      - name: Verify standalone runtime and Code Mode assets
+        env:
+          ADM_RELEASE_TEST_ADM: ${{ github.workspace }}/target/release/adm
+        run: npm run test:release
 
       - uses: actions/upload-artifact@v7
         if: github.event_name != 'pull_request'
@@ -190,16 +208,15 @@ jobs:
           image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           version="${GITHUB_REF_NAME#v}"
           cat > release-notes.md <<EOF
-          ## CLI
+          ## Install or update
 
-          linux/amd64 binaries for the Debian management host. \`adm\` still launches the runner and terminal from this checkout, including its installed npm dependencies.
+          Complete linux/amd64 distribution for the Debian management host, including the runner, terminal and pinned Node dependencies. Requires Node.js 24 or newer; no checkout, Rust, Go or npm install is needed.
 
           \`\`\`sh
-          install -m 755 adm-linux-amd64 "\$HOME/.local/bin/adm"
-          install -m 755 adm-repositories-linux-amd64 "\$HOME/.local/bin/adm-repositories"
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh | sh -s -- --version ${GITHUB_REF_NAME}
           \`\`\`
 
-          Run \`adm\` from the checkout, or pass \`--project-dir\` / \`ADM_PROJECT_DIR\`. A binary compiled on the management host keeps using that checkout while the build path still exists.
+          Omit \`--version\` to install or update to the latest release while preserving settings and workspace state. First installation offers \`adm setup\`. The archive's default workspace image is pinned to this build.
 
           ## Workspace image
 
@@ -216,6 +233,8 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes-file release-notes.md \
+            dist/adm-linux-amd64.tar.gz \
+            dist/install.sh \
             dist/adm-linux-amd64 \
             dist/adm-repositories-linux-amd64 \
             dist/SHA256SUMS

@@ -13,6 +13,8 @@
     "test": "node --test packages/runner/test/*.test.mjs image/browser.test.mjs && node --import tsx --test packages/terminal/test/*.test.ts",
     "test:runner": "node --test packages/runner/test/*.test.mjs",
     "test:terminal": "node --import tsx --test packages/terminal/test/*.test.ts",
+    "test:install": "node --test tests/install.test.mjs",
+    "test:release": "node --test tests/release.test.mjs",
     "test:repositories": "PATH=\"$(go env GOPATH)/bin:$PATH\" go test -C packages/repositories -count=1 -timeout 180s",
     "test:cluster": "node tests/live-cluster.mjs",
     "test:cluster-contract": "node tests/cluster-contract.mjs",

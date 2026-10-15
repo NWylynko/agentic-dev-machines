@@ -1,10 +1,11 @@
 mod diagnostics;
 mod herdr;
 mod runner;
+mod setup;
 mod workspaces;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -25,8 +26,7 @@ pub struct Cli {
     pub kubectl: String,
     #[arg(long, global = true, default_value = "http://127.0.0.1:7432")]
     pub runner_url: String,
-    /// Checkout that contains the runner and terminal. A binary built elsewhere
-    /// does not keep the build machine's path; pass this or ADM_PROJECT_DIR.
+    /// Runtime installation or development checkout containing the runner and terminal.
     #[arg(long, global = true, env = "ADM_PROJECT_DIR", default_value_os_t = default_project_dir())]
     pub project_dir: PathBuf,
     #[command(subcommand)]
@@ -102,9 +102,14 @@ pub enum Action {
     Stop,
     /// Check prerequisites, cluster access, storage, and runner health.
     Doctor {
-        #[arg(long, default_value = "adm-replicated")]
+        /// StorageClass to inspect; otherwise use the configured default.
+        #[arg(long, default_value = "adm-replicated", hide_default_value = true)]
         storage_class: String,
     },
+    /// Configure workspace defaults, provider login, and the background service.
+    Setup,
+    /// Open the installed Pi provider login interface; use /login there.
+    Login,
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
     Herdr {
         #[command(subcommand)]
@@ -120,6 +125,12 @@ pub enum Action {
 }
 
 fn default_project_dir() -> PathBuf {
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(root) = executable.parent().and_then(|bin| bin.parent())
+        && (root.join("runtime").is_dir() || root.join("VERSION").is_file())
+    {
+        return root.to_path_buf();
+    }
     let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if compiled.join("packages/runner/src/main.ts").is_file() {
         return compiled;
@@ -142,10 +153,23 @@ impl Cli {
         let path = self.project_dir.join(relative);
         anyhow::ensure!(
             path.is_file(),
-            "missing {relative} under {}; pass --project-dir pointing at the ADM checkout",
+            "missing {relative} under {}; reinstall with install.sh, or pass --project-dir pointing at an ADM checkout",
             self.project_dir.display()
         );
         Ok(path)
+    }
+
+    pub fn runtime_command(&self, component: &str) -> Result<Command> {
+        let mut command = Command::new("node");
+        command.current_dir(&self.project_dir);
+        if self.project_dir.join("runtime").is_dir() {
+            command.arg(self.checkout_file(&format!("runtime/{component}.mjs"))?);
+        } else {
+            command
+                .args(["--import", "tsx"])
+                .arg(self.checkout_file(&format!("packages/{component}/src/main.ts"))?);
+        }
+        Ok(command)
     }
 
     pub fn state_path(&self) -> PathBuf {
@@ -205,12 +229,8 @@ fn run(cli: &Cli) -> Result<()> {
                 "workspace has no agent; use adm shell"
             );
             runner::ensure_started(cli)?;
-            let mut command = Command::new("node");
-            command
-                .current_dir(&cli.project_dir)
-                .args(["--import", "tsx"])
-                .arg(cli.checkout_file("packages/terminal/src/main.ts")?)
-                .args(["--url", &cli.runner_url, "--workspace", &workspace.id]);
+            let mut command = cli.runtime_command("terminal")?;
+            command.args(["--url", &cli.runner_url, "--workspace", &workspace.id]);
             if *diagnostics {
                 command.arg("--diagnostics");
             }
@@ -318,6 +338,8 @@ fn run(cli: &Cli) -> Result<()> {
         Action::Serve => runner::serve(cli),
         Action::Stop => runner::stop(cli),
         Action::Doctor { storage_class } => diagnostics::doctor(cli, storage_class),
+        Action::Setup => setup::run(cli),
+        Action::Login => setup::login(cli),
         Action::Herdr { command } => herdr::run(cli, command),
         Action::Browser {
             name,
@@ -355,9 +377,56 @@ fn run(cli: &Cli) -> Result<()> {
 }
 
 fn main() {
-    let cli = Cli::parse();
-    if let Err(error) = run(&cli) {
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).expect("validated CLI arguments");
+    if let Err(error) = configure_defaults(&mut cli, &matches).and_then(|()| run(&cli)) {
         eprintln!("adm: {error:#}");
         std::process::exit(1);
     }
+}
+
+fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
+    match &cli.command {
+        Action::Create(_) | Action::Manifest(_) | Action::Doctor { .. } => {}
+        _ => return Ok(()),
+    }
+    let config = setup::read_config()?;
+    let (_, arguments) = matches.subcommand().expect("required CLI command");
+    let image = if matches!(&cli.command, Action::Create(_) | Action::Manifest(_))
+        && arguments.value_source("image") == Some(ValueSource::DefaultValue)
+    {
+        Some(match config.image {
+            Some(image) => image,
+            None => setup::default_image(cli)?,
+        })
+    } else {
+        None
+    };
+    match &mut cli.command {
+        Action::Create(options) | Action::Manifest(options) => {
+            if let Some(image) = image {
+                options.image = image;
+            }
+            if arguments.value_source("storage_class") == Some(ValueSource::DefaultValue)
+                && let Some(storage_class) = config.storage_class
+            {
+                options.storage_class = storage_class;
+            }
+            if options.model.is_none() && !options.no_agent {
+                options.model = config.model;
+            }
+            if let Some(model) = &options.model {
+                setup::validate_model(model)?;
+            }
+        }
+        Action::Doctor { storage_class } => {
+            if arguments.value_source("storage_class") == Some(ValueSource::DefaultValue)
+                && let Some(configured) = config.storage_class
+            {
+                *storage_class = configured;
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }

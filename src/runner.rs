@@ -44,20 +44,25 @@ fn command(cli: &Cli) -> Result<Command> {
         "runner must listen on loopback"
     );
     let port = url.port().unwrap_or(7432);
-    let mut command = Command::new("node");
+    let mut command = cli.runtime_command("runner")?;
     command
-        .current_dir(&cli.project_dir)
-        .args(["--import", "tsx"])
-        .arg(cli.checkout_file("packages/runner/src/main.ts")?)
         .args(["--host", host, "--port", &port.to_string(), "--state-dir"])
         .arg(cli.state_path().join("runner"));
     Ok(command)
 }
 
 pub fn serve(cli: &Cli) -> Result<()> {
-    let status = command(cli)?.status().context("start Pi Durable runner")?;
-    ensure!(status.success(), "runner exited with {status}");
-    Ok(())
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command(cli)?.exec()).context("start Pi Durable runner")
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command(cli)?.status().context("start Pi Durable runner")?;
+        ensure!(status.success(), "runner exited with {status}");
+        Ok(())
+    }
 }
 
 pub fn ensure_started(cli: &Cli) -> Result<()> {
@@ -133,7 +138,11 @@ pub fn stop(cli: &Cli) -> Result<()> {
     let mut command_line = Vec::new();
     fs::File::open(format!("/proc/{pid}/cmdline"))?.read_to_end(&mut command_line)?;
     ensure!(
-        String::from_utf8_lossy(&command_line).contains("packages/runner/src/main.ts"),
+        command_line.split(|byte| *byte == 0).any(|argument| {
+            let argument = String::from_utf8_lossy(argument);
+            argument.ends_with("/packages/runner/src/main.ts")
+                || argument.ends_with("/runtime/runner.mjs")
+        }),
         "refusing to stop unrelated PID {pid}"
     );
     ensure!(

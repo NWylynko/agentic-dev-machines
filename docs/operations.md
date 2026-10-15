@@ -4,48 +4,37 @@ ADM has two parts on the management host: the Rust CLI and one long-running Node
 
 ## Management host
 
-Use Node 24 or newer, Rust, Go 1.26, `kubectl`, and Git. `gh` is needed for repository discovery. Keep this checkout available: the CLI launches the runner and terminal from it, including its installed npm dependencies.
-
-```sh
-npm ci
-cargo install --path . --root "$HOME/.local"
-go build -C packages/repositories -o "$HOME/.local/bin/adm-repositories" .
-adm doctor
-```
+Install the standalone release with the command in the [README](../README.md), then run `adm setup`. The management host needs Node.js 24+, `kubectl`, and Git; `gh` is needed for repository discovery. Rust, Go, npm, and the checkout are only needed for source development. See [installation and updates](installation.md) for prerequisites, version selection, and migrating an older manual installation.
 
 Make sure `$HOME/.local/bin` is on your shell's PATH. `adm doctor` reports tool availability, cluster readiness, the default StorageClass, runner health, and the selected local state directory. It preserves storage and runner error causes instead of treating every failure as a stopped service. Use `adm doctor --storage-class NAME` to inspect another class; node-local storage is labeled explicitly. Diagnostics do not allocate a workspace or install missing prerequisites.
 
-Run `npm exec -- pi` on the management host and use its `/login` command to configure the provider you intend to use. ADM uses the pinned Pi model runtime and its normal authentication store. Subscription compatibility depends on that provider integration; it has not been validated for every account. API keys follow the home-level `SECRETS.md`: inject them from Infisical into the runner's process, and never create a project `.env` containing values. Do not copy provider authentication into a workspace.
+Run `adm login` on the management host and use its `/login` command to configure the provider you intend to use. ADM uses the pinned Pi model runtime and its normal authentication store. Subscription compatibility depends on that provider integration; it has not been validated for every account. API keys follow the home-level `SECRETS.md`: inject them from Infisical into the runner's process, and never create a project `.env` containing values. Do not copy provider authentication into a workspace.
 
-Select a model explicitly with `--model PROVIDER/MODEL_ID` when creating an agent workspace. `faux/faux-1` is a deterministic local test provider and is available only when explicitly selected. It does not call an external model.
+Choose a default model in `adm setup`, or select one explicitly with `--model PROVIDER/MODEL_ID` when creating an agent workspace. `faux/faux-1` is a deterministic local test provider and is available only when explicitly selected. It does not call an external model.
 
 ```sh
 adm start
 adm status my-project
 ```
 
-`adm start` detaches the runner from the invoking terminal. For restart after a management-host reboot or runner crash, supervise `adm serve` with a user service; an example is [deploy/adm-runner.service](../deploy/adm-runner.service). Replace its checkout and executable paths before installing it. Do not start a second runner for the same state directory. Its owner lock rejects competing processes; SQLite is not a multi-owner database.
+`adm start` detaches the runner from the invoking terminal. For restart after a management-host reboot or runner crash, use `adm setup` to install the user service supervising `adm serve`. A manual [service template](../deploy/adm-runner.service) is also available. Do not start a second runner for the same state directory. Its owner lock rejects competing processes; SQLite is not a multi-owner database.
 
 The default state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm` when XDG_DATA_HOME is unset. `--state-dir` and `--runner-url` are global options. Use the same values in the service and every CLI command. The default runner URL is `http://127.0.0.1:7432`; remote unauthenticated binds are rejected.
 
-`adm stop` stops the runner while preserving recoverable work. Restart it with `adm start`, or let the service supervise it. Workspace deletion uses `adm destroy`, which has different semantics.
+`adm stop` stops a runner launched by `adm start` while preserving recoverable work. For the user service, use `systemctl --user stop adm-runner.service` and `systemctl --user start adm-runner.service`. Workspace deletion uses `adm destroy`, which has different semantics.
 
 ## Published builds
 
 `.github/workflows/build.yml` checks the CLI, runner, and terminal on pull requests and on `main`. Markdown-only changes skip that workflow. FUSE repository tests stay on a machine with `/dev/fuse`. Pull requests that change the build smoke the workspace image, then stop. Pushes to `main` that change the build, version tags (`v*`), and manual runs from `main` publish the `linux/amd64` image to `ghcr.io/nwylynko/agentic-dev-machines`:
 
-| Git ref | Image tags |
-| --- | --- |
-| `main` | `latest`, `sha-<commit>` |
+| Git ref  | Image tags                                  |
+| -------- | ------------------------------------------- |
+| `main`   | `latest`, `sha-<commit>`                    |
 | `v0.1.0` | `0.1.0`, `v0.1.0`, `latest`, `sha-<commit>` |
 
-A version tag creates a GitHub release with `adm-linux-amd64` and `adm-repositories-linux-amd64`. Pushes to `main` that change the build upload those same binaries as a workflow artifact. The release CLI still needs this checkout and `npm ci`, because it launches the runner and terminal from the source tree. Run it from the checkout, or pass `--project-dir` / `ADM_PROJECT_DIR`. A binary built on the management host with `cargo install --path .` keeps using that checkout while the path exists.
+A version tag creates a GitHub release with `install.sh`, `adm-linux-amd64.tar.gz`, compatibility binaries, and `SHA256SUMS`. The archive contains the CLI, repository helper, compiled runner/terminal, and their pinned production Node dependencies. Pushes to `main` that change the build upload the same files as a workflow artifact. Installation needs no checkout. The bundle records its matching `sha-<commit>` workspace image reference; setup can select a different image.
 
-```sh
-install -m 755 adm-linux-amd64 "$HOME/.local/bin/adm"
-install -m 755 adm-repositories-linux-amd64 "$HOME/.local/bin/adm-repositories"
-adm create my-project --image ghcr.io/nwylynko/agentic-dev-machines:0.1.0 --model PROVIDER/MODEL_ID
-```
+The installer consumes tagged GitHub release assets. Until the first release with the new bundle is published, use the workflow artifact or a source checkout to validate it. A main-branch artifact alone does not populate the installer's `latest` URL.
 
 The workflow token needs package write access; the first push creates the GHCR package. If that package is private, the cluster needs a pull credential. A node that cannot pull from GHCR still needs the image imported locally.
 
@@ -55,7 +44,7 @@ The workflow token needs package write access; the first push creates the GHCR p
 docker build -f image/Dockerfile -t adm-dev:0.1.0 .
 ```
 
-Distribute that exact image to the cluster's nodes, or use the published GHCR reference with `--image`. Building it on the management host does not make it available to Kubernetes. ADM does not install node helpers or change container-runtime configuration.
+For local image development, distribute that exact image to the cluster's nodes and pass `--image adm-dev:0.1.0`. Installed releases default to their matching published GHCR reference unless setup configured another image. Building it on the management host does not make it available to Kubernetes. ADM does not install node helpers or change container-runtime configuration.
 
 Configure a replicated StorageClass as described in [storage.md](../deploy/storage.md). The default is `adm-replicated`; this repository does not install a storage backend. The filesystem must support the required mount behavior, and the runner's management-host SQLite store needs a WAL-compatible filesystem. Keep management-host state in the backup plan as well as workspace volumes.
 
@@ -129,6 +118,9 @@ cargo fmt --check
 cargo test
 npm run check
 npm test
+npm run test:install
+cargo build --bin adm
+npm run test:release
 npm run test:repositories
 npm run test:image -- adm-dev:0.1.0
 ```

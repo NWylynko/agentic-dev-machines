@@ -1,5 +1,6 @@
-# Copy to ~/.config/systemd/user/adm-runner.service after replacing both paths.
-# `adm` can be a GitHub release binary or `cargo install --path .`.
+# Prefer `adm setup`, which generates this service with the actual Node PATH.
+# For manual installation, copy to ~/.config/systemd/user/adm-runner.service
+# and include your Node.js 24+ directory in Environment=PATH below.
 # Enable with: systemctl --user enable --now adm-runner.service
 # Persistent user services after logout also require operator-configured lingering.
 [Unit]
@@ -9,8 +10,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/ABSOLUTE/PATH/TO/agentic-dev-machines
-ExecStart=%h/.local/bin/adm --project-dir /ABSOLUTE/PATH/TO/agentic-dev-machines serve
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/adm serve
 Restart=on-failure
 RestartSec=3
 KillMode=control-group

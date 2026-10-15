@@ -41,6 +41,7 @@ else: sys.exit(2)
         });
         let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
         command
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
             .arg("--state-dir")
             .arg(root.path().join("state"))
             .arg("--kubectl")

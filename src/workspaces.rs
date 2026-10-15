@@ -48,9 +48,15 @@ pub struct CreateOptions {
     pub name: String,
     #[arg(long,default_value="coding",value_parser=["coding","bot"])]
     pub role: String,
-    #[arg(long, default_value = "adm-dev:0.1.0")]
+    /// Workspace image; otherwise use the configured or matching release image.
+    #[arg(
+        long,
+        default_value = "ghcr.io/nwylynko/agentic-dev-machines:latest",
+        hide_default_value = true
+    )]
     pub image: String,
-    #[arg(long, default_value = "adm-replicated")]
+    /// StorageClass; otherwise use the configured default or adm-replicated.
+    #[arg(long, default_value = "adm-replicated", hide_default_value = true)]
     pub storage_class: String,
     #[arg(long, default_value = "4Gi")]
     pub storage_size: String,
@@ -64,6 +70,7 @@ pub struct CreateOptions {
     pub no_repositories: bool,
     #[arg(long)]
     pub catalog: Option<std::path::PathBuf>,
+    /// Provider/model-id; overrides the model chosen in adm setup.
     #[arg(long)]
     pub model: Option<String>,
     #[arg(long)]

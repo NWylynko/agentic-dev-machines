@@ -47,6 +47,7 @@ fn fresh_runner_start_returns_and_daemon_survives_cli_exit() {
 
 fn adm(root: &Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
@@ -58,6 +59,7 @@ fn adm(root: &Path, arguments: &[&str]) -> Output {
 
 fn adm_with_input(root: &Path, arguments: &[&str], input: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")

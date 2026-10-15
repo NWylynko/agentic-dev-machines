@@ -11,6 +11,14 @@ This is the shared contract for the initial implementation. Nick authorized auto
 
 Model/provider authentication is held on the management host, never passed to the dev container. The runner executes coding tools through `kubectl exec` into `/opt/adm/workspace-env.mjs` in the workspace's `dev` container. An explicitly selected `environment: "local"` exists for tests; it is never an automatic fallback when Kubernetes fails.
 
+## Installation and configuration
+
+`install.sh` installs or updates a complete Linux x86_64 release without a checkout. Versioned runtime directories sit under `$XDG_DATA_HOME/adm/install` (normally `$HOME/.local/share/adm/install`); `$HOME/.local/bin` commands point through its active `current` link. The CLI resolves compiled runner/terminal entry points beside its executable. `--project-dir` / `ADM_PROJECT_DIR` explicitly select a runtime or development checkout. Release archives include production Node dependencies with their worker/WASM assets and require host Node.js 24+.
+
+First installation offers `adm setup`; updates preserve configuration and workspace state. `adm setup` writes nonsecret image, StorageClass, and optional model defaults to `$XDG_CONFIG_HOME/adm/config.json`, normally `$HOME/.config/adm/config.json`. Explicit command flags take precedence; `--no-agent` disables agents regardless of a configured default model. Without a model default, creation still requires `--model PROVIDER/MODEL_ID` or `--no-agent`. The release's matching image is used when no image is configured or supplied.
+
+Setup can open pinned Pi provider authentication (`adm login`) and generate a systemd user service for `adm serve`. It never configures cluster storage, changes Kubernetes context, stores provider keys, or imports the login shell's keys into systemd. Persistent operation after logout also requires systemd lingering. Installer and setup tests run public shell/CLI entry points with isolated homes, release fixtures, and external service boundaries; package tests run the actual compiled CLI/runner and Code Mode from the release archive without source paths.
+
 ## Runner service API
 
 Default bind: `127.0.0.1:7432`. CLI options can select another bind/port/state path. No public network exposure by default. The runner must reject non-loopback binds unless explicit authenticated configuration is supplied.
@@ -30,7 +38,7 @@ Default bind: `127.0.0.1:7432`. CLI options can select another bind/port/state p
 
 Errors: non-2xx JSON `{error:{code,message}}`. Deleted IDs return 410 for admissions. Unknown IDs return 404. Invalid names/paths/roles return 400. No silent provider/environment fallback. Health/status failures are visible.
 
-Status includes `needs_model` when no model is selected and `error` with a persisted provider failure message when the latest generation failed. CLI creation requires either `--model PROVIDER/MODEL_ID` or `--no-agent` before provisioning. Provider errors survive runner restart; no automatic provider switch or retry timer is used.
+Status includes `needs_model` when no model is selected and `error` with a persisted provider failure message when the latest generation failed. CLI creation requires a configured default model, explicit `--model PROVIDER/MODEL_ID`, or `--no-agent` before provisioning. Provider errors survive runner restart; no automatic provider switch or retry timer is used.
 
 ## Ownership and isolation
 

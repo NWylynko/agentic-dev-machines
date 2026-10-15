@@ -1,0 +1,101 @@
+#!/usr/bin/env node
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parseArgs, promisify } from "node:util";
+import { build } from "esbuild";
+
+const execute = promisify(execFile);
+const project = fileURLToPath(new URL("../", import.meta.url));
+if (process.platform !== "linux" || process.arch !== "x64")
+  throw new Error("Release packaging requires Linux x86_64");
+const { values } = parseArgs({
+  options: Object.fromEntries(
+    ["version", "image", "adm", "repositories", "output"].map((name) => [
+      name,
+      { type: "string" },
+    ]),
+  ),
+});
+for (const name of ["version", "image", "adm", "repositories", "output"]) {
+  if (!values[name]) throw new Error(`--${name} is required`);
+}
+if (!/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(values.version))
+  throw new Error("--version must be a release tag or build identifier");
+if (/\s/.test(values.image))
+  throw new Error("--image must be a single image reference");
+const output = resolve(values.output);
+const staging = await mkdtemp(join(tmpdir(), "adm-release-"));
+try {
+  await mkdir(join(staging, "bin"));
+  for (const [source, name] of [
+    [values.adm, "adm"],
+    [values.repositories, "adm-repositories"],
+  ]) {
+    const destination = join(staging, "bin", name);
+    await copyFile(resolve(source), destination);
+    await chmod(destination, 0o755);
+  }
+  for (const file of [
+    "package.json",
+    "package-lock.json",
+    "packages/runner/package.json",
+    "packages/terminal/package.json",
+  ]) {
+    const destination = join(staging, file);
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(join(project, file), destination);
+  }
+  await build({
+    entryPoints: {
+      runner: join(project, "packages/runner/src/main.ts"),
+      terminal: join(project, "packages/terminal/src/main.ts"),
+    },
+    outdir: join(staging, "runtime"),
+    outExtension: { ".js": ".mjs" },
+    bundle: true,
+    packages: "external",
+    platform: "node",
+    target: "node24",
+    format: "esm",
+  });
+  // Preserve dependency-owned workers, WASM and native assets at their published paths.
+  await execute(
+    "npm",
+    ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
+    { cwd: staging, maxBuffer: 1024 * 1024 },
+  );
+  await writeFile(join(staging, "VERSION"), values.version + "\n");
+  await writeFile(join(staging, "IMAGE"), values.image + "\n");
+  await mkdir(output, { recursive: true });
+  const archive = "adm-linux-amd64.tar.gz";
+  await execute("tar", ["-czf", join(output, archive), "-C", staging, "."]);
+  const binaries = [
+    ["adm", "adm-linux-amd64"],
+    ["adm-repositories", "adm-repositories-linux-amd64"],
+  ];
+  for (const [name, artifact] of binaries)
+    await copyFile(join(staging, "bin", name), join(output, artifact));
+  const sums = [];
+  for (const name of [archive, ...binaries.map(([, artifact]) => artifact)]) {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(join(output, name)))
+      hash.update(chunk);
+    sums.push(`${hash.digest("hex")}  ${name}`);
+  }
+  await writeFile(join(output, "SHA256SUMS"), sums.join("\n") + "\n");
+  console.log(join(output, archive));
+} finally {
+  await rm(staging, { recursive: true });
+}
