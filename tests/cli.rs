@@ -807,6 +807,11 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         String::from_utf8_lossy(&ready.stdout),
         String::from_utf8_lossy(&ready.stderr)
     );
+    let create_guidance = String::from_utf8_lossy(&ready.stderr);
+    assert!(
+        create_guidance.contains("adm shell repo-demo"),
+        "{create_guidance}"
+    );
     let workspace = assert_ok(ready);
     assert_eq!(workspace["repository"], "owner/project");
     assert_eq!(workspace["cwd"], "/repos/owner/project");
@@ -867,6 +872,15 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
             "owner/project",
         ],
         (&rewrite, "https://github.com/"),
+    );
+    let other_guidance = String::from_utf8_lossy(&other.stderr);
+    assert!(
+        other_guidance.contains("adm shell repo-other"),
+        "{other_guidance}"
+    );
+    assert!(
+        !other_guidance.contains("agent starts there"),
+        "{other_guidance}"
     );
     let other = assert_ok(other);
     let other_readme = root
@@ -1086,11 +1100,41 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
     assert!(guidance.contains("clone"), "{guidance}");
     assert!(guidance.contains("adm shell navigation"), "{guidance}");
 
-    let shell = adm(root.path(), &["shell", "navigation"]);
+    let exec_root = root.path().join("workspace-fixture");
+    let populate = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("ADM_TEST_EXEC_ROOT", &exec_root)
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .arg("--kubectl")
+        .arg(root.path().join("kubectl"))
+        .args(["exec", "navigation", "--", "touch", "existing-work"])
+        .output()
+        .unwrap();
+    assert!(populate.status.success(), "{populate:?}");
+    assert!(
+        exec_root
+            .join(workspace["namespace"].as_str().unwrap())
+            .join("repos/existing-work")
+            .exists()
+    );
+    let shell = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .arg("--kubectl")
+        .arg(root.path().join("kubectl"))
+        .args(["shell", "navigation"])
+        .output()
+        .unwrap();
     assert!(shell.status.success(), "{shell:?}");
     let shell_guidance = String::from_utf8_lossy(&shell.stderr);
     assert!(
-        shell_guidance.contains("empty writable directory"),
+        shell_guidance.contains("opening shell at /repos"),
+        "{shell_guidance}"
+    );
+    assert!(
+        !shell_guidance.contains("empty writable"),
         "{shell_guidance}"
     );
 

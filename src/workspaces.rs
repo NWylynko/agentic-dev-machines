@@ -436,36 +436,51 @@ pub fn verify_ownership(cli: &Cli, w: &Workspace) -> Result<()> {
     Ok(())
 }
 
-pub fn navigation_guidance(workspace: &Workspace, shell_opened: bool) -> String {
-    let context = if shell_opened {
-        "adm: shell opened at"
+pub fn navigation_guidance(workspace: &Workspace, opening_shell: bool) -> String {
+    let context = if opening_shell {
+        "adm: opening shell at"
     } else {
         "adm: work in"
     };
     if let Some(repository) = &workspace.repository {
-        format!(
-            "{context} {} (the {repository} checkout is writable and private to this workspace). The agent starts there.",
-            workspace.cwd
-        )
-    } else if workspace.repositories {
-        let shell = if shell_opened {
+        let next = if opening_shell {
             String::new()
         } else {
-            format!(" Open a shell with `adm shell {}`.", workspace.name)
+            format!(" Next: `adm shell {}`.", workspace.name)
+        };
+        let agent = if workspace.agent_enabled {
+            " The coding agent also starts there."
+        } else {
+            ""
         };
         format!(
-            "{context} /repos. Lazy catalog: list entries with `ls /repos`, then enter one with `cd /repos/OWNER/REPO`.{shell}"
+            "{context} {} (the {repository} checkout is writable and private to this workspace).{next}{agent}",
+            workspace.cwd,
+        )
+    } else if workspace.repositories {
+        let next = if opening_shell {
+            String::new()
+        } else {
+            format!(" Next: `adm shell {}`.", workspace.name)
+        };
+        format!(
+            "{context} /repos. Lazy catalog: list entries with `ls /repos`, then enter one with `cd /repos/OWNER/REPO`.{next}"
         )
     } else {
-        let action = if shell_opened {
-            " Clone a repository here to get started.".to_owned()
+        let description = if opening_shell {
+            "writable work directory"
+        } else {
+            "starts empty, writable"
+        };
+        let next = if opening_shell {
+            " Clone a repository here if needed.".to_owned()
         } else {
             format!(
-                " Open it with `adm shell {}`, then clone a repository there.",
+                " Next: `adm shell {}`, then clone a repository there.",
                 workspace.name
             )
         };
-        format!("{context} /repos, an empty writable directory.{action}")
+        format!("{context} /repos ({description}).{next}")
     }
 }
 
