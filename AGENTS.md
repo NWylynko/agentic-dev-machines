@@ -2,6 +2,8 @@ keep this file up to date
 
 # Project notes
 
+- Confirmed target, not yet implemented (2026-10-16): all coding/bot agent execution belongs in workspace pods; the host is an access plane only. Bots broadly control coding-agent lifecycles, and agents have unattended root/sudo inside their own pods. Older host-runner, individual-grant, and opt-in-sudo notes below describe current implementation, not the target policy.
+- Todo investigation and implementation boundaries are in `docs/todo-investigation-2026-10-16.md` and its linked runtime/management/CLI research notes. TASK-22 is the pod-runtime integration parent; TASK-47 owns shared in-cluster lifecycle operations, TASK-48 pod runtime/routing, and TASK-49 fenced session migration. No implementation was made during this investigation.
 - Read `README.md` for the quick start, `docs/installation.md` for install/update behavior, `docs/operations.md` for day-to-day commands, Herdr ownership, and verification, `docs/product-requirements.md` for design requirements, and `docs/implementation-contract.md` for the implemented API. Storage backend, the node-failure loss window, and live Herdr installation remain open.
 - `adm` is the Rust CLI. The runner and terminal are the npm workspaces `@adm/runner` and `@adm/terminal`. Repository catalog code is `packages/repositories`. The workspace image is `image/Dockerfile` (`adm-dev:0.1.0`).
 - Repository code is MIT licensed in `LICENSE`; release archives and the workspace image include that license.
