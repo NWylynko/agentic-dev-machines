@@ -462,6 +462,8 @@ fn print_inspect(status: &Value) -> Result<()> {
         ("Role", "role"),
         ("Local phase", "phase"),
         ("Namespace", "namespace"),
+        ("Repository", "repository"),
+        ("Working directory", "cwd"),
         ("Image", "image"),
         ("Storage class", "storage_class"),
         ("Storage size", "storage_size"),
@@ -616,6 +618,8 @@ fn run(cli: &Cli) -> Result<()> {
                     &workspace.namespace,
                     "--workspace-id",
                     &workspace.id,
+                    "--cwd",
+                    &workspace.cwd,
                     "--runner-url",
                     &cli.runner_url,
                 ]);
@@ -640,7 +644,7 @@ fn run(cli: &Cli) -> Result<()> {
             child.arg("-it");
             child.arg("--");
             if command.is_empty() {
-                let working_directory = "/repos";
+                let working_directory = &workspace.cwd;
                 child.args([
                     "bash",
                     "-l",

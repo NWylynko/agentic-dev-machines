@@ -88,6 +88,31 @@ fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output 
         .expect("run public CLI with runner fixture")
 }
 
+fn adm_with_runner_env(
+    root: &Path,
+    runner_url: &str,
+    arguments: &[&str],
+    git_config: (&str, &str),
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", git_config.0)
+        .env("GIT_CONFIG_VALUE_0", git_config.1)
+        .env("ADM_TEST_EXEC_ROOT", root.join("pv"))
+        .arg("--state-dir")
+        .arg(root.join("state"))
+        .arg("--kubectl")
+        .arg(root.join("kubectl"))
+        .arg("--runner-url")
+        .arg(runner_url)
+        .args(arguments)
+        .output()
+        .expect("run public CLI with Git and runner fixtures")
+}
+
 fn serve_runner_status_fixture(listener: TcpListener) {
     for _ in 0..3 {
         let (stream, _) = listener.accept().unwrap();
@@ -165,7 +190,7 @@ fn fixture() -> TempDir {
     let root = tempfile::tempdir().unwrap();
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, r##"#!/usr/bin/env python3
-import json, pathlib, sys
+import json, os, pathlib, subprocess, sys
 path = pathlib.Path(__file__).parent / 'cluster.json'
 state = json.loads(path.read_text()) if path.exists() else {}
 args = sys.argv[1:]
@@ -181,6 +206,7 @@ if args[:2] == ['get', 'storageclass']:
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
 elif args[0] == 'apply':
     doc=json.load(sys.stdin)
+    (pathlib.Path(__file__).parent / 'last-manifest.json').write_text(json.dumps(doc))
     for item in doc['items']:
         if item['kind']=='Namespace': state[item['metadata']['name']]=item
     path.write_text(json.dumps(state)); print('applied')
@@ -208,6 +234,22 @@ elif args[:2] == ['get','pods']:
     print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':status}]}))
 elif args and args[0] == 'exec':
     (pathlib.Path(__file__).parent / 'exec-args.json').write_text(json.dumps(args))
+    exec_root = os.environ.get('ADM_TEST_EXEC_ROOT')
+    if exec_root:
+        namespace = args[args.index('-n') + 1]
+        block = os.environ.get('ADM_TEST_BLOCK_EXEC')
+        if block and pathlib.Path(block).exists():
+            pathlib.Path(block + '.entered').write_text('waiting')
+            while not pathlib.Path(block + '.release').exists():
+                __import__('time').sleep(0.01)
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if namespace not in state:
+            print('workspace namespace was deleted during exec', file=sys.stderr)
+            sys.exit(1)
+        repos = pathlib.Path(exec_root) / namespace / 'repos'
+        repos.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(args[args.index('--') + 1:], cwd=repos)
+        sys.exit(result.returncode)
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
 "##).unwrap();
     fs::set_permissions(kubectl, fs::Permissions::from_mode(0o755)).unwrap();
@@ -562,6 +604,388 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
         actual,
         [Some("bash"), Some("-lc"), Some("printf '%s' \"$PWD\""),]
     );
+}
+
+#[test]
+fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
+    let root = fixture();
+    let upstreams = root.path().join("upstreams");
+    let upstream = upstreams.join("owner/project.git");
+    fs::create_dir_all(upstream.parent().unwrap()).unwrap();
+    let seed = root.path().join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    fs::write(seed.join("README.md"), "fixture upstream\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&[
+        "init",
+        "--bare",
+        "--initial-branch=main",
+        upstream.to_str().unwrap(),
+    ]);
+    git(&["init", "--initial-branch=main", seed.to_str().unwrap()]);
+    git(&[
+        "-C",
+        seed.to_str().unwrap(),
+        "config",
+        "user.name",
+        "Fixture User",
+    ]);
+    git(&[
+        "-C",
+        seed.to_str().unwrap(),
+        "config",
+        "user.email",
+        "fixture@example.invalid",
+    ]);
+    git(&["-C", seed.to_str().unwrap(), "add", "README.md"]);
+    git(&["-C", seed.to_str().unwrap(), "commit", "-m", "fixture"]);
+    git(&[
+        "-C",
+        seed.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        upstream.to_str().unwrap(),
+    ]);
+    git(&["-C", seed.to_str().unwrap(), "push", "-u", "origin", "main"]);
+
+    let git_bin = root.path().join("git-bin");
+    fs::create_dir_all(&git_bin).unwrap();
+    let fail_after_clone = root.path().join("fail-after-clone");
+    fs::write(&fail_after_clone, "once").unwrap();
+    let git_path = String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let wrapper = git_bin.join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = clone ] && [ -e \"$ADM_TEST_FAIL_AFTER_CLONE\" ]; then\n  {git_path} \"$@\"\n  result=$?\n  rm \"$ADM_TEST_FAIL_AFTER_CLONE\"\n  [ \"$result\" -eq 0 ] || exit \"$result\"\n  exit 1\nfi\nexec {git_path} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let registration_path = root.path().join("registration.json");
+    let server_path = registration_path.clone();
+    let server = std::thread::spawn(move || {
+        for request_number in 0..4 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = BufReader::new(stream);
+            let mut line = String::new();
+            request.read_line(&mut line).unwrap();
+            let method = line.split_whitespace().next().unwrap().to_owned();
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                request.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("content-length:") {
+                    content_length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            request.read_exact(&mut body).unwrap();
+            if method == "PUT" {
+                fs::write(&server_path, &body).unwrap();
+            }
+            let status = if request_number == 1 {
+                "500 Internal Server Error"
+            } else {
+                "200 OK"
+            };
+            let response = if method == "GET" {
+                r#"{"status":"ok"}"#
+            } else {
+                "{}"
+            };
+            let mut stream = request.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+    let options = [
+        "create",
+        "repo-demo",
+        "--model",
+        "faux/faux-1",
+        "--repo",
+        "owner/project",
+    ];
+    let rewrite = format!("url.file://{}/.insteadOf", upstreams.display());
+    let command = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_adm"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", &rewrite)
+            .env("GIT_CONFIG_VALUE_0", "https://github.com/")
+            .env("ADM_TEST_EXEC_ROOT", root.path().join("pv"))
+            .env("ADM_TEST_FAIL_AFTER_CLONE", &fail_after_clone)
+            .env(
+                "PATH",
+                format!("{}:/usr/local/bin:/usr/bin:/bin", git_bin.display()),
+            )
+            .arg("--state-dir")
+            .arg(root.path().join("state"))
+            .arg("--kubectl")
+            .arg(root.path().join("kubectl"))
+            .arg("--runner-url")
+            .arg(&runner_url)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let interrupted = command(&options);
+    assert!(
+        !interrupted.status.success(),
+        "clone interruption must fail creation"
+    );
+    let workspace = assert_ok(adm(root.path(), &["list", "--json"]))[0].clone();
+    assert_eq!(workspace["phase"], "failed");
+    let repos = root
+        .path()
+        .join("pv")
+        .join(workspace["namespace"].as_str().unwrap())
+        .join("repos");
+    let staging = repos
+        .join("owner")
+        .join(format!(".adm-clone-{}", workspace["id"].as_str().unwrap()));
+    assert!(
+        staging.join("README.md").exists(),
+        "interrupted clone should retain its staging checkout"
+    );
+
+    let failed_registration = command(&options);
+    assert!(
+        !failed_registration.status.success(),
+        "runner failure must keep creation failed"
+    );
+    let checkout = repos.join("owner/project");
+    assert_eq!(
+        fs::read_to_string(checkout.join("README.md")).unwrap_or_else(|error| panic!(
+            "{error}; workspace files={:?}, stdout={}, stderr={}",
+            fs::read_dir(&repos)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>(),
+            String::from_utf8_lossy(&failed_registration.stdout),
+            String::from_utf8_lossy(&failed_registration.stderr)
+        )),
+        "fixture upstream\n",
+        "workspace files={:?}, stdout={}, stderr={}",
+        fs::read_dir(&repos)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>(),
+        String::from_utf8_lossy(&failed_registration.stdout),
+        String::from_utf8_lossy(&failed_registration.stderr)
+    );
+    fs::write(checkout.join("README.md"), "local workspace edit\n").unwrap();
+
+    let ready = command(&options);
+    assert!(
+        ready.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&ready.stdout),
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let workspace = assert_ok(ready);
+    assert_eq!(workspace["repository"], "owner/project");
+    assert_eq!(workspace["cwd"], "/repos/owner/project");
+    assert_eq!(workspace["phase"], "ready");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.path().join("last-manifest.json")).unwrap()).unwrap();
+    let deployment = manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap();
+    let pod = &deployment["spec"]["template"]["spec"];
+    assert_eq!(pod["containers"][0]["workingDir"], "/repos");
+    assert_eq!(
+        pod["containers"].as_array().unwrap().len(),
+        1,
+        "normal checkout must not add the FUSE sidecar"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("README.md")).unwrap(),
+        "local workspace edit\n"
+    );
+    let branch = Command::new("git")
+        .args(["-C", checkout.to_str().unwrap(), "branch", "--show-current"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
+    let registration: Value =
+        serde_json::from_slice(&fs::read(registration_path).unwrap()).unwrap();
+    assert_eq!(registration["cwd"], "/repos/owner/project");
+    server.join().unwrap();
+
+    let inspected = adm_with_runner(root.path(), &runner_url, &["inspect", "repo-demo"]);
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspected = String::from_utf8_lossy(&inspected.stdout);
+    assert!(
+        inspected.contains("Repository: owner/project"),
+        "{inspected}"
+    );
+    assert!(
+        inspected.contains("Working directory: /repos/owner/project"),
+        "{inspected}"
+    );
+
+    let other = adm_with_runner_env(
+        root.path(),
+        &runner_url,
+        &[
+            "create",
+            "repo-other",
+            "--no-agent",
+            "--repo",
+            "owner/project",
+        ],
+        (&rewrite, "https://github.com/"),
+    );
+    let other = assert_ok(other);
+    let other_readme = root
+        .path()
+        .join("pv")
+        .join(other["namespace"].as_str().unwrap())
+        .join("repos/owner/project/README.md");
+    assert_eq!(
+        fs::read_to_string(other_readme).unwrap(),
+        "fixture upstream\n"
+    );
+
+    let shell = adm(root.path(), &["shell", "repo-demo"]);
+    assert!(
+        shell.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shell.stderr)
+    );
+    let args: Value =
+        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
+    assert_eq!(
+        args.as_array().unwrap().last().unwrap(),
+        "/repos/owner/project"
+    );
+}
+
+#[test]
+fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace() {
+    use std::time::{Duration, Instant};
+
+    let root = fixture();
+    let block = root.path().join("block-repository-exec");
+    fs::write(&block, "wait").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let runner = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = BufReader::new(stream);
+            let mut line = String::new();
+            request.read_line(&mut line).unwrap();
+            let method = line.split_whitespace().next().unwrap().to_owned();
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                request.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("content-length:") {
+                    content_length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            request.read_exact(&mut body).unwrap();
+            let (status, response) = if method == "GET" {
+                ("200 OK", r#"{"status":"ok"}"#)
+            } else {
+                (
+                    "404 Not Found",
+                    r#"{"error":{"code":"WORKSPACE_NOT_FOUND","message":"Unknown workspace"}}"#,
+                )
+            };
+            let mut stream = request.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+    let create = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("ADM_TEST_EXEC_ROOT", root.path().join("pv"))
+        .env("ADM_TEST_BLOCK_EXEC", &block)
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .arg("--kubectl")
+        .arg(root.path().join("kubectl"))
+        .arg("--runner-url")
+        .arg(&runner_url)
+        .args([
+            "create",
+            "delete-during-repo",
+            "--model",
+            "faux/faux-1",
+            "--repo",
+            "owner/project",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let entered = root.path().join("block-repository-exec.entered");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        entered.exists(),
+        "create never reached repository preparation"
+    );
+
+    let deleted = adm_with_runner(root.path(), &runner_url, &["destroy", "delete-during-repo"]);
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    fs::write(format!("{}.release", block.display()), "continue").unwrap();
+    let create = create.wait_with_output().unwrap();
+    assert!(
+        !create.status.success(),
+        "creation must stop after its namespace is deleted"
+    );
+    let records = assert_ok(adm(root.path(), &["list", "--json", "--all"]));
+    assert_eq!(records[0]["phase"], "deleted");
+    runner.join().unwrap();
 }
 
 #[test]
@@ -1366,6 +1790,71 @@ fn repository_catalog_options_must_match_the_workspace_role() {
         assert!(!output.status.success(), "args={args:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("catalog"));
     }
+
+    let fixture = fixture();
+    for (args, error) in [
+        (
+            vec![
+                "create",
+                "bad-repo",
+                "--no-agent",
+                "--repo",
+                "owner//project",
+            ],
+            "repository name",
+        ),
+        (
+            vec![
+                "create",
+                "no-repos",
+                "--no-agent",
+                "--no-repositories",
+                "--repo",
+                "owner/project",
+            ],
+            "--no-repositories",
+        ),
+        (
+            vec![
+                "create",
+                "bot-repo",
+                "--no-agent",
+                "--role",
+                "bot",
+                "--repo",
+                "owner/project",
+            ],
+            "coding workspaces",
+        ),
+        (
+            vec![
+                "create",
+                "catalog-repo",
+                "--no-agent",
+                "--catalog",
+                catalog.to_str().unwrap(),
+                "--repo",
+                "owner/project",
+            ],
+            "--catalog",
+        ),
+    ] {
+        let output = adm(fixture.path(), &args);
+        assert!(!output.status.success(), "args={args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(error),
+            "args={args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        assert_ok(adm(fixture.path(), &["list", "--json"]))
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "invalid repository requests must fail before provisioning"
+    );
 }
 
 #[test]

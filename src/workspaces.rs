@@ -65,6 +65,10 @@ pub struct Workspace {
     pub agent_enabled: bool,
     pub repositories: bool,
     pub catalog: Value,
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default = "default_workspace_cwd")]
+    pub cwd: String,
     pub model: Option<Value>,
     pub allowed_agents: Vec<String>,
     #[serde(default)]
@@ -102,6 +106,9 @@ pub struct CreateOptions {
     pub no_repositories: bool,
     #[arg(long)]
     pub catalog: Option<std::path::PathBuf>,
+    /// Clone one public GitHub repository into this workspace.
+    #[arg(long)]
+    pub repo: Option<String>,
     /// Provider/model-id; overrides the model chosen in adm setup.
     #[arg(long)]
     pub model: Option<String>,
@@ -130,9 +137,44 @@ pub fn validate_name(name: &str) -> Result<()> {
     );
     Ok(())
 }
+
+fn default_workspace_cwd() -> String {
+    "/repos".into()
+}
+
+fn validate_repository(repository: &str) -> Result<(&str, &str)> {
+    let (owner, name) = repository
+        .split_once('/')
+        .context("repository must be OWNER/REPO")?;
+    ensure!(
+        !owner.is_empty()
+            && owner.len() <= 39
+            && owner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && owner.as_bytes()[0].is_ascii_alphanumeric()
+            && owner.as_bytes()[owner.len() - 1].is_ascii_alphanumeric(),
+        "invalid repository owner: {owner}"
+    );
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 100
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            && name.as_bytes()[0].is_ascii_alphanumeric()
+            && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric(),
+        "invalid repository name: {name}"
+    );
+    Ok((owner, name))
+}
+
 impl CreateOptions {
     pub fn workspace(&self) -> Result<Workspace> {
         validate_name(&self.name)?;
+        if let Some(repository) = &self.repo {
+            validate_repository(repository)?;
+        }
         ensure!(
             !(self.no_repositories && self.catalog.is_some()),
             "--catalog cannot be combined with --no-repositories"
@@ -144,6 +186,18 @@ impl CreateOptions {
         ensure!(
             self.role == "bot" || self.mcp_config.is_none(),
             "--mcp-config is only supported for bot workspaces"
+        );
+        ensure!(
+            self.repo.is_none() || self.catalog.is_none(),
+            "--repo cannot be combined with --catalog"
+        );
+        ensure!(
+            self.repo.is_none() || !self.no_repositories,
+            "--repo cannot be combined with --no-repositories"
+        );
+        ensure!(
+            self.repo.is_none() || self.role != "bot",
+            "--repo is only supported for coding workspaces"
         );
         let id = Uuid::new_v4().simple().to_string();
         let model = match &self.model {
@@ -175,6 +229,10 @@ impl CreateOptions {
             }
             None => None,
         };
+        let cwd = self.repo.as_ref().map_or_else(
+            || "/repos".to_owned(),
+            |repository| format!("/repos/{repository}"),
+        );
         Ok(Workspace {
             id: id.clone(),
             name: self.name.clone(),
@@ -189,6 +247,8 @@ impl CreateOptions {
             agent_enabled: !self.no_agent,
             repositories: self.catalog.is_some() && !self.no_repositories && self.role == "coding",
             catalog,
+            repository: self.repo.clone(),
+            cwd,
             model,
             allowed_agents: self.allow_agent.clone(),
             mcp_servers,
@@ -224,6 +284,42 @@ impl WorkspaceStore {
             "UPDATE workspaces SET phase=?2,spec=?3 WHERE id=?1",
             params![w.id, w.phase, serde_json::to_string(w)?],
         )?;
+        Ok(())
+    }
+    pub fn save_if_phase(&self, w: &Workspace, expected: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE workspaces SET phase=?2,spec=?3 WHERE id=?1 AND phase=?4",
+            params![w.id, w.phase, serde_json::to_string(w)?, expected],
+        )? == 1)
+    }
+    pub fn admit_if_provisioning(
+        &mut self,
+        w: &Workspace,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let phase =
+            transaction.query_row("SELECT phase FROM workspaces WHERE id=?1", [&w.id], |row| {
+                row.get::<_, String>(0)
+            })?;
+        ensure!(
+            phase == "provisioning",
+            "workspace {} is no longer being provisioned (phase: {phase})",
+            w.name
+        );
+        admit()?;
+        let changed = transaction.execute(
+            "UPDATE workspaces SET phase=?2,spec=?3 WHERE id=?1 AND phase='provisioning'",
+            params![w.id, w.phase, serde_json::to_string(w)?],
+        )?;
+        ensure!(
+            changed == 1,
+            "workspace {} changed during admission",
+            w.name
+        );
+        transaction.commit()?;
         Ok(())
     }
     pub fn list(&self, all: bool) -> Result<Vec<Workspace>> {
@@ -340,7 +436,7 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
         "agent workspaces require an explicit --model PROVIDER/MODEL_ID; use --no-agent to create a workspace without an agent"
     );
     let requested = options.workspace()?;
-    let store = cli.store()?;
+    let mut store = cli.store()?;
     let existing = store
         .list(false)?
         .into_iter()
@@ -353,7 +449,16 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
                 "workspace {} has an unfinished creation with different options; destroy it before changing its configuration",
                 requested.name
             );
-            existing
+            let previous_phase = existing.phase.clone();
+            let mut resuming = existing;
+            resuming.phase = "provisioning".into();
+            resuming.last_error = None;
+            ensure!(
+                store.save_if_phase(&resuming, &previous_phase)?,
+                "workspace {} changed while creation was being resumed",
+                requested.name
+            );
+            resuming
         }
         Some(_) => bail!("workspace name {} already exists", requested.name),
         None => requested,
@@ -384,11 +489,7 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
             Ok(())
         })?;
     }
-    if resuming {
-        w.phase = "provisioning".into();
-        w.last_error = None;
-        store.save(&w)?;
-    } else {
+    if !resuming {
         store.insert(&w)?;
     }
     let provision = (|| -> Result<()> {
@@ -423,6 +524,10 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
                 },
             )?;
         }
+        if let Some(repository) = &w.repository {
+            prepare_repository(cli, &w, repository)?;
+        }
+        w.phase = "ready".into();
         if w.agent_enabled {
             lifecycle_stage("create", &w.name, "starting agent runner", || {
                 runner::ensure_started(cli)
@@ -431,7 +536,7 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
             if w.role == "coding" {
                 registration["namespace"] = w.namespace.clone().into();
                 registration["container"] = "dev".into();
-                registration["cwd"] = "/repos".into();
+                registration["cwd"] = w.cwd.clone().into();
                 registration["kubectl"] = cli.kubectl.clone().into();
             }
             if let Some(model) = &w.model {
@@ -441,29 +546,91 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
                 registration["mcpServers"] = mcp_servers.clone();
             }
             lifecycle_stage("create", &w.name, "registering agent workspace", || {
-                cli.request(
-                    "PUT",
-                    &format!("/v1/workspaces/{}", w.id),
-                    Some(&registration),
-                )?;
+                store.admit_if_provisioning(&w, || {
+                    cli.request(
+                        "PUT",
+                        &format!("/v1/workspaces/{}", w.id),
+                        Some(&registration),
+                    )?;
+                    Ok(())
+                })?;
                 Ok(())
             })?;
+        } else {
+            store.admit_if_provisioning(&w, || Ok(()))?;
         }
         Ok(())
     })();
     if let Err(error) = provision {
         w.phase = "failed".into();
         w.last_error = Some(format!("{error:#}"));
-        store.save(&w)?;
+        if !store.save_if_phase(&w, "provisioning")? {
+            return Err(error.context(format!(
+                "workspace {} changed or was deleted during creation",
+                w.name
+            )));
+        }
         return Err(error.context(format!(
             "workspace {} is recorded as failed; inspect status or destroy it",
             w.name
         )));
     }
-    w.phase = "ready".into();
-    store.save(&w)?;
     lifecycle_complete("create", &w.name, "ready", started);
     Ok(w)
+}
+
+fn prepare_repository(cli: &Cli, workspace: &Workspace, repository: &str) -> Result<()> {
+    let (owner, name) = validate_repository(repository)?;
+    let script = r#"set -eu
+owner="$1"
+name="$2"
+workspace_id="$3"
+target="$owner/$name"
+staging="$owner/.adm-clone-$workspace_id"
+remote="https://github.com/$owner/$name.git"
+if [ -e "$target" ]; then
+  [ "$(git -C "$target" rev-parse --is-inside-work-tree 2>/dev/null || true)" = true ] || { echo "repository target exists but is not a Git checkout: $target" >&2; exit 1; }
+  [ "$(git -C "$target" config --get remote.origin.url 2>/dev/null || true)" = "$remote" ] || { echo "repository checkout remote does not match $remote" >&2; exit 1; }
+  git -C "$target" rev-parse --verify HEAD >/dev/null
+  exit 0
+fi
+mkdir -p -- "$owner"
+if [ -e "$staging" ]; then
+  if [ "$(git -C "$staging" rev-parse --is-inside-work-tree 2>/dev/null || true)" = true ] && [ "$(git -C "$staging" config --get remote.origin.url 2>/dev/null || true)" = "$remote" ] && git -C "$staging" rev-parse --verify HEAD >/dev/null 2>&1; then
+    mv -- "$staging" "$target"
+    exit 0
+  fi
+  rm -r -- "$staging"
+fi
+git clone -- "$remote" "$staging"
+git -C "$staging" rev-parse --verify HEAD >/dev/null
+test "$(git -C "$staging" config --get remote.origin.url)" = "$remote"
+mv -- "$staging" "$target"
+"#;
+    lifecycle_stage("create", &workspace.name, "preparing repository", || {
+        kubectl(
+            cli,
+            &[
+                "exec",
+                "-n",
+                &workspace.namespace,
+                "deployment/workspace",
+                "-c",
+                "dev",
+                "--",
+                "sh",
+                "-eu",
+                "-c",
+                script,
+                "adm-repository",
+                owner,
+                name,
+                &workspace.id,
+            ],
+            None,
+        )?;
+        Ok(())
+    })
 }
 
 fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
@@ -476,6 +643,8 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.agent_enabled == requested.agent_enabled
         && existing.repositories == requested.repositories
         && existing.catalog == requested.catalog
+        && existing.repository == requested.repository
+        && existing.cwd == requested.cwd
         && existing.model == requested.model
         && existing.allowed_agents == requested.allowed_agents
         && existing.mcp_servers == requested.mcp_servers
@@ -518,7 +687,14 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
     if w.agent_enabled {
         lifecycle_stage("destroy", &w.name, "cancelling agent activity", || {
             runner::ensure_started(cli)?;
-            cli.request("DELETE", &format!("/v1/workspaces/{}", w.id), None)?;
+            if let Err(error) = cli.request("DELETE", &format!("/v1/workspaces/{}", w.id), None) {
+                let message = format!("{error:#}");
+                ensure!(
+                    (message.contains("404") && message.contains("Unknown workspace"))
+                        || message.contains("410"),
+                    "{message}"
+                );
+            }
             Ok(())
         })?;
     }

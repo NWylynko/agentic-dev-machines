@@ -167,6 +167,7 @@ const { values, positionals } = parseArgs({
     kubectl: { type: "string" },
     namespace: { type: "string" },
     "workspace-id": { type: "string" },
+    cwd: { type: "string" },
     "runner-url": { type: "string" },
   },
   allowPositionals: true,
@@ -176,14 +177,17 @@ const {
   kubectl,
   namespace,
   "workspace-id": workspaceId,
+  cwd,
   "runner-url": runnerUrl,
 } = values;
-if (!kubectl || !namespace || !workspaceId || !runnerUrl)
+if (!kubectl || !namespace || !workspaceId || !cwd || !runnerUrl)
   throw new Error(
     "managed shell needs kubectl, namespace, workspace ID, and runner URL",
   );
 if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(workspaceId))
   throw new Error("invalid immutable workspace ID");
+if (!cwd.startsWith("/") || cwd.includes("\0"))
+  throw new Error("managed shell cwd must be an absolute container path");
 const runner = new URL(runnerUrl);
 if (
   runner.protocol !== "http:" ||
@@ -202,6 +206,11 @@ const relay = spawn(
     "-c",
     "dev",
     "--",
+    "sh",
+    "-lc",
+    'cd -- "$1" && shift && exec "$@"',
+    "adm-managed-shell",
+    cwd,
     "node",
     "--input-type=module",
     "-e",

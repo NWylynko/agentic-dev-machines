@@ -124,7 +124,15 @@ else if (args[0] === "apply") {
 } else if (args[0] === "wait") process.stdout.write("condition met\\n");
 else if (args[0] === "exec") {
   const split = args.indexOf("--"); const command = args.slice(split + 1);
-  if (command[0] === "node" && command[1] === "--input-type=module" && command[2] === "-e") {
+  if (command[0] === "sh" && command[1] === "-eu" && command[4] === "adm-repository") {
+    process.stdout.write("repository prepared\\n");
+  } else if (command[0] === "sh" && command[1] === "-lc" && command[5] === "node") {
+    const remoteEnv = { HOME: ${JSON.stringify(join(root, "container-home"))}, TMPDIR: ${JSON.stringify(join(root, "remote-tmp"))}, PATH: "/usr/local/bin:/usr/bin:/bin", TERM: "xterm", ADM_TEST_CWD: command[4] };
+    await appendFile(${JSON.stringify(envLog)}, JSON.stringify(remoteEnv) + "\\n");
+    const child = spawn(process.execPath, command.slice(6), { env: remoteEnv, stdio: "inherit" });
+    const [code, signal] = await new Promise(resolve => child.once("exit", (code, signal) => resolve([code, signal])));
+    if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1;
+  } else if (command[0] === "node" && command[1] === "--input-type=module" && command[2] === "-e") {
     const remoteEnv = { HOME: ${JSON.stringify(join(root, "container-home"))}, TMPDIR: ${JSON.stringify(join(root, "remote-tmp"))}, PATH: "/usr/local/bin:/usr/bin:/bin", TERM: "xterm", HOST_SENTINEL: undefined };
     delete remoteEnv.HOST_SENTINEL;
     await appendFile(${JSON.stringify(envLog)}, JSON.stringify(remoteEnv) + "\\n");
@@ -189,7 +197,8 @@ else if (args[0] === "exec") {
     "manage-current",
     "--model",
     "faux/faux-1",
-    "--no-repositories",
+    "--repo",
+    "owner/project",
   ]);
   assert.equal(created.code, 0, created.stderr);
   const workspace = JSON.parse(created.stdout);
@@ -233,17 +242,25 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
-  const remote = kubectlCalls.find(
-    (args) => args[0] === "exec" && args[args.indexOf("--") + 1] === "node",
+  const managedRelay = kubectlCalls.find(
+    (args) =>
+      args[0] === "exec" &&
+      args.includes("-i") &&
+      args[args.indexOf("--") + 1] === "sh",
   );
-  assert.ok(remote, "managed session opens an stdin/stdout relay exec");
-  const remoteCommand = remote.slice(remote.indexOf("--") + 1);
-  assert.deepEqual(remoteCommand.slice(0, 3), [
+  assert.ok(managedRelay, "managed session opens an stdin/stdout relay exec");
+  const remoteCommand = managedRelay.slice(managedRelay.indexOf("--") + 1);
+  assert.deepEqual(remoteCommand.slice(0, 8), [
+    "sh",
+    "-lc",
+    'cd -- "$1" && shift && exec "$@"',
+    "adm-managed-shell",
+    "/repos/owner/project",
     "node",
     "--input-type=module",
     "-e",
   ]);
-  assert.doesNotMatch(remoteCommand[3], new RegExp(workspace.id));
+  assert.doesNotMatch(remoteCommand[8], new RegExp(workspace.id));
   assert.doesNotMatch(
     remoteCommand.join(" "),
     /runner-url|state-dir|HOST_SENTINEL|credential/i,
@@ -289,6 +306,13 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
       ["POST", `/v1/workspaces/${workspace.id}/abort`],
       ["POST", `/v1/workspaces/${workspace.id}/input`],
     ],
+  );
+  assert.equal(
+    requests.find(
+      ({ method, path }) =>
+        method === "PUT" && path === `/v1/workspaces/${workspace.id}`,
+    ).body.cwd,
+    "/repos/owner/project",
   );
   assert.equal(
     requests.find(({ path }) => path.endsWith("/input")).body.message,
