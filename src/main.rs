@@ -5,7 +5,7 @@ mod setup;
 mod workspaces;
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -138,6 +138,8 @@ pub enum Action {
     Setup,
     /// Open the installed Pi provider login interface; use /login there.
     Login,
+    /// Generate shell completion scripts.
+    Completions { shell: CompletionShell },
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
     Herdr {
         #[command(subcommand)]
@@ -150,6 +152,12 @@ pub enum Action {
         #[arg(long)]
         screenshot: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum CompletionShell {
+    /// Z shell.
+    Zsh,
 }
 
 fn default_project_dir() -> PathBuf {
@@ -195,7 +203,16 @@ impl Cli {
             "browser",
         ];
         const MANAGEMENT: &[&str] = &[
-            "manifest", "setup", "login", "start", "serve", "stop", "doctor", "herdr", "help",
+            "manifest",
+            "setup",
+            "login",
+            "start",
+            "serve",
+            "stop",
+            "doctor",
+            "herdr",
+            "completions",
+            "help",
         ];
         let mut command = Self::command();
         command.build();
@@ -1065,6 +1082,18 @@ fn run(cli: &Cli) -> Result<()> {
         } => diagnostics::doctor(cli, storage_class, *json),
         Action::Setup => setup::run(cli),
         Action::Login => setup::login(cli),
+        Action::Completions { shell } => {
+            let mut command = Cli::command();
+            match shell {
+                CompletionShell::Zsh => clap_complete::generate(
+                    clap_complete::aot::Shell::Zsh,
+                    &mut command,
+                    "adm",
+                    &mut std::io::stdout(),
+                ),
+            }
+            Ok(())
+        }
         Action::Herdr { command } => herdr::run(cli, command),
         Action::Browser {
             name,

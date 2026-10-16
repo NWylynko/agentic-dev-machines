@@ -139,6 +139,7 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
         "stop",
         "doctor",
         "herdr",
+        "completions",
         "help",
     ] {
         assert_eq!(help.matches(&format!("  {command} ")).count(), 1, "{help}");
@@ -152,6 +153,86 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
     assert!(run(&["herdr", "--help"], true).status.success());
     assert_eq!(run(&["missing-command"], true).status.code(), Some(2));
     assert_eq!(run(&["list", "--bad-flag"], true).status.code(), Some(2));
+}
+
+#[test]
+fn zsh_completions_load_and_complete_cli_commands_and_flags_offline() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("config/adm")).unwrap();
+    fs::write(root.path().join("config/adm/config.json"), "not json").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("ADM_STATE_DIR", root.path().join("state"))
+        .env("KUBECONFIG", root.path().join("missing-kubeconfig"))
+        .args([
+            "--runner-url",
+            "http://127.0.0.1:1",
+            "--kubectl",
+            "/missing/kubectl",
+            "completions",
+            "zsh",
+        ])
+        .output()
+        .expect("run completion generation through the public CLI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let script = String::from_utf8(output.stdout).unwrap();
+    assert!(script.contains("_adm"), "{script}");
+    assert!(script.contains("herdr"), "{script}");
+    assert!(!root.path().join("data/adm").exists());
+    assert!(!root.path().join("state").exists());
+
+    let script_path = root.path().join("_adm");
+    fs::write(&script_path, script).unwrap();
+    if Command::new("zsh").arg("--version").output().is_err() {
+        eprintln!("skipping interactive completion assertions because zsh is unavailable");
+        return;
+    }
+    let driver = root.path().join("completion-test.zsh");
+    fs::write(
+        &driver,
+        r#"zmodload zsh/zpty
+zpty adm-completion zsh -f -i
+zpty -w adm-completion $'stty -echo\nautoload -Uz compinit\ncompinit -D\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() { print -r -- "__ADM_RESULT__:$*"; }\nprint __ADM_READY__\n'
+zpty -r -m adm-completion output '*__ADM_READY__*'
+for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t'; do
+  zpty -w adm-completion "$input"
+  zpty -r -m adm-completion output '*__ADM_RESULT__*'
+  print -r -- "$output"
+done
+zpty -d adm-completion
+"#,
+    )
+    .unwrap();
+    let zsh = Command::new("zsh")
+        .env("ZDOTDIR", root.path())
+        .env("ADM_TEST_COMPLETION_SCRIPT", &script_path)
+        .arg("-f")
+        .arg(&driver)
+        .output()
+        .expect("load completion script in zsh");
+    assert!(
+        zsh.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&zsh.stdout),
+        String::from_utf8_lossy(&zsh.stderr)
+    );
+    let candidates = String::from_utf8_lossy(&zsh.stdout);
+    for candidate in [
+        "adm list",
+        "adm herdr bind",
+        "adm list --json",
+        "adm --state-dir",
+    ] {
+        assert!(
+            candidates.contains(candidate),
+            "missing {candidate:?}: {candidates}"
+        );
+    }
 }
 
 fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output {
