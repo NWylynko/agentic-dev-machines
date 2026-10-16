@@ -374,10 +374,21 @@ pub fn kubectl(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
         child.stdin.take().unwrap().write_all(input)?;
     }
     let output = child.wait_with_output()?;
+    let display_args = args
+        .iter()
+        .map(|argument| {
+            if argument.contains('\n') {
+                "<multiline argument omitted>"
+            } else {
+                argument
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     ensure!(
         output.status.success(),
         "kubectl {}: {}",
-        args.join(" "),
+        display_args,
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(output.stdout)
@@ -499,6 +510,18 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
     let resuming = existing.is_some();
     let mut w = match existing {
         Some(existing) if existing.phase == "failed" || existing.phase == "provisioning" => {
+            if existing.repository != requested.repository {
+                let requested_repository = match requested.repository.as_deref() {
+                    Some(repository) => format!("recreating with --repo {repository}"),
+                    None => "recreating without --repo".into(),
+                };
+                bail!(
+                    "workspace {} has an unfinished creation for repository {}; inspect its status/error and deliberately destroy it before {} (failed workspace files are retained)",
+                    existing.name,
+                    existing.repository.as_deref().unwrap_or("none"),
+                    requested_repository
+                );
+            }
             ensure!(
                 same_creation_spec(&existing, &requested),
                 "workspace {} has an unfinished creation with different options; destroy it before changing its configuration",
@@ -685,7 +708,12 @@ mv -- "$staging" "$target"
                 &workspace.id,
             ],
             None,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "repository {repository} preparation failed; verify the OWNER/REPO spelling and whether the repository is public or accessible from the workspace. Retry the same repository after transient failures. Correcting it requires inspecting and deliberately destroying this failed workspace, then recreating with --repo OWNER/REPO"
+            )
+        })?;
         Ok(())
     })
 }

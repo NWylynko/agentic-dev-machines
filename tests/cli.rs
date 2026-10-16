@@ -833,12 +833,98 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
             .output()
             .unwrap()
     };
+    let typo_options = [
+        "create",
+        "typo-demo",
+        "--model",
+        "faux/faux-1",
+        "--repo",
+        "owner/missing",
+    ];
+    let typo = command(&typo_options);
+    assert!(!typo.status.success());
+    let typo_stderr = String::from_utf8_lossy(&typo.stderr);
+    assert!(typo_stderr.contains("owner/missing"), "{typo_stderr}");
+    assert!(
+        typo_stderr.contains("preparing repository"),
+        "{typo_stderr}"
+    );
+    assert!(
+        typo_stderr.contains("does not appear to be a git repository"),
+        "{typo_stderr}"
+    );
+    assert!(typo_stderr.contains("inspect"), "{typo_stderr}");
+    assert!(typo_stderr.contains("destroy"), "{typo_stderr}");
+    assert!(!typo_stderr.contains("set -eu"), "{typo_stderr}");
+    let failed = assert_ok(adm(root.path(), &["list", "--json"]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|workspace| workspace["name"] == "typo-demo")
+        .unwrap()
+        .clone();
+    assert_eq!(failed["phase"], "failed");
+    let persisted_error = failed["last_error"].as_str().unwrap();
+    assert!(
+        persisted_error.contains("owner/missing"),
+        "{persisted_error}"
+    );
+    assert!(
+        persisted_error.contains("does not appear to be a git repository"),
+        "{persisted_error}"
+    );
+    assert!(!persisted_error.contains("set -eu"), "{persisted_error}");
+    assert!(
+        !registration_path.exists(),
+        "failed clone must not admit the agent"
+    );
+    let changed_repo = command(&[
+        "create",
+        "typo-demo",
+        "--model",
+        "faux/faux-1",
+        "--repo",
+        "owner/project",
+    ]);
+    assert!(!changed_repo.status.success());
+    let changed_repo_error = String::from_utf8_lossy(&changed_repo.stderr);
+    assert!(
+        changed_repo_error.contains("inspect"),
+        "{changed_repo_error}"
+    );
+    assert!(
+        changed_repo_error.contains("destroy"),
+        "{changed_repo_error}"
+    );
+    assert!(
+        changed_repo_error.contains("recreating"),
+        "{changed_repo_error}"
+    );
+    let no_repository = command(&["create", "typo-demo", "--model", "faux/faux-1"]);
+    assert!(!no_repository.status.success());
+    let no_repository_error = String::from_utf8_lossy(&no_repository.stderr);
+    assert!(
+        no_repository_error.contains("recreating without --repo"),
+        "{no_repository_error}"
+    );
+    assert!(
+        !no_repository_error.contains("--repo none"),
+        "{no_repository_error}"
+    );
+    fs::write(&fail_after_clone, "once").unwrap();
+
     let interrupted = command(&options);
     assert!(
         !interrupted.status.success(),
         "clone interruption must fail creation"
     );
-    let workspace = assert_ok(adm(root.path(), &["list", "--json"]))[0].clone();
+    let workspace = assert_ok(adm(root.path(), &["list", "--json"]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|workspace| workspace["name"] == "repo-demo")
+        .unwrap()
+        .clone();
     assert_eq!(workspace["phase"], "failed");
     let repos = root
         .path()
