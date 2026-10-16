@@ -8,19 +8,25 @@ import {
   workspacePiAuthPath,
 } from "../src/credentials.ts";
 
-test("workspace Pi credentials survive runtime restart and logout only removes that workspace credential", async () => {
+test("workspace Pi credentials survive restart and logout in one workspace preserves another workspace's credential", async () => {
   const root = await mkdtemp(join(tmpdir(), "adm-workspace-auth-"));
-  const sentinel = "synthetic-provider-secret-do-not-log";
+  const otherRoot = await mkdtemp(join(tmpdir(), "adm-other-workspace-auth-"));
+  const firstSecret = "synthetic-workspace-one-secret";
+  const otherSecret = "synthetic-workspace-two-secret";
   try {
     assert.equal(workspacePiAuthPath(root), join(root, ".adm/pi/auth.json"));
     await mkdir(join(root, ".adm/pi"), { recursive: true });
+    await mkdir(join(otherRoot, ".adm/pi"), { recursive: true });
     await writeFile(
       workspacePiAuthPath(root),
-      JSON.stringify({ openai: { type: "api_key", key: sentinel } }),
+      JSON.stringify({ openai: { type: "api_key", key: firstSecret } }),
       { mode: 0o600 },
     );
-    const persisted = await readFile(workspacePiAuthPath(root), "utf8");
-    assert.match(persisted, new RegExp(sentinel));
+    await writeFile(
+      workspacePiAuthPath(otherRoot),
+      JSON.stringify({ anthropic: { type: "api_key", key: otherSecret } }),
+      { mode: 0o600 },
+    );
 
     const restarted = await workspaceCredentialRuntime(root);
     assert.equal(
@@ -29,6 +35,19 @@ test("workspace Pi credentials survive runtime restart and logout only removes t
       ),
       true,
     );
+    const otherRuntime = await workspaceCredentialRuntime(otherRoot);
+    assert.equal(
+      otherRuntime.getProviderAuthStatus("anthropic").configured,
+      true,
+    );
+    assert.equal(
+      (await otherRuntime.listCredentials()).some(
+        ({ providerId }) => providerId === "anthropic",
+      ),
+      true,
+    );
+    assert.notEqual(workspacePiAuthPath(root), workspacePiAuthPath(otherRoot));
+
     await restarted.logout("openai");
 
     const afterLogout = await workspaceCredentialRuntime(root);
@@ -40,19 +59,31 @@ test("workspace Pi credentials survive runtime restart and logout only removes t
     );
     assert.doesNotMatch(
       await readFile(workspacePiAuthPath(root), "utf8"),
-      new RegExp(sentinel),
+      new RegExp(firstSecret),
     );
+    const otherAfterLogout = await workspaceCredentialRuntime(otherRoot);
+    assert.equal(
+      otherAfterLogout.getProviderAuthStatus("anthropic").configured,
+      true,
+    );
+    assert.equal(
+      (await otherAfterLogout.listCredentials()).some(
+        ({ providerId }) => providerId === "anthropic",
+      ),
+      true,
+    );
+    const otherPersisted = await readFile(
+      workspacePiAuthPath(otherRoot),
+      "utf8",
+    );
+    assert.match(otherPersisted, new RegExp(otherSecret));
+    assert.doesNotMatch(otherPersisted, new RegExp(firstSecret));
   } finally {
-    await rm(root, { recursive: true });
+    await Promise.all([
+      rm(root, { recursive: true }),
+      rm(otherRoot, { recursive: true }),
+    ]);
   }
-});
-
-test("independent workspace auth paths do not share mutable OAuth state", async () => {
-  const one = workspacePiAuthPath("/pod-one/workspace");
-  const two = workspacePiAuthPath("/pod-two/workspace");
-  assert.notEqual(one, two);
-  assert.equal(one, "/pod-one/workspace/.adm/pi/auth.json");
-  assert.equal(two, "/pod-two/workspace/.adm/pi/auth.json");
 });
 
 test("one workspace file store serializes OAuth rotation and retains the rotated token across restart", async () => {
