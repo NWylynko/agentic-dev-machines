@@ -2553,3 +2553,32 @@ fn missing_replicated_storage_points_at_the_deploy_note() {
         0
     );
 }
+
+#[test]
+fn manifest_delivers_only_referenced_workspace_credentials_to_the_dev_pod() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = assert_ok(adm(
+        root.path(),
+        &[
+            "manifest",
+            "example",
+            "--credential-env",
+            "OPENAI_API_KEY=provider-auth:openai",
+        ],
+    ));
+    let items = manifest["items"].as_array().unwrap();
+    let deployment = items
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap();
+    let dev = &deployment["spec"]["template"]["spec"]["containers"][0];
+    assert_eq!(dev["env"][0]["name"], "OPENAI_API_KEY");
+    assert_eq!(
+        dev["env"][0]["valueFrom"]["secretKeyRef"]["name"],
+        "provider-auth"
+    );
+    assert_eq!(dev["env"][0]["valueFrom"]["secretKeyRef"]["key"], "openai");
+    let serialized = serde_json::to_string(&manifest).unwrap();
+    assert!(!serialized.contains("synthetic"));
+    assert!(!serialized.contains("OPENAI_API_KEY="));
+}
