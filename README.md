@@ -29,7 +29,7 @@ adm create my-project
 adm attach my-project
 ```
 
-Choose a default model during setup, or pass `--model PROVIDER/MODEL_ID` when creating a workspace. `--no-agent` creates a shell-only workspace. Provider credentials are configured for each coding workspace through Pi login or an operator-managed credential source; they are not copied from the management host.
+Every workspace starts with its durable agent. Choose a default model during setup or pass `--model PROVIDER/MODEL_ID` when creating a workspace; otherwise select one in `adm attach` with `/model`. Provider credentials belong to each workspace and are not copied from the management host.
 
 Work inside `/repos`. A plain workspace starts empty; clone there, or use `adm create my-project --repo OWNER/REPO` to prepare a checkout and start the shell and agent in it. See [repository navigation](docs/operations.md#find-your-repositories) for plain and lazy-catalog examples.
 

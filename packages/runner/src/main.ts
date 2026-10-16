@@ -226,6 +226,7 @@ async function openWorkspace(
     },
     passive,
     deferActivation,
+    values.provider,
   );
   workspaces.set(config.id, workspace);
   return workspace;
@@ -463,11 +464,7 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
       typeof config.model.id !== "string")
   )
     throw new ApiError(400, "INVALID_MODEL", "Model requires provider and id");
-  if (
-    !config.model &&
-    values.provider &&
-    (values.model || values.provider === "faux")
-  )
+  if (!config.model && values.provider && values.model)
     config.model = { provider: values.provider, id: values.model ?? "faux-1" };
   return config;
 }
@@ -531,7 +528,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|kubernetes-connection))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|kubernetes-connection|model|models))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -690,6 +687,46 @@ const server = createServer(async (request, response) => {
       );
     }
     await assertActive(id);
+    if (request.method === "GET" && action === "models") {
+      const controller = new AbortController();
+      request.once("aborted", () => controller.abort());
+      response.once("close", () => {
+        if (!response.writableEnded) controller.abort();
+      });
+      return json(
+        response,
+        200,
+        await workspace.modelCatalog(
+          controller.signal,
+          url.searchParams.get("refresh") === "true",
+        ),
+      );
+    }
+    if (request.method === "PUT" && action === "model") {
+      const data = await body(request);
+      if (
+        typeof data.provider !== "string" ||
+        !data.provider ||
+        typeof data.modelId !== "string" ||
+        !data.modelId
+      )
+        throw new ApiError(
+          400,
+          "INVALID_MODEL",
+          "Model selection requires provider and modelId",
+        );
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(
+          response,
+          200,
+          await workspace.changeModel(
+            data.provider as string,
+            data.modelId as string,
+          ),
+        );
+      });
+    }
     if (request.method === "GET" && !action)
       return json(response, 200, await workspace.status());
     if (request.method === "POST" && action === "goals") {

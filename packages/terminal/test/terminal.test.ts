@@ -18,9 +18,24 @@ import {
 function terminalText(terminal: WorkspaceTerminal) {
   return stripTerminalSequences(terminal.render(100).join("\n"));
 }
-async function fixture(role = "coding", events: any[] = []) {
+async function fixture(
+  role = "coding",
+  events: any[] = [],
+  {
+    needsModel = false,
+    holdRefresh = false,
+  }: { needsModel?: boolean; holdRefresh?: boolean } = {},
+) {
   const requests: any[] = [];
   let stream: any;
+  let refreshStartedResolve = () => {};
+  let refreshClosedResolve = () => {};
+  const refreshStarted = new Promise<void>((resolve) => {
+    refreshStartedResolve = resolve;
+  });
+  const refreshClosed = new Promise<void>((resolve) => {
+    refreshClosedResolve = resolve;
+  });
   let admissionResolve: (value: any) => void = () => {};
   const admission = () =>
     new Promise<any>((resolve) => (admissionResolve = resolve));
@@ -36,6 +51,31 @@ async function fixture(role = "coding", events: any[] = []) {
           events: found,
           nextAfter: found.at(-1)?.seq || 0,
           hasMore: false,
+        }),
+      );
+    } else if (url.pathname.endsWith("/models")) {
+      if (holdRefresh && url.searchParams.get("refresh") === "true") {
+        refreshStartedResolve();
+        res.once("close", refreshClosedResolve);
+        return;
+      }
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          selected: needsModel ? undefined : { provider: "faux", id: "faux-1" },
+          providers: [{ id: "faux", name: "Faux", authenticated: true }],
+          models: [
+            {
+              provider: "faux",
+              id: "faux-1",
+              name: "Faux 1",
+              api: "faux",
+              contextWindow: 4096,
+              maxTokens: 1024,
+              reasoning: false,
+              input: ["text"],
+            },
+          ],
         }),
       );
     } else if (url.pathname.endsWith("/events")) {
@@ -71,7 +111,16 @@ async function fixture(role = "coding", events: any[] = []) {
       admissionResolve(item);
       res.setHeader("content-type", "application/json");
       res.end(
-        JSON.stringify({ submissionId: "submission", status: "accepted" }),
+        JSON.stringify(
+          url.pathname.endsWith("/model")
+            ? {
+                selected: {
+                  provider: item.body.provider,
+                  id: item.body.modelId,
+                },
+              }
+            : { submissionId: "submission", status: "accepted" },
+        ),
       );
     }
   });
@@ -82,6 +131,8 @@ async function fixture(role = "coding", events: any[] = []) {
     url: `http://127.0.0.1:${address.port}`,
     requests,
     admission,
+    refreshStarted,
+    refreshClosed,
     push(event: any) {
       stream.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
     },
@@ -149,10 +200,7 @@ test("Pi terminal formats assistant Markdown and identifies named tool failures"
     assert.match(rendered, /Tool · read · failed/);
     assert.match(rendered, /permission denied/);
     await terminal.submit("/help");
-    assert.match(
-      terminalText(terminal),
-      /Pi-native \/model, \/compact, \/tree, and \/settings are unavailable/,
-    );
+    assert.match(terminalText(terminal), /\/model opens Pi's model selector/);
   } finally {
     terminal.close();
     await service.close();
@@ -329,6 +377,16 @@ test(
         assert.match(req.url, /diagnostics=true/);
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.write(": attached\n\n");
+      } else if (
+        new URL(req.url!, "http://localhost").pathname.endsWith("/models")
+      ) {
+        res.end(
+          JSON.stringify({
+            selected: { provider: "faux", id: "faux-1" },
+            models: [],
+            providers: [],
+          }),
+        );
       } else if (req.method === "POST") {
         let text = "";
         for await (const chunk of req) text += chunk;
@@ -390,6 +448,14 @@ test(
       } else if (url.pathname.endsWith("/events")) {
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.write(": attached\n\n");
+      } else if (url.pathname.endsWith("/models")) {
+        res.end(
+          JSON.stringify({
+            selected: { provider: "faux", id: "faux-1" },
+            models: [],
+            providers: [],
+          }),
+        );
       } else if (req.method === "POST") {
         for await (const _chunk of req) {
         }
@@ -432,6 +498,121 @@ test(
       terminal.close();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
+
+test(
+  "attach selects a model through Pi's actual selector in a PTY and persists it over HTTP",
+  { timeout: 10000 },
+  async () => {
+    const service = await fixture("coding", [], { needsModel: true });
+    const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`;
+    const args = [
+      process.execPath,
+      "--import",
+      "tsx",
+      fileURLToPath(new URL("../src/main.ts", import.meta.url)),
+      "--url",
+      service.url,
+      "--workspace",
+      "work",
+    ];
+    const child = spawn(
+      "script",
+      [
+        "--quiet",
+        "--return",
+        "--command",
+        args.map(quote).join(" "),
+        "/dev/null",
+      ],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let output = "";
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.stdout.on("data", (chunk) => {
+          output += chunk;
+          if (output.includes("Faux 1")) resolve();
+        });
+        child.stderr.on("data", (chunk) => (output += chunk));
+        child.once("error", reject);
+        child.once("exit", (code) =>
+          reject(
+            new Error(
+              `Terminal exited before showing the selector (${code}): ${output}`,
+            ),
+          ),
+        );
+      });
+      child.stdin.write("\r");
+      await new Promise<void>((resolve, reject) => {
+        const limit = setTimeout(
+          () =>
+            reject(new Error(`Model selection did not complete: ${output}`)),
+          4000,
+        );
+        child.stdout.on("data", (chunk) => {
+          output += chunk;
+          if (output.includes("Model selected · faux/faux-1")) {
+            clearTimeout(limit);
+            resolve();
+          }
+        });
+        child.stderr.on("data", (chunk) => (output += chunk));
+      });
+      assert.ok(
+        service.requests.some(
+          (request) =>
+            request.method === "PUT" &&
+            request.path.endsWith("/model") &&
+            request.body.provider === "faux" &&
+            request.body.modelId === "faux-1",
+        ),
+      );
+      const exited = once(child, "exit");
+      child.stdin.write("\x03");
+      assert.equal((await exited)[0], 0);
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await service.close();
+    }
+  },
+);
+
+test(
+  "reconnecting closes the open Pi model selector and aborts its catalog refresh",
+  { timeout: 5000 },
+  async () => {
+    const service = await fixture("coding", [], {
+      needsModel: true,
+      holdRefresh: true,
+    });
+    const ui = new TuiMainScreen(new ProcessTerminal());
+    const terminal = new WorkspaceTerminal({
+      url: service.url,
+      workspaceId: "work",
+      tui: ui,
+    });
+    try {
+      await terminal.connect();
+      await service.refreshStarted;
+      await terminal.connect();
+      const canceled = await Promise.race([
+        service.refreshClosed.then(() => true),
+        new Promise<boolean>((resolve) =>
+          setTimeout(() => resolve(false), 1000),
+        ),
+      ]);
+      assert.equal(
+        canceled,
+        true,
+        "reconnect aborts the selector-owned HTTP refresh",
+      );
+    } finally {
+      terminal.close();
+      await service.close();
     }
   },
 );

@@ -1171,7 +1171,7 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
             {
                 options.storage_class = storage_class;
             }
-            if options.model.is_none() && !options.no_agent {
+            if options.model.is_none() {
                 options.model = config.model;
             }
             if let Some(model) = &options.model {

@@ -341,7 +341,6 @@ test(
       "--memory",
       "1Gi",
       "--allow-node-local-storage",
-      "--no-agent",
       "--no-repositories",
     ];
     const createTracked = async () => {
@@ -354,7 +353,8 @@ test(
         return created;
       } catch (error) {
         const entries = json(
-          (await adm(binary, state, kubectl, ["list", "--json", "--all"])).stdout,
+          (await adm(binary, state, kubectl, ["list", "--json", "--all"]))
+            .stdout,
           "adm list --all after failed create",
         );
         const partial = entries.find(
@@ -500,7 +500,8 @@ test(
     children.delete(after.child);
 
     const status = json(
-      (await adm(binary, state, kubectl, ["status", workspace, "--json"])).stdout,
+      (await adm(binary, state, kubectl, ["status", workspace, "--json"]))
+        .stdout,
       "adm status --json",
     );
     assert.equal(status.cluster.pods[0].spec.nodeName, oldNode);

@@ -332,7 +332,7 @@ fn setup_requires_stopping_a_standalone_runner_before_installing_the_service() {
 }
 
 #[test]
-fn configured_model_is_used_explicit_model_wins_and_no_agent_disables_the_default() {
+fn configured_model_is_used_and_explicit_model_wins() {
     let root = tempfile::tempdir().unwrap();
     assert_ok(adm(root.path(), &["setup"], "\n\nfaux/faux-1\nn\nn\n"));
     let kubectl = root.path().join("kubectl");
@@ -401,11 +401,8 @@ fn configured_model_is_used_explicit_model_wins_and_no_agent_disables_the_defaul
         overridden["model"],
         serde_json::json!({"provider":"faux","id":"faux-1"})
     );
-    let disabled = create("disabled-agent", &["--no-agent"]);
-    assert_eq!(disabled["agent_enabled"], false);
-    assert!(disabled["model"].is_null());
     let owned: Value =
         serde_json::from_slice(&assert_ok(adm(root.path(), &["list", "--json"], "")).stdout)
             .unwrap();
-    assert_eq!(owned.as_array().unwrap().len(), 3);
+    assert_eq!(owned.as_array().unwrap().len(), 2);
 }

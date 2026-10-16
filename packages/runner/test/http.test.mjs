@@ -18,7 +18,11 @@ import { test } from "node:test";
 
 const main = new URL("../src/main.ts", import.meta.url);
 
-async function startRunner(directory, env = {}, { useFaux = true } = {}) {
+async function startRunner(
+  directory,
+  env = {},
+  { useFaux = true, defaultModel = true } = {},
+) {
   const child = spawn(
     process.execPath,
     [
@@ -28,7 +32,7 @@ async function startRunner(directory, env = {}, { useFaux = true } = {}) {
       "--state-dir",
       directory,
       ...(useFaux
-        ? ["--provider", "faux"]
+        ? ["--provider", "faux", ...(defaultModel ? ["--model", "faux-1"] : [])]
         : ["--auth-path", join(directory, "empty-auth.json")]),
     ],
     {
@@ -394,6 +398,203 @@ test("a bot without a selected model waits without admitting onboarding", async 
   });
   assert.equal(input.status, 409);
   assert.equal(input.body.error.code, "MODEL_REQUIRED");
+});
+
+test(
+  "selecting a bot model admits onboarding once and keeps its durable choice across restart",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-bot-model-selection-"));
+    let runner = await startRunner(directory, {}, { defaultModel: false });
+    t.after(async () => runner.stop());
+    const bot = {
+      id: "bot-model-selection",
+      name: "model-selected bot",
+      role: "bot",
+      environment: "local",
+    };
+    const path = `/v1/workspaces/${bot.id}`;
+    assert.equal((await runner.request(path, "PUT", bot)).status, 200);
+    assert.deepEqual((await runner.request(path + "/history")).body.events, []);
+    const changed = await runner.request(
+      path + "/model",
+      "PUT",
+      {
+        provider: "faux",
+        modelId: "faux-1",
+      },
+      AbortSignal.timeout(2000),
+    );
+    assert.equal(changed.status, 200);
+    const onboarding = await nextEvent(
+      runner,
+      bot.id,
+      (event) =>
+        event.kind === "user" && event.data.text.includes("onboarding"),
+    );
+    await nextEvent(
+      runner,
+      bot.id,
+      (event) =>
+        event.kind === "message" &&
+        event.data.text.includes("identity and purpose"),
+      onboarding.seq,
+    );
+    await runner.request(path + "/input", "POST", {
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            {
+              tool: "saveProfile",
+              args: {
+                identity: "Build monitor",
+                purpose: "Track build health.",
+              },
+            },
+          ],
+          answer: "Setup saved.",
+        }),
+      requestId: "finish-model-selection-onboarding",
+    });
+    await nextEvent(
+      runner,
+      bot.id,
+      (event) => event.kind === "tool" && event.data.name === "saveProfile",
+      onboarding.seq,
+      true,
+    );
+    assert.equal((await runner.request(path)).body.profile.state, "ready");
+    await runner.stop("SIGKILL");
+    runner = await startRunner(directory);
+    assert.equal(
+      (
+        await runner.request(path, "PUT", {
+          ...bot,
+          model: { provider: "faux", id: "faux-2" },
+        })
+      ).status,
+      200,
+    );
+    const reselected = await runner.request(
+      path + "/model",
+      "PUT",
+      {
+        provider: "faux",
+        modelId: "faux-1",
+      },
+      AbortSignal.timeout(2000),
+    );
+    assert.equal(reselected.status, 200);
+    assert.deepEqual((await runner.request(path + "/models")).body.selected, {
+      provider: "faux",
+      id: "faux-1",
+    });
+    const history = await runner.request(path + "/history?limit=1000");
+    assert.equal(
+      history.body.events.filter(
+        (event) =>
+          event.kind === "user" && event.data.text.includes("onboarding"),
+      ).length,
+      1,
+    );
+    assert.equal((await runner.request(path)).body.profile.state, "ready");
+  },
+);
+
+test("model catalog and selection operate on the existing durable conversation", async (t) => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "adm-runner-model-selection-"),
+  );
+  let runner = await startRunner(directory);
+  t.after(async () => runner.stop());
+  const id = "model-selection";
+  const path = `/v1/workspaces/${id}`;
+  const config = {
+    id,
+    name: "model selection",
+    role: "coding",
+    environment: "local",
+    localRoot: join(directory, "repo"),
+    model: { provider: "faux", id: "faux-1" },
+  };
+  await runner.request(path, "PUT", config);
+  const catalog = await runner.request(`${path}/models`);
+  assert.equal(catalog.status, 200);
+  assert.deepEqual(catalog.body.selected, { provider: "faux", id: "faux-1" });
+  assert.ok(
+    catalog.body.models.some(
+      (model) => model.provider === "faux" && model.id === "faux-1",
+    ),
+  );
+  assert.equal(JSON.stringify(catalog.body).includes("secret"), false);
+
+  const invalid = await runner.request(`${path}/model`, "PUT", {
+    provider: "missing-provider",
+    modelId: "missing-model",
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.error.code, "MODEL_NOT_FOUND");
+
+  const changed = await runner.request(`${path}/model`, "PUT", {
+    provider: "faux",
+    modelId: "faux-1",
+  });
+  assert.equal(changed.status, 200);
+  assert.deepEqual(changed.body.selected, { provider: "faux", id: "faux-1" });
+  await runner.request(path + "/input", "POST", {
+    message: "keep this history",
+  });
+  await nextEvent(runner, id, (event) => event.kind === "assistant");
+  await runner.stop();
+  runner = await startRunner(directory);
+  const reRegistered = await runner.request(path, "PUT", {
+    ...config,
+    model: { provider: "faux", id: "faux-2" },
+  });
+  assert.equal(reRegistered.body.status, "idle");
+  const afterRestart = await runner.request(`${path}/models`);
+  assert.deepEqual(afterRestart.body.selected, {
+    provider: "faux",
+    id: "faux-1",
+  });
+  assert.equal(
+    (await runner.request(`${path}/history`)).body.events.some(
+      (event) => event.data.text === "keep this history",
+    ),
+    true,
+  );
+});
+
+test("model selection reports missing provider authentication without falling back", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-model-auth-"));
+  const runner = await startRunner(directory, {}, { useFaux: false });
+  t.after(async () => runner.stop());
+  const id = "model-auth";
+  const path = `/v1/workspaces/${id}`;
+  await runner.request(path, "PUT", {
+    id,
+    name: "model auth",
+    role: "coding",
+    environment: "local",
+    localRoot: join(directory, "repo"),
+  });
+  const catalog = await runner.request(`${path}/models`);
+  assert.equal(catalog.body.selected, undefined);
+  assert.equal(
+    catalog.body.providers.find((provider) => provider.id === "openai")
+      ?.authenticated,
+    false,
+  );
+  assert.deepEqual(catalog.body.models, []);
+  const selection = await runner.request(`${path}/model`, "PUT", {
+    provider: "openai",
+    modelId: "gpt-4.1",
+  });
+  assert.equal(selection.status, 409);
+  assert.equal(selection.body.error.code, "MODEL_AUTH_REQUIRED");
+  assert.equal((await runner.request(path)).body.status, "needs_model");
+  assert.deepEqual((await runner.request(`${path}/history`)).body.events, []);
 });
 
 test(
