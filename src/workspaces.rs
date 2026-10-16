@@ -147,26 +147,23 @@ fn validate_repository(repository: &str) -> Result<(&str, &str)> {
         .split_once('/')
         .context("repository must be OWNER/REPO")?;
     ensure!(
-        !owner.is_empty()
-            && owner.len() <= 39
-            && owner
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            && owner.as_bytes()[0].is_ascii_alphanumeric()
-            && owner.as_bytes()[owner.len() - 1].is_ascii_alphanumeric(),
+        valid_repository_component(owner),
         "invalid repository owner: {owner}"
     );
     ensure!(
-        !name.is_empty()
-            && name.len() <= 100
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-            && name.as_bytes()[0].is_ascii_alphanumeric()
-            && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric(),
+        valid_repository_component(name),
         "invalid repository name: {name}"
     );
     Ok((owner, name))
+}
+
+fn valid_repository_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && component
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
 impl CreateOptions {
@@ -597,7 +594,7 @@ if [ -e "$target" ]; then
 fi
 mkdir -p -- "$owner"
 if [ -e "$staging" ]; then
-  if [ "$(git -C "$staging" rev-parse --is-inside-work-tree 2>/dev/null || true)" = true ] && [ "$(git -C "$staging" config --get remote.origin.url 2>/dev/null || true)" = "$remote" ] && git -C "$staging" rev-parse --verify HEAD >/dev/null 2>&1; then
+  if [ "$(git -C "$staging" rev-parse --is-inside-work-tree 2>/dev/null || true)" = true ] && [ "$(git -C "$staging" config --get remote.origin.url 2>/dev/null || true)" = "$remote" ] && [ "$(git -C "$staging" config --get adm.preparedWorkspaceId 2>/dev/null || true)" = "$workspace_id" ] && git -C "$staging" rev-parse --verify HEAD >/dev/null 2>&1; then
     mv -- "$staging" "$target"
     exit 0
   fi
@@ -606,6 +603,7 @@ fi
 git clone -- "$remote" "$staging"
 git -C "$staging" rev-parse --verify HEAD >/dev/null
 test "$(git -C "$staging" config --get remote.origin.url)" = "$remote"
+git -C "$staging" config --local adm.preparedWorkspaceId "$workspace_id"
 mv -- "$staging" "$target"
 "#;
     lifecycle_stage("create", &workspace.name, "preparing repository", || {
@@ -689,12 +687,19 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
         lifecycle_stage("destroy", &w.name, "cancelling agent activity", || {
             runner::ensure_started(cli)?;
             if let Err(error) = cli.request("DELETE", &format!("/v1/workspaces/{}", w.id), None) {
-                let message = format!("{error:#}");
-                ensure!(
-                    (message.contains("404") && message.contains("Unknown workspace"))
-                        || message.contains("410"),
-                    "{message}"
-                );
+                let missing = error
+                    .downcast_ref::<runner::HttpError>()
+                    .is_some_and(|error| {
+                        error.status == reqwest::StatusCode::NOT_FOUND
+                            && error.code.as_deref() == Some("WORKSPACE_NOT_FOUND")
+                    });
+                let deleted = error
+                    .downcast_ref::<runner::HttpError>()
+                    .is_some_and(|error| {
+                        error.status == reqwest::StatusCode::GONE
+                            && error.code.as_deref() == Some("WORKSPACE_DELETED")
+                    });
+                ensure!(missing || deleted, "{error:#}");
             }
             Ok(())
         })?;

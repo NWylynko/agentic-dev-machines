@@ -2,11 +2,27 @@ use crate::Cli;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
-    fs,
+    error::Error,
+    fmt, fs,
     io::{BufRead, BufReader, Read},
     process::{Command, Stdio},
     time::Duration,
 };
+
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: reqwest::StatusCode,
+    pub code: Option<String>,
+    message: String,
+}
+
+impl fmt::Display for HttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "runner {}: {}", self.status, self.message)
+    }
+}
+
+impl Error for HttpError {}
 
 pub fn request(url: &str, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let client = reqwest::blocking::Client::builder()
@@ -28,11 +44,17 @@ pub fn request(url: &str, method: &str, path: &str, body: Option<&Value>) -> Res
     } else {
         serde_json::from_str(&text).context("runner returned invalid JSON")?
     };
-    ensure!(
-        status.is_success(),
-        "runner {status}: {}",
-        value["error"]["message"].as_str().unwrap_or(&text)
-    );
+    if !status.is_success() {
+        return Err(HttpError {
+            status,
+            code: value["error"]["code"].as_str().map(str::to_owned),
+            message: value["error"]["message"]
+                .as_str()
+                .unwrap_or(&text)
+                .to_owned(),
+        }
+        .into());
+    }
     Ok(value)
 }
 

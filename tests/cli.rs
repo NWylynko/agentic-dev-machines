@@ -668,7 +668,7 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
     fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = clone ] && [ -e \"$ADM_TEST_FAIL_AFTER_CLONE\" ]; then\n  {git_path} \"$@\"\n  result=$?\n  rm \"$ADM_TEST_FAIL_AFTER_CLONE\"\n  [ \"$result\" -eq 0 ] || exit \"$result\"\n  exit 1\nfi\nexec {git_path} \"$@\"\n"
+            "#!/bin/sh\nif [ \"$1\" = clone ] && [ -e \"$ADM_TEST_FAIL_AFTER_CLONE\" ]; then\n  shift\n  {git_path} clone --no-checkout \"$@\"\n  result=$?\n  rm \"$ADM_TEST_FAIL_AFTER_CLONE\"\n  [ \"$result\" -eq 0 ] || exit \"$result\"\n  exit 1\nfi\nexec {git_path} \"$@\"\n"
         ),
     )
     .unwrap();
@@ -769,8 +769,8 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         .join("owner")
         .join(format!(".adm-clone-{}", workspace["id"].as_str().unwrap()));
     assert!(
-        staging.join("README.md").exists(),
-        "interrupted clone should retain its staging checkout"
+        staging.join(".git").exists() && !staging.join("README.md").exists(),
+        "interrupted clone should retain Git metadata without a checkout"
     );
 
     let failed_registration = command(&options);
@@ -986,6 +986,85 @@ fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace(
     let records = assert_ok(adm(root.path(), &["list", "--json", "--all"]));
     assert_eq!(records[0]["phase"], "deleted");
     runner.join().unwrap();
+}
+
+#[test]
+fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
+    let root = fixture();
+    let workspace = assert_ok(adm(
+        root.path(),
+        &["create", "runner-error", "--no-agent", "--no-repositories"],
+    ));
+    let database = rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
+    let mut spec: Value = serde_json::from_str(
+        &database
+            .query_row(
+                "SELECT spec FROM workspaces WHERE name='runner-error'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    spec["agent_enabled"] = Value::Bool(true);
+    database
+        .execute(
+            "UPDATE workspaces SET spec=?1 WHERE name='runner-error'",
+            [spec.to_string()],
+        )
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let runner = std::thread::spawn(move || {
+        for request_number in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = BufReader::new(stream);
+            let mut line = String::new();
+            request.read_line(&mut line).unwrap();
+            let method = line.split_whitespace().next().unwrap().to_owned();
+            loop {
+                line.clear();
+                request.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let (status, response) = if request_number == 0 && method == "GET" {
+                ("200 OK", r#"{"status":"ok"}"#)
+            } else {
+                (
+                    "500 Internal Server Error",
+                    r#"{"error":{"code":"INTERNAL","message":"upstream mentioned 410 while failing"}}"#,
+                )
+            };
+            let mut stream = request.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+    let deleted = adm_with_runner(root.path(), &runner_url, &["destroy", "runner-error"]);
+    runner.join().unwrap();
+    assert!(
+        !deleted.status.success(),
+        "a 500 mentioning 410 must not authorize runtime deletion"
+    );
+    assert_eq!(
+        assert_ok(adm(root.path(), &["list", "--json", "--all"]))[0]["phase"],
+        "deleting"
+    );
+    let cluster: Value =
+        serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
+    assert!(
+        cluster
+            .get(workspace["namespace"].as_str().unwrap())
+            .is_some(),
+        "the namespace must remain while runner cancellation is unconfirmed"
+    );
 }
 
 #[test]
@@ -1855,6 +1934,16 @@ fn repository_catalog_options_must_match_the_workspace_role() {
         0,
         "invalid repository requests must fail before provisioning"
     );
+    assert_ok(adm(
+        fixture.path(),
+        &[
+            "manifest",
+            "punctuation",
+            "--no-agent",
+            "--repo",
+            "_owner/project.",
+        ],
+    ));
 }
 
 #[test]
