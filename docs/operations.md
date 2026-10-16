@@ -88,6 +88,7 @@ sudo apt-get install -y ripgrep
 ```
 
 The workspace and ordinary commands still run as UID 1000. This option grants a limited set of container capabilities needed by sudo and apt; it does not grant host access or a service-account token. Bots cannot use it. Installed packages and other operating-system changes live in the replaceable container and disappear when Kubernetes replaces its Pod. Repository files, Git state, and agent history follow their separate persistence rules. Existing workspaces keep their current security profile; unfinished workspaces cannot resume with different creation options.
+
 To seed the catalog without cloning repository contents:
 
 ```sh
