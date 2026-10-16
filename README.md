@@ -31,6 +31,8 @@ adm attach my-project
 
 Choose a default model during setup, or pass `--model PROVIDER/MODEL_ID` when creating a workspace. `--no-agent` creates a shell-only workspace. Provider credentials stay on the management host.
 
+Work inside `/repos`. A plain workspace starts empty; clone there, or use `adm create my-project --repo OWNER/REPO` to prepare a checkout and start the shell and agent in it. See [repository navigation](docs/operations.md#find-your-repositories) for plain and lazy-catalog examples.
+
 See [operations](docs/operations.md) for commands, Herdr integration, bots, and verification; [the implementation contract](docs/implementation-contract.md) for APIs; and [product requirements](docs/product-requirements.md) for the design and open decisions.
 
 ## License
