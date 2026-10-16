@@ -115,6 +115,8 @@ test(
     await mkdir(target);
     await mkdir(untouched);
     const kubectl = join(directory, "kubectl");
+    const kubeconfig = join(directory, "kubeconfig");
+    await writeFile(kubeconfig, "");
     await writeFile(
       kubectl,
       `#!/usr/bin/env python3
@@ -132,6 +134,23 @@ os.execvp(command[0], command)
     const runner = await startRunner(join(directory, "state"));
     t.after(() => runner.stop());
     const id = "kube-coder";
+    const unpinned = await runner.request(
+      "/v1/workspaces/missing-context",
+      "PUT",
+      {
+        id: "missing-context",
+        name: "missing-context",
+        role: "coding",
+        environment: "kubernetes",
+        namespace: "adm-missing-context",
+        cwd: target,
+        kubectl,
+        remoteEnv,
+        model: { provider: "faux", id: "faux-1" },
+      },
+    );
+    assert.equal(unpinned.status, 400);
+    assert.equal(unpinned.body.error.code, "KUBECONFIG_REQUIRED");
     const registered = await runner.request(`/v1/workspaces/${id}`, "PUT", {
       id,
       name: "kube",
@@ -140,6 +159,7 @@ os.execvp(command[0], command)
       namespace: "adm-kube",
       cwd: target,
       kubectl,
+      kubeconfig,
       remoteEnv,
       model: { provider: "faux", id: "faux-1" },
     });

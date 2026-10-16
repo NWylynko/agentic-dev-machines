@@ -8,7 +8,7 @@ use std::{
     fs,
     io::Write,
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -350,7 +350,7 @@ impl WorkspaceStore {
 }
 
 pub fn kubectl(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
-    let mut command = Command::new(&cli.kubectl);
+    let mut command = cli.kubectl_command()?;
     command
         .args(args)
         .stdout(Stdio::piped())
@@ -538,6 +538,7 @@ pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
                 registration["container"] = "dev".into();
                 registration["cwd"] = w.cwd.clone().into();
                 registration["kubectl"] = cli.kubectl.clone().into();
+                registration["kubeconfig"] = cli.kubeconfig_reference()?.into();
             }
             if let Some(model) = &w.model {
                 registration["model"] = model.clone();

@@ -267,7 +267,7 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
     );
   if (
     config.role === "bot" &&
-    (config.localRoot || config.cwd || config.namespace)
+    (config.localRoot || config.cwd || config.namespace || config.kubeconfig)
   )
     throw new ApiError(
       400,
@@ -411,6 +411,24 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
         "kubectl must be a command name or path without spaces",
       );
     if (
+      config.kubeconfig !== undefined &&
+      (typeof config.kubeconfig !== "string" ||
+        !config.kubeconfig ||
+        config.kubeconfig.includes("\0") ||
+        config.kubeconfig.split(":").some((path) => !path.startsWith("/")))
+    )
+      throw new ApiError(
+        400,
+        "INVALID_KUBECONFIG",
+        "kubeconfig must be an absolute host-side path list without NUL bytes",
+      );
+    if (!config.kubeconfig)
+      throw new ApiError(
+        400,
+        "KUBECONFIG_REQUIRED",
+        "Kubernetes coding workspaces require a pinned host kubeconfig; create with --kubeconfig or rebind an existing workspace with adm reconnect NAME --kubeconfig PATHS",
+      );
+    if (
       config.remoteEnv !== undefined &&
       (typeof config.remoteEnv !== "string" ||
         !config.remoteEnv.startsWith("/") ||
@@ -513,7 +531,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|kubernetes-connection))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -537,7 +555,7 @@ const server = createServer(async (request, response) => {
         const previous = configs.get(id);
         if (
           previous &&
-          ["role", "environment", "namespace", "localRoot"].some(
+          ["role", "environment", "namespace", "localRoot", "kubeconfig"].some(
             (key) =>
               previous[key as keyof WorkspaceConfig] !==
               config[key as keyof WorkspaceConfig],
@@ -546,7 +564,7 @@ const server = createServer(async (request, response) => {
           throw new ApiError(
             409,
             "IDENTITY_CONFLICT",
-            "Workspace role and environment identity cannot change",
+            "Workspace role, environment, and Kubernetes connection cannot change",
           );
         if (!previous) {
           const registration = {
@@ -607,6 +625,47 @@ const server = createServer(async (request, response) => {
     if (!workspace) {
       await assertActive(id);
       throw new ApiError(404, "WORKSPACE_NOT_FOUND", "Unknown workspace");
+    }
+    if (request.method === "PUT" && action === "kubernetes-connection") {
+      const data = await body(request);
+      if (
+        typeof data.kubectl !== "string" ||
+        !/^[\w./@+-]+$/.test(data.kubectl)
+      )
+        throw new ApiError(
+          400,
+          "INVALID_KUBECTL",
+          "kubectl must be a command name or path without spaces",
+        );
+      if (
+        typeof data.kubeconfig !== "string" ||
+        !data.kubeconfig ||
+        data.kubeconfig.includes("\0") ||
+        data.kubeconfig.split(":").some((path) => !path.startsWith("/"))
+      )
+        throw new ApiError(
+          400,
+          "INVALID_KUBECONFIG",
+          "kubeconfig must be an absolute host-side path list without NUL bytes",
+        );
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(
+          response,
+          200,
+          await workspace.rebindKubernetesConnection(
+            data.kubectl as string,
+            data.kubeconfig as string,
+            async (config) => {
+              const updated = [...configs.values()].map((entry) =>
+                entry.id === id ? config : entry,
+              );
+              await atomicJson(registryPath, updated);
+              configs.set(id, config);
+            },
+          ),
+        );
+      });
     }
     if (request.method === "GET" && action === "history") {
       let after = Number(url.searchParams.get("after") ?? 0);

@@ -24,6 +24,9 @@ pub struct Cli {
     pub state_dir: Option<PathBuf>,
     #[arg(long, global = true, default_value = "kubectl")]
     pub kubectl: String,
+    /// Host kubeconfig file list used by coding agents; defaults to ~/.kube/config.
+    #[arg(long, global = true, env = "KUBECONFIG")]
+    pub kubeconfig: Option<String>,
     #[arg(long, global = true, default_value = "http://127.0.0.1:7432")]
     pub runner_url: String,
     /// Runtime installation or development checkout containing the runner and terminal.
@@ -63,6 +66,8 @@ pub enum Action {
     },
     /// Permanently stop a workspace and remove its owned resources.
     Destroy { name: String },
+    /// Rebind a Kubernetes coding workspace to the selected host connection without replacing it.
+    Reconnect { name: String },
     /// Open the reconnectable Pi-style terminal client.
     Attach {
         name: String,
@@ -204,6 +209,56 @@ impl Cli {
                 })
                 .join("adm")
         })
+    }
+    pub fn kubeconfig_reference(&self) -> Result<String> {
+        let configured = self.kubeconfig.as_deref().filter(|value| !value.is_empty());
+        let value = if let Some(configured) = configured {
+            configured.to_owned()
+        } else {
+            let default = PathBuf::from(
+                std::env::var_os("HOME").context("HOME must be set when KUBECONFIG is unset")?,
+            )
+            .join(".kube/config");
+            let default = if default.is_absolute() {
+                default
+            } else {
+                std::env::current_dir()?.join(default)
+            };
+            default
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("default kubeconfig path must be valid UTF-8"))?
+        };
+        let paths = value
+            .split(':')
+            .map(|entry| {
+                anyhow::ensure!(
+                    !entry.is_empty(),
+                    "KUBECONFIG must not contain empty path entries"
+                );
+                let path = PathBuf::from(entry);
+                let absolute = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()?.join(path)
+                };
+                let text = absolute
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("KUBECONFIG paths must be valid UTF-8"))?;
+                anyhow::ensure!(
+                    !text.contains('\0'),
+                    "KUBECONFIG paths must not contain NUL bytes"
+                );
+                Ok(text)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(paths.join(":"))
+    }
+    pub fn kubectl_command(&self) -> Result<Command> {
+        let mut command = Command::new(&self.kubectl);
+        command.env("KUBECONFIG", self.kubeconfig_reference()?);
+        Ok(command)
     }
     pub fn store(&self) -> Result<WorkspaceStore> {
         WorkspaceStore::open(&self.state_path())
@@ -582,6 +637,24 @@ fn run(cli: &Cli) -> Result<()> {
             }
         }
         Action::Destroy { name } => print_json(&workspaces::destroy(cli, name)?),
+        Action::Reconnect { name } => {
+            let workspace = cli.store()?.active(name)?;
+            anyhow::ensure!(
+                workspace.role == "coding",
+                "only Kubernetes coding workspaces have a host connection to reconnect"
+            );
+            workspaces::verify_ownership(cli, &workspace)
+                .context("verify workspace namespace ownership using the selected kubeconfig")?;
+            runner::ensure_started(cli)?;
+            print_json(&cli.request(
+                "PUT",
+                &format!("/v1/workspaces/{}/kubernetes-connection", workspace.id),
+                Some(&json!({
+                    "kubectl": cli.kubectl,
+                    "kubeconfig": cli.kubeconfig_reference()?
+                })),
+            )?)
+        }
         Action::Attach { name, diagnostics } => {
             let workspace = cli.store()?.active(name)?;
             anyhow::ensure!(
@@ -611,6 +684,7 @@ fn run(cli: &Cli) -> Result<()> {
             workspaces::verify_ownership(cli, &workspace)?;
             if *manage {
                 let mut management = cli.runtime_command("shell-management")?;
+                management.env("KUBECONFIG", cli.kubeconfig_reference()?);
                 management.args([
                     "--kubectl",
                     &cli.kubectl,
@@ -632,7 +706,7 @@ fn run(cli: &Cli) -> Result<()> {
                 anyhow::ensure!(status.success(), "managed shell exited with {status}");
                 return Ok(());
             }
-            let mut child = Command::new(&cli.kubectl);
+            let mut child = cli.kubectl_command()?;
             child.args([
                 "exec",
                 "-n",
@@ -700,7 +774,8 @@ fn run(cli: &Cli) -> Result<()> {
             eprintln!(
                 "Preview: http://{bind}:{local}  (forward this management-host port over SSH from your MacBook)"
             );
-            let status = Command::new(&cli.kubectl)
+            let status = cli
+                .kubectl_command()?
                 .args([
                     "port-forward",
                     "-n",
@@ -772,7 +847,7 @@ fn run(cli: &Cli) -> Result<()> {
                 "bots have no coding browser environment"
             );
             workspaces::verify_ownership(cli, &workspace)?;
-            let mut command = Command::new(&cli.kubectl);
+            let mut command = cli.kubectl_command()?;
             command.args([
                 "exec",
                 "-n",

@@ -8,6 +8,7 @@ export type WorkspaceConfig = {
   cwd?: string;
   localRoot?: string;
   kubectl?: string;
+  kubeconfig?: string;
   remoteEnv?: string;
   model?: { provider: string; id: string };
   allowedAgents?: string[];

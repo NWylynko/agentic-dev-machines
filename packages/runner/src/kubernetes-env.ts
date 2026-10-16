@@ -73,6 +73,7 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
   readonly id: string;
   cwd: string;
   private readonly kubectl: string;
+  private readonly kubeconfig?: string;
   private readonly namespace: string;
   private readonly container: string;
   private readonly script: string;
@@ -86,6 +87,7 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
 
   constructor(options: {
     kubectl: string;
+    kubeconfig?: string;
     namespace: string;
     container: string;
     cwd: string;
@@ -96,6 +98,7 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
     this.id = `kubernetes:${options.namespace}/${options.container}`;
     this.cwd = options.cwd;
     this.kubectl = options.kubectl;
+    this.kubeconfig = options.kubeconfig;
     this.namespace = options.namespace;
     this.container = options.container;
     this.script = options.script;
@@ -144,6 +147,12 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
   }
 
   private async ensure(context: Context) {
+    const kubeconfig = this.kubeconfig;
+    if (!kubeconfig)
+      throw new ExecutionError(
+        "spawn_error",
+        "This coding workspace has no pinned Kubernetes connection. Rebind it in place with `adm reconnect NAME --kubeconfig PATHS` after selecting the correct host kubeconfig.",
+      );
     if (
       this.child &&
       this.child.exitCode === null &&
@@ -169,7 +178,10 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
             "--cwd",
             this.cwd,
           ],
-          { stdio: ["pipe", "pipe", "pipe"] },
+          {
+            stdio: ["pipe", "pipe", "pipe"],
+            env: { ...process.env, KUBECONFIG: kubeconfig },
+          },
         );
         this.child = child;
         this.buffer = "";

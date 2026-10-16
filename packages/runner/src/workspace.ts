@@ -115,6 +115,7 @@ export class Workspace {
   mcpError?: string;
   localEnv?: NodeExecutionEnv;
   kubeEnv?: KubernetesExecutionEnv;
+  private execution?: ExecutionEnv;
   private accepting = true;
   private admissions = Promise.resolve();
   private readonly assertActive: () => Promise<void>;
@@ -203,6 +204,7 @@ export class Workspace {
         } else if (!passive) {
           kubeEnv = new KubernetesExecutionEnv({
             kubectl: config.kubectl ?? "kubectl",
+            kubeconfig: config.kubeconfig,
             namespace: config.namespace!,
             container: config.container ?? "dev",
             cwd: config.cwd ?? "/repos",
@@ -255,7 +257,7 @@ export class Workspace {
         {
           models: await workspaceModels(config.model?.provider, authPath),
           registry,
-          ...(execution ? { env: () => execution } : {}),
+          ...(execution ? { env: () => openedWorkspace!.execution! } : {}),
           onReport: recordError,
         },
         context,
@@ -298,6 +300,7 @@ export class Workspace {
       workspace.mcpError = mcpError;
       workspace.localEnv = localEnv;
       workspace.kubeEnv = kubeEnv;
+      workspace.execution = localEnv ?? kubeEnv;
       workspace.sandbox = sandbox;
       workspace.passive = passive;
       if (passive) workspace.accepting = false;
@@ -306,9 +309,7 @@ export class Workspace {
     } catch (error) {
       const cleanupErrors: unknown[] = [];
       for (const cleanup of [
-        openedWorkspace
-          ? () => openedWorkspace!.close(true)
-          : closeOpenedState,
+        openedWorkspace ? () => openedWorkspace!.close(true) : closeOpenedState,
         openedWorkspace ? undefined : mcp?.close,
         openedWorkspace ? undefined : sandbox?.close.bind(sandbox),
         openedWorkspace ? undefined : kubeEnv?.cleanup.bind(kubeEnv, context),
@@ -438,6 +439,46 @@ export class Workspace {
     if (this.config.role === "bot" && this.config.onboardingRequired)
       await this.admitOnboarding();
     this.harness.resume();
+  }
+
+  async rebindKubernetesConnection(
+    kubectl: string,
+    kubeconfig: string,
+    persist: (config: WorkspaceConfig) => Promise<void>,
+  ) {
+    return this.withAdmission(async () => {
+      if (
+        this.config.role !== "coding" ||
+        this.config.environment !== "kubernetes"
+      )
+        throw new ApiError(
+          409,
+          "CONNECTION_NOT_SUPPORTED",
+          "Only Kubernetes coding workspaces have a host connection to rebind",
+        );
+      const inspection = await this.harness.inspect(context);
+      if (inspection.tasks.some((task) => agentIsBusy(task)))
+        throw new ApiError(
+          409,
+          "WORKSPACE_BUSY",
+          "Workspace work is active; stop it with adm abort NAME, then retry the reconnect",
+        );
+      const config = { ...this.config, kubectl, kubeconfig };
+      const execution = new KubernetesExecutionEnv({
+        kubectl,
+        kubeconfig,
+        namespace: config.namespace!,
+        container: config.container ?? "dev",
+        cwd: config.cwd ?? "/repos",
+        script: config.remoteEnv ?? defaultRemoteEnv,
+      });
+      await persist(config);
+      await this.kubeEnv?.cleanup(context);
+      this.config = config;
+      this.kubeEnv = execution;
+      this.execution = execution;
+      return this.status();
+    });
   }
 
   saveGoal(input: unknown) {
