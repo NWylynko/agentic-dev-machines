@@ -232,6 +232,7 @@ test(
     });
     await request(path + "/input", "POST", {
       requestId: "release-worker",
+      whenBusy: "followUp",
       message:
         "/faux " +
         JSON.stringify({
@@ -266,8 +267,10 @@ test(
             .find((line) => line.startsWith("data: "));
           if (!data) continue;
           const event = JSON.parse(data.slice(6));
-          if (event.kind === "message") {
-            assert.equal(event.data.text, "Packaged worker delivered this.");
+          if (
+            event.kind === "message" &&
+            event.data.text === "Packaged worker delivered this."
+          ) {
             delivered = true;
             break;
           }
