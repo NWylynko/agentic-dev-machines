@@ -18,9 +18,12 @@ assert.ok(adm, "pass the public adm executable");
 const root = await mkdtemp(join(tmpdir(), "adm-managed-shell-"));
 const stateFile = join(root, "cluster.json");
 const execLog = join(root, "exec.jsonl");
+const hostEnvLog = join(root, "host-env.jsonl");
 const envLog = join(root, "remote-env.jsonl");
 const requestLog = join(root, "requests.jsonl");
 const kube = join(root, "kubectl");
+const wrongKubeconfig = join(root, "wrong.kubeconfig");
+const selectedKubeconfig = join(root, "selected.kubeconfig");
 let agentStatus = "running";
 let abortCount = 0;
 let releaseHeldRequest;
@@ -101,6 +104,8 @@ await once(server, "listening");
 try {
   await writeFile(join(root, "package.json"), '{"type":"module"}');
   await mkdir(join(root, "remote-tmp"));
+  await writeFile(wrongKubeconfig, "parent context");
+  await writeFile(selectedKubeconfig, "selected context");
   await writeFile(
     kube,
     `#!/usr/bin/env node
@@ -109,6 +114,7 @@ import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 const args = process.argv.slice(2);
 await appendFile(${JSON.stringify(execLog)}, JSON.stringify(args) + "\\n");
+await appendFile(${JSON.stringify(hostEnvLog)}, JSON.stringify(process.env.KUBECONFIG ?? "<unset>") + "\\n");
 const statePath = ${JSON.stringify(stateFile)};
 const shellPidPath = ${JSON.stringify(join(root, "shell.pid"))};
 let state = {};
@@ -158,6 +164,7 @@ else if (args[0] === "exec") {
   const env = {
     ...process.env,
     XDG_CONFIG_HOME: join(root, "config"),
+    KUBECONFIG: wrongKubeconfig,
     HOST_SENTINEL: "must-not-cross-exec",
   };
   delete env.ADM_PROJECT_DIR;
@@ -173,6 +180,8 @@ else if (args[0] === "exec") {
           kube,
           "--runner-url",
           runnerUrl,
+          "--kubeconfig",
+          selectedKubeconfig,
           ...args,
         ],
         { env, stdio: ["ignore", "pipe", "pipe"] },
@@ -242,6 +251,15 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
+  const hostKubeconfigs = (await readFile(hostEnvLog, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(hostKubeconfigs.length, kubectlCalls.length);
+  assert.ok(
+    hostKubeconfigs.every((value) => value === selectedKubeconfig),
+    `every host kubectl call, including relay and interactive shell, must use the selected kubeconfig: ${hostKubeconfigs}`,
+  );
   const managedRelay = kubectlCalls.find(
     (args) =>
       args[0] === "exec" &&
@@ -249,6 +267,10 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
       args[args.indexOf("--") + 1] === "sh",
   );
   assert.ok(managedRelay, "managed session opens an stdin/stdout relay exec");
+  assert.equal(
+    hostKubeconfigs[kubectlCalls.indexOf(managedRelay)],
+    selectedKubeconfig,
+  );
   const remoteCommand = managedRelay.slice(managedRelay.indexOf("--") + 1);
   assert.deepEqual(remoteCommand.slice(0, 8), [
     "sh",
@@ -272,6 +294,10 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
     remoteShell,
     "shell receives only its private client path and socket",
   );
+  assert.equal(
+    hostKubeconfigs[kubectlCalls.indexOf(remoteShell)],
+    selectedKubeconfig,
+  );
   const remoteEnvs = (await readFile(envLog, "utf8"))
     .trim()
     .split("\n")
@@ -283,6 +309,11 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
   assert.equal(
     remoteEnvs.some((value) => value.ADM_RUNNER_URL || value.ADM_STATE_DIR),
     false,
+  );
+  assert.equal(
+    remoteEnvs.some((value) => value.KUBECONFIG),
+    false,
+    "the host kubeconfig path must not be sent into the workspace container",
   );
   assert.equal(
     agentStatus,
@@ -341,6 +372,8 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
       kube,
       "--runner-url",
       runnerUrl,
+      "--kubeconfig",
+      selectedKubeconfig,
       "shell",
       "manage-current",
       "--manage",
@@ -376,6 +409,16 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
     "detaching a pending prompt must not submit an abort",
   );
   assert.deepEqual(await readdir(join(root, "remote-tmp")), []);
+  const allKubectlCalls = (await readFile(execLog, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const allHostKubeconfigs = (await readFile(hostEnvLog, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(allHostKubeconfigs.length, allKubectlCalls.length);
+  assert.ok(allHostKubeconfigs.every((value) => value === selectedKubeconfig));
 } finally {
   await new Promise((resolve) => server.close(resolve));
   await rm(root, { recursive: true });
