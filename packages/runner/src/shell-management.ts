@@ -420,7 +420,7 @@ try {
         "-c",
         'cd -- "$1" && export PWD="$1" PATH="$2:$PATH" ADM_MANAGE_SOCKET="$3" && exec bash',
         "adm-shell",
-        "/repos",
+        cwd,
         ready.directory,
         ready.socket,
       ];

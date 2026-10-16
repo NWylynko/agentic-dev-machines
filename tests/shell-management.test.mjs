@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 
@@ -24,6 +24,8 @@ const requestLog = join(root, "requests.jsonl");
 const kube = join(root, "kubectl");
 const wrongKubeconfig = join(root, "wrong.kubeconfig");
 const selectedKubeconfig = join(root, "selected.kubeconfig");
+const mappedRepos = join(root, "mapped-repos");
+const mappedRepository = join(mappedRepos, "owner", "project");
 let agentStatus = "running";
 let abortCount = 0;
 let releaseHeldRequest;
@@ -106,6 +108,8 @@ try {
   await mkdir(join(root, "remote-tmp"));
   await writeFile(wrongKubeconfig, "parent context");
   await writeFile(selectedKubeconfig, "selected context");
+  await mkdir(mappedRepository, { recursive: true });
+  await writeFile(join(mappedRepository, "README.md"), "selected repository\n");
   await writeFile(
     kube,
     `#!/usr/bin/env node
@@ -132,6 +136,35 @@ else if (args[0] === "exec") {
   const split = args.indexOf("--"); const command = args.slice(split + 1);
   if (command[0] === "sh" && command[1] === "-eu" && command[4] === "adm-repository") {
     process.stdout.write("repository prepared\\n");
+  } else if (
+    command[0] === "bash" &&
+    command[1] === "-l" &&
+    command[2] === "-c"
+  ) {
+    const remoteEnv = {
+      HOME: ${JSON.stringify(join(root, "container-home"))},
+      PATH: dirname(process.execPath) + ":/usr/bin:/bin",
+      TERM: "xterm",
+    };
+    const mappedCommand = [...command];
+    const cwdIndex = mappedCommand.findIndex(
+      (value) => value === "/repos" || value === "/repos/owner/project",
+    );
+    if (cwdIndex < 0)
+      throw new Error("default managed shell omitted its public cwd argv");
+    mappedCommand[cwdIndex] =
+      mappedCommand[cwdIndex] === "/repos"
+        ? ${JSON.stringify(mappedRepos)}
+        : ${JSON.stringify(mappedRepository)};
+    const child = spawn("bash", mappedCommand.slice(1), {
+      env: remoteEnv,
+      stdio: "inherit",
+    });
+    const [code, signal] = await new Promise((resolve) =>
+      child.once("exit", (code, signal) => resolve([code, signal])),
+    );
+    if (signal) process.kill(process.pid, signal);
+    else process.exitCode = code ?? 1;
   } else if (command[0] === "sh" && command[1] === "-lc" && command[5] === "node") {
     const remoteEnv = { HOME: ${JSON.stringify(join(root, "container-home"))}, TMPDIR: ${JSON.stringify(join(root, "remote-tmp"))}, PATH: "/usr/local/bin:/usr/bin:/bin", TERM: "xterm", ADM_TEST_CWD: command[4] };
     await appendFile(${JSON.stringify(envLog)}, JSON.stringify(remoteEnv) + "\\n");
@@ -160,6 +193,10 @@ else if (args[0] === "exec") {
     { mode: 0o755 },
   );
   await mkdir(join(root, "container-home"));
+  await writeFile(
+    join(root, "container-home", ".bash_profile"),
+    `export PATH=${dirname(process.execPath)}:/usr/bin:/bin\n`,
+  );
   const runnerUrl = `http://127.0.0.1:${server.address().port}`;
   const env = {
     ...process.env,
@@ -199,6 +236,38 @@ else if (args[0] === "exec") {
           stderr: Buffer.concat(stderr).toString(),
         }),
       );
+    });
+  const runInteractive = (args, input) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(
+        adm,
+        [
+          "--state-dir",
+          join(root, "state"),
+          "--kubectl",
+          kube,
+          "--runner-url",
+          runnerUrl,
+          "--kubeconfig",
+          selectedKubeconfig,
+          ...args,
+        ],
+        { env, stdio: ["pipe", "pipe", "pipe"] },
+      );
+      const stdout = [],
+        stderr = [];
+      child.stdout.on("data", (chunk) => stdout.push(chunk));
+      child.stderr.on("data", (chunk) => stderr.push(chunk));
+      child.once("error", reject);
+      child.once("exit", (code, signal) =>
+        resolve({
+          code,
+          signal,
+          stdout: Buffer.concat(stdout).toString(),
+          stderr: Buffer.concat(stderr).toString(),
+        }),
+      );
+      child.stdin.end(input);
     });
 
   const created = await run([
@@ -409,6 +478,19 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
     "detaching a pending prompt must not submit an abort",
   );
   assert.deepEqual(await readdir(join(root, "remote-tmp")), []);
+
+  const defaultShell = await runInteractive(
+    ["shell", "manage-current", "--manage"],
+    "pwd\ncat README.md\nadm status --json\nexit\n",
+  );
+  assert.equal(
+    defaultShell.code,
+    0,
+    `stdout=${defaultShell.stdout}\\nstderr=${defaultShell.stderr}`,
+  );
+  assert.ok(defaultShell.stdout.includes(mappedRepository), defaultShell.stdout);
+  assert.match(defaultShell.stdout, /selected repository/);
+  assert.match(defaultShell.stdout, /"status": "running"/);
   const allKubectlCalls = (await readFile(execLog, "utf8"))
     .trim()
     .split("\n")
