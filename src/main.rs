@@ -128,6 +128,9 @@ pub enum Action {
         /// StorageClass to inspect; otherwise use the configured default.
         #[arg(long, default_value = "adm-replicated", hide_default_value = true)]
         storage_class: String,
+        /// Print the complete diagnostic report as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Configure workspace defaults, provider login, and the background service.
     Setup,
@@ -884,7 +887,10 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Action::Serve => runner::serve(cli),
         Action::Stop => runner::stop(cli),
-        Action::Doctor { storage_class } => diagnostics::doctor(cli, storage_class),
+        Action::Doctor {
+            storage_class,
+            json,
+        } => diagnostics::doctor(cli, storage_class, *json),
         Action::Setup => setup::run(cli),
         Action::Login => setup::login(cli),
         Action::Herdr { command } => herdr::run(cli, command),
@@ -971,7 +977,7 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
                 setup::validate_model(model)?;
             }
         }
-        Action::Doctor { storage_class } => {
+        Action::Doctor { storage_class, .. } => {
             if arguments.value_source("storage_class") == Some(ValueSource::DefaultValue)
                 && let Some(configured) = config.storage_class
             {

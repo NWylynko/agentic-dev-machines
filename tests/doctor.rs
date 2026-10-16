@@ -11,10 +11,13 @@ use std::{
 fn doctor_reports_missing_storage_and_preserves_runner_failure_causes() {
     let root = tempfile::tempdir().unwrap();
     let kubectl = root.path().join("kubectl");
-    fs::write(&kubectl, r#"#!/usr/bin/env python3
-import json,sys
+    fs::write(&kubectl, r#"#!/usr/bin/python3
+import json,os,sys
 args=sys.argv[1:]
-if args[:2]==['get','nodes']:
+open(os.environ['ADM_DOCTOR_LOG'],'a').write(' '.join(args)+'\n')
+if args[:2]==['get','nodes'] and os.environ.get('ADM_DOCTOR_FAIL_NODES'):
+ print('Error from server: context unavailable',file=sys.stderr);sys.exit(1)
+elif args[:2]==['get','nodes']:
  print(json.dumps({'items':[{'metadata':{'name':'node-a'},'status':{'conditions':[{'type':'Ready','status':'True'}]}}]}))
 elif args[:2]==['get','storageclass']:
  name=args[2]
@@ -24,52 +27,180 @@ elif args[:2]==['get','storageclass']:
 else: sys.exit(2)
 "#).unwrap();
     fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    for (storage_class, expected_status) in [
-        (None, "unavailable"),
-        (Some("local-path"), "node-local"),
-        (Some("replicated-test"), "available"),
+    let empty_path = root.path().join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    for (
+        storage_class,
+        expected_status,
+        healthy_runner,
+        failed_cluster,
+        configured_class,
+        healthy_tools,
+        missing_runner_status,
+    ) in [
+        (None, "unavailable", false, false, None, false, false),
+        (
+            Some("local-path"),
+            "node-local",
+            false,
+            false,
+            None,
+            false,
+            false,
+        ),
+        (
+            Some("replicated-test"),
+            "available",
+            false,
+            false,
+            None,
+            false,
+            false,
+        ),
+        (
+            Some("replicated-test"),
+            "available",
+            true,
+            false,
+            None,
+            false,
+            false,
+        ),
+        (
+            None,
+            "available",
+            true,
+            true,
+            Some("configured-test"),
+            false,
+            false,
+        ),
+        (
+            Some("replicated-test"),
+            "available",
+            true,
+            false,
+            Some("configured-test"),
+            false,
+            false,
+        ),
+        (
+            Some("replicated-test"),
+            "available",
+            true,
+            false,
+            None,
+            true,
+            false,
+        ),
+        (
+            Some("replicated-test"),
+            "available",
+            true,
+            false,
+            None,
+            false,
+            true,
+        ),
     ] {
+        fs::create_dir_all(root.path().join("config/adm")).unwrap();
+        let config_path = root.path().join("config/adm/config.json");
+        if let Some(name) = configured_class {
+            fs::write(&config_path, json!({"storageClass":name}).to_string()).unwrap();
+        } else if config_path.exists() {
+            fs::remove_file(&config_path).unwrap();
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 4096];
-            let received = stream.read(&mut request).unwrap();
-            assert!(received > 0, "doctor must send a health request");
-            let body = json!({"error":{"code":"STORE_UNAVAILABLE","message":"session storage is temporarily unavailable"}}).to_string();
-            write!(stream,"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let received = stream.read(&mut request).unwrap();
+                assert!(received > 0, "doctor must send a health request");
+                let (status, body) = if missing_runner_status {
+                    ("200 OK", json!({}).to_string())
+                } else if healthy_runner {
+                    ("200 OK", json!({"status":"ok"}).to_string())
+                } else {
+                    ("503 Service Unavailable", json!({"error":{"code":"STORE_UNAVAILABLE","message":"session storage is temporarily unavailable"}}).to_string())
+                };
+                write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
         });
-        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
-        command
-            .env("XDG_CONFIG_HOME", root.path().join("config"))
-            .arg("--state-dir")
-            .arg(root.path().join("state"))
-            .arg("--kubectl")
-            .arg(&kubectl)
-            .args(["--runner-url", &url, "doctor"]);
-        if let Some(name) = storage_class {
-            command.args(["--storage-class", name]);
-        }
-        let output = command.output().unwrap();
+        let invoke = |json_output: bool| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+            command
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("ADM_DOCTOR_LOG", root.path().join("kubectl.log"))
+                .arg("--state-dir")
+                .arg(root.path().join("state"))
+                .arg("--kubectl")
+                .arg(&kubectl)
+                .args(["--runner-url", &url, "doctor"]);
+            if !healthy_tools {
+                command.env("PATH", &empty_path);
+            }
+            if failed_cluster {
+                command.env("ADM_DOCTOR_FAIL_NODES", "1");
+            }
+            if let Some(name) = storage_class {
+                command.args(["--storage-class", name]);
+            }
+            if json_output {
+                command.arg("--json");
+            }
+            command.output().unwrap()
+        };
+        let output = invoke(true);
         if !output.status.success() {
             panic!("doctor failed: {}", String::from_utf8_lossy(&output.stderr));
         }
-        server.join().unwrap();
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["storage"]["status"], expected_status);
         assert_eq!(
             report["storage"]["name"],
-            storage_class.unwrap_or("adm-replicated")
+            storage_class
+                .or(configured_class)
+                .unwrap_or("adm-replicated")
         );
-        assert_eq!(report["cluster"][0]["ready"], true);
-        assert_eq!(report["runner"]["status"], "unavailable");
-        assert!(
-            report["runner"]["error"]
-                .as_str()
-                .unwrap()
-                .contains("session storage is temporarily unavailable")
-        );
-        if storage_class.is_none() {
+        if failed_cluster {
+            assert_eq!(report["cluster"], Value::Null);
+            assert!(
+                report["clusterError"]
+                    .as_str()
+                    .unwrap()
+                    .contains("context unavailable")
+            );
+        } else {
+            assert_eq!(report["cluster"][0]["ready"], true);
+        }
+        if missing_runner_status {
+            assert_eq!(report["runner"]["status"], Value::Null);
+        } else if healthy_runner {
+            assert_eq!(report["runner"]["status"], "ok");
+        } else {
+            assert_eq!(report["runner"]["status"], "unavailable");
+            assert!(
+                report["runner"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("session storage is temporarily unavailable")
+            );
+        }
+        if healthy_tools {
+            assert_eq!(report["tools"][0][1], true);
+            assert_eq!(report["tools"][1][1], true);
+        } else {
+            assert!(
+                report["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|tool| tool[1] == false)
+            );
+        }
+        if expected_status == "unavailable" {
             assert!(
                 report["storage"]["error"]
                     .as_str()
@@ -81,5 +212,59 @@ else: sys.exit(2)
             !root.path().join("state/workspaces.sqlite").exists(),
             "diagnostics must not allocate a workspace store"
         );
+        let human = invoke(false);
+        assert!(
+            human.status.success(),
+            "{}",
+            String::from_utf8_lossy(&human.stderr)
+        );
+        let human = String::from_utf8(human.stdout).unwrap();
+        for label in [
+            "Tools:", "node:", "Cluster:", "Storage:", "Runner:", "State:",
+        ] {
+            assert!(human.contains(label), "missing {label:?}: {human}");
+        }
+        if healthy_tools {
+            assert!(human.contains("node: available"), "{human}");
+            assert!(human.contains("git: available"), "{human}");
+        }
+        if failed_cluster {
+            assert!(human.contains("context unavailable"), "{human}");
+            assert!(human.contains("Check kubectl access"), "{human}");
+        } else {
+            assert!(human.contains("node-a: ready"), "{human}");
+        }
+        if !healthy_runner {
+            assert!(
+                human.contains("session storage is temporarily unavailable"),
+                "{human}"
+            );
+        }
+        if expected_status == "unavailable" {
+            assert!(
+                human.contains("Next:") && human.contains("adm-replicated"),
+                "{human}"
+            );
+        } else if expected_status == "node-local" {
+            assert!(
+                human.contains("Warning:") && human.contains("cannot recover a volume"),
+                "{human}"
+            );
+        } else {
+            assert!(
+                human.contains("Note:") && human.contains("does not prove replication"),
+                "{human}"
+            );
+        }
+        if healthy_runner && !missing_runner_status {
+            assert!(human.contains("Runner:\n  ok"), "{human}");
+        }
+        if missing_runner_status {
+            assert!(human.contains("Runner:\n  unknown"), "{human}");
+            assert!(!human.contains("Runner:\n  available"), "{human}");
+        }
+        let kubectl_calls = fs::read_to_string(root.path().join("kubectl.log")).unwrap();
+        assert!(kubectl_calls.lines().all(|call| call.starts_with("get ")));
+        server.join().unwrap();
     }
 }

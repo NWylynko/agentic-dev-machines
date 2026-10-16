@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::process::Command;
 
-pub fn doctor(cli: &Cli, storage_class: &str) -> Result<()> {
+pub fn doctor(cli: &Cli, storage_class: &str, json_output: bool) -> Result<()> {
     let tools = ["node", "git", "gh"].map(|name| {
         (
             name,
@@ -31,9 +31,80 @@ pub fn doctor(cli: &Cli, storage_class: &str) -> Result<()> {
         Ok(health) => health,
         Err(error) => json!({"status":"unavailable", "error":format!("{error:#}")}),
     };
-    print_json(
-        &json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"runner":runner,"state":cli.state_path()}),
-    )
+    let report = json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"runner":runner,"state":cli.state_path()});
+    if json_output {
+        print_json(&report)
+    } else {
+        print_doctor_report(&report);
+        Ok(())
+    }
+}
+
+fn print_doctor_report(report: &Value) {
+    println!("Tools:");
+    for tool in report["tools"].as_array().into_iter().flatten() {
+        let name = tool[0].as_str().unwrap_or("unknown");
+        let status = if tool[1].as_bool() == Some(true) {
+            "available"
+        } else {
+            "unavailable"
+        };
+        println!("  {name}: {status}");
+    }
+
+    println!("Cluster:");
+    if let Some(error) = report["clusterError"].as_str() {
+        println!("  unavailable: {error}");
+        println!("  Next: Check kubectl access and the selected Kubernetes context.");
+    } else {
+        for node in report["cluster"].as_array().into_iter().flatten() {
+            println!(
+                "  {}: {}",
+                node["name"].as_str().unwrap_or("unknown"),
+                if node["ready"] == true {
+                    "ready"
+                } else {
+                    "not ready"
+                }
+            );
+        }
+    }
+
+    println!("Storage:");
+    let storage = &report["storage"];
+    println!(
+        "  {}: {}",
+        storage["name"].as_str().unwrap_or("unknown"),
+        storage["status"].as_str().unwrap_or("unknown")
+    );
+    for key in ["error", "warning", "note"] {
+        if let Some(message) = storage[key].as_str() {
+            println!(
+                "  {}: {message}",
+                if key == "error" {
+                    "Error"
+                } else if key == "warning" {
+                    "Warning"
+                } else {
+                    "Note"
+                }
+            );
+        }
+    }
+    if let Some(action) = storage["action"].as_str() {
+        println!("  Next: {action}");
+    }
+
+    println!("Runner:");
+    println!(
+        "  {}",
+        report["runner"]["status"].as_str().unwrap_or("unknown")
+    );
+    if let Some(error) = report["runner"]["error"].as_str() {
+        println!("  Error: {error}");
+        println!("  Next: Check the runner process and its logs.");
+    }
+    println!("State: {}", report["state"].as_str().unwrap_or("unknown"));
 }
 
 fn inspect_nodes(cli: &Cli) -> Result<Value> {
