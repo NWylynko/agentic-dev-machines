@@ -74,6 +74,86 @@ fn adm(root: &Path, arguments: &[&str]) -> Output {
         .expect("run public CLI")
 }
 
+#[test]
+fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("config/adm")).unwrap();
+    fs::write(root.path().join("config/adm/config.json"), "not json").unwrap();
+    let state_dir = root.path().join("state");
+    let state_dir = state_dir.to_str().unwrap();
+    let run = |args: &[&str], isolated: bool| {
+        Command::new(env!("CARGO_BIN_EXE_adm"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .args(if isolated {
+                vec![
+                    "--state-dir",
+                    state_dir,
+                    "--kubectl",
+                    "/missing/kubectl",
+                    "--runner-url",
+                    "http://127.0.0.1:1",
+                ]
+            } else {
+                vec![]
+            })
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let outputs = [
+        run(&[], false),
+        run(&["help"], true),
+        run(&["--help"], true),
+    ];
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let help = String::from_utf8(outputs[0].stdout.clone()).unwrap();
+    assert!(help.contains("Workspace use:"), "{help}");
+    assert!(help.contains("ADM management:"), "{help}");
+    for command in [
+        "create",
+        "list",
+        "status",
+        "inspect",
+        "destroy",
+        "reconnect",
+        "attach",
+        "shell",
+        "exec",
+        "port",
+        "prompt",
+        "abort",
+        "history",
+        "browser",
+        "manifest",
+        "setup",
+        "login",
+        "start",
+        "serve",
+        "stop",
+        "doctor",
+        "herdr",
+        "help",
+    ] {
+        assert_eq!(help.matches(&format!("  {command} ")).count(), 1, "{help}");
+    }
+    assert_eq!(String::from_utf8(outputs[1].stdout.clone()).unwrap(), help);
+    assert_eq!(String::from_utf8(outputs[2].stdout.clone()).unwrap(), help);
+    assert!(!root.path().join("data/adm").exists());
+    assert!(!root.path().join("state").exists());
+    assert!(run(&["help", "create"], true).status.success());
+    assert!(run(&["create", "--help"], true).status.success());
+    assert!(run(&["herdr", "--help"], true).status.success());
+    assert_eq!(run(&["missing-command"], true).status.code(), Some(2));
+    assert_eq!(run(&["list", "--bad-flag"], true).status.code(), Some(2));
+}
+
 fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_adm"))
         .env("XDG_CONFIG_HOME", root.join("config"))

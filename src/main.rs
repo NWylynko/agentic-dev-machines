@@ -172,6 +172,52 @@ fn default_project_dir() -> PathBuf {
 }
 
 impl Cli {
+    fn help_command() -> clap::Command {
+        const WORKSPACE: &[&str] = &[
+            "create",
+            "list",
+            "status",
+            "inspect",
+            "destroy",
+            "reconnect",
+            "attach",
+            "shell",
+            "exec",
+            "port",
+            "prompt",
+            "abort",
+            "history",
+            "browser",
+        ];
+        const MANAGEMENT: &[&str] = &[
+            "manifest", "setup", "login", "start", "serve", "stop", "doctor", "herdr", "help",
+        ];
+        let mut command = Self::command();
+        command.build();
+        let grouped = |names: &[&str], command: &clap::Command| {
+            names
+                .iter()
+                .filter_map(|name| {
+                    command.find_subcommand(name).map(|subcommand| {
+                        format!(
+                            "  {:<16} {}",
+                            subcommand.get_name(),
+                            subcommand.get_about().unwrap_or_default()
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let template = format!(
+            "{{before-help}}{{name}} {{version}}\n{{about-with-newline}}{{usage-heading}} {{usage}}\n\nWorkspace use:\n{}\n\nADM management:\n{}\n\nOptions:\n{{options}}{{after-help}}",
+            grouped(WORKSPACE, &command),
+            grouped(MANAGEMENT, &command)
+        );
+        command = command.help_template(template);
+        command
+    }
+
     pub fn checkout_file(&self, relative: &str) -> Result<PathBuf> {
         let path = self.project_dir.join(relative);
         anyhow::ensure!(
@@ -878,7 +924,12 @@ fn run(cli: &Cli) -> Result<()> {
 }
 
 fn main() {
-    let matches = Cli::command().get_matches();
+    if std::env::args_os().len() == 1 {
+        let mut command = Cli::help_command();
+        command.print_help().expect("write CLI help");
+        return;
+    }
+    let matches = Cli::help_command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).expect("validated CLI arguments");
     if let Err(error) = configure_defaults(&mut cli, &matches).and_then(|()| run(&cli)) {
         eprintln!("adm: {error:#}");
