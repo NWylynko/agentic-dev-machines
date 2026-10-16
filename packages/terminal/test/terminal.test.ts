@@ -637,7 +637,9 @@ test(
       try {
         const connected = waitForOutput(first, "Connected ·");
         await connected;
-        first.stdin.write("The runner continued after terminal detach\r");
+        const multilinePrompt =
+          "The runner continued after terminal detach\nKeep the second line.";
+        first.stdin.write(multilinePrompt + "\r");
         await waitForOutput(first, "Input accepted");
         const detached = once(first, "exit");
         first.stdin.write("\x03");
@@ -647,6 +649,13 @@ test(
           `${runnerUrl}${path}/history?limit=1000`,
         );
         const history = await historyResponse.json();
+        assert.ok(
+          history.events.some(
+            (event: any) =>
+              event.kind === "user" && event.data.text === multilinePrompt,
+          ),
+          "the real PTY must submit both editor lines as one prompt",
+        );
         assert.ok(
           history.events.some(
             (event: any) =>
