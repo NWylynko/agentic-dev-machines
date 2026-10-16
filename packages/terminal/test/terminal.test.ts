@@ -9,7 +9,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WorkspaceTerminal } from "../src/terminal.ts";
-import { stripTerminalSequences } from "@earendil-works/pi-tui";
+import {
+  ProcessTerminal,
+  stripTerminalSequences,
+  TuiMainScreen,
+} from "@earendil-works/pi-tui";
 
 function terminalText(terminal: WorkspaceTerminal) {
   return stripTerminalSequences(terminal.render(100).join("\n"));
@@ -100,10 +104,12 @@ const event = (seq: number, kind: string, text: string) => ({
 });
 function changedTerminal(url: string, diagnostics = false) {
   let notify: () => void = () => {};
+  const ui = new TuiMainScreen(new ProcessTerminal());
   const terminal = new WorkspaceTerminal({
     url,
     workspaceId: "work",
     diagnostics,
+    tui: ui,
     onRender() {
       notify();
     },
@@ -120,6 +126,62 @@ function changedTerminal(url: string, diagnostics = false) {
     });
   return { terminal, waitFor };
 }
+
+test("Pi terminal formats assistant Markdown and identifies named tool failures", async () => {
+  const service = await fixture("coding", [
+    {
+      ...event(1, "assistant", ""),
+      data: { text: "## Plan\n\n- inspect\n- **fix**" },
+    },
+    {
+      ...event(2, "tool", ""),
+      data: { name: "read", text: "permission denied", isError: true },
+    },
+  ]);
+  const { terminal } = changedTerminal(service.url);
+  try {
+    await terminal.connect();
+    const rendered = terminalText(terminal);
+    assert.match(rendered, /Plan/);
+    assert.match(rendered, /- inspect/);
+    assert.match(rendered, /fix/);
+    assert.doesNotMatch(rendered, /\*\*fix\*\*/);
+    assert.match(rendered, /Tool · read · failed/);
+    assert.match(rendered, /permission denied/);
+    await terminal.submit("/help");
+    assert.match(
+      terminalText(terminal),
+      /Pi-native \/model, \/compact, \/tree, and \/settings are unavailable/,
+    );
+  } finally {
+    terminal.close();
+    await service.close();
+  }
+});
+
+test("Pi editor submits multiline prompts and restores them from editor history", async () => {
+  const service = await fixture();
+  const { terminal, waitFor } = changedTerminal(service.url);
+  try {
+    await terminal.connect();
+    const accepted = waitFor("Input accepted");
+    terminal.handleInput("first line");
+    terminal.handleInput("\x0a");
+    terminal.handleInput("second line");
+    terminal.handleInput("\r");
+    await accepted;
+    assert.equal(
+      service.requests.at(-1).body.message,
+      "first line\nsecond line",
+    );
+    terminal.handleInput("\x1b[A");
+    assert.match(terminalText(terminal), /first line/);
+    assert.match(terminalText(terminal), /second line/);
+  } finally {
+    terminal.close();
+    await service.close();
+  }
+});
 
 test(
   "Herdr terminal loads coding history, receives live work, sends steering input, and detaches without aborting",
@@ -575,7 +637,7 @@ test(
       try {
         const connected = waitForOutput(first, "Connected ·");
         await connected;
-        first.stdin.write("The runner continued after terminal detach\n");
+        first.stdin.write("The runner continued after terminal detach\r");
         await waitForOutput(first, "Input accepted");
         const detached = once(first, "exit");
         first.stdin.write("\x03");
@@ -628,13 +690,13 @@ test(
             /authentication credentials are invalid/i,
           );
 
-          second.stdin.write("/status\n");
+          second.stdin.write("/status\r");
           await waitForOutput(second, "0 goals · 0 loops");
           assert.match(
             stripTerminalSequences(firstOutput),
             /Provider error · Authentication credentials are invalid/,
           );
-          second.stdin.write("/resume\n");
+          second.stdin.write("/resume\r");
           await waitForOutput(second, "Provider retry queued");
           await waitForOutput(
             second,
@@ -646,13 +708,13 @@ test(
           assert.equal(resumedWorkspace.error, undefined);
 
           firstOutput = "";
-          second.stdin.write("/newgoal Ship the release\n");
+          second.stdin.write("/newgoal Ship the release\r");
           await waitForOutput(second, "Goal saved");
           firstOutput = "";
-          second.stdin.write("/goal Retire the old API\n");
+          second.stdin.write("/goal Retire the old API\r");
           await waitForOutput(second, "Goal saved");
           firstOutput = "";
-          second.stdin.write("/loop 3600 Review the release status\n");
+          second.stdin.write("/loop 3600 Review the release status\r");
           await waitForOutput(second, "Loop saved");
 
           const managed = await fetch(`${runnerUrl}${path}`);
@@ -664,21 +726,21 @@ test(
           assert.equal(cancelledLoop.prompt, "Review the release status");
 
           firstOutput = "";
-          second.stdin.write("/goals\n");
+          second.stdin.write("/goals\r");
           await waitForOutput(second, completedGoal.id);
           await waitForOutput(second, cancelledGoal.id);
           firstOutput = "";
-          second.stdin.write("/loops\n");
+          second.stdin.write("/loops\r");
           await waitForOutput(second, cancelledLoop.id);
 
           firstOutput = "";
-          second.stdin.write(`/complete-goal ${completedGoal.id}\n`);
+          second.stdin.write(`/complete-goal ${completedGoal.id}\r`);
           await waitForOutput(second, "Goal marked completed");
           firstOutput = "";
-          second.stdin.write(`/cancel-goal ${cancelledGoal.id}\n`);
+          second.stdin.write(`/cancel-goal ${cancelledGoal.id}\r`);
           await waitForOutput(second, "Goal cancelled");
           firstOutput = "";
-          second.stdin.write(`/cancel-loop ${cancelledLoop.id}\n`);
+          second.stdin.write(`/cancel-loop ${cancelledLoop.id}\r`);
           await waitForOutput(second, "Loop cancelled");
 
           const managedAfter = await fetch(`${runnerUrl}${path}`);

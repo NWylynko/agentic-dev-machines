@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 import {
   Container,
+  Editor,
   Input,
   Key,
+  Markdown,
+  type TUI,
   matchesKey,
   stripTerminalSequences,
   Text,
@@ -18,6 +21,7 @@ type TerminalOptions = {
   url: string;
   workspaceId: string;
   diagnostics?: boolean;
+  tui?: TUI;
   onRender?: () => void;
   onDetach?: () => void;
 };
@@ -26,9 +30,35 @@ const clean = (text: unknown) =>
     /[\x00-\x08\x0b-\x1f\x7f]/g,
     "",
   );
+const markdownTheme = {
+  heading: (text: string) => `\x1b[1m${text}\x1b[0m`,
+  link: (text: string) => `\x1b[4m${text}\x1b[0m`,
+  linkUrl: (text: string) => `\x1b[2m${text}\x1b[0m`,
+  code: (text: string) => `\x1b[36m${text}\x1b[0m`,
+  codeBlock: (text: string) => text,
+  codeBlockBorder: (text: string) => `\x1b[2m${text}\x1b[0m`,
+  quote: (text: string) => text,
+  quoteBorder: (text: string) => `\x1b[2m${text}\x1b[0m`,
+  hr: (text: string) => `\x1b[2m${text}\x1b[0m`,
+  listBullet: (text: string) => text,
+  bold: (text: string) => `\x1b[1m${text}\x1b[0m`,
+  italic: (text: string) => `\x1b[3m${text}\x1b[0m`,
+  strikethrough: (text: string) => `\x1b[9m${text}\x1b[0m`,
+  underline: (text: string) => `\x1b[4m${text}\x1b[0m`,
+};
+const editorTheme = {
+  borderColor: (text: string) => text,
+  selectList: {
+    selectedPrefix: (text: string) => text,
+    selectedText: (text: string) => text,
+    description: (text: string) => text,
+    scrollInfo: (text: string) => text,
+    noMatch: (text: string) => text,
+  },
+};
 export class WorkspaceTerminal extends Container {
   private options: TerminalOptions;
-  private input = new Input();
+  private input: Input | Editor;
   private heading = new Text("");
   private transcript = new Container();
   private statusLine = new Text("");
@@ -50,9 +80,14 @@ export class WorkspaceTerminal extends Container {
   constructor(options: TerminalOptions) {
     super();
     this.options = options;
+    this.input = options.tui
+      ? new Editor(options.tui, editorTheme)
+      : new Input();
     this.input.onSubmit = (value) => {
       void this.submit(value);
     };
+    if (this.input instanceof Editor)
+      this.input.onChange = () => this.options.onRender?.();
     this.addChild(this.heading);
     this.addChild(this.transcript);
     this.addChild(this.statusLine);
@@ -87,16 +122,22 @@ export class WorkspaceTerminal extends Container {
               : item.kind === "status"
                 ? "Status"
                 : "Agent";
-      this.transcript.addChild(
-        new Text(
-          `${label}: ${clean(item.data?.text ?? item.data?.message ?? item.data)}`,
-          1,
-          1,
-        ),
-      );
+      const body = clean(item.data?.text ?? item.data?.message ?? item.data);
+      if (item.kind === "tool") {
+        const name = clean(item.data?.name || "unknown");
+        const outcome = item.data?.isError ? "failed" : "complete";
+        this.transcript.addChild(new Text(`Tool · ${name} · ${outcome}`, 1, 0));
+        this.transcript.addChild(new Markdown(body, 1, 1, markdownTheme));
+      } else if (item.kind === "status") {
+        this.transcript.addChild(new Text(`Status: ${body}`, 1, 1));
+      } else {
+        this.transcript.addChild(
+          new Markdown(`**${label}**\n\n${body}`, 1, 1, markdownTheme),
+        );
+      }
     }
     this.statusLine.setText(
-      `${clean(this.status)}\nEnter: steer · /followup · /help · Ctrl+R: reconnect · Ctrl+C: detach`,
+      `${clean(this.status)}\nEnter: steer · Shift+Enter: new line · /followup · /help · Ctrl+R: reconnect · Ctrl+C: detach`,
     );
     this.options.onRender?.();
   }
@@ -277,12 +318,13 @@ export class WorkspaceTerminal extends Container {
     if (!message || this.closed || this.inputPending) return;
     this.inputPending = true;
     this.status = "Processing command…";
+    if (this.input instanceof Editor) this.setInputText(value);
     this.refresh();
-    const clearInput = () => this.input.setValue("");
+    const clearInput = () => this.setInputText("");
     try {
       if (message === "/help") {
         this.status =
-          "/followup TEXT · /abort [all] · /resume · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach";
+          "/followup TEXT · /abort [all] · /resume · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\nPi-native /model, /compact, /tree, and /settings are unavailable in adm attach. /resume retries this workspace's safe failed turn.";
         clearInput();
         return;
       }
@@ -383,7 +425,7 @@ export class WorkspaceTerminal extends Container {
         return;
       }
       if (message.startsWith("/") && !message.startsWith("/followup "))
-        throw new Error("Unknown command; use /help");
+        throw new Error("This command is unavailable in adm attach; use /help");
       const followUp = message.startsWith("/followup ");
       const content = followUp ? message.slice(10).trim() : message;
       const whenBusy = followUp ? "followUp" : "steer";
@@ -398,14 +440,21 @@ export class WorkspaceTerminal extends Container {
         };
       await this.request("/input", this.pendingInput);
       this.pendingInput = undefined;
+      if (this.input instanceof Editor) this.input.addToHistory(content);
       this.status = followUp ? "Follow-up queued" : "Input accepted";
       clearInput();
     } catch (error) {
       this.status = `Error: ${error instanceof Error ? error.message : error}`;
+      if (this.input instanceof Editor && !this.input.getText())
+        this.setInputText(value);
     } finally {
       this.inputPending = false;
       this.refresh();
     }
+  }
+  private setInputText(value: string) {
+    if (this.input instanceof Editor) this.input.setText(value);
+    else this.input.setValue(value);
   }
   close() {
     this.closed = true;

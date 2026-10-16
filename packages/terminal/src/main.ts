@@ -37,6 +37,7 @@ async function runTerminal() {
     url,
     workspaceId,
     diagnostics,
+    tui: ui,
     onRender: () => ui.requestRender(),
     onDetach: finish,
   });

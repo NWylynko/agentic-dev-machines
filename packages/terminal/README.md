@@ -1,6 +1,6 @@
 # Herdr terminal client
 
-This client uses Pi TUI 1.2.0 and connects to the durable runner. `adm attach` launches it with inherited terminal input/output. It does not own the agent process.
+This client uses Pi TUI 1.2.0 and connects to the durable runner. `adm attach` launches an ADM terminal client with Pi's multiline editor and Markdown renderer; it does not launch Pi's interactive coding-agent application or own the agent process. The durable runner remains the owner across detach and reconnect.
 
 From the repository root:
 
@@ -28,8 +28,12 @@ The terminal loads persisted history, subscribes to server-sent events, and resu
 | `/help`                | Show available commands                                          |
 | Ctrl+R or `/reconnect` | Reattach from the last received cursor                           |
 | Ctrl+C or `/detach`    | Close this terminal attachment                                   |
+| Ctrl+J or Shift+Enter  | Insert a newline in the prompt editor                            |
+| Up / Down              | Browse submitted prompt history                                  |
 
 Bot chat shows user input, explicit `sendMessage` deliveries, and system status. Ordinary model responses and tool output remain hidden even if the server accidentally includes them. Start with `--diagnostics` to inspect raw diagnostic events explicitly. Model-supplied terminal control sequences are stripped before display.
+
+Assistant and bot messages render through Pi TUI's Markdown component. Tool results show the tool name and whether execution completed or failed. ADM attach does not provide Pi-native `/model`, `/compact`, `/tree`, or `/settings` commands; `/help` explains this boundary. ADM's `/resume` retries a safe failed provider turn and does not select another Pi session.
 
 An input whose HTTP response is lost retains its request ID when retried unchanged in the same attachment. The runner can deduplicate the admission. If input fails, its text returns to the editor and the error is shown.
 
