@@ -63,8 +63,6 @@ pub struct Workspace {
     pub cpu: String,
     pub memory: String,
     pub agent_enabled: bool,
-    #[serde(default)]
-    pub allow_sudo: bool,
     pub repositories: bool,
     pub catalog: Value,
     #[serde(default)]
@@ -106,9 +104,6 @@ pub struct CreateOptions {
     pub no_agent: bool,
     #[arg(long)]
     pub no_repositories: bool,
-    /// Allow passwordless sudo inside this coding workspace's container.
-    #[arg(long)]
-    pub allow_sudo: bool,
     #[arg(long)]
     pub catalog: Option<std::path::PathBuf>,
     /// Clone one public GitHub repository into this workspace.
@@ -201,10 +196,6 @@ impl CreateOptions {
             self.repo.is_none() || self.role != "bot",
             "--repo is only supported for coding workspaces"
         );
-        ensure!(
-            !(self.role == "bot" && self.allow_sudo),
-            "--allow-sudo is only supported for coding workspaces"
-        );
         let id = Uuid::new_v4().simple().to_string();
         let model = match &self.model {
             Some(model) => {
@@ -251,7 +242,6 @@ impl CreateOptions {
             cpu: self.cpu.clone(),
             memory: self.memory.clone(),
             agent_enabled: !self.no_agent,
-            allow_sudo: self.allow_sudo,
             repositories: self.catalog.is_some() && !self.no_repositories && self.role == "coding",
             catalog,
             repository: self.repo.clone(),
@@ -418,7 +408,7 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         json!({"name":"shm","emptyDir":{"medium":"Memory","sizeLimit":"256Mi"}}),
     ];
     let mut containers = vec![
-        json!({"name":"dev","image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/repos","securityContext":{"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true,"allowPrivilegeEscalation":w.allow_sudo,"capabilities":if w.allow_sudo{json!({"drop":["ALL"],"add":["CHOWN","DAC_OVERRIDE","FOWNER","SETGID","SETUID"]})}else{json!({"drop":["ALL"]})},"seccompProfile":{"type":"RuntimeDefault"}},"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"exec":{"command":["test","-d","/repos"]},"initialDelaySeconds":1,"periodSeconds":2}}),
+        json!({"name":"dev","image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/repos","securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"exec":{"command":["test","-d","/repos"]},"initialDelaySeconds":1,"periodSeconds":2}}),
     ];
     if w.repositories {
         volumes.push(json!({"name":"catalog","configMap":{"name":"repositories"}}));
@@ -430,6 +420,21 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     let network = json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":metadata(w,"workspace-isolation"),"spec":{"podSelector":{},"policyTypes":["Ingress","Egress"],"ingress":[{"from":[{"podSelector":{}}]}],"egress":[{"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}}}],"ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]},{"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.42.0.0/16","10.43.0.0/16","169.254.0.0/16"]}}]}]}});
     items.extend([claim, deployment, network]);
     Ok(json!({"apiVersion":"v1","kind":"List","items":items}))
+}
+
+/// Standard own-container administration profile for coding and bot workspace pods.
+pub fn workspace_security_context() -> Value {
+    json!({
+        "runAsUser": 1000,
+        "runAsGroup": 1000,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": true,
+        "capabilities": {
+            "drop": ["ALL"],
+            "add": ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+        },
+        "seccompProfile": {"type": "RuntimeDefault"}
+    })
 }
 
 pub fn verify_ownership(cli: &Cli, w: &Workspace) -> Result<()> {
@@ -726,7 +731,6 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.cpu == requested.cpu
         && existing.memory == requested.memory
         && existing.agent_enabled == requested.agent_enabled
-        && existing.allow_sudo == requested.allow_sudo
         && existing.repositories == requested.repositories
         && existing.catalog == requested.catalog
         && existing.repository == requested.repository

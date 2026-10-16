@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
-const image = process.argv[2] ?? "adm-dev:0.1.0";
+const image = process.argv[2] ?? "ghcr.io/nwylynko/agentic-dev-machines:latest";
 const container = `adm-image-smoke-${process.pid}`;
 let created = false;
 let failure;
@@ -295,8 +295,18 @@ try {
     "1000:1000",
     "--cap-drop",
     "ALL",
+    "--cap-add",
+    "CHOWN",
+    "--cap-add",
+    "DAC_OVERRIDE",
+    "--cap-add",
+    "FOWNER",
+    "--cap-add",
+    "SETGID",
+    "--cap-add",
+    "SETUID",
     "--security-opt",
-    "no-new-privileges",
+    "no-new-privileges:false",
     "--network",
     "none",
     image,
@@ -317,7 +327,14 @@ try {
   assert.equal(inspection.Config.User, "1000:1000");
   assert.equal(inspection.HostConfig.NetworkMode, "none");
   assert.deepEqual(inspection.HostConfig.CapDrop, ["ALL"]);
-  assert.ok(inspection.HostConfig.SecurityOpt.includes("no-new-privileges"));
+  assert.ok(inspection.HostConfig.SecurityOpt.includes("no-new-privileges:false"));
+  assert.deepEqual(inspection.HostConfig.CapAdd, [
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+    "CAP_SETGID",
+    "CAP_SETUID",
+  ]);
   assert.deepEqual(
     inspection.Mounts,
     [],
@@ -335,18 +352,14 @@ try {
     /^\s*GNU nano, version /,
     "nano should be available in every workspace image",
   );
-  const denied = await docker(
+  const root = await docker(
     "exec",
     container,
     "sh",
     "-c",
-    "if sudo -n id -u >/dev/null 2>&1; then exit 1; else echo escalation denied; fi",
+    "test \"$(sudo -n id -u)\" = 0 && sudo -n sh -c 'printf smoke > /etc/adm-image-smoke && test \"$(cat /etc/adm-image-smoke)\" = smoke && rm /etc/adm-image-smoke' && printf '%s\\n' 'sudo works'",
   );
-  assert.equal(
-    denied.stdout.trim(),
-    "escalation denied",
-    "default profile must block sudo escalation",
-  );
+  assert.equal(root.stdout.trim(), "sudo works");
 
   await docker(
     "exec",
