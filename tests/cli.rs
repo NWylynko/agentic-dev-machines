@@ -161,7 +161,6 @@ fn zsh_completions_load_and_complete_cli_commands_and_flags_offline() {
     fs::create_dir_all(root.path().join("config/adm")).unwrap();
     fs::write(root.path().join("config/adm/config.json"), "not json").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_adm"))
-        .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("ADM_STATE_DIR", root.path().join("state"))
@@ -193,14 +192,13 @@ fn zsh_completions_load_and_complete_cli_commands_and_flags_offline() {
         eprintln!("skipping interactive completion assertions because zsh is unavailable");
         return;
     }
-    let quoted_script_path = format!("{:?}", script_path.to_string_lossy());
     let driver = root.path().join("completion-test.zsh");
     fs::write(
         &driver,
         format!(
             r#"zmodload zsh/zpty
 zpty adm-completion zsh -f -i
-zpty -w adm-completion $'stty -echo\nautoload -Uz compinit\ncompinit -D\nsource {quoted_script_path}\ncompdef _adm adm\nfunction adm() {{ print -r -- "__ADM_RESULT__:$*"; }}\nprint __ADM_READY__\n'
+zpty -w adm-completion $'stty -echo\nautoload -Uz compinit\ncompinit -D\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() {{ print -r -- "__ADM_RESULT__:$*"; }}\nprint __ADM_READY__\n'
 zpty -r -m adm-completion output '*__ADM_READY__*'
 for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t'; do
   zpty -w adm-completion "$input"
@@ -213,8 +211,8 @@ zpty -d adm-completion
     )
     .unwrap();
     let zsh = Command::new("zsh")
-        .env("HOME", root.path())
         .env("ZDOTDIR", root.path())
+        .env("ADM_TEST_COMPLETION_SCRIPT", &script_path)
         .arg("-f")
         .arg(&driver)
         .output()
