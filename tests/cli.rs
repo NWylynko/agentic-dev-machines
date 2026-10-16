@@ -885,6 +885,9 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         "{}",
         String::from_utf8_lossy(&shell.stderr)
     );
+    let guidance = String::from_utf8_lossy(&shell.stderr);
+    assert!(guidance.contains("/repos/owner/project"), "{guidance}");
+    assert!(guidance.contains("private to this workspace"), "{guidance}");
     let args: Value =
         serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
     assert_eq!(
@@ -1064,6 +1067,73 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
             .get(workspace["namespace"].as_str().unwrap())
             .is_some(),
         "the namespace must remain while runner cancellation is unconfirmed"
+    );
+}
+
+#[test]
+fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
+    let root = fixture();
+    let created = adm(
+        root.path(),
+        &["create", "navigation", "--no-agent", "--no-repositories"],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let workspace: Value =
+        serde_json::from_slice(&created.stdout).expect("create keeps its workspace JSON on stdout");
+    assert_eq!(workspace["name"], "navigation");
+    let guidance = String::from_utf8_lossy(&created.stderr);
+    assert!(guidance.contains("/repos"), "{guidance}");
+    assert!(guidance.contains("clone"), "{guidance}");
+    assert!(guidance.contains("adm shell navigation"), "{guidance}");
+
+    let shell = adm(root.path(), &["shell", "navigation"]);
+    assert!(shell.status.success(), "{shell:?}");
+    let shell_guidance = String::from_utf8_lossy(&shell.stderr);
+    assert!(
+        shell_guidance.contains("empty writable directory"),
+        "{shell_guidance}"
+    );
+
+    let catalog = root.path().join("catalog.json");
+    fs::write(&catalog, r#"{"repositories":[]}"#).unwrap();
+    let catalog = adm(
+        root.path(),
+        &[
+            "create",
+            "catalog-navigation",
+            "--no-agent",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ],
+    );
+    assert!(catalog.status.success(), "{catalog:?}");
+    let catalog_guidance = String::from_utf8_lossy(&catalog.stderr);
+    assert!(
+        catalog_guidance.contains("Lazy catalog"),
+        "{catalog_guidance}"
+    );
+    assert!(
+        catalog_guidance.contains("cd /repos/OWNER/REPO"),
+        "{catalog_guidance}"
+    );
+
+    let command = [
+        "shell",
+        "navigation",
+        "--",
+        "printf",
+        "%s",
+        "argument with spaces",
+    ];
+    let opened = adm(root.path(), &command);
+    assert!(opened.status.success(), "{opened:?}");
+    let args: Value =
+        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
+    let actual = args.as_array().unwrap();
+    let command_start = actual.iter().position(|arg| arg == "--").unwrap() + 1;
+    assert_eq!(
+        &actual[command_start..],
+        ["printf", "%s", "argument with spaces"]
     );
 }
 

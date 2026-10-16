@@ -606,6 +606,8 @@ fn run(cli: &Cli) -> Result<()> {
                         workspace.name
                     );
                 }
+            } else {
+                eprintln!("{}", workspaces::navigation_guidance(&workspace, false));
             }
             print_json(&workspace)
         }
@@ -682,6 +684,9 @@ fn run(cli: &Cli) -> Result<()> {
                 "bots have no development shell or repository access"
             );
             workspaces::verify_ownership(cli, &workspace)?;
+            if command.is_empty() {
+                eprintln!("{}", workspaces::navigation_guidance(&workspace, true));
+            }
             if *manage {
                 let mut management = cli.runtime_command("shell-management")?;
                 management.env("KUBECONFIG", cli.kubeconfig_reference()?);

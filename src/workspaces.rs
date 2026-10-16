@@ -436,6 +436,39 @@ pub fn verify_ownership(cli: &Cli, w: &Workspace) -> Result<()> {
     Ok(())
 }
 
+pub fn navigation_guidance(workspace: &Workspace, shell_opened: bool) -> String {
+    let context = if shell_opened {
+        "adm: shell opened at"
+    } else {
+        "adm: work in"
+    };
+    if let Some(repository) = &workspace.repository {
+        format!(
+            "{context} {} (the {repository} checkout is writable and private to this workspace). The agent starts there.",
+            workspace.cwd
+        )
+    } else if workspace.repositories {
+        let shell = if shell_opened {
+            String::new()
+        } else {
+            format!(" Open a shell with `adm shell {}`.", workspace.name)
+        };
+        format!(
+            "{context} /repos. Lazy catalog: list entries with `ls /repos`, then enter one with `cd /repos/OWNER/REPO`.{shell}"
+        )
+    } else {
+        let action = if shell_opened {
+            " Clone a repository here to get started.".to_owned()
+        } else {
+            format!(
+                " Open it with `adm shell {}`, then clone a repository there.",
+                workspace.name
+            )
+        };
+        format!("{context} /repos, an empty writable directory.{action}")
+    }
+}
+
 pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
     let started = Instant::now();
     ensure!(
