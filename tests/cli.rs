@@ -1675,35 +1675,24 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
 }
 
 #[test]
-fn retrying_creation_cannot_change_the_workspace_sudo_choice() {
+fn failed_creation_retry_keeps_the_standard_workspace_security_policy() {
     let root = fixture();
     fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
 
     let first = adm(
         root.path(),
-        &[
-            "create",
-            "sudo-choice",
-            "--no-agent",
-            "--no-repositories",
-            "--allow-sudo",
-        ],
+        &["create", "sudo-choice", "--no-agent", "--no-repositories"],
     );
     assert!(!first.status.success());
     let saved = assert_ok(adm(root.path(), &["list", "--json"]));
-    assert_eq!(saved[0]["allow_sudo"], true);
+    let original_id = saved[0]["id"].clone();
 
-    let retry = adm(
+    let retry = assert_ok(adm(
         root.path(),
         &["create", "sudo-choice", "--no-agent", "--no-repositories"],
-    );
-    assert!(!retry.status.success());
-    assert!(String::from_utf8_lossy(&retry.stderr).contains("different options"));
-    assert_eq!(
-        assert_ok(adm(root.path(), &["list", "--json"]))[0]["allow_sudo"],
-        true,
-        "retry must not silently downgrade or rewrite the persisted security choice"
-    );
+    ));
+    assert_eq!(retry["id"], original_id);
+    assert_eq!(retry["phase"], "ready");
 }
 
 #[test]
@@ -2077,7 +2066,7 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
 }
 
 #[test]
-fn manifest_exposes_only_a_deprivileged_development_container_and_isolated_storage() {
+fn manifest_gives_the_workspace_unattended_container_administration() {
     let root = tempfile::tempdir().unwrap();
     let manifest = assert_ok(adm(root.path(), &["manifest", "example"]));
     let items = manifest["items"].as_array().unwrap();
@@ -2094,8 +2083,19 @@ fn manifest_exposes_only_a_deprivileged_development_container_and_isolated_stora
         None,
         "Kubernetes must preserve the workspace image's tini entrypoint so it forwards termination signals"
     );
-    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], false);
+    assert_eq!(dev["securityContext"]["runAsUser"], 1000);
+    assert_eq!(dev["securityContext"]["runAsGroup"], 1000);
+    assert_eq!(dev["securityContext"]["runAsNonRoot"], true);
+    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
     assert_eq!(dev["securityContext"]["capabilities"]["drop"][0], "ALL");
+    assert_eq!(
+        dev["securityContext"]["capabilities"]["add"],
+        serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
+    );
+    assert_eq!(
+        dev["securityContext"]["seccompProfile"]["type"],
+        "RuntimeDefault"
+    );
     assert!(
         items
             .iter()
@@ -2108,137 +2108,22 @@ fn manifest_exposes_only_a_deprivileged_development_container_and_isolated_stora
 }
 
 #[test]
-fn allow_sudo_is_an_explicit_coding_workspace_security_choice() {
+fn sudo_is_the_standard_workspace_policy_and_has_no_opt_in_flag() {
     let root = tempfile::tempdir().unwrap();
-    let normal = assert_ok(adm(root.path(), &["manifest", "normal"]));
-    let opted = adm(root.path(), &["manifest", "packages", "--allow-sudo"]);
+    let manifest = assert_ok(adm(root.path(), &["manifest", "normal"]));
+    let forbidden = adm(root.path(), &["manifest", "normal", "--allow-sudo"]);
     assert!(
-        opted.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&opted.stdout),
-        String::from_utf8_lossy(&opted.stderr)
+        !forbidden.status.success(),
+        "the obsolete opt-in flag must be removed"
     );
-    let opted: Value = serde_json::from_slice(&opted.stdout).unwrap();
-
-    let dev = |manifest: &Value| {
-        let deployment = manifest["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|item| item["kind"] == "Deployment")
-            .unwrap();
-        deployment["spec"]["template"]["spec"]["containers"][0].clone()
-    };
-    let normal_dev = dev(&normal);
-    assert_eq!(
-        normal_dev["securityContext"]["allowPrivilegeEscalation"],
-        false
-    );
-    assert_eq!(
-        normal_dev["securityContext"]["capabilities"]["drop"],
-        serde_json::json!(["ALL"])
-    );
-    assert_eq!(
-        normal_dev["securityContext"]["capabilities"]["add"],
-        Value::Null
-    );
-
-    let opted_dev = dev(&opted);
-    assert_eq!(opted_dev["securityContext"]["runAsUser"], 1000);
-    assert_eq!(
-        opted_dev["securityContext"]["allowPrivilegeEscalation"],
-        true
-    );
-    assert_eq!(
-        opted_dev["securityContext"]["capabilities"]["drop"],
-        serde_json::json!(["ALL"])
-    );
-    assert_eq!(
-        opted_dev["securityContext"]["capabilities"]["add"],
-        serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
-    );
-    assert_eq!(
-        opted_dev["securityContext"]["seccompProfile"]["type"],
-        "RuntimeDefault"
-    );
-    let pod = &opted["items"]
+    assert!(String::from_utf8_lossy(&forbidden.stderr).contains("unexpected argument"));
+    let dev = &manifest["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|item| item["kind"] == "Deployment")
-        .unwrap()["spec"]["template"]["spec"];
-    assert_eq!(pod["automountServiceAccountToken"], false);
-    assert_eq!(pod["containers"].as_array().unwrap().len(), 1);
-
-    let bot = adm(
-        root.path(),
-        &["manifest", "bot", "--role", "bot", "--allow-sudo"],
-    );
-    assert!(!bot.status.success(), "bots must reject workspace sudo");
-    assert!(String::from_utf8_lossy(&bot.stderr).contains("coding workspaces"));
-
-    let persistent = fixture();
-    let created = assert_ok(adm(
-        persistent.path(),
-        &[
-            "create",
-            "package-workspace",
-            "--no-agent",
-            "--no-repositories",
-            "--allow-sudo",
-        ],
-    ));
-    assert_eq!(created["allow_sudo"], true);
-    let listed = assert_ok(adm(persistent.path(), &["list", "--json"]));
-    assert_eq!(listed[0]["allow_sudo"], true);
-}
-
-#[test]
-fn workspaces_created_before_allow_sudo_default_to_the_restricted_profile() {
-    let root = tempfile::tempdir().unwrap();
-    let state = root.path().join("state");
-    fs::create_dir_all(&state).unwrap();
-    let database = rusqlite::Connection::open(state.join("workspaces.sqlite")).unwrap();
-    database
-        .execute_batch(
-            "CREATE TABLE workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,phase TEXT NOT NULL,spec TEXT NOT NULL);",
-        )
-        .unwrap();
-    let old_spec = serde_json::json!({
-        "id":"legacy-workspace",
-        "name":"legacy-workspace",
-        "role":"coding",
-        "namespace":"adm-legacy-workspace",
-        "phase":"ready",
-        "image":"adm-dev:0.1.0",
-        "storage_class":"adm-replicated",
-        "storage_size":"4Gi",
-        "cpu":"2",
-        "memory":"2Gi",
-        "agent_enabled":false,
-        "repositories":false,
-        "catalog":{"repositories":[]},
-        "model":null,
-        "allowed_agents":[],
-        "herdr_space":null,
-        "created_at":1,
-        "last_error":null
-    });
-    database
-        .execute(
-            "INSERT INTO workspaces(id,name,phase,spec) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![
-                "legacy-workspace",
-                "legacy-workspace",
-                "ready",
-                old_spec.to_string()
-            ],
-        )
-        .unwrap();
-    drop(database);
-
-    let listed = assert_ok(adm(root.path(), &["list", "--json"]));
-    assert_eq!(listed[0]["allow_sudo"], false);
+        .unwrap()["spec"]["template"]["spec"]["containers"][0];
+    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
 }
 
 #[test]

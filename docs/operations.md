@@ -77,17 +77,17 @@ Use `--no-agent` for a shell-only workspace. By default `/repos` is an ordinary 
 
 Use `adm shell NAME --manage` when you also need the current agent controls from inside that shell. The private `adm` client supports `adm status [--json]`, `adm history [--after N] [--limit N]`, `adm prompt MESSAGE`, `adm abort [--background]`, and `adm help`. History defaults to 200 entries; its response limit is 1 MiB, so use a smaller `--limit` if it reports an oversized response. It can address only the workspace selected on the management host; workspace IDs, host state, credentials, and the runner URL are not passed into the development container. Same-workspace processes can use the allowed actions while the managed session is open. Closing the shell closes the temporary management relay and leaves the agent running. The ordinary `adm shell NAME` path does not start a relay. Use the management host for `adm list`, creation/deletion, port forwarding, `exec`, and other workspace operations.
 
-The updated workspace image includes `nano` and `sudo`. If you saved an older image selection, choose the image listed in the new release notes with `--image IMAGE`; updating the CLI does not replace existing Pods or that saved selection. Add `--allow-sudo` when creating a coding workspace to permit passwordless `sudo` for package installation inside its development container:
+The workspace image includes `nano` and passwordless `sudo`. New coding workspaces permit unattended administration inside their own container by default:
 
 ```sh
-adm create package-workspace --no-agent --allow-sudo
+adm create package-workspace --no-agent
 adm shell package-workspace
 # Inside the workspace shell:
 sudo apt-get update
 sudo apt-get install -y ripgrep
 ```
 
-The workspace and ordinary commands still run as UID 1000. This option grants a limited set of container capabilities needed by sudo and apt; it does not grant host access or a service-account token. Bots cannot use it. Installed packages and other operating-system changes live in the replaceable container and disappear when Kubernetes replaces its Pod. Repository files, Git state, and agent history follow their separate persistence rules. Existing workspaces keep their current security profile; unfinished workspaces cannot resume with different creation options.
+The workspace and ordinary commands still run as UID 1000. The container gets the capabilities needed for sudo and apt; it does not grant host access or a service-account token. Bots use the same profile when TASK-22 provides their workspace Pods. Installed packages and other operating-system changes live in the replaceable container and disappear when Kubernetes replaces its Pod. Repository files, Git state, and agent history follow their separate persistence rules.
 
 To seed the catalog without cloning repository contents:
 
@@ -98,7 +98,7 @@ adm create my-project --catalog /tmp/adm-catalog.json --model PROVIDER/MODEL_ID
 
 Discovery authenticates `gh` on the management host. Fetching private repository contents also requires a scoped Git credential mechanism in the repository container; this is an operator prerequisite, not something the discovery JSON supplies. Credentials must not appear in remote URLs. No eager-clone fallback is used when an upstream lacks filtering support. A failed acquisition stays retryable after its cause is fixed.
 
-The repository service requires FUSE, mount propagation, and a Linux kernel supporting unique mount identities (`STATX_MNT_ID_UNIQUE`, available since Linux 6.8 according to [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html)). It fails clearly when that support is unavailable. The repository sidecar currently has elevated mount authority; the `dev` container drops all capabilities by default; `--allow-sudo` adds the restricted set described above. It receives neither a service-account token nor management-host credentials. Treat the sidecar as a separate trusted component. The immutable-upstream cache is optional and must be mounted read-only; each workspace's Git state and writable files remain private.
+The repository service requires FUSE, mount propagation, and a Linux kernel supporting unique mount identities (`STATX_MNT_ID_UNIQUE`, available since Linux 6.8 according to [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html)). It fails clearly when that support is unavailable. The repository sidecar currently has elevated mount authority; the `dev` container has the standard own-container administration profile while retaining UID 1000 for ordinary work. It receives neither a service-account token nor management-host credentials. Treat the sidecar as a separate trusted component. The immutable-upstream cache is optional and must be mounted read-only; each workspace's Git state and writable files remain private.
 
 ## Find your repositories
 
