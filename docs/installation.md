@@ -52,6 +52,25 @@ sh /tmp/adm-install.sh --version v0.1.0 --no-setup
 
 The installer refuses to overwrite an existing unmanaged `adm` or `adm-repositories` command. For an older manual installation, stop its runner, move those executables aside, install, then run `adm setup` to replace any checkout-based service. Keep the existing state directory. This migrates the runtime without moving your workspaces.
 
+## zsh completions
+
+Generate the completion file with the installed `adm` and add its directory to zsh's function path:
+
+```sh
+mkdir -p ~/.zfunc
+adm completions zsh > ~/.zfunc/_adm
+```
+
+Add these lines to `~/.zshrc` (or merge them with an existing completion setup), then open a new shell or run `source ~/.zshrc`:
+
+```zsh
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit
+compinit
+```
+
+After upgrading `adm`, regenerate `~/.zfunc/_adm` with `adm completions zsh > ~/.zfunc/_adm` to pick up new commands and options. The command prints the script to standard output and does not edit shell configuration.
+
 ## Developing from source
 
 Contributors still use the checkout with Node.js 24+, Rust, and Go as pinned in `packages/repositories/go.mod`:
