@@ -88,6 +88,10 @@ adm create supervisor --role bot --model PROVIDER/MODEL_ID --allow-agent CODING_
 adm attach supervisor
 ```
 
+Bots execute their model and tools in the long-running management-host runner. Their Kubernetes namespace intentionally has no workspace Pod. Creation reports this location on stderr while stdout remains the workspace JSON. `adm status supervisor` identifies the management host and distinguishes a reachable agent from an unavailable runner; `adm inspect supervisor` provides detailed diagnostics.
+
+On that host, inspect a service runner with `systemctl --user show adm-runner.service -p MainPID -p ActiveState` and `journalctl --user -u adm-runner.service`. A runner launched by `adm start` writes `runner.pid` and `runner.log` in the ADM state directory (default `$XDG_DATA_HOME/adm`, or `~/.local/share/adm`). Registration and conversations are under `runner/workspaces.json` and `runner/sessions/ID/session.sqlite`. Use the same `--state-dir` and `--runner-url` as the owning runner when inspecting it.
+
 New bot conversations start one durable setup turn. The bot asks for an identity and purpose and publishes the setup question through `sendMessage`; its saved profile appears in future model instructions and survives runner restarts. Existing bot conversations without a profile are left unchanged during upgrade. Ordinary model output remains private in diagnostics.
 
 MCP access is configured by the host with a nonsecret JSON file that grants exact stdio server tools. Environment values are looked up by reference in the runner process and passed only to that MCP server; the runner does not pass its other environment through.

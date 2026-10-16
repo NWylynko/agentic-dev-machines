@@ -20,23 +20,26 @@ await writeFile(
   `#!/usr/bin/env python3
 import json, pathlib, sys
 path = pathlib.Path(__file__).parent / 'cluster.json'
-state = json.loads(path.read_text()) if path.exists() else {}
+state = json.loads(path.read_text()) if path.exists() else {'namespaces': {}, 'resources': []}
 args = sys.argv[1:]
 if args[:2] == ['get', 'storageclass']:
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
 elif args[0] == 'apply':
     doc=json.load(sys.stdin)
     for item in doc['items']:
-        if item['kind']=='Namespace': state[item['metadata']['name']]=item
+        state['resources'].append(item)
+        if item['kind']=='Namespace': state['namespaces'][item['metadata']['name']]=item
     path.write_text(json.dumps(state)); print('applied')
 elif args[:2] == ['get','namespace']:
-    if args[2] in state: print(json.dumps(state[args[2]]))
+    if args[2] in state['namespaces']: print(json.dumps(state['namespaces'][args[2]]))
     else: print('Error from server (NotFound): namespaces not found',file=sys.stderr);sys.exit(1)
 elif args[:2] == ['delete','namespace']:
-    state.pop(args[2],None);path.write_text(json.dumps(state)); print('deleted')
+    state['namespaces'].pop(args[2],None);path.write_text(json.dumps(state)); print('deleted')
 elif args[0] == 'wait': print('condition met')
 elif args[:2] == ['get','pods']:
-    print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':{'phase':'Running'}}]}))
+    namespace = args[args.index('-n')+1] if '-n' in args else None
+    pods = [item for item in state['resources'] if item['kind']=='Pod' and (namespace is None or item.get('metadata',{}).get('namespace')==namespace)]
+    print(json.dumps({'items':pods}))
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
 `,
 );
@@ -141,7 +144,19 @@ try {
       },
     );
   const cli = async (args) => JSON.parse((await runCli(args)).stdout);
-  const bot = await cli([
+  const disabled = await runCli([
+    "create",
+    "shell-bot",
+    "--role",
+    "bot",
+    "--no-agent",
+  ]);
+  const shellBot = JSON.parse(disabled.stdout);
+  assert.equal(shellBot.agent_enabled, false);
+  assert.match(disabled.stderr, /no enabled agent/);
+  assert.doesNotMatch(disabled.stderr, /management-host runner/);
+  await cli(["destroy", "shell-bot"]);
+  const created = await runCli([
     "create",
     "fixture-bot",
     "--role",
@@ -151,6 +166,35 @@ try {
     "--mcp-config",
     mcpConfig,
   ]);
+  const bot = JSON.parse(created.stdout);
+  assert.match(created.stderr, /management-host runner/);
+  assert.match(created.stderr, /namespace.*no.*Pod/i);
+  assert.ok(created.stderr.includes("adm attach fixture-bot"));
+  const cluster = JSON.parse(
+    await readFile(join(root, "cluster.json"), "utf8"),
+  );
+  assert.deepEqual(
+    cluster.resources.map(({ kind }) => kind),
+    ["Namespace", "Namespace"],
+    "bot creation applies only a Kubernetes namespace, never a Pod or workload",
+  );
+  const pods = await exec(kubectl, [
+    "get",
+    "pods",
+    "-n",
+    bot.namespace,
+    "-o",
+    "json",
+  ]);
+  assert.deepEqual(JSON.parse(pods.stdout).items, []);
+  const healthyStatus = (await runCli(["status", "fixture-bot"])).stdout;
+  assert.match(healthyStatus, /management host/);
+  assert.doesNotMatch(healthyStatus, /Agent unavailable/);
+  const offlineStatus = (
+    await runCli(["status", "fixture-bot"], "http://127.0.0.1:1")
+  ).stdout;
+  assert.match(offlineStatus, /management host/);
+  assert.match(offlineStatus, /Agent unavailable/);
   const table = (await runCli(["list"], "http://127.0.0.1:1")).stdout;
   assert.match(table, /NAME\s+ROLE\s+PHASE\s+AGENT\s+ID/);
   assert.match(
@@ -166,6 +210,40 @@ try {
     signal: AbortSignal.timeout(10_000),
   });
   assert.equal(watch.status, 200);
+  const diagnosticWatch = await fetch(
+    `${url}/v1/workspaces/${bot.id}/events?diagnostics=true`,
+    {
+      signal: AbortSignal.timeout(10_000),
+    },
+  );
+  assert.equal(diagnosticWatch.status, 200);
+  const diagnosticAnswer = (async () => {
+    const reader = diagnosticWatch.body.getReader();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffer += Buffer.from(value).toString();
+      for (;;) {
+        const end = buffer.indexOf("\n\n");
+        if (end < 0) break;
+        const frame = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        const data = frame
+          .split("\n")
+          .find((line) => line.startsWith("data: "));
+        if (!data) continue;
+        const event = JSON.parse(data.slice(6));
+        if (
+          event.kind === "assistant" &&
+          event.data.text.includes("Private diagnostic.")
+        ) {
+          await reader.cancel();
+          return event;
+        }
+      }
+    }
+  })();
   const firstMessage = (async () => {
     let buffer = "";
     for await (const bytes of watch.body) {
@@ -208,6 +286,27 @@ try {
   );
   const published = await firstMessage;
   assert.equal(published.data.text, "Prompt without request ID was delivered.");
+  await diagnosticAnswer;
+  const publicHistory = await fetch(
+    `${url}/v1/workspaces/${bot.id}/history?diagnostics=false`,
+  ).then((response) => response.json());
+  const diagnosticHistory = await fetch(
+    `${url}/v1/workspaces/${bot.id}/history?diagnostics=true`,
+  ).then((response) => response.json());
+  assert.ok(publicHistory.events.some((event) => event.kind === "message"));
+  assert.ok(
+    publicHistory.events.every((event) =>
+      ["user", "message", "status"].includes(event.kind),
+    ),
+    "ordinary bot history excludes diagnostic assistant records",
+  );
+  assert.ok(
+    diagnosticHistory.events.some(
+      (event) =>
+        event.kind === "assistant" && event.data.text === "Private diagnostic.",
+    ),
+    "diagnostic history opts in to the assistant record",
+  );
 
   const explicitMessage =
     "/faux " +

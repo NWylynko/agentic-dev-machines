@@ -531,7 +531,27 @@ fn print_inspect(status: &Value) -> Result<()> {
 
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
-        Action::Create(options) => print_json(&workspaces::create(cli, options)?),
+        Action::Create(options) => {
+            let workspace = workspaces::create(cli, options)?;
+            if workspace.role == "bot" {
+                if workspace.agent_enabled {
+                    eprintln!(
+                        "adm: bot {} runs in the management-host runner at {}. Its namespace has no workspace Pod.",
+                        workspace.name, cli.runner_url
+                    );
+                    eprintln!(
+                        "adm: use `adm attach {}` for chat or `adm inspect {}` for diagnostics on the management host.",
+                        workspace.name, workspace.name
+                    );
+                } else {
+                    eprintln!(
+                        "adm: bot {} has no enabled agent. Its namespace has no workspace Pod.",
+                        workspace.name
+                    );
+                }
+            }
+            print_json(&workspace)
+        }
         Action::Manifest(options) => print_json(&workspaces::manifest(&options.workspace()?)?),
         Action::List { all, json } => {
             let items = cli.store()?.list(*all)?;
