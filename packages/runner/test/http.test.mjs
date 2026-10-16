@@ -875,10 +875,15 @@ process.stdin.on("data", (chunk) => {
       true,
     );
     assert.equal(disconnected.data.isError, false);
-    assert.match(
-      (await runner.request(disconnectPath)).body.error,
-      /disconnected/i,
-    );
+    // A successful reply precedes the server process closing its transport.
+    // Observe that independent close before checking its retained diagnostic.
+    const closeDeadline = Date.now() + 5000;
+    let disconnectedStatus = await runner.request(disconnectPath);
+    while (!disconnectedStatus.body.error && Date.now() < closeDeadline) {
+      await new Promise(setImmediate);
+      disconnectedStatus = await runner.request(disconnectPath);
+    }
+    assert.match(disconnectedStatus.body.error ?? "", /disconnected/i);
     const laterInput = await runner.request(disconnectPath + "/input", "POST", {
       message: "later work",
       requestId: "after-mcp-disconnect",
