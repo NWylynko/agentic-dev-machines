@@ -22,7 +22,9 @@ RUN npx esbuild packages/runner/src/remote-env-server.ts --bundle --platform=nod
 FROM node:24.18.0-bookworm
 COPY LICENSE /usr/share/licenses/adm/LICENSE
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bash ca-certificates git tini fuse3 chromium \
+ && apt-get install -y --no-install-recommends bash ca-certificates git tini fuse3 chromium nano sudo \
+ && printf '#1000 ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/adm \
+ && chmod 0440 /etc/sudoers.d/adm \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=go-build /out/adm-repositories /usr/local/bin/adm-repositories
 COPY --from=go-build /go/bin/artifact-fs /usr/local/bin/artifact-fs

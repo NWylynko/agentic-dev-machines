@@ -77,6 +77,15 @@ Use `--no-agent` for a shell-only workspace. By default `/repos` is an ordinary 
 
 Use `adm shell NAME --manage` when you also need the current agent controls from inside that shell. The private `adm` client supports `adm status [--json]`, `adm history [--after N] [--limit N]`, `adm prompt MESSAGE`, `adm abort [--background]`, and `adm help`. History defaults to 200 entries; its response limit is 1 MiB, so use a smaller `--limit` if it reports an oversized response. It can address only the workspace selected on the management host; workspace IDs, host state, credentials, and the runner URL are not passed into the development container. Same-workspace processes can use the allowed actions while the managed session is open. Closing the shell closes the temporary management relay and leaves the agent running. The ordinary `adm shell NAME` path does not start a relay. Use the management host for `adm list`, creation/deletion, port forwarding, `exec`, and other workspace operations.
 
+Coding workspace images include `nano`. Add `--allow-sudo` when creating a coding workspace to permit passwordless `sudo` for package installation inside its development container:
+
+```sh
+adm create package-workspace --no-agent --allow-sudo
+```
+
+The workspace and ordinary commands still run as UID 1000. This option grants a limited set of container capabilities needed by sudo and apt; it does not grant host access or a service-account token. Bots cannot use it. Installed packages and other operating-system changes live in the replaceable container and disappear when Kubernetes replaces its Pod. Repository files, Git state, and agent history follow their separate persistence rules. Existing workspaces keep their current security profile; unfinished workspaces cannot resume with different creation options.
+
+
 ```sh
 adm-repositories discover --owner example-owner > /tmp/adm-catalog.json
 adm create my-project --catalog /tmp/adm-catalog.json --model PROVIDER/MODEL_ID
