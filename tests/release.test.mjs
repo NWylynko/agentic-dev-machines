@@ -116,6 +116,17 @@ test(
       await readFile(join(installed, "VERSION"), "utf8"),
       "v9.8.7\n",
     );
+    assert.ok(
+      (
+        await readFile(join(installed, "runtime/shell-management.mjs"), "utf8")
+      ).includes("adm-manage-"),
+      "the installed runtime includes the managed shell relay entrypoint",
+    );
+    await execute(
+      process.execPath,
+      [join(project, "tests/shell-management.test.mjs"), adm],
+      { cwd: unrelated, env: environment, maxBuffer: 1024 * 1024 },
+    );
     assert.equal(
       await readFile(join(installed, "IMAGE"), "utf8"),
       "ghcr.io/example/adm:9.8.7\n",

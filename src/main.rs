@@ -72,6 +72,9 @@ pub enum Action {
     /// Open a development shell. Terminal exit does not destroy the space.
     Shell {
         name: String,
+        /// Expose current-workspace status, history, prompt, and abort inside this shell.
+        #[arg(long)]
+        manage: bool,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -179,6 +182,10 @@ impl Cli {
         command.current_dir(&self.project_dir);
         if self.project_dir.join("runtime").is_dir() {
             command.arg(self.checkout_file(&format!("runtime/{component}.mjs"))?);
+        } else if component == "shell-management" {
+            command
+                .args(["--import", "tsx"])
+                .arg(self.checkout_file("packages/runner/src/shell-management.ts")?);
         } else {
             command
                 .args(["--import", "tsx"])
@@ -569,13 +576,38 @@ fn run(cli: &Cli) -> Result<()> {
             anyhow::ensure!(status.success(), "terminal exited with {status}");
             Ok(())
         }
-        Action::Shell { name, command } | Action::Exec { name, command } => {
+        Action::Shell {
+            name,
+            manage,
+            command,
+        } => {
             let workspace = cli.store()?.active(name)?;
             anyhow::ensure!(
                 workspace.role == "coding",
                 "bots have no development shell or repository access"
             );
             workspaces::verify_ownership(cli, &workspace)?;
+            if *manage {
+                let mut management = cli.runtime_command("shell-management")?;
+                management.args([
+                    "--kubectl",
+                    &cli.kubectl,
+                    "--namespace",
+                    &workspace.namespace,
+                    "--workspace-id",
+                    &workspace.id,
+                    "--runner-url",
+                    &cli.runner_url,
+                ]);
+                if !command.is_empty() {
+                    management.arg("--").args(command);
+                }
+                let status = management
+                    .status()
+                    .context("start current-workspace management shell")?;
+                anyhow::ensure!(status.success(), "managed shell exited with {status}");
+                return Ok(());
+            }
             let mut child = Command::new(&cli.kubectl);
             child.args([
                 "exec",
@@ -585,9 +617,7 @@ fn run(cli: &Cli) -> Result<()> {
                 "-c",
                 "dev",
             ]);
-            if matches!(&cli.command, Action::Shell { .. }) {
-                child.arg("-it");
-            }
+            child.arg("-it");
             child.arg("--");
             if command.is_empty() {
                 let working_directory = "/repos";
@@ -603,6 +633,29 @@ fn run(cli: &Cli) -> Result<()> {
                 child.args(command);
             }
             let status = child.status().context("connect to development container")?;
+            anyhow::ensure!(status.success(), "remote command exited with {status}");
+            Ok(())
+        }
+        Action::Exec { name, command } => {
+            let workspace = cli.store()?.active(name)?;
+            anyhow::ensure!(
+                workspace.role == "coding",
+                "bots have no development shell or repository access"
+            );
+            workspaces::verify_ownership(cli, &workspace)?;
+            let status = Command::new(&cli.kubectl)
+                .args([
+                    "exec",
+                    "-n",
+                    &workspace.namespace,
+                    "deployment/workspace",
+                    "-c",
+                    "dev",
+                    "--",
+                ])
+                .args(command)
+                .status()
+                .context("run command in development container")?;
             anyhow::ensure!(status.success(), "remote command exited with {status}");
             Ok(())
         }

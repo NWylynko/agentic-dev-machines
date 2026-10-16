@@ -565,6 +565,22 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
 }
 
 #[test]
+fn managed_shell_client_is_scoped_and_closes_without_aborting_the_agent() {
+    let output = Command::new("node")
+        .arg("tests/shell-management.test.mjs")
+        .arg(env!("CARGO_BIN_EXE_adm"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run managed shell public CLI scenario");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn public_cli_rejects_unsafe_names_before_touching_the_cluster() {
     let root = tempfile::tempdir().unwrap();
     for name in ["../escape", "UPPER", "a/b", "", "bad name"] {

@@ -57,6 +57,7 @@ For a deliberately node-local experiment, use `--storage-class local-path --allo
 adm create my-project --model PROVIDER/MODEL_ID
 adm attach my-project
 adm shell my-project
+adm shell my-project --manage
 adm prompt my-project 'Inspect the repository and describe its current state.'
 adm list
 adm status my-project
@@ -68,6 +69,8 @@ adm inspect my-project
 Use `--no-agent` for a shell-only workspace. By default `/repos` is an ordinary writable directory, so normal cloning works. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. To seed the catalog without cloning repository contents:
 
 `adm shell NAME` opens a login shell at the public `/repos` path. For a catalog workspace, `pwd -P` may show its backing storage path under `/workspace/.adm`; that is the same directory through the `/repos` view. Commands supplied to `adm shell NAME -- COMMAND...` or `adm exec` run as given and keep their own working-directory behavior.
+
+Use `adm shell NAME --manage` when you also need the current agent controls from inside that shell. The private `adm` client supports `adm status [--json]`, `adm history [--after N] [--limit N]`, `adm prompt MESSAGE`, `adm abort [--background]`, and `adm help`. History defaults to 200 entries; its response limit is 1 MiB, so use a smaller `--limit` if it reports an oversized response. It can address only the workspace selected on the management host; workspace IDs, host state, credentials, and the runner URL are not passed into the development container. Same-workspace processes can use the allowed actions while the managed session is open. Closing the shell closes the temporary management relay and leaves the agent running. The ordinary `adm shell NAME` path does not start a relay. Use the management host for `adm list`, creation/deletion, port forwarding, `exec`, and other workspace operations.
 
 ```sh
 adm-repositories discover --owner example-owner > /tmp/adm-catalog.json

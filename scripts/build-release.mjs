@@ -62,6 +62,10 @@ try {
     entryPoints: {
       runner: join(project, "packages/runner/src/main.ts"),
       terminal: join(project, "packages/terminal/src/main.ts"),
+      "shell-management": join(
+        project,
+        "packages/runner/src/shell-management.ts",
+      ),
     },
     outdir: join(staging, "runtime"),
     outExtension: { ".js": ".mjs" },
