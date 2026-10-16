@@ -150,6 +150,7 @@ export class Workspace {
     authPath?: string,
     lookup?: (id: string) => Promise<Workspace>,
     passive = false,
+    deferActivation = false,
   ): Promise<Workspace> {
     if (!passive) await assertActive();
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -192,109 +193,141 @@ export class Workspace {
     let kubeEnv: KubernetesExecutionEnv | undefined;
     let sandbox: CodemodeSandbox | undefined;
     let mcp: Awaited<ReturnType<typeof openMcpExtension>> | undefined;
-    if (config.role === "coding") {
-      registry.install(CodingTools);
-      if (config.environment === "local") {
-        await mkdir(config.localRoot!, { recursive: true });
-        localEnv = new NodeExecutionEnv({ cwd: config.localRoot! });
-      } else if (!passive) {
-        kubeEnv = new KubernetesExecutionEnv({
-          kubectl: config.kubectl ?? "kubectl",
-          namespace: config.namespace!,
-          container: config.container ?? "dev",
-          cwd: config.cwd ?? "/repos",
-          script: config.remoteEnv ?? defaultRemoteEnv,
-        });
+    let closeOpenedState: (() => Promise<void>) | undefined;
+    try {
+      if (config.role === "coding") {
+        registry.install(CodingTools);
+        if (config.environment === "local") {
+          await mkdir(config.localRoot!, { recursive: true });
+          localEnv = new NodeExecutionEnv({ cwd: config.localRoot! });
+        } else if (!passive) {
+          kubeEnv = new KubernetesExecutionEnv({
+            kubectl: config.kubectl ?? "kubectl",
+            namespace: config.namespace!,
+            container: config.container ?? "dev",
+            cwd: config.cwd ?? "/repos",
+            script: config.remoteEnv ?? defaultRemoteEnv,
+          });
+        }
       }
-    }
-    if (config.role === "bot") {
-      if (!passive && config.mcpServers?.length) {
-        mcp = await openMcpExtension(config, assertActive, recordMcpError);
-        registry.install(mcp.extension);
+      if (config.role === "bot") {
+        if (!passive && config.mcpServers?.length) {
+          mcp = await openMcpExtension(config, assertActive, recordMcpError);
+          registry.install(mcp.extension);
+        }
+        sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });
+        registry.install(botExtension(config, assertActive, lookup!));
+        registry.install(createCodemodeExtension({ sandbox, models: false }));
       }
-      sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });
-      registry.install(botExtension(config, assertActive, lookup!));
-      registry.install(createCodemodeExtension({ sandbox, models: false }));
-    }
-    registry.install(
-      defineExtension({
-        name: "workspace-lifecycle",
-        hooks: [
-          hook(ToolTask, {
-            beforeTool: async () => {
-              await assertActive();
-              return undefined;
-            },
-          }),
-          hook(GenerationTask, {
-            beforeRequest: async () => {
-              await assertActive();
-              return undefined;
-            },
-            afterResponse: async (message) => {
-              reportedError =
-                message.stopReason === "error"
-                  ? (message.errorMessage ?? "The provider request failed")
-                  : undefined;
-              if (openedWorkspace) openedWorkspace.lastError = reportedError;
-            },
-          }),
-        ],
-      }),
-    );
-    const execution: ExecutionEnv | undefined = localEnv ?? kubeEnv;
-    const databasePath = join(directory, "session.sqlite");
-    const storage = await openNodeSqliteStorage(databasePath);
-    await chmod(databasePath, 0o600);
-    const harness = await Harness.open(
-      storage,
-      {
-        models: await workspaceModels(config.model?.provider, authPath),
-        registry,
-        ...(execution ? { env: () => execution } : {}),
-        onReport: recordError,
-      },
-      context,
-    );
-    const conversation = await harness.root(context, {
-      agent: config.model
-        ? {
-            model: {
-              provider: config.model.provider,
-              modelId: config.model.id,
-            },
-          }
-        : {},
-      init:
-        config.role === "bot"
-          ? async (tx, conversationId) => {
-              const profile = await tx.doc(BotProfileDocument, conversationId);
-              profile.state = "collecting";
-              profile.approvedToolGrants = (config.mcpServers ?? []).flatMap(
-                (server) => server.tools.map((tool) => `${server.id}:${tool}`),
-              );
+      registry.install(
+        defineExtension({
+          name: "workspace-lifecycle",
+          hooks: [
+            hook(ToolTask, {
+              beforeTool: async () => {
+                await assertActive();
+                return undefined;
+              },
+            }),
+            hook(GenerationTask, {
+              beforeRequest: async () => {
+                await assertActive();
+                return undefined;
+              },
+              afterResponse: async (message) => {
+                reportedError =
+                  message.stopReason === "error"
+                    ? (message.errorMessage ?? "The provider request failed")
+                    : undefined;
+                if (openedWorkspace) openedWorkspace.lastError = reportedError;
+              },
+            }),
+          ],
+        }),
+      );
+      const execution: ExecutionEnv | undefined = localEnv ?? kubeEnv;
+      const databasePath = join(directory, "session.sqlite");
+      const storage = await openNodeSqliteStorage(databasePath);
+      closeOpenedState = () => storage.close(context);
+      await chmod(databasePath, 0o600);
+      const harness = await Harness.open(
+        storage,
+        {
+          models: await workspaceModels(config.model?.provider, authPath),
+          registry,
+          ...(execution ? { env: () => execution } : {}),
+          onReport: recordError,
+        },
+        context,
+      );
+      closeOpenedState = () => harness.close(context);
+      const conversation = await harness.root(context, {
+        agent: config.model
+          ? {
+              model: {
+                provider: config.model.provider,
+                modelId: config.model.id,
+              },
             }
-          : undefined,
-    });
-    const workspace = new Workspace(
-      config,
-      harness,
-      conversation,
-      assertActive,
-      schedule.loopTask,
-      mcp?.close,
-    );
-    openedWorkspace = workspace;
-    workspace.lastError = reportedError;
-    workspace.mcpError = mcpError;
-    workspace.localEnv = localEnv;
-    workspace.kubeEnv = kubeEnv;
-    workspace.sandbox = sandbox;
-    workspace.passive = passive;
-    if (config.role === "bot" && !passive) await workspace.admitOnboarding();
-    if (passive) workspace.accepting = false;
-    if (!passive) harness.resume();
-    return workspace;
+          : {},
+        init:
+          config.role === "bot" && config.onboardingRequired
+            ? async (tx, conversationId) => {
+                const profile = await tx.doc(
+                  BotProfileDocument,
+                  conversationId,
+                );
+                profile.state = "collecting";
+                profile.approvedToolGrants = (config.mcpServers ?? []).flatMap(
+                  (server) =>
+                    server.tools.map((tool) => `${server.id}:${tool}`),
+                );
+              }
+            : undefined,
+      });
+      const workspace = new Workspace(
+        config,
+        harness,
+        conversation,
+        assertActive,
+        schedule.loopTask,
+        mcp?.close,
+      );
+      openedWorkspace = workspace;
+      workspace.lastError = reportedError;
+      workspace.mcpError = mcpError;
+      workspace.localEnv = localEnv;
+      workspace.kubeEnv = kubeEnv;
+      workspace.sandbox = sandbox;
+      workspace.passive = passive;
+      if (passive) workspace.accepting = false;
+      if (!passive && !deferActivation) await workspace.activate();
+      return workspace;
+    } catch (error) {
+      const cleanupErrors: unknown[] = [];
+      for (const cleanup of [
+        openedWorkspace
+          ? () => openedWorkspace!.close(true)
+          : closeOpenedState,
+        openedWorkspace ? undefined : mcp?.close,
+        openedWorkspace ? undefined : sandbox?.close.bind(sandbox),
+        openedWorkspace ? undefined : kubeEnv?.cleanup.bind(kubeEnv, context),
+        openedWorkspace ? undefined : localEnv?.cleanup.bind(localEnv, context),
+      ]) {
+        if (!cleanup) continue;
+        try {
+          await cleanup();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      if (cleanupErrors.length)
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          "Workspace open failed and cleanup was incomplete",
+        );
+      throw error;
+    }
   }
 
   async status() {
@@ -398,6 +431,13 @@ export class Workspace {
         context,
       );
     });
+  }
+
+  async activate() {
+    if (this.passive || this.closed) return;
+    if (this.config.role === "bot" && this.config.onboardingRequired)
+      await this.admitOnboarding();
+    this.harness.resume();
   }
 
   saveGoal(input: unknown) {

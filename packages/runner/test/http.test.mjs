@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  stat,
+  watch,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -54,11 +63,12 @@ async function startRunner(directory, env = {}) {
       }
       lines.close();
     },
-    async request(path, method = "GET", body) {
+    async request(path, method = "GET", body, signal) {
       const response = await fetch(url + path, {
         method,
         headers: { "content-type": "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body),
+        ...(signal ? { signal } : {}),
       });
       return { status: response.status, body: await response.json() };
     },
@@ -496,18 +506,101 @@ test(
 );
 
 test(
+  "legacy bots without a profile are not prompted for setup after upgrade",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-legacy-bot-"));
+    let runner = await startRunner(directory);
+    t.after(async () => runner.stop());
+    const bot = {
+      id: "legacy-bot",
+      name: "legacy",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    };
+    const path = `/v1/workspaces/${bot.id}`;
+    assert.equal((await runner.request(path, "PUT", bot)).status, 200);
+    await nextEvent(
+      runner,
+      bot.id,
+      (event) =>
+        event.kind === "message" &&
+        /identity and purpose/i.test(event.data.text),
+    );
+
+    await runner.stop("SIGTERM");
+    const database = new DatabaseSync(
+      join(directory, "sessions", bot.id, "session.sqlite"),
+    );
+    database.exec(`
+      DELETE FROM document_revisions
+      WHERE document_id IN (SELECT id FROM documents WHERE kind = '"adm.bot-profile"');
+      DELETE FROM documents WHERE kind = '"adm.bot-profile"';
+    `);
+    assert.equal(
+      database
+        .prepare(
+          "SELECT COUNT(*) AS count FROM documents WHERE kind = '\"adm.bot-profile\"'",
+        )
+        .get().count,
+      0,
+    );
+    database.close();
+    const registryPath = join(directory, "workspaces.json");
+    const registry = JSON.parse(await readFile(registryPath, "utf8"));
+    delete registry[0].onboardingRequired;
+    await writeFile(registryPath, JSON.stringify(registry));
+
+    runner = await startRunner(directory);
+    assert.equal((await runner.request(path, "PUT", bot)).status, 200);
+    assert.equal((await runner.request(path)).body.profile, undefined);
+    const before = await runner.request(
+      path + "/history?diagnostics=true&limit=1000",
+    );
+    await runner.request(path + "/input", "POST", {
+      message: "/faux-inspect-system-prompt",
+      requestId: "legacy-prompt",
+    });
+    const prompt = await nextEvent(
+      runner,
+      bot.id,
+      (event) => event.kind === "assistant",
+      before.body.nextAfter,
+      true,
+      5000,
+    );
+    assert.doesNotMatch(prompt.data.text, /You are a bot being set up/);
+    const history = await runner.request(path + "/history?limit=1000");
+    assert.equal(
+      history.body.events.filter(
+        (event) =>
+          event.kind === "user" && event.data.text.includes("onboarding"),
+      ).length,
+      1,
+    );
+  },
+);
+
+test(
   "a bot can call only host-granted stdio MCP tools with referenced secrets through Durable and Code Mode",
   { timeout: 30000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-mcp-"));
     const fixture = join(directory, "mcp-fixture.mjs");
     const starts = join(directory, "mcp-starts.txt");
+    const registrySeen = join(directory, "registry-seen.txt");
     await writeFile(
       fixture,
-      `import { appendFileSync } from "node:fs";
-appendFileSync(process.argv[2], "start\\n");
+      `#!${process.execPath}
+import { appendFileSync, readFileSync } from "node:fs";
+const starts = ${JSON.stringify(starts)};
+const registryPath = ${JSON.stringify(join(directory, "workspaces.json"))};
+const registrySeen = ${JSON.stringify(registrySeen)};
+appendFileSync(starts, "start\\n");
 let buffer = "";
 process.stdin.setEncoding("utf8");
+process.stdin.on("end", () => { appendFileSync(starts, "exit\\n"); process.exit(0); });
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
   for (;;) {
@@ -517,15 +610,24 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(end + 1);
     if (!("id" in message)) continue;
     let result;
-    if (message.method === "initialize") result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } };
+    if (message.method === "initialize") {
+      const registered = JSON.parse(readFileSync(registryPath, "utf8")).some((entry) => entry.id === "mcp-bot" && entry.mcpServers?.[0]?.tools?.includes("allowed_lookup"));
+      appendFileSync(registrySeen, String(registered));
+      result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } };
+    }
     else if (message.method === "tools/list") result = { tools: [
       { name: "allowed_lookup", description: "Read an allowed fixture value", annotations: { readOnlyHint: true }, inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
       { name: "denied_write", description: "Must stay unavailable", inputSchema: { type: "object", properties: {} } },
-      { name: "drop_connection", description: "Ends the fixture process", inputSchema: { type: "object", properties: {} } }
+      { name: "drop_connection", description: "Ends the fixture process", inputSchema: { type: "object", properties: {} } },
+      { name: "hang", description: "Waits until the caller is cancelled", inputSchema: { type: "object", properties: {} } }
     ] };
     else if (message.method === "tools/call" && message.params.name === "allowed_lookup") result = { content: [{ type: "text", text: JSON.stringify({ query: message.params.arguments.query, injected: process.env.MCP_TOKEN === "fixture-secret", providerSecretForwarded: process.env.PROVIDER_SECRET !== undefined }) }] };
     else if (message.method === "tools/call" && message.params.name === "drop_connection") {
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "Connection is closing." }] } }) + "\\n", () => process.exit(0));
+      return;
+    }
+    else if (message.method === "tools/call" && message.params.name === "hang") {
+      appendFileSync(starts, "hang\\n");
       return;
     }
     else result = { content: [{ type: "text", text: "unexpected tool" }], isError: true };
@@ -534,6 +636,7 @@ process.stdin.on("data", (chunk) => {
 });
 `,
     );
+    await chmod(fixture, 0o700);
     const runnerEnv = {
       INJECTED_MCP_SECRET: "fixture-secret",
       PROVIDER_SECRET: "must-not-forward",
@@ -549,9 +652,8 @@ process.stdin.on("data", (chunk) => {
       mcpServers: [
         {
           id: "fixture",
-          command: process.execPath,
-          args: [fixture, starts],
-          tools: ["allowed_lookup"],
+          command: fixture,
+          tools: ["allowed_lookup", "hang"],
           secretEnv: { MCP_TOKEN: "INJECTED_MCP_SECRET" },
         },
       ],
@@ -560,6 +662,7 @@ process.stdin.on("data", (chunk) => {
     const registration = await runner.request(path, "PUT", bot);
     assert.equal(registration.status, 200);
     assert.equal((await readFile(starts, "utf8")).trim().split("\n").length, 1);
+    assert.equal(await readFile(registrySeen, "utf8"), "true");
     assert.ok(registration.body.tools.includes("mcp_fixture_allowed_lookup"));
     assert.ok(!registration.body.tools.includes("mcp_fixture_denied_write"));
     const registry = await readFile(join(directory, "workspaces.json"), "utf8");
@@ -640,15 +743,68 @@ process.stdin.on("data", (chunk) => {
       true,
     );
     assert.equal(denied.data.isError, true);
+
     await runner.stop("SIGKILL");
     runner = await startRunner(directory, runnerEnv);
     const restored = await runner.request(path, "PUT", bot);
     assert.equal(restored.status, 200);
     assert.ok(restored.body.tools.includes("mcp_fixture_allowed_lookup"));
     assert.ok(!restored.body.tools.includes("mcp_fixture_denied_write"));
-    assert.equal((await readFile(starts, "utf8")).trim().split("\n").length, 2);
+    assert.equal(
+      (await readFile(starts, "utf8"))
+        .trim()
+        .split("\n")
+        .filter((line) => line === "start").length,
+      2,
+    );
+
+    const cancellationBot = { ...bot, id: "cancellation-bot" };
+    const cancellationPath = `/v1/workspaces/${cancellationBot.id}`;
+    assert.equal(
+      (await runner.request(cancellationPath, "PUT", cancellationBot)).status,
+      200,
+    );
+    const exitsBeforeCancellation = (await readFile(starts, "utf8"))
+      .split("\n")
+      .filter((line) => line === "exit").length;
+    const markerWatch = watch(starts);
+    const hangingStarted = (async () => {
+      for await (const _event of markerWatch) {
+        if ((await readFile(starts, "utf8")).includes("hang")) {
+          await markerWatch.return();
+          return;
+        }
+      }
+    })();
+    await runner.request(cancellationPath + "/input", "POST", {
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [{ tool: "mcp_fixture_hang", args: {} }],
+          answer: "This response waits for cancellation.",
+        }),
+      requestId: "mcp-hanging-call",
+    });
+    await hangingStarted;
+    const deletion = await runner.request(
+      cancellationPath,
+      "DELETE",
+      undefined,
+      AbortSignal.timeout(5000),
+    );
+    assert.equal(deletion.status, 200);
+    assert.ok(
+      (await readFile(starts, "utf8"))
+        .split("\n")
+        .filter((line) => line === "exit").length > exitsBeforeCancellation,
+    );
     assert.equal((await runner.request(path, "DELETE")).status, 200);
-    assert.equal((await readFile(starts, "utf8")).trim().split("\n").length, 2);
+    assert.equal(
+      (await readFile(starts, "utf8"))
+        .split("\n")
+        .filter((line) => line === "start").length,
+      3,
+    );
 
     const disconnectBot = {
       ...bot,
@@ -700,7 +856,8 @@ process.stdin.on("data", (chunk) => {
       runner,
       disconnectBot.id,
       (event) =>
-        event.kind === "assistant" && event.data.text.includes("Echo: later work"),
+        event.kind === "assistant" &&
+        event.data.text.includes("Echo: later work"),
       disconnected.seq,
       true,
       5000,
@@ -709,6 +866,74 @@ process.stdin.on("data", (chunk) => {
       (await runner.request(disconnectPath)).body.error,
       /disconnected/i,
     );
+  },
+);
+
+test(
+  "MCP subprocesses close and registry state rolls back when workspace initialization fails",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-mcp-open-failure-"),
+    );
+    const fixture = join(directory, "mcp-server.mjs");
+    const initialized = join(directory, "initialized.txt");
+    const exited = join(directory, "exited.txt");
+    const registryPath = join(directory, "workspaces.json");
+    await writeFile(
+      fixture,
+      `#!${process.execPath}
+import { appendFileSync, readFileSync } from "node:fs";
+const registryPath = ${JSON.stringify(registryPath)};
+const initialized = ${JSON.stringify(initialized)};
+const exited = ${JSON.stringify(exited)};
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("end", () => { appendFileSync(exited, "exit"); process.exit(0); });
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const end = buffer.indexOf("\\n");
+    if (end < 0) break;
+    const message = JSON.parse(buffer.slice(0, end));
+    buffer = buffer.slice(end + 1);
+    if (!("id" in message)) continue;
+    let result;
+    if (message.method === "initialize") {
+      const registered = JSON.parse(readFileSync(registryPath, "utf8")).some((entry) => entry.id === "bad-mcp");
+      appendFileSync(initialized, String(registered));
+      result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "failure-fixture", version: "1" } };
+    } else {
+      result = { tools: [] };
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
+  }
+});
+`,
+    );
+    await chmod(fixture, 0o700);
+    await mkdir(join(directory, "sessions", "bad-mcp", "session.sqlite"), {
+      recursive: true,
+    });
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const config = {
+      id: "bad-mcp",
+      name: "mcp failure cleanup",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+      mcpServers: [{ id: "failure", command: fixture, tools: ["probe"] }],
+    };
+    const failed = await runner.request(
+      `/v1/workspaces/${config.id}`,
+      "PUT",
+      config,
+    );
+    assert.equal(failed.status, 500);
+    assert.equal(await readFile(initialized, "utf8"), "true");
+    assert.equal(await readFile(exited, "utf8"), "exit");
+    assert.deepEqual(JSON.parse(await readFile(registryPath, "utf8")), []);
   },
 );
 

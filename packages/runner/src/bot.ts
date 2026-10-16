@@ -62,7 +62,8 @@ export function botExtension(
             input.conversationId,
             context,
           );
-          if (!profile || profile.state !== "ready")
+          if (!profile) return undefined;
+          if (profile.state !== "ready")
             return "You are a bot being set up. Ask the user for your identity and purpose. Publish setup questions and confirmations only by calling sendMessage. Save a confirmed identity and purpose with saveProfile before acting on them. The host controls MCP grants: you may ask the user to grant a tool, but cannot grant it yourself or claim to have access before it is available.";
           return `You are ${profile.identity}. Your purpose is: ${profile.purpose}\nApproved MCP tools: ${profile.approvedToolGrants.length ? profile.approvedToolGrants.join(", ") : "none"}. The host controls these grants: you may ask the user to grant an additional tool, but cannot grant it yourself or claim to have access before it is available. Publish user-facing messages only with sendMessage.`;
         },

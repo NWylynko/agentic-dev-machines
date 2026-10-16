@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -12,6 +12,9 @@ assert.ok(binary, "adm binary path is required");
 const root = await mkdtemp(join(tmpdir(), "adm-bot-prompt-"));
 const exec = promisify(execFile);
 const kubectl = join(root, "kubectl");
+const mcpServer = join(root, "mcp-server.mjs");
+const mcpConfig = join(root, "mcp-config.json");
+const mcpInitialized = join(root, "mcp-initialized.txt");
 await writeFile(
   kubectl,
   `#!/usr/bin/env python3
@@ -38,6 +41,50 @@ else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exi
 `,
 );
 await chmod(kubectl, 0o755);
+await writeFile(
+  mcpServer,
+  `#!${process.execPath}
+import { appendFileSync, readFileSync } from "node:fs";
+const registryPath = ${JSON.stringify(join(root, "runner", "workspaces.json"))};
+const initialized = ${JSON.stringify(join(root, "mcp-initialized.txt"))};
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("end", () => process.exit(0));
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const end = buffer.indexOf("\\n");
+    if (end < 0) break;
+    const message = JSON.parse(buffer.slice(0, end));
+    buffer = buffer.slice(end + 1);
+    if (!("id" in message)) continue;
+    let result;
+    if (message.method === "initialize") {
+      const registered = process.env.MCP_TOKEN === "cli-secret" && JSON.parse(readFileSync(registryPath, "utf8")).some((entry) => entry.mcpServers?.[0]?.tools?.includes("cli_ping"));
+      appendFileSync(initialized, String(registered));
+      result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "cli-fixture", version: "1" } };
+    } else if (message.method === "tools/list") {
+      result = { tools: [{ name: "cli_ping", description: "CLI fixture", inputSchema: { type: "object", properties: {} } }] };
+    } else {
+      result = { content: [{ type: "text", text: "pong" }] };
+    }
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
+  }
+});
+`,
+);
+await chmod(mcpServer, 0o755);
+await writeFile(
+  mcpConfig,
+  JSON.stringify([
+    {
+      id: "cli_fixture",
+      command: mcpServer,
+      tools: ["cli_ping"],
+      secretEnv: { MCP_TOKEN: "MCP_CLI_TOKEN" },
+    },
+  ]),
+);
 
 const runner = spawn(
   process.execPath,
@@ -52,7 +99,11 @@ const runner = spawn(
     "--provider",
     "faux",
   ],
-  { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
+  {
+    cwd: process.cwd(),
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, MCP_CLI_TOKEN: "cli-secret" },
+  },
 );
 const runnerExited = once(runner, "exit");
 const lines = createInterface({ input: runner.stdout });
@@ -97,6 +148,8 @@ try {
     "bot",
     "--model",
     "faux/faux-1",
+    "--mcp-config",
+    mcpConfig,
   ]);
   const table = (await runCli(["list"], "http://127.0.0.1:1")).stdout;
   assert.match(table, /NAME\s+ROLE\s+PHASE\s+AGENT\s+ID/);
@@ -105,6 +158,10 @@ try {
     new RegExp(`fixture-bot\\s+bot\\s+ready\\s+enabled\\s+${bot.id}`),
     "default list shows the configured agent state and full immutable ID without contacting the runner",
   );
+  const registered = await fetch(`${url}/v1/workspaces/${bot.id}`);
+  const botStatus = await registered.json();
+  assert.ok(botStatus.tools.includes("mcp_cli_fixture_cli_ping"));
+  assert.equal(await readFile(mcpInitialized, "utf8"), "true");
   const watch = await fetch(`${url}/v1/workspaces/${bot.id}/events`, {
     signal: AbortSignal.timeout(10_000),
   });

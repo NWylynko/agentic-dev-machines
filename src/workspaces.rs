@@ -543,45 +543,6 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
     Ok(w)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    #[test]
-    fn bot_creation_reads_nonsecret_mcp_grants_for_runner_registration() {
-        let path = std::env::temp_dir().join(format!("adm-mcp-config-{}.json", Uuid::new_v4()));
-        let config = json!([{
-            "id": "notes",
-            "command": "/usr/bin/node",
-            "args": ["/opt/notes-server.mjs"],
-            "tools": ["search"],
-            "secretEnv": {"TOKEN": "MCP_NOTES_TOKEN"}
-        }]);
-        fs::write(&path, config.to_string()).unwrap();
-        let parsed = Cli::try_parse_from([
-            "adm",
-            "--project-dir",
-            ".",
-            "create",
-            "helper",
-            "--role",
-            "bot",
-            "--model",
-            "faux/faux-1",
-            "--mcp-config",
-            path.to_str().unwrap(),
-        ])
-        .unwrap();
-        let workspace = match parsed.command {
-            crate::Action::Create(options) => options.workspace().unwrap(),
-            _ => unreachable!(),
-        };
-        fs::remove_file(path).unwrap();
-        assert_eq!(workspace.mcp_servers, Some(config));
-    }
-}
-
 pub fn cluster_status(cli: &Cli, w: &Workspace) -> Result<Value> {
     verify_ownership(cli, w)?;
     let pods: Value = serde_json::from_slice(&kubectl(

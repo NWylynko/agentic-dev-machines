@@ -203,7 +203,11 @@ async function assertActive(id: string) {
       "This workspace was deliberately deleted",
     );
 }
-async function openWorkspace(config: WorkspaceConfig, passive = false) {
+async function openWorkspace(
+  config: WorkspaceConfig,
+  passive = false,
+  deferActivation = false,
+) {
   const workspace = await Workspace.open(
     config,
     join(stateDirectory, "sessions", config.id),
@@ -221,6 +225,7 @@ async function openWorkspace(config: WorkspaceConfig, passive = false) {
       return workspace;
     },
     passive,
+    deferActivation,
   );
   workspaces.set(config.id, workspace);
   return workspace;
@@ -230,6 +235,16 @@ for (const config of configs.values())
 
 function validateConfig(id: string, input: unknown): WorkspaceConfig {
   const config = input as WorkspaceConfig;
+  if (
+    input &&
+    typeof input === "object" &&
+    Object.hasOwn(input, "onboardingRequired")
+  )
+    throw new ApiError(
+      400,
+      "INVALID_WORKSPACE",
+      "onboardingRequired is managed by the runner",
+    );
   if (
     !config ||
     config.id !== id ||
@@ -272,9 +287,12 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
         .sort()
         .join(",");
       if (
-        keys !== "args,command,id,secretEnv,tools" &&
-        keys !== "command,id,tools" &&
-        keys !== "args,command,id,tools"
+        ![
+          "command,id,tools",
+          "args,command,id,tools",
+          "command,id,secretEnv,tools",
+          "args,command,id,secretEnv,tools",
+        ].includes(keys)
       )
         throw new ApiError(
           400,
@@ -531,14 +549,34 @@ const server = createServer(async (request, response) => {
             "Workspace role and environment identity cannot change",
           );
         if (!previous) {
-          await openWorkspace(config);
-          configs.set(id, config);
+          const registration = {
+            ...config,
+            ...(config.role === "bot" ? { onboardingRequired: true } : {}),
+          };
+          configs.set(id, registration);
           try {
             await atomicJson(registryPath, [...configs.values()]);
+            await openWorkspace(registration, false, true);
+            await workspaces.get(id)!.activate();
           } catch (error) {
-            configs.delete(id);
-            await workspaces.get(id)?.close(true);
+            const cleanupErrors: unknown[] = [];
+            try {
+              await workspaces.get(id)?.close(true);
+            } catch (cleanupError) {
+              cleanupErrors.push(cleanupError);
+            }
             workspaces.delete(id);
+            configs.delete(id);
+            try {
+              await atomicJson(registryPath, [...configs.values()]);
+            } catch (cleanupError) {
+              cleanupErrors.push(cleanupError);
+            }
+            if (cleanupErrors.length)
+              throw new AggregateError(
+                [error, ...cleanupErrors],
+                "Workspace registration failed and rollback was incomplete",
+              );
             throw error;
           }
         }

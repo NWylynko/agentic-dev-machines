@@ -61,7 +61,7 @@ export async function openMcpExtension(
             parameters: tool.inputSchema as never,
             callers: ["model", "tools"],
             replay: tool.annotations?.readOnlyHint ? "safe" : "unsafe",
-            execute: async (args) => {
+            execute: async (args, _api, context) => {
               await assertActive();
               if (
                 !config.mcpServers?.some(
@@ -72,7 +72,9 @@ export async function openMcpExtension(
                 throw new Error(
                   `MCP tool grant ${server.id}:${toolName} was revoked`,
                 );
-              const result = await client.callTool(toolName, args);
+              const result = await client.callTool(toolName, args, {
+                signal: context.abortSignal,
+              });
               return {
                 output: [
                   {
