@@ -22,6 +22,61 @@ async function docker(...args) {
   }
 }
 
+async function verifySignalForwarding() {
+  const signalContainer = `${container}-signal`;
+  let exists = false;
+  let running = false;
+  try {
+    await docker(
+      "create",
+      "--name",
+      signalContainer,
+      "--network",
+      "none",
+      "--read-only",
+      "--pids-limit",
+      "8",
+      image,
+    );
+    exists = true;
+    await docker("start", signalContainer);
+    running = true;
+
+    const [{ stdout: inspectOutput }, { stdout: pid1 }] = await Promise.all([
+      docker("inspect", signalContainer),
+      docker("exec", signalContainer, "cat", "/proc/1/comm"),
+    ]);
+    const [inspection] = JSON.parse(inspectOutput);
+    assert.deepEqual(inspection.Config.Entrypoint, [
+      "/usr/bin/tini",
+      "--",
+      "/usr/local/bin/adm-dev-entrypoint",
+    ]);
+    assert.equal(pid1.trim(), "tini", "tini must remain PID 1");
+    assert.equal(inspection.HostConfig.NetworkMode, "none");
+    assert.equal(inspection.HostConfig.ReadonlyRootfs, true);
+    assert.deepEqual(inspection.Mounts, [], "signal test must not mount host or workspace files");
+
+    const started = performance.now();
+    await docker("stop", "--timeout", "2", signalContainer);
+    running = false;
+    const elapsed = performance.now() - started;
+    const { stdout: exitCode } = await docker(
+      "inspect",
+      signalContainer,
+      "--format",
+      "{{.State.ExitCode}}",
+    );
+    assert.equal(Number(exitCode.trim()), 143, "SIGTERM must reach the workspace wait process");
+    assert.ok(elapsed < 1900, `SIGTERM should be forwarded before Docker's two-second kill deadline (${elapsed.toFixed(1)}ms)`);
+  } finally {
+    if (running) {
+      await docker("stop", "--timeout", "2", signalContainer).catch(() => {});
+    }
+    if (exists) await docker("rm", signalContainer);
+  }
+}
+
 const browserFixture = String.raw`
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -132,6 +187,7 @@ try {
     "set -eu; git init -q --initial-branch=main /tmp/adm-image-smoke-git; cd /tmp/adm-image-smoke-git; git config user.name 'Image Smoke'; git config user.email smoke@example.invalid; printf 'smoke\\n' > README.md; git add README.md; git commit -qm 'image smoke'; test \"$(git status --porcelain)\" = ''; test \"$(git log -1 --format=%s)\" = 'image smoke'; test \"$(cat README.md)\" = smoke",
   );
   assert.equal(git.stderr, "");
+  await verifySignalForwarding();
   await docker(
     "exec",
     container,

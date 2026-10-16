@@ -1,6 +1,7 @@
 #!/bin/sh
 # The development container stays up after the terminal detaches.
-# Kubernetes replaces this command; `exec` lets the runtime signal the wait directly.
+# Kubernetes keeps the image's Tini entrypoint so it can forward signals here.
+# `exec` lets Tini deliver them directly to the workspace wait process.
 set -eu
 if [ "${1:-}" = "--check" ]; then
   test "$(readlink /repos)" = "/workspace/.adm/catalog"

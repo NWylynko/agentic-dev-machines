@@ -1258,6 +1258,11 @@ fn manifest_exposes_only_a_deprivileged_development_container_and_isolated_stora
     assert_eq!(pod["automountServiceAccountToken"], false);
     let dev = &pod["containers"][0];
     assert_eq!(dev["name"], "dev");
+    assert_eq!(
+        dev.get("command"),
+        None,
+        "Kubernetes must preserve the workspace image's tini entrypoint so it forwards termination signals"
+    );
     assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], false);
     assert_eq!(dev["securityContext"]["capabilities"]["drop"][0], "ALL");
     assert!(
