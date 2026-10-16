@@ -161,7 +161,7 @@ pub fn run(cli: &Cli) -> Result<()> {
         Some(model)
     };
     config.validate()?;
-    let should_login = confirm("Open provider login now?")?;
+    let should_login = confirm("Open local Pi login now?")?;
     let should_install_service = confirm("Install and start the user runner service?")?;
     let path = save_config(&config)?;
     println!("Saved {}", path.display());
@@ -279,7 +279,7 @@ fn install_service(cli: &Cli) -> Result<bool> {
         "User runner service enabled. Staying up after logout requires operator-configured lingering."
     );
     println!(
-        "The service uses Pi's host authentication store. Login-shell API keys are not inherited; inject them through your Infisical service configuration."
+        "The service does not inherit login-shell provider keys. Configure credentials for each workspace using Pi login or an operator-managed credential source."
     );
     Ok(true)
 }
@@ -331,7 +331,7 @@ pub fn login(cli: &Cli) -> Result<()> {
     let entry =
         cli.checkout_file("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js")?;
     println!(
-        "Use /login in Pi to authenticate your provider, then /quit to return. Credentials stay on this management host."
+        "Use /login in Pi to authenticate. This configures Pi's local store; coding workspaces use their own credential store or explicitly configured credential references."
     );
     let status = Command::new("node")
         .arg(entry)

@@ -14,11 +14,11 @@ The script downloads `adm-linux-amd64.tar.gz` and verifies its checksum from the
 
 The commands are installed in `$HOME/.local/bin`. Add that directory to your PATH if needed. The installation lives under `$XDG_DATA_HOME/adm/install`, or `$HOME/.local/share/adm/install` when XDG_DATA_HOME is unset. Versioned runtime files are separate from workspace and runner state.
 
-First installation offers `adm setup` through the terminal. Setup configures the image, storage class, and optional default model, offers the installed Pi `/login` interface, and can create/start a systemd user service. With no terminal, installation prints the command to run later. `adm login` reopens provider authentication.
+First installation offers `adm setup` through the terminal. Setup configures the image, storage class, and optional default model, offers local Pi `/login`, and can create/start a systemd user service. Local `adm login` configures only the host's Pi store. Workspace login is performed in that workspace and is kept on its private volume. With no terminal, installation prints the command to run later.
 
 Settings are nonsecret JSON at `$XDG_CONFIG_HOME/adm/config.json`, normally `$HOME/.config/adm/config.json`. Explicit CLI flags override these defaults. Leaving the model unset means agent creation still requires `--model PROVIDER/MODEL_ID`; `--no-agent` disables the agent. Setup never changes your Kubernetes context or installs a storage backend. It saves an explicit image reference, so updates preserve your image choice too.
 
-Provider authentication stays in Pi's management-host auth store. API keys must be injected into the runner process from Infisical; do not put them in ADM config, a service file, or a project `.env`. The generated service does not inherit keys from your login shell. Persistent user services after logout require operator-configured systemd lingering; setup reports this requirement.
+The generated runner service does not inherit keys from your login shell. Configure each coding workspace's credentials with Pi login in that workspace or references to keys in a Secret in that workspace's namespace. For API keys, pass references such as `--credential-env OPENAI_API_KEY=provider-auth:openai`; ADM stores only the environment name and Secret/key reference and maps the value into that workspace's dev container. No particular secret manager is required. Do not put values in ADM config, service files, or project `.env` files. Persistent user services after logout require operator-configured systemd lingering; setup reports this requirement.
 
 ```sh
 adm doctor

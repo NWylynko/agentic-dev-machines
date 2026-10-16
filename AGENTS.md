@@ -34,4 +34,4 @@ keep this file up to date
 - Preserve the distinction between requirements and proposals. Do not turn candidate technologies or command syntax into settled decisions without evidence.
 - Do not claim transparent process recovery or filesystem durability that has not been demonstrated end to end.
 - Keep implementations simple, colocate feature code, and write end-to-end tests first for behavior changes. Verify the expected failure before implementing a change, and keep failures visible in status and logs.
-- Keep secrets in Infisical and inject API keys into the runner process; commit schema only. Never store real keys in repository env files, ADM config, or service units.
+- Use the operator's chosen secret source and inject credentials only into the runtime that needs them; commit schema only. Never store real keys in repository env files, ADM config, or service units.

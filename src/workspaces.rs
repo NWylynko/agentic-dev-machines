@@ -5,6 +5,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     fs,
     io::Write,
     path::Path,
@@ -72,12 +73,23 @@ pub struct Workspace {
     #[serde(default = "default_workspace_cwd")]
     pub cwd: String,
     pub model: Option<Value>,
+    #[serde(default)]
+    pub credential_env: Vec<CredentialEnvRef>,
     pub allowed_agents: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Option<Value>,
     pub herdr_space: Option<String>,
     pub created_at: u64,
     pub last_error: Option<String>,
+}
+
+/// A reference to one key in a Secret scoped to this workspace namespace.
+/// The value itself is never read by ADM or stored in workspace metadata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CredentialEnvRef {
+    pub name: String,
+    pub secret_name: String,
+    pub key: String,
 }
 
 #[derive(Args)]
@@ -117,6 +129,9 @@ pub struct CreateOptions {
     /// Provider/model-id; overrides the model chosen in adm setup.
     #[arg(long)]
     pub model: Option<String>,
+    /// Inject one key from a Secret created in this workspace's namespace: ENV=SECRET:KEY.
+    #[arg(long = "credential-env", value_name = "ENV=SECRET:KEY")]
+    pub credential_env: Vec<String>,
     #[arg(long)]
     pub allow_node_local_storage: bool,
     #[arg(long)]
@@ -205,6 +220,22 @@ impl CreateOptions {
             !(self.role == "bot" && self.allow_sudo),
             "--allow-sudo is only supported for coding workspaces"
         );
+        ensure!(
+            self.role == "coding" || self.credential_env.is_empty(),
+            "--credential-env is only supported for coding workspaces"
+        );
+        let credential_env = self
+            .credential_env
+            .iter()
+            .map(|reference| parse_credential_env_ref(reference))
+            .collect::<Result<Vec<_>>>()?;
+        let mut credential_names = HashSet::new();
+        ensure!(
+            credential_env
+                .iter()
+                .all(|reference| credential_names.insert(&reference.name)),
+            "each credential environment name may be specified only once"
+        );
         let id = Uuid::new_v4().simple().to_string();
         let model = match &self.model {
             Some(model) => {
@@ -257,6 +288,7 @@ impl CreateOptions {
             repository: self.repo.clone(),
             cwd,
             model,
+            credential_env,
             allowed_agents: self.allow_agent.clone(),
             mcp_servers,
             herdr_space: self.herdr_space.clone(),
@@ -264,6 +296,49 @@ impl CreateOptions {
             last_error: None,
         })
     }
+}
+
+fn parse_credential_env_ref(reference: &str) -> Result<CredentialEnvRef> {
+    let (name, target) = reference
+        .split_once('=')
+        .context("credential reference must be ENV=SECRET:KEY")?;
+    let (secret_name, key) = target
+        .split_once(':')
+        .context("credential reference must be ENV=SECRET:KEY")?;
+    ensure!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && name.as_bytes()[0].is_ascii_uppercase(),
+        "credential environment name must be a valid uppercase environment variable"
+    );
+    ensure!(
+        valid_kubernetes_name(secret_name),
+        "credential Secret name must be a lowercase DNS name"
+    );
+    ensure!(
+        !key.is_empty()
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)),
+        "credential Secret key is invalid"
+    );
+    Ok(CredentialEnvRef {
+        name: name.to_owned(),
+        secret_name: secret_name.to_owned(),
+        key: key.to_owned(),
+    })
+}
+
+fn valid_kubernetes_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 pub struct WorkspaceStore {
@@ -417,9 +492,16 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         json!({"name":"work","persistentVolumeClaim":{"claimName":"work"}}),
         json!({"name":"shm","emptyDir":{"medium":"Memory","sizeLimit":"256Mi"}}),
     ];
-    let mut containers = vec![
-        json!({"name":"dev","image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/repos","securityContext":{"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true,"allowPrivilegeEscalation":w.allow_sudo,"capabilities":if w.allow_sudo{json!({"drop":["ALL"],"add":["CHOWN","DAC_OVERRIDE","FOWNER","SETGID","SETUID"]})}else{json!({"drop":["ALL"]})},"seccompProfile":{"type":"RuntimeDefault"}},"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"exec":{"command":["test","-d","/repos"]},"initialDelaySeconds":1,"periodSeconds":2}}),
-    ];
+    let mut dev = json!({"name":"dev","image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/repos","securityContext":{"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true,"allowPrivilegeEscalation":w.allow_sudo,"capabilities":if w.allow_sudo{json!({"drop":["ALL"],"add":["CHOWN","DAC_OVERRIDE","FOWNER","SETGID","SETUID"]})}else{json!({"drop":["ALL"]})},"seccompProfile":{"type":"RuntimeDefault"}},"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"exec":{"command":["test","-d","/repos"]},"initialDelaySeconds":1,"periodSeconds":2}});
+    if !w.credential_env.is_empty() {
+        dev["env"] = Value::Array(
+            w.credential_env
+                .iter()
+                .map(|reference| json!({"name":reference.name,"valueFrom":{"secretKeyRef":{"name":reference.secret_name,"key":reference.key}}}))
+                .collect(),
+        );
+    }
+    let mut containers = vec![dev];
     if w.repositories {
         volumes.push(json!({"name":"catalog","configMap":{"name":"repositories"}}));
         containers.push(json!({"name":"repositories","image":w.image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--catalog","/config/catalog.json","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":[{"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"},{"name":"catalog","mountPath":"/config","readOnly":true}]}));
