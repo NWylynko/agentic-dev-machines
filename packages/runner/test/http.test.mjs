@@ -18,7 +18,7 @@ import { test } from "node:test";
 
 const main = new URL("../src/main.ts", import.meta.url);
 
-async function startRunner(directory, env = {}) {
+async function startRunner(directory, env = {}, { useFaux = true } = {}) {
   const child = spawn(
     process.execPath,
     [
@@ -27,10 +27,16 @@ async function startRunner(directory, env = {}) {
       "0",
       "--state-dir",
       directory,
-      "--provider",
-      "faux",
+      ...(useFaux
+        ? ["--provider", "faux"]
+        : ["--auth-path", join(directory, "empty-auth.json")]),
     ],
-    { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } },
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: useFaux
+        ? { ...process.env, ...env }
+        : { PATH: process.env.PATH, HOME: directory, ...env },
+    },
   );
   let errors = "";
   child.stderr.on("data", (chunk) => {
@@ -363,6 +369,32 @@ test("a stale legacy PID-only owner lock is reclaimed after its process exits", 
 });
 
 export { startRunner, nextEvent };
+
+test("a bot without a selected model waits without admitting onboarding", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-bot-needs-model-"));
+  let runner = await startRunner(directory, {}, { useFaux: false });
+  t.after(() => runner.stop());
+  const path = "/v1/workspaces/unconfigured-bot";
+  const registered = await runner.request(path, "PUT", {
+    id: "unconfigured-bot",
+    name: "unconfigured",
+    role: "bot",
+    environment: "local",
+  });
+  assert.equal(registered.status, 200);
+  assert.equal(registered.body.status, "needs_model");
+  assert.deepEqual((await runner.request(path + "/history")).body.events, []);
+  assert.deepEqual((await runner.request(path)).body.tasks, []);
+  await runner.stop();
+  runner = await startRunner(directory, {}, { useFaux: false });
+  assert.equal((await runner.request(path)).body.status, "needs_model");
+  assert.deepEqual((await runner.request(path + "/history")).body.events, []);
+  const input = await runner.request(path + "/input", "POST", {
+    message: "hello",
+  });
+  assert.equal(input.status, 409);
+  assert.equal(input.body.error.code, "MODEL_REQUIRED");
+});
 
 test(
   "bot onboarding is admitted once, publishes setup through sendMessage, and keeps its profile after restart",

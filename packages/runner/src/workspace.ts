@@ -434,7 +434,7 @@ export class Workspace {
   }
 
   async activate() {
-    if (this.passive || this.closed) return;
+    if (this.passive || this.closed || !this.config.model) return;
     if (this.config.role === "bot" && this.config.onboardingRequired)
       await this.admitOnboarding();
     this.harness.resume();
