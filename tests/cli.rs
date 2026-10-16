@@ -450,6 +450,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         wait_for_stage(&destroy_progress, "waiting for namespace removal started");
     let during_destroy = assert_ok(adm(root.path(), &["list", "--json"]));
     assert_eq!(during_destroy[0]["phase"], "deleting");
+    assert_eq!(during_destroy[0]["activity"]["status"], "disabled");
     let cluster: Value =
         serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
     assert!(
@@ -487,7 +488,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
 }
 
 #[test]
-fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
+fn list_shows_activity_and_keeps_full_records_with_json() {
     let root = fixture();
 
     let empty = adm(root.path(), &["list"]);
@@ -529,7 +530,8 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
         table.contains("NAME")
             && table.contains("ROLE")
             && table.contains("PHASE")
-            && table.contains("AGENT")
+            && table.contains("AGENT CONFIG")
+            && table.contains("ACTIVITY")
             && table.contains("ID"),
         "{table}"
     );
@@ -572,7 +574,7 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
         3
     );
 
-    // Listing is local even when both external dependencies are unavailable.
+    // A runner outage leaves stored records listable and never calls kubectl.
     let marker = root.path().join("kubectl-contacted");
     let kubectl = root.path().join("kubectl");
     fs::write(
@@ -594,6 +596,189 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
         .unwrap();
     assert_eq!(assert_ok(offline).as_array().unwrap().len(), 2);
     assert!(!marker.exists(), "list must not contact kubectl");
+}
+
+#[test]
+fn list_joins_activity_from_one_runner_directory_request() {
+    let root = fixture();
+    let disabled = assert_ok(adm(
+        root.path(),
+        &["create", "disabled", "--no-agent", "--no-repositories"],
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let creation_server = std::thread::spawn(move || {
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = BufReader::new(stream);
+            let mut line = String::new();
+            request.read_line(&mut line).unwrap();
+            let method = line.split_whitespace().next().unwrap().to_owned();
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                request.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("content-length:") {
+                    content_length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            request.read_exact(&mut body).unwrap();
+            if method == "PUT" {
+                ids.push(
+                    serde_json::from_slice::<Value>(&body).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+            let response = if method == "GET" {
+                r#"{"status":"ok"}"#
+            } else {
+                "{}"
+            };
+            let mut stream = request.into_inner();
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).unwrap();
+        }
+        ids
+    });
+    for name in ["idle", "running", "error", "missing"] {
+        let created = adm_with_runner(
+            root.path(),
+            &runner_url,
+            &["create", name, "--role", "bot", "--model", "faux/faux-1"],
+        );
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    }
+    let ids = creation_server.join().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let batch = serde_json::json!({"workspaces":[
+        {"id":ids[0],"status":"idle"},
+        {"id":ids[1],"status":"running"},
+        {"id":ids[2],"status":"error","error":"provider token expired"}
+    ]})
+    .to_string();
+    let request_server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut request = BufReader::new(stream);
+        let mut line = String::new();
+        request.read_line(&mut line).unwrap();
+        let path = line.split_whitespace().nth(1).unwrap().to_owned();
+        let mut stream = request.into_inner();
+        write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{batch}", batch.len()).unwrap();
+        path
+    });
+    let listed = adm_with_runner(root.path(), &runner_url, &["list", "--json"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["id"], disabled["id"]);
+    assert_eq!(listed[0]["activity"]["status"], "disabled");
+    for (name, activity) in [("idle", "idle"), ("running", "running"), ("error", "error")] {
+        let row = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap();
+        assert_eq!(row["activity"]["status"], activity);
+    }
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "error")
+            .unwrap()["activity"]["error"],
+        "provider token expired"
+    );
+    let missing = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "missing")
+        .unwrap();
+    assert_eq!(missing["activity"]["status"], "unavailable");
+    assert!(
+        missing["activity"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("directory omitted")
+    );
+    assert_eq!(request_server.join().unwrap(), "/v1/workspaces");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let running_id = ids[1].clone();
+    let status_server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut request = BufReader::new(stream);
+        let mut line = String::new();
+        request.read_line(&mut line).unwrap();
+        let path = line.split_whitespace().nth(1).unwrap().to_owned();
+        let body = format!(r#"{{"id":"{running_id}","status":"running"}}"#);
+        let mut stream = request.into_inner();
+        write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        path
+    });
+    let status = adm_with_runner(root.path(), &runner_url, &["status", "running", "--json"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["activity"]["status"], "running");
+    assert_eq!(status["agent"]["status"], "running");
+    assert_eq!(
+        status_server.join().unwrap(),
+        format!("/v1/workspaces/{}", ids[1])
+    );
+
+    assert_ok(adm(root.path(), &["destroy", "disabled"]));
+    let kubectl_contact = root.path().join("list-kubectl-contact");
+    fs::write(
+        root.path().join("kubectl"),
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", kubectl_contact.display()),
+    )
+    .unwrap();
+    let all = adm_with_runner(
+        root.path(),
+        "http://127.0.0.1:1",
+        &["list", "--all", "--json"],
+    );
+    assert!(all.status.success());
+    let all: Value = serde_json::from_slice(&all.stdout).unwrap();
+    let deleted = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "disabled")
+        .unwrap();
+    assert_eq!(deleted["phase"], "deleted");
+    assert_eq!(deleted["activity"]["status"], "deleted");
+    assert_eq!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "running")
+            .unwrap()["activity"]["status"],
+        "unavailable"
+    );
+    assert!(!kubectl_contact.exists());
 }
 
 #[test]
@@ -1459,8 +1644,8 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         status.contains("NAME")
             && status.contains("ROLE")
             && status.contains("PHASE")
-            && status.contains("POD")
-            && status.contains("AGENT")
+            && status.contains("RUNTIME")
+            && status.contains("ACTIVITY")
             && status.contains("NODE"),
         "{status}"
     );
@@ -1468,8 +1653,12 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         status.contains("demo")
             && status.contains("coding")
             && status.contains("NotReady (Running)")
+            && status.contains("Runtime readiness: NotReady (Running)")
             && status.contains("disabled")
             && status.contains("node-a")
+            && status.contains(&format!("ID: {}", coding["id"].as_str().unwrap()))
+            && status.contains("Namespace:")
+            && status.contains("Resources: CPU 2, memory 2Gi, storage 4Gi")
             && status.contains("ContainersNotReady"),
         "{status}"
     );
@@ -1511,6 +1700,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     assert_eq!(full["workspace"]["id"], coding["id"]);
     assert_eq!(full["cluster"]["pods"][0]["status"]["phase"], "Running");
     assert_eq!(full["agent"]["status"], "disabled");
+    assert_eq!(full["activity"]["status"], "disabled");
     assert_eq!(
         assert_ok(adm(root.path(), &["inspect", "demo", "--json"])),
         full
@@ -1564,6 +1754,19 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     assert!(
         bot_inspect.contains("Location: management host (no workspace Pod)"),
         "{bot_inspect}"
+    );
+
+    assert_ok(adm(root.path(), &["destroy", "supervisor"]));
+    let deleted_bot = adm(root.path(), &["status", "supervisor"]);
+    assert!(deleted_bot.status.success());
+    let deleted_bot = String::from_utf8_lossy(&deleted_bot.stdout);
+    assert!(
+        deleted_bot.contains("Runtime readiness: deleted"),
+        "{deleted_bot}"
+    );
+    assert!(
+        deleted_bot.contains("Agent activity: deleted"),
+        "{deleted_bot}"
     );
 
     assert_eq!(
@@ -1629,13 +1832,34 @@ fn status_distinguishes_agent_provider_errors_from_unavailable_runner() {
     );
     let status = String::from_utf8_lossy(&status.stdout);
     assert!(
-        status.contains("AGENT")
+        status.contains("ACTIVITY")
             && status.contains("error")
             && status.contains("Agent failure: provider token expired"),
         "{status}"
     );
     assert!(!status.contains("Agent unavailable"), "{status}");
     server.join().unwrap();
+
+    let unavailable = adm_with_runner(
+        root.path(),
+        "http://127.0.0.1:1",
+        &["status", "supervisor", "--json"],
+    );
+    assert!(unavailable.status.success());
+    let unavailable: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
+    assert_eq!(unavailable["activity"]["status"], "unavailable");
+    assert_eq!(
+        unavailable["activity"]["error"], unavailable["agent"]["error"],
+        "normalized activity keeps the actual runner failure cause"
+    );
+    assert!(
+        unavailable["activity"]["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("connection refused"),
+        "{unavailable}"
+    );
 }
 
 #[test]
@@ -1661,6 +1885,19 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     );
     let original_id = failed[0]["id"].as_str().unwrap();
     assert_eq!(failed[0]["phase"], "failed");
+    assert_eq!(failed[0]["activity"]["status"], "disabled");
+    assert!(failed[0]["last_error"].as_str().is_some());
+    let failure_status = adm(root.path(), &["status", "retry-me"]);
+    assert!(failure_status.status.success());
+    let failure_status = String::from_utf8_lossy(&failure_status.stdout);
+    assert!(
+        failure_status.contains("Workspace failure:"),
+        "{failure_status}"
+    );
+    assert!(
+        failure_status.contains("deployment did not become available"),
+        "{failure_status}"
+    );
 
     let retried = assert_ok(adm(
         root.path(),

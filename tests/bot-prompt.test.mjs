@@ -199,11 +199,16 @@ try {
   assert.match(offlineStatus, /management host/);
   assert.match(offlineStatus, /Agent unavailable/);
   const table = (await runCli(["list"], "http://127.0.0.1:1")).stdout;
-  assert.match(table, /NAME\s+ROLE\s+PHASE\s+AGENT\s+ID/);
   assert.match(
     table,
-    new RegExp(`fixture-bot\\s+bot\\s+ready\\s+enabled\\s+${bot.id}`),
-    "default list shows the configured agent state and full immutable ID without contacting the runner",
+    /NAME\s+ROLE\s+PHASE\s+AGENT CONFIG\s+ACTIVITY\s+ID/,
+  );
+  assert.match(
+    table,
+    new RegExp(
+      `fixture-bot\\s+bot\\s+ready\\s+enabled\\s+unavailable\\s+${bot.id}`,
+    ),
+    "default list shows configured agent state, live activity, and full immutable ID",
   );
   const registered = await fetch(`${url}/v1/workspaces/${bot.id}`);
   const botStatus = await registered.json();

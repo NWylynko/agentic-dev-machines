@@ -25,9 +25,19 @@ impl fmt::Display for HttpError {
 impl Error for HttpError {}
 
 pub fn request(url: &str, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+    request_with_timeout(url, method, path, body, Duration::from_secs(60))
+}
+
+pub fn request_with_timeout(
+    url: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+) -> Result<Value> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(60))
+        .timeout(timeout)
         .build()?;
     let method = reqwest::Method::from_bytes(method.as_bytes())?;
     let mut request = client.request(method, format!("{}{path}", url.trim_end_matches('/')));
