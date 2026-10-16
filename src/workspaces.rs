@@ -113,8 +113,6 @@ pub struct CreateOptions {
     #[arg(long, default_value = "2Gi")]
     pub memory: String,
     #[arg(long)]
-    pub no_agent: bool,
-    #[arg(long)]
     pub no_repositories: bool,
     #[arg(long)]
     pub catalog: Option<std::path::PathBuf>,
@@ -272,7 +270,7 @@ impl CreateOptions {
             storage_size: self.storage_size.clone(),
             cpu: self.cpu.clone(),
             memory: self.memory.clone(),
-            agent_enabled: !self.no_agent,
+            agent_enabled: true,
             repositories: self.catalog.is_some() && !self.no_repositories && self.role == "coding",
             catalog,
             repository: self.repo.clone(),
@@ -584,10 +582,6 @@ pub fn navigation_guidance(workspace: &Workspace, opening_shell: bool) -> String
 
 pub fn create(cli: &Cli, options: &CreateOptions) -> Result<Workspace> {
     let started = Instant::now();
-    ensure!(
-        options.no_agent || options.model.is_some(),
-        "agent workspaces require an explicit --model PROVIDER/MODEL_ID; use --no-agent to create a workspace without an agent"
-    );
     let requested = options.workspace()?;
     let mut store = cli.store()?;
     let existing = store

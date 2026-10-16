@@ -407,7 +407,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let readiness = root.path().join("release-readiness");
     let (create, create_progress, create_stderr) = launch(
         root.path(),
-        &["create", "progress-demo", "--no-agent", "--no-repositories"],
+        &["create", "progress-demo", "--no-repositories"],
     );
     wait_for_file(&root.path().join("entered-readiness"));
     let active_create_stage =
@@ -450,7 +450,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         wait_for_stage(&destroy_progress, "waiting for namespace removal started");
     let during_destroy = assert_ok(adm(root.path(), &["list", "--json"]));
     assert_eq!(during_destroy[0]["phase"], "deleting");
-    assert_eq!(during_destroy[0]["activity"]["status"], "disabled");
+    assert_eq!(during_destroy[0]["activity"]["status"], "deleted");
     let cluster: Value =
         serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
     assert!(
@@ -508,16 +508,13 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
 
     let coding = assert_ok(adm(
         root.path(),
-        &["create", "coding-agent", "--no-agent", "--no-repositories"],
+        &["create", "coding-agent", "--no-repositories"],
     ));
     let shell = assert_ok(adm(
         root.path(),
-        &["create", "shell-only", "--no-agent", "--no-repositories"],
+        &["create", "shell-only", "--no-repositories"],
     ));
-    let bot = assert_ok(adm(
-        root.path(),
-        &["create", "observer", "--role", "bot", "--no-agent"],
-    ));
+    let bot = assert_ok(adm(root.path(), &["create", "observer", "--role", "bot"]));
 
     let table = adm(root.path(), &["list"]);
     assert!(
@@ -536,9 +533,9 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
         "{table}"
     );
     for (name, role, agent, record) in [
-        ("coding-agent", "coding", "disabled", &coding),
-        ("shell-only", "coding", "disabled", &shell),
-        ("observer", "bot", "disabled", &bot),
+        ("coding-agent", "coding", "needs_model", &coding),
+        ("shell-only", "coding", "needs_model", &shell),
+        ("observer", "bot", "needs_model", &bot),
     ] {
         assert!(table.contains(name), "{table}");
         assert!(table.contains(role), "{table}");
@@ -601,9 +598,9 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
 #[test]
 fn list_joins_activity_from_one_runner_directory_request() {
     let root = fixture();
-    let disabled = assert_ok(adm(
+    let needs_model = assert_ok(adm(
         root.path(),
-        &["create", "disabled", "--no-agent", "--no-repositories"],
+        &["create", "disabled", "--no-repositories"],
     ));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let runner_url = format!("http://{}", listener.local_addr().unwrap());
@@ -685,8 +682,8 @@ fn list_joins_activity_from_one_runner_directory_request() {
         String::from_utf8_lossy(&listed.stderr)
     );
     let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(listed[0]["id"], disabled["id"]);
-    assert_eq!(listed[0]["activity"]["status"], "disabled");
+    assert_eq!(listed[0]["id"], needs_model["id"]);
+    assert_eq!(listed[0]["activity"]["status"], "unavailable");
     for (name, activity) in [("idle", "idle"), ("running", "running"), ("error", "error")] {
         let row = listed
             .as_array()
@@ -786,7 +783,7 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
     let root = fixture();
     assert_ok(adm(
         root.path(),
-        &["create", "shell-cwd", "--no-agent", "--no-repositories"],
+        &["create", "shell-cwd", "--no-repositories"],
     ));
 
     let shell = adm(root.path(), &["shell", "shell-cwd"]);
@@ -1215,13 +1212,7 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
     let other = adm_with_runner_env(
         root.path(),
         &runner_url,
-        &[
-            "create",
-            "repo-other",
-            "--no-agent",
-            "--repo",
-            "owner/project",
-        ],
+        &["create", "repo-other", "--repo", "owner/project"],
         (&rewrite, "https://github.com/"),
     );
     let other_guidance = String::from_utf8_lossy(&other.stderr);
@@ -1361,7 +1352,7 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "runner-error", "--no-agent", "--no-repositories"],
+        &["create", "runner-error", "--no-repositories"],
     ));
     let database = rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
     let mut spec: Value = serde_json::from_str(
@@ -1438,10 +1429,7 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
 #[test]
 fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
     let root = fixture();
-    let created = adm(
-        root.path(),
-        &["create", "navigation", "--no-agent", "--no-repositories"],
-    );
+    let created = adm(root.path(), &["create", "navigation", "--no-repositories"]);
     assert!(created.status.success(), "{created:?}");
     let workspace: Value =
         serde_json::from_slice(&created.stdout).expect("create keeps its workspace JSON on stdout");
@@ -1496,7 +1484,6 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
         &[
             "create",
             "catalog-navigation",
-            "--no-agent",
             "--catalog",
             catalog.to_str().unwrap(),
         ],
@@ -1552,48 +1539,38 @@ fn managed_shell_client_is_scoped_and_closes_without_aborting_the_agent() {
 fn public_cli_rejects_unsafe_names_before_touching_the_cluster() {
     let root = tempfile::tempdir().unwrap();
     for name in ["../escape", "UPPER", "a/b", "", "bad name"] {
-        let output = adm(
-            root.path(),
-            &["create", name, "--no-agent", "--no-repositories"],
-        );
+        let output = adm(root.path(), &["create", name, "--no-repositories"]);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("name"));
     }
 }
 
 #[test]
-fn agent_workspace_requires_an_explicit_model_before_provisioning() {
+fn agent_workspace_can_be_created_before_a_model_is_selected() {
     let root = fixture();
     let output = adm(root.path(), &["create", "needs-model"]);
-    assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("--model PROVIDER/MODEL_ID"),
+        output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        !root.path().join("state/workspaces.sqlite").exists(),
-        "invalid agent configuration must fail before local or cluster provisioning"
-    );
+    let workspace: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(workspace["agent_enabled"], true);
+    assert!(workspace["model"].is_null());
+    assert_eq!(workspace["phase"], "ready");
 }
 
 #[test]
 fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() {
     let root = fixture();
-    let first = assert_ok(adm(
-        root.path(),
-        &["create", "demo", "--no-agent", "--no-repositories"],
-    ));
+    let first = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
     assert_eq!(first["name"], "demo");
     assert_eq!(first["phase"], "ready");
     assert_eq!(
         assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"],
         first["id"]
     );
-    let duplicate = adm(
-        root.path(),
-        &["create", "demo", "--no-agent", "--no-repositories"],
-    );
+    let duplicate = adm(root.path(), &["create", "demo", "--no-repositories"]);
     assert!(
         !duplicate.status.success(),
         "duplicate names must be explicit errors"
@@ -1614,24 +1591,15 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
         assert_ok(adm(root.path(), &["list", "--json", "--all"]))[0]["phase"],
         "deleted"
     );
-    let second = assert_ok(adm(
-        root.path(),
-        &["create", "demo", "--no-agent", "--no-repositories"],
-    ));
+    let second = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
     assert_ne!(first["id"], second["id"]);
 }
 
 #[test]
 fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let root = fixture();
-    let coding = assert_ok(adm(
-        root.path(),
-        &["create", "demo", "--no-agent", "--no-repositories"],
-    ));
-    let bot = assert_ok(adm(
-        root.path(),
-        &["create", "supervisor", "--role", "bot", "--no-agent"],
-    ));
+    let coding = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
+    let bot = assert_ok(adm(root.path(), &["create", "supervisor", "--role", "bot"]));
 
     let status = adm(root.path(), &["status", "demo"]);
     assert!(
@@ -1654,7 +1622,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
             && status.contains("coding")
             && status.contains("NotReady (Running)")
             && status.contains("Runtime readiness: NotReady (Running)")
-            && status.contains("disabled")
+            && status.contains("needs_model")
             && status.contains("node-a")
             && status.contains(&format!("ID: {}", coding["id"].as_str().unwrap()))
             && status.contains("Namespace:")
@@ -1699,8 +1667,8 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let full = assert_ok(adm(root.path(), &["status", "demo", "--json"]));
     assert_eq!(full["workspace"]["id"], coding["id"]);
     assert_eq!(full["cluster"]["pods"][0]["status"]["phase"], "Running");
-    assert_eq!(full["agent"]["status"], "disabled");
-    assert_eq!(full["activity"]["status"], "disabled");
+    assert_eq!(full["agent"]["status"], "needs_model");
+    assert_eq!(full["activity"]["status"], "needs_model");
     assert_eq!(
         assert_ok(adm(root.path(), &["inspect", "demo", "--json"])),
         full
@@ -1737,7 +1705,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         bot_status.contains("bot")
             && bot_status.contains("n/a")
             && bot_status.contains("management host")
-            && bot_status.contains("disabled"),
+            && bot_status.contains("needs_model"),
         "{bot_status}"
     );
     assert_eq!(
@@ -1867,10 +1835,7 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     let root = fixture();
     fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
 
-    let first = adm(
-        root.path(),
-        &["create", "retry-me", "--no-agent", "--no-repositories"],
-    );
+    let first = adm(root.path(), &["create", "retry-me", "--no-repositories"]);
     assert!(
         !first.status.success(),
         "stdout={} stderr={}",
@@ -1885,7 +1850,7 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     );
     let original_id = failed[0]["id"].as_str().unwrap();
     assert_eq!(failed[0]["phase"], "failed");
-    assert_eq!(failed[0]["activity"]["status"], "disabled");
+    assert_eq!(failed[0]["activity"]["status"], "unavailable");
     assert!(failed[0]["last_error"].as_str().is_some());
     let failure_status = adm(root.path(), &["status", "retry-me"]);
     assert!(failure_status.status.success());
@@ -1901,7 +1866,7 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
 
     let retried = assert_ok(adm(
         root.path(),
-        &["create", "retry-me", "--no-agent", "--no-repositories"],
+        &["create", "retry-me", "--no-repositories"],
     ));
     assert_eq!(retried["phase"], "ready");
     assert_eq!(retried["id"], original_id);
@@ -1916,17 +1881,14 @@ fn failed_creation_retry_keeps_the_standard_workspace_security_policy() {
     let root = fixture();
     fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
 
-    let first = adm(
-        root.path(),
-        &["create", "sudo-choice", "--no-agent", "--no-repositories"],
-    );
+    let first = adm(root.path(), &["create", "sudo-choice", "--no-repositories"]);
     assert!(!first.status.success());
     let saved = assert_ok(adm(root.path(), &["list", "--json"]));
     let original_id = saved[0]["id"].clone();
 
     let retry = assert_ok(adm(
         root.path(),
-        &["create", "sudo-choice", "--no-agent", "--no-repositories"],
+        &["create", "sudo-choice", "--no-repositories"],
     ));
     assert_eq!(retry["id"], original_id);
     assert_eq!(retry["phase"], "ready");
@@ -1936,10 +1898,7 @@ fn failed_creation_retry_keeps_the_standard_workspace_security_policy() {
 fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
     let root = fixture();
     fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
-    let first = adm(
-        root.path(),
-        &["create", "retry-safe", "--no-agent", "--no-repositories"],
-    );
+    let first = adm(root.path(), &["create", "retry-safe", "--no-repositories"]);
     assert!(!first.status.success());
     let failed = assert_ok(adm(root.path(), &["list", "--json"]));
     let namespace = failed[0]["namespace"].as_str().unwrap();
@@ -1948,10 +1907,7 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
     cluster[namespace]["metadata"]["labels"]["adm.dev/workspace-id"] = "someone-else".into();
     fs::write(&cluster_path, serde_json::to_vec(&cluster).unwrap()).unwrap();
 
-    let retry = adm(
-        root.path(),
-        &["create", "retry-safe", "--no-agent", "--no-repositories"],
-    );
+    let retry = adm(root.path(), &["create", "retry-safe", "--no-repositories"]);
     assert!(
         !retry.status.success(),
         "retry must refuse a namespace with changed ownership"
@@ -1967,10 +1923,7 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
 #[test]
 fn destruction_refuses_a_namespace_whose_immutable_ownership_changed() {
     let root = fixture();
-    let workspace = assert_ok(adm(
-        root.path(),
-        &["create", "safe", "--no-agent", "--no-repositories"],
-    ));
+    let workspace = assert_ok(adm(root.path(), &["create", "safe", "--no-repositories"]));
     let cluster_path = root.path().join("cluster.json");
     let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
     cluster[workspace["namespace"].as_str().unwrap()]["metadata"]["labels"]["adm.dev/workspace-id"] =
@@ -1992,15 +1945,15 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-owned", "--no-agent", "--no-repositories"],
+        &["create", "herdr-owned", "--no-repositories"],
     ));
     let other_workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-other", "--no-agent", "--no-repositories"],
+        &["create", "herdr-other", "--no-repositories"],
     ));
     let stale_workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-stale", "--no-agent", "--no-repositories"],
+        &["create", "herdr-stale", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2167,7 +2120,7 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "journaled", "--no-agent", "--no-repositories"],
+        &["create", "journaled", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2214,7 +2167,7 @@ fn browser_refuses_to_enter_a_namespace_whose_immutable_ownership_changed() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "browser-safe", "--no-agent", "--no-repositories"],
+        &["create", "browser-safe", "--no-repositories"],
     ));
     let cluster_path = root.path().join("cluster.json");
     let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
@@ -2235,7 +2188,7 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-owned", "--no-agent", "--no-repositories"],
+        &["create", "herdr-owned", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2268,12 +2221,7 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &[
-            "create",
-            "offline-status",
-            "--no-agent",
-            "--no-repositories",
-        ],
+        &["create", "offline-status", "--no-repositories"],
     ));
     fs::write(root.path().join("fail-status"), "offline").unwrap();
 
@@ -2441,20 +2389,13 @@ fn repository_catalog_options_must_match_the_workspace_role() {
     let fixture = fixture();
     for (args, error) in [
         (
-            vec![
-                "create",
-                "bad-repo",
-                "--no-agent",
-                "--repo",
-                "owner//project",
-            ],
+            vec!["create", "bad-repo", "--repo", "owner//project"],
             "repository name",
         ),
         (
             vec![
                 "create",
                 "no-repos",
-                "--no-agent",
                 "--no-repositories",
                 "--repo",
                 "owner/project",
@@ -2465,7 +2406,6 @@ fn repository_catalog_options_must_match_the_workspace_role() {
             vec![
                 "create",
                 "bot-repo",
-                "--no-agent",
                 "--role",
                 "bot",
                 "--repo",
@@ -2477,7 +2417,6 @@ fn repository_catalog_options_must_match_the_workspace_role() {
             vec![
                 "create",
                 "catalog-repo",
-                "--no-agent",
                 "--catalog",
                 catalog.to_str().unwrap(),
                 "--repo",
@@ -2504,13 +2443,7 @@ fn repository_catalog_options_must_match_the_workspace_role() {
     );
     assert_ok(adm(
         fixture.path(),
-        &[
-            "manifest",
-            "punctuation",
-            "--no-agent",
-            "--repo",
-            "_owner/project.",
-        ],
+        &["manifest", "punctuation", "--repo", "_owner/project."],
     ));
 }
 
@@ -2541,7 +2474,7 @@ fn missing_replicated_storage_points_at_the_deploy_note() {
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, "#!/bin/sh\necho 'Error from server (NotFound): storageclasses.storage.k8s.io \"adm-replicated\" not found' >&2\nexit 1\n").unwrap();
     fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    let output = adm(root.path(), &["create", "demo", "--no-agent"]);
+    let output = adm(root.path(), &["create", "demo"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("deploy/storage.md"), "{stderr}");

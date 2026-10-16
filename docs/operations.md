@@ -71,7 +71,7 @@ adm inspect my-project
 
 If an older coding workspace's tool calls report that no Kubernetes connection is pinned, verify that the selected host kubeconfig reaches the intended cluster and run `adm reconnect NAME --kubeconfig PATHS`. The command checks the namespace's `adm.dev/workspace-id` ownership label, then updates the runner's persisted host connection while retaining the same namespace, workspace ID, files, Durable history, goals, and loops. If active work blocks the rebind, stop it deliberately with `adm abort NAME`, then retry. Restarting the runner alone does not change a registered connection. The `--kubeconfig` argument accepts the ordinary colon-separated merge list; CLI-relative entries are resolved from the current directory.
 
-Use `--no-agent` for a shell-only workspace. By default `/repos` is an ordinary writable directory, so normal cloning works. `--repo OWNER/REPO` performs a normal full clone of a public GitHub repository into `/repos/OWNER/REPO`; Git checks out the remote's advertised default branch. The shell and coding agent start there. The clone uses the private workspace volume and does not enable the lazy catalog. Private repository authentication is not configured by this option, and the clone does not use shallow or filtered fetches. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. `--repo` cannot be combined with `--catalog`, `--no-repositories`, or bot workspaces.
+Every workspace starts with a durable agent. Without a configured default, select a model after attaching with `/model`; input remains paused until a model is selected. By default `/repos` is an ordinary writable directory, so normal cloning works. `--repo OWNER/REPO` performs a normal full clone of a public GitHub repository into `/repos/OWNER/REPO`; Git checks out the remote's advertised default branch. The shell and coding agent start there. The clone uses the private workspace volume and does not enable the lazy catalog. Private repository authentication is not configured by this option, and the clone does not use shallow or filtered fetches. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. `--repo` cannot be combined with `--catalog`, `--no-repositories`, or bot workspaces.
 
 `adm shell NAME` opens a login shell at the workspace's selected working directory (`/repos` by default, or the selected repository root). For a catalog workspace, `pwd -P` may show its backing storage path under `/workspace/.adm`; that is the same directory through the `/repos` view. Commands supplied to `adm shell NAME -- COMMAND...` or `adm exec` run as given and keep their own working-directory behavior.
 
@@ -80,7 +80,7 @@ Use `adm shell NAME --manage` when you also need the current agent controls from
 The workspace image includes `nano` and passwordless `sudo`. New coding workspaces permit unattended administration inside their own container by default:
 
 ```sh
-adm create package-workspace --no-agent
+adm create package-workspace
 adm shell package-workspace
 # Inside the workspace shell:
 sudo apt-get update

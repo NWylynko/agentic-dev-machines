@@ -9,11 +9,13 @@ export function workspacePiAuthPath(workspaceRoot = "/workspace"): string {
 /** Create Pi's normal runtime against the workspace-owned, restart-persistent auth store. */
 export async function workspaceCredentialRuntime(
   workspaceRoot = "/workspace",
+  options: { allowModelNetwork?: boolean } = {},
 ): Promise<Models> {
   const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
   return ModelRuntime.create({
     authPath: workspacePiAuthPath(workspaceRoot),
     modelsStorePath: join(workspaceRoot, ".adm", "pi", "models-store.json"),
-    allowModelNetwork: false,
+    allowModelNetwork: options.allowModelNetwork === true,
+    ...(options.allowModelNetwork ? { refreshOnCreate: false } : {}),
   });
 }

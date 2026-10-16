@@ -153,13 +153,12 @@ if (!enabled) {
     await writeFile(catalogPath, JSON.stringify({ repositories: [] }));
 
     const first = json(
-      (await adm(state, ["create", label, "--role", "bot", "--no-agent"]))
-        .stdout,
+      (await adm(state, ["create", label, "--role", "bot"])).stdout,
       "adm create bot",
     );
     created.push(first);
     assert.equal(first.role, "bot");
-    assert.equal(first.agent_enabled, false);
+    assert.equal(first.agent_enabled, true);
     assert.equal(first.phase, "ready");
     await assertOwnedNamespace(first);
 
@@ -175,7 +174,7 @@ if (!enabled) {
       "adm status --json",
     );
     assert.equal(status.workspace.id, first.id);
-    assert.equal(status.agent.status, "disabled");
+    assert.equal(status.agent.status, "needs_model");
 
     const generated = json(
       (
@@ -220,8 +219,7 @@ if (!enabled) {
     await expectNamespaceAbsent(first.namespace);
 
     const second = json(
-      (await adm(state, ["create", label, "--role", "bot", "--no-agent"]))
-        .stdout,
+      (await adm(state, ["create", label, "--role", "bot"])).stdout,
       "adm recreate bot label",
     );
     created.push(second);

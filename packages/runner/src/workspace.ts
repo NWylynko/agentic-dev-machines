@@ -21,6 +21,7 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { workspaceModels } from "./models.ts";
+import type { Models } from "@earendil-works/pi-ai/models";
 import { BotProfileDocument, botExtension } from "./bot.ts";
 import { openMcpExtension } from "./mcp.ts";
 import {
@@ -118,6 +119,7 @@ export class Workspace {
   private execution?: ExecutionEnv;
   private accepting = true;
   private admissions = Promise.resolve();
+  private models: Models;
   private readonly assertActive: () => Promise<void>;
   private readonly loopTask: ReturnType<
     typeof createScheduleExtension
@@ -129,6 +131,7 @@ export class Workspace {
     config: WorkspaceConfig,
     harness: Workspace["harness"],
     conversation: Workspace["conversation"],
+    models: Models,
     assertActive: () => Promise<void>,
     loopTask: Workspace["loopTask"],
     mcpClose?: () => Promise<void>,
@@ -136,6 +139,7 @@ export class Workspace {
     this.config = config;
     this.harness = harness;
     this.conversation = conversation;
+    this.models = models;
     this.assertActive = assertActive;
     this.loopTask = loopTask;
     this.mcpClose = mcpClose;
@@ -152,6 +156,7 @@ export class Workspace {
     lookup?: (id: string) => Promise<Workspace>,
     passive = false,
     deferActivation = false,
+    runtimeProvider?: string,
   ): Promise<Workspace> {
     if (!passive) await assertActive();
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -252,10 +257,15 @@ export class Workspace {
       const storage = await openNodeSqliteStorage(databasePath);
       closeOpenedState = () => storage.close(context);
       await chmod(databasePath, 0o600);
+      const models = await workspaceModels(
+        config.model?.provider ?? runtimeProvider,
+        authPath,
+        config.localRoot ?? "/workspace",
+      );
       const harness = await Harness.open(
         storage,
         {
-          models: await workspaceModels(config.model?.provider, authPath),
+          models,
           registry,
           ...(execution ? { env: () => openedWorkspace!.execution! } : {}),
           onReport: recordError,
@@ -287,10 +297,23 @@ export class Workspace {
               }
             : undefined,
       });
+      const selectedModel = (await conversation.agent(context)).model;
+      const effectiveConfig: WorkspaceConfig = {
+        ...config,
+        ...(selectedModel
+          ? {
+              model: {
+                provider: selectedModel.provider,
+                id: selectedModel.modelId,
+              },
+            }
+          : { model: undefined }),
+      };
       const workspace = new Workspace(
-        config,
+        effectiveConfig,
         harness,
         conversation,
+        models,
         assertActive,
         schedule.loopTask,
         mcp?.close,
@@ -412,26 +435,125 @@ export class Workspace {
     });
   }
 
-  private async admitOnboarding() {
-    await this.withAdmission(async () => {
-      await this.assertActive();
-      const profile = await this.harness.snapshot(
-        BotProfileDocument,
-        this.conversation.id,
+  async modelCatalog(signal?: AbortSignal, refresh = false) {
+    if (signal?.aborted) throw signal.reason;
+    const refreshResult = refresh
+      ? await this.models.refresh({ signal })
+      : undefined;
+    const available = await this.models.getAvailable(undefined, { signal });
+    const providers = await Promise.all(
+      this.models.getProviders().map(async (provider) => ({
+        id: provider.id,
+        name: provider.name,
+        authenticated:
+          (await this.models.checkAuth(provider.id, { signal })) !== undefined,
+      })),
+    );
+    const selected = (await this.conversation.agent(context)).model;
+    return {
+      selected: selected
+        ? { provider: selected.provider, id: selected.modelId }
+        : undefined,
+      providers,
+      models: available.map((model) => ({
+        provider: model.provider,
+        id: model.id,
+        name: model.name,
+        api: model.api,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+        reasoning: model.reasoning,
+        input: model.input,
+      })),
+      error: refreshResult?.errors.size
+        ? [...refreshResult.errors.values()]
+            .map((error) => error.message)
+            .join("; ")
+        : providers.length > 0 && available.length === 0
+          ? "Set workspace credentials before selecting a model."
+          : undefined,
+      refresh: refreshResult
+        ? {
+            aborted: refreshResult.aborted,
+            errors: [...refreshResult.errors].map(([provider, error]) => ({
+              provider,
+              message: error.message,
+            })),
+          }
+        : undefined,
+    };
+  }
+
+  async changeModel(provider: string, modelId: string) {
+    return this.withAdmission(async () => {
+      const inspection = await this.harness.inspect(context);
+      if (inspection.tasks.some((task) => agentIsBusy(task)))
+        throw new ApiError(
+          409,
+          "WORKSPACE_BUSY",
+          "Model changes apply to the next request; wait for active work to finish",
+        );
+      const available = await this.models.getAvailable(provider);
+      const model = available.find((entry) => entry.id === modelId);
+      if (!model) {
+        const exists = this.models.getModel(provider, modelId);
+        if (!exists)
+          throw new ApiError(
+            400,
+            "MODEL_NOT_FOUND",
+            "That model is not in the configured catalog",
+          );
+        throw new ApiError(
+          409,
+          "MODEL_AUTH_REQUIRED",
+          `Provider ${provider} is not authenticated for model ${modelId}`,
+        );
+      }
+      await this.conversation.configure(
+        { model: { provider, modelId } },
         context,
       );
-      if (!profile || profile.state === "ready") return;
-      await this.conversation.submit(
-        {
-          type: "input",
-          content:
-            "ADM bot onboarding: ask the user to choose your identity and purpose. Use sendMessage to publish the setup question, then wait for the user's answer. Save confirmed details with saveProfile.",
-          requestId: `onboarding:${this.config.id}`,
-          whenBusy: "followUp",
-        },
-        context,
-      );
+      const effective = (await this.conversation.agent(context)).model;
+      this.config = {
+        ...this.config,
+        model: effective
+          ? { provider: effective.provider, id: effective.modelId }
+          : undefined,
+      };
+      await this.activateWhileAdmitted();
+      return { selected: this.config.model };
     });
+  }
+
+  private async queueOnboarding() {
+    await this.assertActive();
+    const profile = await this.harness.snapshot(
+      BotProfileDocument,
+      this.conversation.id,
+      context,
+    );
+    if (!profile || profile.state === "ready") return;
+    await this.conversation.submit(
+      {
+        type: "input",
+        content:
+          "ADM bot onboarding: ask the user to choose your identity and purpose. Use sendMessage to publish the setup question, then wait for the user's answer. Save confirmed details with saveProfile.",
+        requestId: `onboarding:${this.config.id}`,
+        whenBusy: "followUp",
+      },
+      context,
+    );
+  }
+
+  private async admitOnboarding() {
+    await this.withAdmission(() => this.queueOnboarding());
+  }
+
+  private async activateWhileAdmitted() {
+    if (this.passive || this.closed || !this.config.model) return;
+    if (this.config.role === "bot" && this.config.onboardingRequired)
+      await this.queueOnboarding();
+    this.harness.resume();
   }
 
   async activate() {

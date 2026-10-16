@@ -130,7 +130,7 @@ test(
       env: environment,
     });
     assert.match(version.stdout, /^adm /);
-    const manifest = await execute(adm, ["manifest", "release", "--no-agent"], {
+    const manifest = await execute(adm, ["manifest", "release"], {
       cwd: unrelated,
       env: environment,
     });
