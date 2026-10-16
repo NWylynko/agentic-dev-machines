@@ -172,6 +172,9 @@ elif args[0] == 'exec':
     target = next(line[7:] for line in config.splitlines() if line.startswith('target='))
     os.environ['ADM_TEST_TARGET'] = target
     command = args[args.index('--') + 1:]
+    if command[0] != 'node':
+        os.chdir(target)
+        os.execvp(command[0], command)
     command[command.index('--cwd') + 1] = target
     command[1] = os.environ['ADM_TEST_REMOTE_ENV']
     command.insert(2, command[1])
@@ -229,6 +232,42 @@ else:
         ],
     ));
     let id = created["id"].as_str().unwrap();
+    let exec_output = invoke(
+        root.path(),
+        &url,
+        wrong_config.to_str().unwrap(),
+        &[
+            "--kubeconfig",
+            &good_list,
+            "exec",
+            "context-test",
+            "--",
+            "sh",
+            "-c",
+            "printf intended > exec-marker && cat exec-marker",
+        ],
+    );
+    assert!(
+        exec_output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&exec_output.stdout),
+        String::from_utf8_lossy(&exec_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&exec_output.stdout).trim(),
+        "intended"
+    );
+    assert!(
+        intended.join("exec-marker").exists(),
+        "adm exec must target the selected workspace; parent-context marker was: {}",
+        fs::read_to_string(wrong.join("exec-marker")).unwrap_or_default()
+    );
+    assert_eq!(
+        fs::read_to_string(intended.join("exec-marker")).unwrap(),
+        "intended"
+    );
+    assert!(!wrong.join("exec-marker").exists());
+    assert!(!host.join("exec-marker").exists());
     let goal = request(
         &url,
         "POST",

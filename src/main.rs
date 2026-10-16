@@ -746,7 +746,8 @@ fn run(cli: &Cli) -> Result<()> {
                 "bots have no development shell or repository access"
             );
             workspaces::verify_ownership(cli, &workspace)?;
-            let status = Command::new(&cli.kubectl)
+            let status = cli
+                .kubectl_command()?
                 .args([
                     "exec",
                     "-n",
