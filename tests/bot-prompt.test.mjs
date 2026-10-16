@@ -144,6 +144,9 @@ try {
       },
     );
   const cli = async (args) => JSON.parse((await runCli(args)).stdout);
+  const createHelp = await runCli(["create", "--help"]);
+  assert.match(createHelp.stdout, /management-host runner/);
+  assert.match(createHelp.stdout, /no workspace Pod/);
   const disabled = await runCli([
     "create",
     "shell-bot",

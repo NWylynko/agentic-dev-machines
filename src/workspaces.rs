@@ -77,6 +77,7 @@ pub struct Workspace {
 #[derive(Args)]
 pub struct CreateOptions {
     pub name: String,
+    /// Bot agents run in the management-host runner and have no workspace Pod.
     #[arg(long,default_value="coding",value_parser=["coding","bot"])]
     pub role: String,
     /// Workspace image; otherwise use the configured or matching release image.
