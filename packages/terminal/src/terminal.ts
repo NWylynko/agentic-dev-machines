@@ -25,6 +25,7 @@ import {
   TreeSelectorComponent,
   UserMessageComponent,
   SettingsSelectorComponent,
+  copyToClipboard,
   initTheme,
   type ModelRuntime,
   type SettingsCallbacks,
@@ -45,6 +46,7 @@ type TerminalOptions = {
   tokenFile?: string;
   identityFile?: string;
   diagnostics?: boolean;
+  writeClipboard?: (text: string) => Promise<void>;
   tui?: TUI;
   onRender?: () => void;
   onDetach?: () => void;
@@ -302,7 +304,7 @@ export class WorkspaceTerminal extends Container {
       }
     }
     this.statusLine.setText(
-      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · Ctrl+O: tool details · Ctrl+T: thinking · Shift+Tab: cycle thinking · /model · /settings · /thinking · /session · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
+      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · Ctrl+O: tool details · Ctrl+T: thinking · Shift+Tab: cycle thinking · /model · /settings · /thinking · /session · /copy · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
     );
     this.options.onRender?.();
   }
@@ -698,7 +700,7 @@ export class WorkspaceTerminal extends Container {
     try {
       if (message === "/help") {
         this.status =
-          "/model · /settings · /thinking · /session · /resume · /new · /fork · /tree · /hotkeys · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /thinking changes the durable thinking level; /session shows the selected workspace conversation; /resume selects a durable branch; /new creates an empty durable conversation in this workspace; /fork opens the durable tree; /retry retries a safe failed provider turn.";
+          "/model · /settings · /thinking · /session · /copy · /resume · /new · /fork · /tree · /hotkeys · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /thinking changes the durable thinking level; /session shows the selected workspace conversation; /copy copies the latest assistant reply or explicit bot message; /resume selects a durable branch; /new creates an empty durable conversation in this workspace; /fork opens the durable tree; /retry retries a safe failed provider turn.";
         clearInput();
         return;
       }
@@ -761,7 +763,66 @@ export class WorkspaceTerminal extends Container {
             "Runner returned invalid workspace session information",
           );
         const branches = navigation.branches;
-        this.status = `Workspace session ${clean(navigation.activeConversationId)} · ${branches.length} durable conversations`;
+        const prompts = this.records.filter(
+          (record) => record.kind === "user",
+        ).length;
+        const replies =
+          this.role === "bot"
+            ? undefined
+            : this.records.filter((record) => record.kind === "assistant")
+                .length;
+        const toolResults =
+          this.role === "bot"
+            ? undefined
+            : this.records.filter((record) => record.kind === "tool").length;
+        const usage = this.records
+          .filter((record) => record.kind === "assistant")
+          .map((record) => record.data?.message?.usage)
+          .filter((value) => value && typeof value === "object")
+          .reduce(
+            (totals, value) => ({
+              tokens: totals.tokens + (Number(value.totalTokens) || 0),
+              cost: totals.cost + (Number(value.cost?.total) || 0),
+            }),
+            { tokens: 0, cost: 0 },
+          );
+        this.status = [
+          `Workspace session ${clean(navigation.activeConversationId)}`,
+          `${branches.length} durable conversations`,
+          `${prompts} ${prompts === 1 ? "prompt" : "prompts"}`,
+          ...(replies === undefined
+            ? []
+            : [`${replies} ${replies === 1 ? "reply" : "replies"}`]),
+          ...(toolResults === undefined
+            ? []
+            : [
+                `${toolResults} tool ${toolResults === 1 ? "result" : "results"}`,
+              ]),
+          ...(this.role === "bot" ? [] : [`${usage.tokens} tokens`]),
+          ...(this.role === "bot" || usage.cost <= 0
+            ? []
+            : [`$${usage.cost.toFixed(3)}`]),
+        ].join(" · ");
+        clearInput();
+        return;
+      }
+      if (message === "/copy") {
+        const kind = this.role === "bot" ? "message" : "assistant";
+        const latest = [...this.records]
+          .reverse()
+          .find((record) => record.kind === kind);
+        const text = latest?.data?.text;
+        if (typeof text !== "string" || !text.trim())
+          throw new Error(
+            this.role === "bot"
+              ? "No published bot message to copy in this conversation"
+              : "No assistant reply to copy in this conversation",
+          );
+        await (this.options.writeClipboard ?? copyToClipboard)(text);
+        this.status =
+          this.role === "bot"
+            ? "Copied latest published bot message"
+            : "Copied latest assistant reply";
         clearInput();
         return;
       }
@@ -807,7 +868,7 @@ export class WorkspaceTerminal extends Container {
       }
       if (message === "/hotkeys") {
         this.status =
-          "Keyboard shortcuts\nEnter: send or steer · Shift+Enter: new line · Ctrl+O: expand tool details · Ctrl+T: toggle thinking · Shift+Tab: cycle thinking · Esc: abort · Ctrl+R: reconnect · Ctrl+C: detach\nCommands: /model · /settings · /thinking · /session · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry";
+          "Keyboard shortcuts\nEnter: send or steer · Shift+Enter: new line · Ctrl+O: expand tool details · Ctrl+T: toggle thinking · Shift+Tab: cycle thinking · Esc: abort · Ctrl+R: reconnect · Ctrl+C: detach\nCommands: /model · /settings · /thinking · /session · /copy · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry";
         clearInput();
         return;
       }

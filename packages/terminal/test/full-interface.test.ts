@@ -18,7 +18,43 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
     response.setHeader("content-type", "application/json");
     if (url.pathname.endsWith("/history")) {
       response.end(
-        JSON.stringify({ events: [], nextAfter: 0, hasMore: false }),
+        JSON.stringify(
+          activeConversationId === 9
+            ? {
+                events: [
+                  {
+                    seq: 1,
+                    workspaceId: "work",
+                    kind: "user",
+                    data: { text: "hello" },
+                    timestamp: 1,
+                  },
+                  {
+                    seq: 2,
+                    workspaceId: "work",
+                    kind: "assistant",
+                    data: {
+                      text: "hello there",
+                      message: {
+                        role: "assistant",
+                        usage: {
+                          input: 10,
+                          output: 4,
+                          cacheRead: 2,
+                          cacheWrite: 1,
+                          totalTokens: 17,
+                          cost: { total: 0.02 },
+                        },
+                      },
+                    },
+                    timestamp: 2,
+                  },
+                ],
+                nextAfter: 2,
+                hasMore: false,
+              }
+            : { events: [], nextAfter: 0, hasMore: false },
+        ),
       );
     } else if (url.pathname.endsWith("/models")) {
       response.end(
@@ -106,6 +142,13 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
       stripTerminalSequences(terminal.render(100).join("\n")),
       /Workspace session 9/,
     );
+    const sessionStats = stripTerminalSequences(
+      terminal.render(100).join("\n"),
+    );
+    assert.match(sessionStats, /1 prompt/);
+    assert.match(sessionStats, /1 reply/);
+    assert.match(sessionStats, /17 tokens/);
+    assert.match(sessionStats, /\$0\.020/);
 
     await terminal.submit("/fork");
     assert.ok(
@@ -143,6 +186,102 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
   } finally {
     terminal.close();
     stream?.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("/copy copies the selected assistant reply and only explicit bot messages", async () => {
+  let role: "coding" | "bot" = "coding";
+  const copied: string[] = [];
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId: 1,
+          events:
+            role === "coding"
+              ? [
+                  {
+                    seq: 1,
+                    workspaceId: "work",
+                    kind: "assistant",
+                    data: { text: "Coding reply" },
+                    timestamp: 1,
+                  },
+                ]
+              : [
+                  {
+                    seq: 1,
+                    workspaceId: "work",
+                    kind: "assistant",
+                    data: { text: "Private bot reasoning" },
+                    timestamp: 1,
+                  },
+                  {
+                    seq: 2,
+                    workspaceId: "work",
+                    kind: "message",
+                    data: { text: "Published bot message" },
+                    timestamp: 2,
+                  },
+                ],
+          nextAfter: role === "coding" ? 1 : 2,
+          hasMore: false,
+        }),
+      );
+    } else if (url.pathname.endsWith("/models")) {
+      response.end(JSON.stringify({ models: [], providers: [] }));
+    } else if (url.pathname.endsWith("/settings")) {
+      response.end(JSON.stringify({ thinkingLevel: "off" }));
+    } else if (url.pathname.endsWith("/branches")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId: 1,
+          branches: [{ conversationId: 1 }],
+        }),
+      );
+    } else if (url.pathname.endsWith("/events")) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else {
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          role,
+          conversationId: 1,
+          status: "idle",
+        }),
+      );
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+    writeClipboard: async (text) => void copied.push(text),
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit("/copy");
+    assert.deepEqual(copied, ["Coding reply"]);
+    role = "bot";
+    await terminal.connect();
+    await terminal.submit("/copy");
+    assert.deepEqual(copied, ["Coding reply", "Published bot message"]);
+    await terminal.submit("/session");
+    assert.equal(
+      (terminal as any).status,
+      "Workspace session 1 · 1 durable conversations · 0 prompts",
+      "bot session stats must not reveal private replies, tool output, or usage",
+    );
+  } finally {
+    terminal.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
