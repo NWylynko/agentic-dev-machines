@@ -85,9 +85,6 @@ fn validate_herdr_space(space_id: &str) -> Result<()> {
         .context("`herdr workspace get` returned invalid JSON")?;
     let returned_id = response["result"]["workspace"]["workspace_id"]
         .as_str()
-        .or_else(|| response["result"]["workspace"]["workspaceId"].as_str())
-        .or_else(|| response["workspace"]["workspace_id"].as_str())
-        .or_else(|| response["workspace"]["workspaceId"].as_str())
         .context("`herdr workspace get` did not return a workspace ID")?;
     ensure!(
         returned_id == space_id,
