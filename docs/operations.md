@@ -215,12 +215,12 @@ adm herdr bind my-project "$HERDR_WORKSPACE_ID"
 
 # Open sibling shell and agent panes without changing focus
 herdr pane split --current --direction right --cwd "$PWD" --no-focus
-# Copy the returned .result.pane.pane_id, then run in that pane:
-adm shell my-project
+# Copy the returned .result.pane.pane_id, then open a shell there:
+herdr pane run SHELL_PANE_ID adm shell my-project
 
 herdr pane split --current --direction down --cwd "$PWD" --no-focus
-# In that pane:
-adm attach my-project
+# Copy its pane ID, then open the agent terminal there:
+herdr pane run AGENT_PANE_ID adm attach my-project
 
 # Start a supervised watcher for this Herdr session
 systemd-run --user --unit=adm-herdr-watch --property=Restart=on-failure \
