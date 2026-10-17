@@ -5,6 +5,8 @@ mod lifecycle;
 mod runner;
 mod runtime_access;
 mod setup;
+mod setup_connection;
+mod setup_control_plane;
 mod workspaces;
 
 use anyhow::{Context, Result};
@@ -51,6 +53,8 @@ pub struct Cli {
     /// File containing the lifecycle service bearer token.
     #[arg(long, global = true, env = "ADM_LIFECYCLE_TOKEN_FILE")]
     pub lifecycle_token_file: Option<PathBuf>,
+    #[arg(skip)]
+    pub lifecycle_token_secret: bool,
     #[arg(
         long,
         global = true,
@@ -158,9 +162,9 @@ pub enum Action {
         #[arg(long, default_value_t = 0)]
         after: u64,
     },
-    /// Manage the supervised durable runner.
+    /// Explain workspace runtime startup (no host runner).
     Start,
-    /// Run the durable runner in the foreground.
+    /// Explain workspace runtime ownership (no host runner).
     Serve,
     /// Run the in-cluster lifecycle owner.
     LifecycleServe {
@@ -169,9 +173,11 @@ pub enum Action {
         #[arg(long, default_value_t = 7433)]
         port: u16,
     },
-    /// Stop only the runner process, preserving recoverable work.
+    /// Maintain the supervised management-host connection to the lifecycle service.
+    LifecycleForward,
+    /// Explain workspace runtime shutdown (no host runner).
     Stop,
-    /// Check prerequisites, cluster access, storage, and runner health.
+    /// Check prerequisites, cluster access, storage, and lifecycle health.
     Doctor {
         /// StorageClass to inspect; otherwise use the configured default.
         #[arg(long, default_value = "adm-replicated", hide_default_value = true)]
@@ -180,7 +186,7 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Configure workspace defaults, provider login, and the background service.
+    /// Configure workspace defaults and install/connect the cluster controller.
     Setup,
     /// Generate shell completion scripts.
     Completions { shell: CompletionShell },
@@ -240,6 +246,7 @@ impl Cli {
             lifecycle_url: self.lifecycle_url.clone(),
             lifecycle_namespace: self.lifecycle_namespace.clone(),
             lifecycle_token_file: self.lifecycle_token_file.clone(),
+            lifecycle_token_secret: self.lifecycle_token_secret,
             runtime_status_port: self.runtime_status_port,
             lifecycle_fence: self.lifecycle_fence.clone(),
             lifecycle_operation_id: self.lifecycle_operation_id.clone(),
@@ -274,6 +281,7 @@ impl Cli {
             "start",
             "serve",
             "lifecycle-serve",
+            "lifecycle-forward",
             "stop",
             "doctor",
             "herdr",
@@ -448,6 +456,16 @@ impl Cli {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value> {
+        if self.lifecycle_token_secret && self.lifecycle_token_file.is_none() {
+            let token = lifecycle::kubernetes_token(self)?;
+            return lifecycle::request_with_token(
+                &self.lifecycle_url,
+                Some(&token),
+                method,
+                path,
+                body,
+            );
+        }
         lifecycle::request(
             &self.lifecycle_url,
             self.lifecycle_token_file.as_deref(),
@@ -1155,7 +1173,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Action::Start => {
             anyhow::bail!(
-                "agent runtimes start inside workspace Pods; use `adm attach NAME` to connect"
+                "agent runtimes start inside workspace Pods. Run `adm setup` to install and connect the lifecycle control plane, then `adm doctor`, `adm create NAME`, and `adm attach NAME`"
             )
         }
         Action::Serve => anyhow::bail!(
@@ -1164,6 +1182,7 @@ fn run(cli: &Cli) -> Result<()> {
         Action::LifecycleServe { host, port } => {
             lifecycle::serve(cli.clone_for_lifecycle(), host, *port)
         }
+        Action::LifecycleForward => setup_connection::serve(cli),
         Action::Stop => anyhow::bail!(
             "there is no host agent runner to stop; workspace Pods own agent execution"
         ),
@@ -1241,11 +1260,42 @@ fn main() {
 }
 
 fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
-    match &cli.command {
-        Action::Create(_) | Action::Manifest(_) | Action::Doctor { .. } => {}
-        _ => return Ok(()),
+    let workspace_defaults = matches!(
+        cli.command,
+        Action::Create(_) | Action::Manifest(_) | Action::Doctor { .. }
+    );
+    let connection_defaults = !matches!(
+        cli.command,
+        Action::Completions { .. }
+            | Action::LifecycleServe { .. }
+            | Action::LifecycleForward
+            | Action::Manifest(_)
+    );
+    if !workspace_defaults && !connection_defaults {
+        return Ok(());
     }
     let config = setup::read_config()?;
+    if connection_defaults && let Some(connection) = &config.lifecycle {
+        if matches.value_source("lifecycle_url") == Some(ValueSource::DefaultValue) {
+            cli.lifecycle_url = connection.url.clone();
+        }
+        if matches.value_source("lifecycle_namespace") == Some(ValueSource::DefaultValue) {
+            cli.lifecycle_namespace = connection.namespace.clone();
+        }
+        if matches.value_source("kubectl") == Some(ValueSource::DefaultValue) {
+            cli.kubectl = connection.kubectl.clone();
+        }
+        if matches.value_source("kubeconfig").is_none() {
+            cli.kubeconfig = Some(connection.kubeconfig.clone());
+        }
+        if matches.value_source("lifecycle_token_file").is_none() {
+            cli.lifecycle_token_file = connection.token_file.clone();
+            cli.lifecycle_token_secret = connection.token_file.is_none();
+        }
+    }
+    if !workspace_defaults {
+        return Ok(());
+    }
     let (_, arguments) = matches.subcommand().expect("required CLI command");
     let image = if matches!(&cli.command, Action::Create(_) | Action::Manifest(_))
         && arguments.value_source("image") == Some(ValueSource::DefaultValue)

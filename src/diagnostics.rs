@@ -29,7 +29,12 @@ pub fn doctor(cli: &Cli, storage_class: &str, json_output: bool) -> Result<()> {
     };
     let lifecycle = match cli.request_lifecycle("GET", "/health", None) {
         Ok(health) => health,
-        Err(error) => json!({"status":"unavailable", "error":format!("{error:#}")}),
+        Err(error) => json!({
+            "status":"unavailable",
+            "url":cli.lifecycle_url,
+            "error":format!("{error:#}"),
+            "action":crate::lifecycle::setup_guidance(cli),
+        }),
     };
     let report = json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"lifecycle":lifecycle,"state":cli.state_path()});
     if json_output {
@@ -102,7 +107,9 @@ fn print_doctor_report(report: &Value) {
     );
     if let Some(error) = report["lifecycle"]["error"].as_str() {
         println!("  Error: {error}");
-        println!("  Next: Check the in-cluster lifecycle service and its logs.");
+    }
+    if let Some(action) = report["lifecycle"]["action"].as_str() {
+        println!("  Next: {action}");
     }
     println!("State: {}", report["state"].as_str().unwrap_or("unknown"));
 }

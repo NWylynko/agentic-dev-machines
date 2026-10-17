@@ -400,6 +400,7 @@ mod forward_pipe_tests {
             lifecycle_url: String::new(),
             lifecycle_namespace: String::new(),
             lifecycle_token_file: None,
+            lifecycle_token_secret: false,
             runtime_status_port: 7432,
             lifecycle_fence: None,
             lifecycle_operation_id: None,

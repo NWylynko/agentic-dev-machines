@@ -16,6 +16,19 @@ pub struct Config {
     pub storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<LifecycleConfig>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleConfig {
+    pub url: String,
+    pub namespace: String,
+    pub kubectl: String,
+    pub kubeconfig: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<PathBuf>,
 }
 
 fn config_home() -> Result<PathBuf> {
@@ -150,10 +163,68 @@ pub fn run(cli: &Cli) -> Result<()> {
         Some(model)
     };
     config.validate()?;
+    let install = prompt(
+        "Install/update the cluster controller and enable its connection? (yes/no)",
+        "yes",
+    )?;
+    let connected = match install.to_ascii_lowercase().as_str() {
+        "yes" | "y" => {
+            let mut connection = cli.clone_for_lifecycle();
+            connection.kubeconfig = Some(cli.kubeconfig_reference()?);
+            let kubectl = PathBuf::from(&connection.kubectl);
+            if kubectl.is_relative() && kubectl.components().count() > 1 {
+                connection.kubectl = std::env::current_dir()?
+                    .join(kubectl)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            if let Some(path) = &mut connection.lifecycle_token_file
+                && path.is_relative()
+            {
+                *path = std::env::current_dir()?.join(&*path);
+            }
+            crate::setup_connection::preflight(&connection)?;
+            crate::setup_control_plane::install(
+                &connection,
+                config.image.as_deref().expect("configured image"),
+                config
+                    .storage_class
+                    .as_deref()
+                    .expect("configured storage class"),
+            )?;
+            crate::setup_connection::install(&connection)?;
+            connection.lifecycle_token_secret = connection.lifecycle_token_file.is_none();
+            connection
+                .request_lifecycle("GET", "/v1/workspaces", None)
+                .context("verify authenticated lifecycle connection after setup")?;
+            config.lifecycle = Some(LifecycleConfig {
+                url: connection.lifecycle_url,
+                namespace: connection.lifecycle_namespace,
+                kubectl: connection.kubectl,
+                kubeconfig: connection.kubeconfig.expect("selected kubeconfig"),
+                token_file: connection.lifecycle_token_file,
+            });
+            true
+        }
+        "no" | "n" => false,
+        _ => anyhow::bail!("answer yes or no; rerun adm setup"),
+    };
     let path = save_config(&config)?;
     println!("Saved {}", path.display());
+    if connected {
+        println!("Lifecycle controller is installed and the authenticated connection is ready.");
+    } else if config.lifecycle.is_some() {
+        println!(
+            "Lifecycle connection settings retained. Run `adm doctor` to check current availability."
+        );
+    } else {
+        println!(
+            "The lifecycle control plane must be installed and connected before creating workspaces."
+        );
+        println!("{}", crate::lifecycle::setup_guidance(cli));
+    }
     println!(
-        "Run `adm doctor` to check cluster access, then create a workspace. Use `adm login NAME` to authenticate its private provider store."
+        "Run `adm doctor` to check cluster and lifecycle access, then create a workspace. Use `adm login NAME` to authenticate its private provider store."
     );
     Ok(())
 }

@@ -16,12 +16,13 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import YAML from "yaml";
 
 const execute = promisify(execFile);
 const project = fileURLToPath(new URL("../", import.meta.url));
 
 test(
-  "a release runs the CLI, terminal, provider runtime, and Code Mode without a checkout",
+  "a release supplies lifecycle deployment and runs the CLI, terminal, provider runtime, and Code Mode without a checkout",
   { timeout: 180000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-release-test-"));
@@ -114,6 +115,40 @@ test(
     assert.equal(
       await readFile(join(installed, "VERSION"), "utf8"),
       "v9.8.7\n",
+    );
+    const lifecycleDirectory = join(installed, "deploy/lifecycle");
+    const kustomization = YAML.parse(
+      await readFile(join(lifecycleDirectory, "kustomization.yaml"), "utf8"),
+    );
+    assert.equal(kustomization.namespace, "adm-system");
+    assert.deepEqual(kustomization.resources, ["control-plane.yaml"]);
+    const lifecycleResources = YAML.parseAllDocuments(
+      await readFile(
+        join(lifecycleDirectory, kustomization.resources[0]),
+        "utf8",
+      ),
+    ).map((document) => document.toJSON());
+    const lifecycleDeployment = lifecycleResources.find(
+      (resource) => resource.kind === "Deployment",
+    );
+    assert.equal(lifecycleDeployment.metadata.name, "adm-lifecycle");
+    const lifecyclePod = lifecycleDeployment.spec.template.spec;
+    assert.equal(
+      lifecyclePod.initContainers[0].image,
+      "ghcr.io/example/adm:9.8.7",
+    );
+    assert.equal(lifecyclePod.containers[0].image, "ghcr.io/example/adm:9.8.7");
+    assert.equal(
+      lifecyclePod.volumes.find((volume) => volume.name === "token").secret
+        .defaultMode,
+      0o440,
+    );
+    assert.ok(
+      lifecycleResources.some(
+        (resource) =>
+          resource.kind === "Service" &&
+          resource.metadata.name === "adm-lifecycle",
+      ),
     );
     await execute(
       process.execPath,

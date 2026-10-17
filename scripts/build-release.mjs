@@ -7,6 +7,7 @@ import {
   copyFile,
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -15,6 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, promisify } from "node:util";
 import { build } from "esbuild";
+import YAML from "yaml";
 
 const execute = promisify(execFile);
 const project = fileURLToPath(new URL("../", import.meta.url));
@@ -58,6 +60,36 @@ try {
     await mkdir(dirname(destination), { recursive: true });
     await copyFile(join(project, file), destination);
   }
+  const lifecycleDirectory = join(staging, "deploy/lifecycle");
+  await mkdir(lifecycleDirectory, { recursive: true });
+  await copyFile(
+    join(project, "deploy/lifecycle/kustomization.yaml"),
+    join(lifecycleDirectory, "kustomization.yaml"),
+  );
+  const lifecycleResources = YAML.parseAllDocuments(
+    await readFile(
+      join(project, "deploy/lifecycle/control-plane.yaml"),
+      "utf8",
+    ),
+    { version: "1.1" },
+  ).map((document) => document.toJSON());
+  const lifecyclePod = lifecycleResources.find(
+    (resource) =>
+      resource.kind === "Deployment" &&
+      resource.metadata.name === "adm-lifecycle",
+  ).spec.template.spec;
+  for (const container of [
+    ...lifecyclePod.initContainers,
+    ...lifecyclePod.containers,
+  ]) {
+    container.image = values.image;
+  }
+  await writeFile(
+    join(lifecycleDirectory, "control-plane.yaml"),
+    lifecycleResources
+      .map((resource) => YAML.stringify(resource))
+      .join("---\n"),
+  );
   await build({
     entryPoints: {
       runner: join(project, "packages/runner/src/main.ts"),

@@ -4,7 +4,17 @@ ADM has a Rust CLI and an in-cluster lifecycle service. The management host is a
 
 ## Management host
 
-Install the standalone release with the command in the [README](../README.md), then run `adm setup`. The management host needs `kubectl`; Git and `gh` are needed only for repository discovery. Rust, Go, npm, and the checkout are only needed for source development. See [installation and updates](installation.md) for prerequisites and version selection.
+Install the standalone release with the command in the [README](../README.md), then run `adm setup` if first installation did not open it. Setup installs or updates the cluster controller and enables its supervised connection by default. It needs configured `kubectl` access, replicated storage, and a running systemd user manager. Git and `gh` are needed for repository discovery. Rust, Go, npm, and the checkout are only needed for source development. See [installation and updates](installation.md) for prerequisites and version selection.
+
+```sh
+adm setup
+adm list
+systemctl --user status adm-lifecycle-forward.service
+```
+
+Setup creates the internal lifecycle credential in Kubernetes only when its Secret is missing and reuses it on later runs. The CLI reads it through the selected host kubeconfig; no local token file is created by default. Nonsecret connection settings are saved after rollout and an authenticated API check succeed. Explicit `--lifecycle-token-file` or `ADM_LIFECYCLE_TOKEN_FILE` selects a protected client file instead. Automatic setup uses `adm-system` and a loopback URL; see [advanced manual installation](installation.md#advanced-manual-installation) for separately managed connections.
+
+The `adm-lifecycle-forward.service` user unit reports ready after forwarding is established. Inspect it with `journalctl --user -u adm-lifecycle-forward.service` or restart it with `systemctl --user restart adm-lifecycle-forward.service`. Operator-configured user lingering keeps the connection available after logout; workspace agents continue in their Pods even when the management connection stops.
 
 Make sure `$HOME/.local/bin` is on your shell's PATH. `adm doctor` reports local tools, cluster readiness, the default StorageClass, and the selected CLI state directory. Use `adm doctor --storage-class NAME` to inspect another class; node-local storage is labeled explicitly. Diagnostics do not allocate a workspace or install missing prerequisites.
 
@@ -21,7 +31,7 @@ adm attach my-project
 
 Kubernetes credentials stay on the management host. `adm create` records the host-side `KUBECONFIG` path list for each coding workspace so coding tools keep using the selected cluster after Pod replacement. Use `--kubeconfig PATHS` or `KUBECONFIG` to select a file or the normal colon-separated merge list; relative entries are made absolute. If neither is set, ADM uses `$HOME/.kube/config`. Kubeconfig contents never enter a workspace Pod. `adm reconnect NAME --kubeconfig PATHS` verifies namespace ownership and updates the host-side coding-tool connection while preserving the workspace ID, files, and history.
 
-The default CLI state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm` when XDG_DATA_HOME is unset. Lifecycle state and deletion work are owned by the in-cluster service on its persistent volume. See [the lifecycle API deployment guide](lifecycle-api.md#fresh-control-plane-install) for installation and the management-host connection.
+The default CLI state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm` when XDG_DATA_HOME is unset. Lifecycle state and deletion work are owned by the in-cluster service on its persistent volume. See [controller installation](installation.md#in-cluster-lifecycle-owner) and [the lifecycle API](lifecycle-api.md) for the management connection and authentication boundary.
 
 ## Published builds
 
@@ -32,9 +42,11 @@ The default CLI state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/
 | `main`   | `latest`, `sha-<commit>`                    |
 | `v0.1.0` | `0.1.0`, `v0.1.0`, `latest`, `sha-<commit>` |
 
-After verification, image publishing, and runtime packaging pass, a `main` build automatically creates a GitHub release under `sha-<commit>` and marks it latest. Each release has its own assets, so a newer build does not overwrite files being downloaded. The release includes `install.sh`, `LICENSE`, `adm-linux-amd64.tar.gz`, compatibility binaries, and `SHA256SUMS`. The archive contains the CLI, repository helper, compiled runner/terminal, and their pinned production Node dependencies. The same files remain available as a workflow artifact. Installation needs no checkout. The bundle records its matching `sha-<commit>` workspace image reference; setup can select a different image.
+After verification, image publishing, and runtime packaging pass, a `main` build automatically creates a GitHub release under `sha-<commit>` and marks it latest. Each release has its own assets, so a newer build does not overwrite files being downloaded. The release includes `install.sh`, `LICENSE`, `adm-linux-amd64.tar.gz`, compatibility binaries, and `SHA256SUMS`. The archive contains the CLI, repository helper, compiled runner/terminal, their pinned production Node dependencies, and the lifecycle deployment manifests. Both controller images in the bundled manifests match the release image. The same files remain available as a workflow artifact. Installation needs no checkout. The bundle records its matching `sha-<commit>` workspace image reference; setup can select a different image.
 
 The installer consumes the latest successful `main` release automatically. Optional `v*` tags also publish pinned releases; they do not change the installer's latest release. Rerunning the same build preserves published assets. An older or unrelated main build is published under its own tag and is not promoted over a newer published build. A draft left by a failed publish is not reused; delete that draft before rerunning the build. Markdown-only pushes skip publication; a manual Build run on `main` can publish that commit when needed.
+
+The installer preserves settings and leaves services running on updates. Rerun `adm setup` and select the desired image to update the controller and its management connection. Setup retains its existing credential and PVC; its StorageClass cannot be changed in place. Existing workspace Pods keep their own image and storage settings.
 
 The workflow token needs package write access; the first push creates the GHCR package. If that package is private, the cluster needs a pull credential. A node that cannot pull from GHCR still needs the image imported locally.
 
@@ -203,7 +215,7 @@ Run `adm herdr` for the worked setup. Create or bind the ADM workspace from the 
 
 ```sh
 # On the management host
-adm start
+adm setup
 adm doctor
 
 # In a pane of the Herdr workspace that should own the ADM workspace
@@ -261,7 +273,7 @@ The lighter cluster contract check needs no workspace image or storage provision
 ADM_LIVE_CLUSTER=1 npm run test:cluster-contract
 ```
 
-Live CLI tests require access to the installed lifecycle service and its protected client-token file; they never fall back to a host runner. Set `ADM_LIFECYCLE_URL` and `ADM_LIFECYCLE_TOKEN_FILE` for the commands below (for example, point the URL at the supervised local port-forward described in the [installation guide](installation.md#in-cluster-lifecycle-owner)).
+These opt-in cluster test scripts currently require explicit `ADM_LIFECYCLE_URL` and `ADM_LIFECYCLE_TOKEN_FILE` settings for their test connection. They use the protected client-file mode described in [advanced manual installation](installation.md#advanced-manual-installation); ordinary CLI use after `adm setup` uses its saved Kubernetes credential source. The tests never fall back to a host runner.
 
 The full opt-in cluster suite creates coding workspaces, checks normal Git and untracked work after Pod replacement, checks browser and forwarded-port behavior, then destroys its namespaces and claims. It uses local-path deliberately and never drains a node:
 

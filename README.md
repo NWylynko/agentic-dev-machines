@@ -18,15 +18,17 @@ Successful `main` builds publish a release automatically. See [installation deta
 
 ## Setup
 
-First install opens guided setup for the workspace image, storage class, and optional default model. Run `adm setup` to change these later. Provider credentials are configured inside each workspace and are never copied from the management host.
-
-Your Kubernetes access and [storage class](deploy/storage.md) must already be configured, and the [lifecycle control plane](docs/installation.md#in-cluster-lifecycle-owner) must be installed. Then:
+Your Kubernetes access, replicated [StorageClass](deploy/storage.md), and systemd user session must already be configured. First interactive installation opens `adm setup`; otherwise run it yourself:
 
 ```sh
+adm setup
+adm list
 adm doctor
 adm create my-project
 adm attach my-project
 ```
+
+Setup asks for the image, storage class, and optional default model, then installs the cluster controller and enables its supervised management-host connection by default. It creates an internal credential in Kubernetes when needed and reuses it on later runs. No local token file or manual port-forward is needed for this setup. See [installation details](docs/installation.md#in-cluster-lifecycle-owner) for prerequisites and advanced manual installation.
 
 Every workspace starts with its durable agent. Choose a default model during setup or pass `--model PROVIDER/MODEL_ID` when creating a workspace; otherwise select one in `adm attach` with `/model`. Provider credentials belong to each workspace and are not copied from the management host.
 

@@ -150,35 +150,6 @@ fi
 if [ -e "$release" ] || [ -L "$release" ]; then
   [ -d "$release" ] && [ ! -L "$release" ] && [ -f "$release/.adm-release-sha256" ] && [ ! -L "$release/.adm-release-sha256" ] && [ "$(cat "$release/.adm-release-sha256")" = "$checksum" ] || fail "refusing unmanaged release directory: $release"
 fi
-restart_runner=false
-if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet adm-runner.service 2>/dev/null; then
-  restart_runner=true
-  service_command=$(systemctl --user show adm-runner.service --property=ExecStart --value 2>/dev/null) || service_command=
-  case "$service_command" in
-    *--project-dir*|'')
-      printf 'adm installer: adm-runner.service has a custom ExecStart; run adm setup to use %s without a checkout, then verify the service.\n' "$bin_dir/adm" >&2
-      ;;
-    *"$bin_dir/adm"*) ;;
-    *)
-      printf 'adm installer: adm-runner.service has a custom ExecStart; run adm setup to use %s, then verify the service.\n' "$bin_dir/adm" >&2
-      ;;
-  esac
-fi
-if [ "$restart_runner" = false ]; then
-  node - "${ADM_STATE_DIR:-$data_home/adm}" <<'NODE' || fail 'stop the standalone runner with adm stop, rerun the installer, then run adm start'
-const fs = require('node:fs'), path = require('node:path');
-const state = path.resolve(process.argv[2]);
-try {
-  const pid = fs.readFileSync(path.join(state, 'runner.pid'), 'utf8').trim();
-  if (!/^[1-9][0-9]*$/.test(pid)) throw new Error('invalid runner.pid; inspect existing runner state');
-  const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
-  const directory = args.indexOf('--state-dir');
-  if (args.some(argument => argument.endsWith('/runtime/runner.mjs') || argument.endsWith('/packages/runner/src/main.ts')) &&
-      directory >= 0 && path.resolve(args[directory + 1]) === path.join(state, 'runner'))
-    process.exitCode = 1;
-} catch (error) { if (error.code !== 'ENOENT') throw error; }
-NODE
-fi
 if [ ! -e "$release" ]; then
   [ ! -e "$bundle/.adm-release-sha256" ] && [ ! -L "$bundle/.adm-release-sha256" ] || fail 'archive contains reserved installer metadata'
   printf '%s\n' "$checksum" > "$bundle/.adm-release-sha256"
@@ -189,9 +160,6 @@ mv -T "$temporary/current" "$prefix/current"
 for binary in adm adm-repositories; do
   if [ ! -L "$bin_dir/$binary" ]; then ln -s "$prefix/current/bin/$binary" "$bin_dir/$binary"; fi
 done
-if [ "$restart_runner" = true ]; then
-  systemctl --user restart adm-runner.service || fail 'ADM was updated, but adm-runner.service restart failed; inspect systemctl --user status adm-runner.service'
-fi
 printf 'Installed ADM %s.\n' "$(cat "$release/VERSION")"
 case ":$PATH:" in *":$bin_dir:"*) ;; *) printf 'Add %s to PATH.\n' "$bin_dir" ;; esac
 if [ "$first_install" = true ]; then

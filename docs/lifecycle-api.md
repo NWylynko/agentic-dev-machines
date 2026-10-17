@@ -4,7 +4,7 @@
 
 ## Authentication
 
-`GET /health` is public and reports whether the service currently holds its Kubernetes Lease. Operator and CLI lifecycle routes use `Authorization: Bearer <client-token>`, read from a protected file supplied by `--lifecycle-token-file` or `ADM_LIFECYCLE_TOKEN_FILE`. Keep the Service private and the client token outside workspace Pods.
+`GET /health` is public and reports whether the service currently holds its Kubernetes Lease. Operator and CLI lifecycle routes use `Authorization: Bearer <client-token>`. After `adm setup`, the CLI reads the internal token from `adm-system/adm-lifecycle-token` through its selected host kubeconfig. An explicit `--lifecycle-token-file` or `ADM_LIFECYCLE_TOKEN_FILE` selects a protected client file instead. Keep the Service private and the client token outside workspace Pods.
 
 Runtime routes use a different credential: a projected ServiceAccount token with audience `adm-lifecycle`, bound to the calling Pod UID. The service verifies it with Kubernetes TokenReview and checks the `adm-runtime` account and canonical workspace namespace. Management authorization also matches the bound UID to exactly one current Pod with the immutable workspace label and checks its unexpired runtime lease. Initial lease acquisition establishes that lease. Runtime tokens do not grant control-plane bearer access. A bot may act across live coding workspaces; a coding runtime can act only on itself. The lifecycle service does not use per-agent grants.
 
@@ -32,6 +32,10 @@ These routes require a valid projected Pod token; they do not accept the operato
 Bot runtime authorization is broad across coding workspaces, including calls made through Code Mode. The runtime API exposes monitoring, prompting, history, model, goal, loop, and lifecycle operations. It does not expose repository files, shell access, or general credentials for another workspace. Workspace network policies permit lifecycle and bot-to-coding runtime traffic; coding Pods also have external egress for their tools and provider requests.
 
 ## Client setup
+
+Run `adm setup` for the default installation. It installs the controller, creates or reuses its Kubernetes credential, enables a supervised loopback connection, and saves nonsecret settings only after authenticated access succeeds. No token file or manual port-forward is required. See [installation](installation.md#in-cluster-lifecycle-owner) for prerequisites.
+
+For an independently managed installation:
 
 The control-plane Deployment uses the ADM image containing the `adm` and pinned `kubectl` binaries. Create `adm-system`, a protected client-token file, and the Kubernetes Secret `adm-lifecycle-token` with key `token`; do not put the value in a manifest, shell history, normal ADM config, workspace spec, receipt, or log. Apply `deploy/lifecycle/control-plane.yaml`. The cluster must already provide the configured StorageClass.
 

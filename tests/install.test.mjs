@@ -164,26 +164,56 @@ test("a bad download keeps the current release usable and rerunning an unchanged
   );
 });
 
-test("an active user runner restarts only after the stable command points at the validated update", async (t) => {
-  const f = await fixture(t),
-    boundary = join(f.directory, "system"),
-    log = join(f.home, "service-events");
-  await mkdir(boundary);
-  await writeFile(
-    join(boundary, "systemctl"),
-    `#!/bin/sh\nif [ "$*" = '--user is-active --quiet adm-runner.service' ]; then exit 0; fi\nif [ "$*" = '--user restart adm-runner.service' ]; then "$HOME/.local/bin/adm" --version >> "$HOME/service-events"; exit 0; fi\nexit 1\n`,
-  );
-  await chmod(join(boundary, "systemctl"), 0o755);
-  f.env.PATH = `${boundary}:${f.env.PATH}`;
-  await f.release("v1");
-  assert.equal((await f.install("v1")).code, undefined);
-  await f.release("v2");
-  assert.equal((await f.install("v2")).code, undefined);
-  assert.equal(await readFile(log, "utf8"), "v1\nv2\n");
-  await f.release("bad");
-  f.assets.set("/bad/adm-linux-amd64.tar.gz", Buffer.from("corrupt"));
-  assert.equal((await f.install("bad")).code, 1);
-  assert.equal(await readFile(log, "utf8"), "v1\nv2\n");
+test("updates leave old host runner services and state untouched", async (t) => {
+  for (const activeService of [true, false]) {
+    await t.test(
+      activeService ? "active service" : "standalone process",
+      async (t) => {
+        const f = await fixture(t),
+          log = join(f.home, "service-events"),
+          systemctl = join(f.directory, "commands/systemctl"),
+          main = join(f.directory, "runtime/runner.mjs"),
+          pidFile = join(f.home, "data/adm/runner.pid");
+        await f.release("v1");
+        assert.equal((await f.install("v1")).code, undefined);
+        await mkdir(dirname(main));
+        await writeFile(
+          main,
+          "process.stdout.write('ready\\n');process.stdin.resume();\n",
+        );
+        const child = spawn(
+          process.execPath,
+          [main, "--state-dir", join(f.home, "data/adm/runner")],
+          { stdio: ["pipe", "pipe", "pipe"] },
+        );
+        t.after(async () => {
+          const stopped = once(child, "exit");
+          child.kill();
+          await stopped;
+        });
+        await once(child.stdout, "data");
+        await writeFile(pidFile, String(child.pid));
+        await writeFile(
+          systemctl,
+          `#!/bin/sh\nprintf '%s\\n' "$*" >> "$HOME/service-events"\nif [ "$*" = '--user is-active --quiet adm-runner.service' ]; then exit ${activeService ? 0 : 1}; fi\nexit 0\n`,
+        );
+        await f.release("v2");
+        const result = await f.install("v2");
+        assert.equal(result.code, undefined, result.stderr);
+        await assert.rejects(access(log), { code: "ENOENT" });
+        assert.doesNotMatch(
+          result.stdout + result.stderr,
+          /adm (?:start|stop)|custom ExecStart/,
+        );
+        assert.equal(await readFile(pidFile, "utf8"), String(child.pid));
+        assert.equal(child.exitCode, null);
+        assert.equal(
+          (await execute(f.command, ["--version"], { env: f.env })).stdout,
+          "v2\n",
+        );
+      },
+    );
+  }
 });
 
 test("a staged release cannot use runtime files outside its installation", async (t) => {
@@ -203,39 +233,6 @@ test("a staged release cannot use runtime files outside its installation", async
     (await execute(f.command, ["--version"], { env: f.env })).stdout,
     "v1\n",
   );
-});
-
-test("an update asks the operator to stop an existing standalone runner before switching", async (t) => {
-  const f = await fixture(t);
-  await f.release("v1");
-  assert.equal((await f.install("v1")).code, undefined);
-  const main = join(f.directory, "runtime/runner.mjs");
-  await mkdir(dirname(main));
-  await writeFile(
-    main,
-    "process.stdout.write('ready\\n');process.stdin.resume();\n",
-  );
-  const child = spawn(
-    process.execPath,
-    [main, "--state-dir", join(f.home, "data/adm/runner")],
-    { stdio: ["pipe", "pipe", "pipe"] },
-  );
-  t.after(async () => {
-    const stopped = once(child, "exit");
-    child.kill();
-    await stopped;
-  });
-  await once(child.stdout, "data");
-  await writeFile(join(f.home, "data/adm/runner.pid"), String(child.pid));
-  await f.release("v2");
-  const result = await f.install("v2");
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /adm stop/);
-  assert.equal(
-    (await execute(f.command, ["--version"], { env: f.env })).stdout,
-    "v1\n",
-  );
-  assert.equal(child.exitCode, null);
 });
 
 test("a piped installer opens first-run onboarding through the terminal and updates never repeat it", async (t) => {
@@ -260,26 +257,6 @@ test("a piped installer opens first-run onboarding through the terminal and upda
   await f.release("v2");
   await piped("v2");
   assert.equal(await readFile(join(f.home, "setup-called"), "utf8"), "setup\n");
-});
-
-test("a failed service restart is reported after installing the validated release", async (t) => {
-  const f = await fixture(t),
-    boundary = join(f.directory, "system");
-  await mkdir(boundary);
-  await writeFile(
-    join(boundary, "systemctl"),
-    "#!/bin/sh\nif [ \"$*\" = '--user is-active --quiet adm-runner.service' ]; then exit 0; fi\nexit 1\n",
-  );
-  await chmod(join(boundary, "systemctl"), 0o755);
-  f.env.PATH = `${boundary}:${f.env.PATH}`;
-  await f.release("v1");
-  const result = await f.install("v1");
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /restart failed/);
-  assert.equal(
-    (await execute(f.command, ["--version"], { env: f.env })).stdout,
-    "v1\n",
-  );
 });
 
 test("prerequisite failures and unmanaged commands are rejected before creating an installation", async (t) => {
@@ -335,20 +312,4 @@ test("two installers cannot update the same installation concurrently", async (t
     (await execute(f.command, ["--version"], { env: f.env })).stdout,
     "v1\n",
   );
-});
-
-test("an existing custom service configuration is called out during an update", async (t) => {
-  const f = await fixture(t),
-    boundary = join(f.directory, "custom-service");
-  await mkdir(boundary);
-  await writeFile(
-    join(boundary, "systemctl"),
-    "#!/bin/sh\ncase \"$*\" in\n'--user is-active --quiet adm-runner.service') exit 0;;\n'--user show adm-runner.service --property=ExecStart --value') echo '/old/adm --project-dir /old/checkout serve'; exit 0;;\n'--user restart adm-runner.service') exit 0;;\nesac\nexit 1\n",
-  );
-  await chmod(join(boundary, "systemctl"), 0o755);
-  f.env.PATH = `${boundary}:${f.env.PATH}`;
-  await f.release("v1");
-  const result = await f.install("v1");
-  assert.equal(result.code, undefined, result.stderr);
-  assert.match(result.stderr, /custom ExecStart/);
 });

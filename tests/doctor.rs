@@ -8,6 +8,111 @@ use std::{
 };
 
 #[test]
+fn disconnected_lifecycle_guides_the_operator_through_control_plane_setup() {
+    let root = tempfile::tempdir().unwrap();
+    let kubectl = root.path().join("kubectl");
+    fs::write(
+        &kubectl,
+        r#"#!/usr/bin/python3
+import json,sys
+if sys.argv[1:3]==['get','nodes']:
+ print(json.dumps({'items':[{'metadata':{'name':'node-a'},'status':{'conditions':[{'type':'Ready','status':'True'}]}}]}))
+elif sys.argv[1:3]==['get','storageclass']:
+ print(json.dumps({'metadata':{'name':'adm-replicated'},'provisioner':'driver.longhorn.io'}))
+else: sys.exit(2)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let invoke = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_adm"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
+            .args(["--state-dir"])
+            .arg(root.path().join("state"))
+            .args(["--project-dir"])
+            .arg(root.path().join("release"))
+            .args(["--kubectl"])
+            .arg(&kubectl)
+            .args(["--lifecycle-url", &url, "--lifecycle-namespace", "adm-test"])
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let output = invoke(&["list"]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("Connection refused"), "{error}");
+    assert!(error.contains("adm doctor"), "{error}");
+
+    let output = invoke(&["doctor", "--json"]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["cluster"][0]["ready"], true);
+    assert_eq!(report["storage"]["status"], "available");
+    assert_eq!(report["lifecycle"]["status"], "unavailable");
+    assert_eq!(report["lifecycle"]["url"], url);
+    let action = report["lifecycle"]["action"].as_str().unwrap();
+    assert!(action.contains("adm-test"), "{action}");
+    assert!(
+        action.contains("deploy/lifecycle/control-plane.yaml"),
+        "{action}"
+    );
+    assert!(action.contains("ADM_LIFECYCLE_TOKEN_FILE"), "{action}");
+    assert!(
+        action.contains("installation.md#in-cluster-lifecycle-owner"),
+        "{action}"
+    );
+
+    let output = invoke(&["doctor"]);
+    assert!(output.status.success());
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(report.contains(action), "{report}");
+    let output = invoke(&["start"]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("adm doctor"), "{error}");
+    assert!(error.contains("lifecycle"), "{error}");
+    assert!(!root.path().join("state/workspaces.sqlite").exists());
+}
+
+#[test]
+fn lifecycle_authentication_failure_explains_the_required_client_token() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let received = stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..received]).starts_with("GET /v1/workspaces "));
+        let body = r#"{"error":{"code":"UNAUTHORIZED","message":"valid lifecycle bearer token required"}}"#;
+        write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--lifecycle-url", &url, "list"])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("401"), "{error}");
+    assert!(
+        error.contains("valid lifecycle bearer token required"),
+        "{error}"
+    );
+    assert!(error.contains("ADM_LIFECYCLE_TOKEN_FILE"), "{error}");
+    assert!(error.contains("same token"), "{error}");
+}
+
+#[test]
 fn doctor_reports_missing_storage_and_preserves_lifecycle_failure_causes() {
     let root = tempfile::tempdir().unwrap();
     let kubectl = root.path().join("kubectl");

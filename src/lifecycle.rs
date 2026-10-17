@@ -17,6 +17,18 @@ use std::{
 const RUNTIME_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_STATUS_PARALLELISM: usize = 4;
 const MAX_RUNTIME_STATUS_BYTES: u64 = 64 * 1024;
+pub const INSTALLATION_GUIDE: &str = "https://github.com/NWylynko/agentic-dev-machines/blob/main/docs/installation.md#in-cluster-lifecycle-owner";
+
+pub fn setup_guidance(cli: &crate::Cli) -> String {
+    format!(
+        "Run `adm setup` to install the controller and configure its supervised connection. For manual installations, check the adm-lifecycle Deployment and Service in namespace {}. Manifest: {} (targets adm-system; adapt it for a custom namespace). For the default local endpoint, supervise `kubectl -n {} port-forward service/adm-lifecycle 7433:7433`. Manual authentication uses ADM_LIFECYCLE_URL and ADM_LIFECYCLE_TOKEN_FILE. Installation: {INSTALLATION_GUIDE}",
+        cli.lifecycle_namespace,
+        cli.project_dir
+            .join("deploy/lifecycle/control-plane.yaml")
+            .display(),
+        cli.lifecycle_namespace,
+    )
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -544,20 +556,58 @@ pub fn request(
     path: &str,
     body: Option<&Value>,
 ) -> Result<Value> {
+    let token = token_file
+        .map(|path| fs::read_to_string(path).context("read lifecycle bearer token file"))
+        .transpose()?;
+    request_with_token(url, token.as_deref().map(str::trim), method, path, body)
+}
+
+pub fn kubernetes_token(cli: &crate::Cli) -> Result<String> {
+    let bytes = crate::workspaces::kubectl(
+        cli,
+        &[
+            "-n",
+            &cli.lifecycle_namespace,
+            "get",
+            "secret",
+            "adm-lifecycle-token",
+            "-o",
+            "go-template={{index .data \"token\" | base64decode}}",
+        ],
+        None,
+    )
+    .context("read lifecycle credential from Kubernetes using the selected host kubeconfig")?;
+    let token = String::from_utf8(bytes).context("lifecycle credential must be UTF-8")?;
+    let token = token.trim();
+    ensure!(
+        !token.is_empty(),
+        "lifecycle credential in Kubernetes is empty"
+    );
+    Ok(token.to_owned())
+}
+
+pub fn request_with_token(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Value> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
     let method = reqwest::Method::from_bytes(method.as_bytes())?;
     let mut request = client.request(method, format!("{}{path}", url.trim_end_matches('/')));
-    if let Some(path) = token_file {
-        let token = fs::read_to_string(path).context("read lifecycle bearer token file")?;
-        request = request.bearer_auth(token.trim());
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
     }
     if let Some(body) = body {
         request = request.json(body);
     }
-    let response = request.send().context("lifecycle service unavailable")?;
+    let response = request.send().context(
+        "lifecycle service unavailable; run `adm doctor` for control-plane installation and connection steps",
+    )?;
     let status = response.status();
     let text = response.text()?;
     let value: Value = if text.is_empty() {
@@ -566,10 +616,13 @@ pub fn request(
         serde_json::from_str(&text)?
     };
     if !status.is_success() {
-        anyhow::bail!(
-            "lifecycle service {status}: {}",
-            value["error"]["message"].as_str().unwrap_or(&text)
-        );
+        let message = value["error"]["message"].as_str().unwrap_or(&text);
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!(
+                "lifecycle service {status}: {message}. Run `adm setup` to configure the controller connection. Manual connections use ADM_LIFECYCLE_TOKEN_FILE (or --lifecycle-token-file), a protected file containing the same token as the controller's adm-lifecycle-token Secret. Installation: {INSTALLATION_GUIDE}"
+            );
+        }
+        anyhow::bail!("lifecycle service {status}: {message}",);
     }
     Ok(value)
 }
