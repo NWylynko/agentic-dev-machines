@@ -2127,11 +2127,11 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
         "{stdout}"
     );
     assert!(
-        stdout.contains(&workspace["id"].as_str().unwrap()),
+        stdout.contains(workspace["id"].as_str().unwrap()),
         "{stdout}"
     );
     assert!(
-        stdout.contains(&other_workspace["id"].as_str().unwrap()),
+        stdout.contains(other_workspace["id"].as_str().unwrap()),
         "{stdout}"
     );
     assert!(
