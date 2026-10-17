@@ -20,6 +20,11 @@ import { parseArgs } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Workspace } from "./workspace.ts";
 import { ApiError, workspaceIdPattern, type WorkspaceConfig } from "./types.ts";
+import { watchEvents } from "@earendil-works/pi-durable";
+import {
+  BACKGROUND_CONTEXT,
+  withAbortSignal,
+} from "@earendil-works/chord/context";
 
 const { values } = parseArgs({
   options: {
@@ -528,7 +533,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|kubernetes-connection|model|models))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|branches|branch|tree|compact|reset|settings))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -687,6 +692,122 @@ const server = createServer(async (request, response) => {
       );
     }
     await assertActive(id);
+    if (request.method === "GET" && action === "branches")
+      return json(response, 200, await workspace.branches());
+    if (request.method === "PUT" && action === "branch") {
+      const data = await body(request);
+      if (
+        !Number.isSafeInteger(data.conversationId) ||
+        (data.conversationId as number) < 1
+      )
+        throw new ApiError(
+          400,
+          "INVALID_CONVERSATION_ID",
+          "conversationId must be a positive Durable conversation ID",
+        );
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(
+          response,
+          200,
+          await workspace.selectBranch(data.conversationId as number),
+        );
+      });
+    }
+    if (request.method === "GET" && action === "tree") {
+      const after = Number(url.searchParams.get("after") ?? 0);
+      const limit = Number(url.searchParams.get("limit") ?? 200);
+      if (
+        !Number.isSafeInteger(after) ||
+        after < 0 ||
+        !Number.isInteger(limit) ||
+        limit < 1 ||
+        limit > 1000
+      )
+        throw new ApiError(
+          400,
+          "INVALID_CURSOR",
+          "after must be nonnegative; limit must be 1..1000",
+        );
+      return json(
+        response,
+        200,
+        await workspace.tree(
+          after,
+          limit,
+          url.searchParams.get("diagnostics") === "true",
+        ),
+      );
+    }
+    if (request.method === "POST" && action === "tree") {
+      const data = await body(request);
+      if (!Number.isSafeInteger(data.entryId) || (data.entryId as number) < 1)
+        throw new ApiError(
+          400,
+          "INVALID_ENTRY_ID",
+          "entryId must be a positive Durable entry ID",
+        );
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(
+          response,
+          200,
+          await workspace.forkBranch(data.entryId as number),
+        );
+      });
+    }
+    if (request.method === "POST" && action === "compact") {
+      const data = await body(request);
+      if (
+        data.instructions !== undefined &&
+        typeof data.instructions !== "string"
+      )
+        throw new ApiError(
+          400,
+          "INVALID_COMPACTION_INSTRUCTIONS",
+          "instructions must be text",
+        );
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(
+          response,
+          202,
+          await workspace.compact(data.instructions as string | undefined),
+        );
+      });
+    }
+    if (request.method === "POST" && action === "reset") {
+      const data = await body(request);
+      if (data.handoff !== undefined && typeof data.handoff !== "string")
+        throw new ApiError(400, "INVALID_HANDOFF", "handoff must be text");
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(
+          response,
+          202,
+          await workspace.reset(data.handoff as string | undefined),
+        );
+      });
+    }
+    if (request.method === "GET" && action === "settings")
+      return json(response, 200, await workspace.settings());
+    if (request.method === "PUT" && action === "settings") {
+      const data = await body(request);
+      if (typeof data.thinkingLevel !== "string")
+        throw new ApiError(
+          400,
+          "INVALID_SETTINGS",
+          "thinkingLevel is required",
+        );
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(
+          response,
+          200,
+          await workspace.changeThinkingLevel(data.thinkingLevel as string),
+        );
+      });
+    }
     if (request.method === "GET" && action === "models") {
       const controller = new AbortController();
       request.once("aborted", () => controller.abort());
@@ -787,7 +908,10 @@ const server = createServer(async (request, response) => {
         return json(response, 200, await workspace.status());
       });
     }
-    if (request.method === "POST" && action === "resume") {
+    if (
+      request.method === "POST" &&
+      (action === "resume" || action === "retry")
+    ) {
       await body(request);
       return await serialized(async () => {
         await assertActive(id);
@@ -800,6 +924,27 @@ const server = createServer(async (request, response) => {
       );
       const limit = Number(url.searchParams.get("limit") ?? 200),
         diagnostics = url.searchParams.get("diagnostics") === "true";
+      const conversationIdParam = url.searchParams.get("conversationId");
+      const requestedConversationId = Number(conversationIdParam ?? 0);
+      if (
+        conversationIdParam !== null &&
+        (!Number.isSafeInteger(requestedConversationId) ||
+          requestedConversationId < 1)
+      )
+        throw new ApiError(
+          400,
+          "INVALID_CONVERSATION_ID",
+          "conversationId must be a positive Durable conversation ID",
+        );
+      if (
+        requestedConversationId &&
+        requestedConversationId !== Number(workspace.conversation.id)
+      )
+        throw new ApiError(
+          409,
+          "WORKSPACE_SESSION_CHANGED",
+          "The selected workspace session changed; reconnect to load its history",
+        );
       if (
         !Number.isSafeInteger(after) ||
         after < 0 ||
@@ -818,10 +963,62 @@ const server = createServer(async (request, response) => {
         connection: "keep-alive",
       });
       response.flushHeaders();
+      const streamConversation = workspace.conversation;
       let pumping = false,
         dirty = false,
         ended = false;
-      const pump = async () => {
+      const includeLiveEvents = workspace.config.role !== "bot" || diagnostics;
+      const watcherController = includeLiveEvents
+        ? new AbortController()
+        : undefined;
+      let watcher: Awaited<ReturnType<typeof watchEvents>> | undefined;
+      let pump = () => {};
+      const notify = () => {
+        pump();
+      };
+      const close = () => {
+        if (ended) return;
+        ended = true;
+        watcherController?.abort();
+        if (watcher) void watcher.stop();
+        workspace.events.off("change", notify);
+        workspace.events.off("branch", close);
+        workspace.events.off("close", close);
+        response.end();
+      };
+      workspace.events.on("change", notify);
+      workspace.events.once("branch", close);
+      workspace.events.once("close", close);
+      response.once("close", close);
+      if (watcherController) {
+        const watcherContext = withAbortSignal(
+          watcherController.signal,
+          BACKGROUND_CONTEXT,
+        );
+        watcher = await watchEvents(
+          workspace.harness,
+          streamConversation.id,
+          watcherContext,
+        );
+        if (ended) {
+          watcherController.abort();
+          void watcher.stop();
+          return;
+        }
+      }
+      const writeLive = (event: unknown) => {
+        if (!ended && !response.destroyed)
+          response.write(
+            `event: live\ndata: ${JSON.stringify({ workspaceId: id, kind: "live", data: event })}\n\n`,
+          );
+      };
+      if (watcher) {
+        writeLive(watcher.snapshot);
+        watcher.start(async (batch) => {
+          for (const event of batch) writeLive(event);
+        });
+      }
+      pump = async () => {
         dirty = true;
         if (pumping || ended) return;
         pumping = true;
@@ -830,7 +1027,12 @@ const server = createServer(async (request, response) => {
             dirty = false;
             let more = true;
             while (more && !ended) {
-              const page = await workspace.history(after, 200, diagnostics);
+              const page = await workspace.history(
+                after,
+                200,
+                diagnostics,
+                streamConversation,
+              );
               after = page.nextAfter;
               for (const event of page.events) {
                 response.write(
@@ -862,18 +1064,6 @@ const server = createServer(async (request, response) => {
           pumping = false;
         }
       };
-      const close = () => {
-        ended = true;
-        workspace.events.off("change", notify);
-        workspace.events.off("close", close);
-        response.end();
-      };
-      const notify = () => {
-        void pump();
-      };
-      workspace.events.on("change", notify);
-      workspace.events.once("close", close);
-      response.once("close", close);
       void pump();
       return;
     }

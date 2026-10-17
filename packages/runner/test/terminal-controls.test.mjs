@@ -1,0 +1,575 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { test } from "node:test";
+
+const main = new URL("../src/main.ts", import.meta.url);
+
+async function runnerFor(directory, { defaultModel = true } = {}) {
+  const args = [
+    main.pathname,
+    "--port",
+    "0",
+    "--state-dir",
+    directory,
+    "--provider",
+    "faux",
+  ];
+  if (defaultModel) args.push("--model", "faux-1");
+  const child = spawn(process.execPath, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let errors = "";
+  child.stderr.on("data", (chunk) => (errors += chunk));
+  const exited = once(child, "exit");
+  const lines = createInterface({ input: child.stdout });
+  const ready = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) =>
+      reject(new Error(`runner exited ${code}: ${errors}`)),
+    );
+    lines.on("line", (line) => {
+      try {
+        const value = JSON.parse(line);
+        if (value.ready) resolve(value.url);
+      } catch {}
+    });
+  });
+  const url = await ready;
+  return {
+    url,
+    async stop() {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        await exited;
+      }
+      lines.close();
+    },
+    async request(path, method = "GET", body) {
+      const response = await fetch(url + path, {
+        method,
+        headers: { "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() };
+    },
+  };
+}
+
+async function waitForEvent(response, predicate) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const part = await reader.read();
+    if (part.done) throw new Error("event stream ended before expected event");
+    buffer += decoder.decode(part.value, { stream: true });
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline).replace(/\r$/, "");
+      buffer = buffer.slice(newline + 1);
+      if (!line.startsWith("data: ")) continue;
+      const event = JSON.parse(line.slice(6));
+      if (predicate(event)) return event;
+    }
+  }
+}
+
+function observeEvents(response) {
+  const frames = [];
+  const waiters = [];
+  const publish = (frame) => {
+    frames.push(frame);
+    for (let index = waiters.length - 1; index >= 0; index--) {
+      if (waiters[index].predicate(frame)) {
+        waiters[index].resolve(frame);
+        waiters.splice(index, 1);
+      }
+    }
+  };
+  const done = (async () => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const part = await reader.read();
+      if (part.done) return;
+      buffer += decoder.decode(part.value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf("\n\n")) >= 0) {
+        const lines = buffer.slice(0, end).split("\n");
+        buffer = buffer.slice(end + 2);
+        const type =
+          lines
+            .find((line) => line.startsWith("event:"))
+            ?.slice(6)
+            .trim() ?? "message";
+        const data = lines
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        if (data) publish({ type, data: JSON.parse(data) });
+      }
+    }
+  })().catch((error) => {
+    if (error?.name !== "AbortError") throw error;
+  });
+  const waitForAfter = (index, predicate) => {
+    const existing = frames.slice(index).find(predicate);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve) =>
+      waiters.push({
+        predicate: (frame) =>
+          frames.indexOf(frame) >= index && predicate(frame),
+        resolve,
+      }),
+    );
+  };
+  return {
+    frames,
+    done,
+    waitFor(predicate) {
+      return waitForAfter(0, predicate);
+    },
+    waitForAfter,
+  };
+}
+
+test(
+  "Durable tree forks and selects a branch, then restores that branch after runner restart",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-terminal-branches-"));
+    let runner = await runnerFor(directory);
+    t.after(async () => runner?.stop());
+    const path = "/v1/workspaces/branch-demo";
+    const registered = await runner.request(path, "PUT", {
+      id: "branch-demo",
+      name: "branch demo",
+      role: "coding",
+      environment: "local",
+      localRoot: directory,
+      model: { provider: "faux", id: "faux-1" },
+    });
+    assert.equal(registered.status, 200);
+    const initial = await runner.request(path + "/branches");
+    assert.equal(initial.status, 200);
+    assert.ok(initial.body.activeConversationId);
+    assert.deepEqual(initial.body.branches.length, 1);
+    assert.equal(
+      initial.body.activeConversationId,
+      (await runner.request(path)).body.conversationId,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/branch", "PUT", {
+          conversationId: 999999,
+        })
+      ).status,
+      404,
+    );
+
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const [firstResponse, secondResponse] = await Promise.all([
+      fetch(
+        `${runner.url}${path}/events?after=0&conversationId=${initial.body.activeConversationId}`,
+        { signal: firstController.signal },
+      ),
+      fetch(
+        `${runner.url}${path}/events?after=0&conversationId=${initial.body.activeConversationId}`,
+        { signal: secondController.signal },
+      ),
+    ]);
+    const firstClient = observeEvents(firstResponse);
+    const secondClient = observeEvents(secondResponse);
+    const answer = firstClient.waitFor(
+      (frame) => frame.type === "message" && frame.data.kind === "assistant",
+    );
+    await runner.request(path + "/input", "POST", {
+      requestId: "branch-seed",
+      message: "Write one concise greeting",
+    });
+    await answer;
+    await secondClient.waitFor(
+      (frame) => frame.type === "message" && frame.data.kind === "assistant",
+    );
+    const history = await runner.request(path + "/history?limit=100");
+    const seedEntry = history.body.events.find(
+      (event) => event.kind === "user",
+    );
+    assert.ok(seedEntry);
+    const treeEvents = [];
+    let treeCursor = 0;
+    let treeHasMore = true;
+    while (treeHasMore) {
+      const page = await runner.request(
+        `${path}/tree?after=${treeCursor}&limit=1`,
+      );
+      assert.equal(
+        page.body.activeConversationId,
+        initial.body.activeConversationId,
+      );
+      treeEvents.push(...page.body.events);
+      treeHasMore = page.body.hasMore;
+      if (treeHasMore) {
+        assert.ok(page.body.nextAfter > treeCursor);
+        treeCursor = page.body.nextAfter;
+      }
+    }
+    assert.ok(treeEvents.some((event) => event.seq === seedEntry.seq));
+    assert.equal(
+      new Set(treeEvents.map((event) => event.seq)).size,
+      treeEvents.length,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/tree", "POST", {
+          entryId: Number.MAX_SAFE_INTEGER,
+        })
+      ).status,
+      404,
+    );
+
+    const compact = await runner.request(path + "/compact", "POST", {
+      instructions: "Retain the project decisions",
+    });
+    assert.equal(compact.status, 202);
+    assert.ok(compact.body.taskId);
+
+    const selected = await runner.request(path + "/tree", "POST", {
+      entryId: seedEntry.seq,
+    });
+    assert.equal(selected.status, 200);
+    assert.notEqual(
+      selected.body.activeConversationId,
+      initial.body.activeConversationId,
+    );
+    const staleStream = await fetch(
+      `${runner.url}${path}/events?after=0&conversationId=${initial.body.activeConversationId}`,
+    );
+    assert.equal(staleStream.status, 409);
+    assert.equal(
+      (await staleStream.json()).error.code,
+      "WORKSPACE_SESSION_CHANGED",
+    );
+    await Promise.all([firstClient.done, secondClient.done]);
+    const current = await runner.request(path);
+    assert.equal(
+      current.body.conversationId,
+      selected.body.activeConversationId,
+    );
+    const reconnectController = new AbortController();
+    const reconnected = await fetch(
+      `${runner.url}${path}/events?after=0&conversationId=${current.body.conversationId}`,
+      { signal: reconnectController.signal },
+    );
+    const reconnectClient = observeEvents(reconnected);
+    await reconnectClient.waitFor(
+      (frame) => frame.type === "message" && frame.data.kind === "user",
+    );
+    reconnectController.abort();
+    await reconnectClient.done;
+    const branch = await runner.request(path + "/branches");
+    assert.equal(
+      branch.body.activeConversationId,
+      selected.body.activeConversationId,
+    );
+    assert.equal(branch.body.branches.length, 2);
+    const changed = await runner.request(path + "/settings", "PUT", {
+      thinkingLevel: "high",
+    });
+    assert.equal(changed.status, 200);
+    assert.equal(changed.body.thinkingLevel, "high");
+    const changedMax = await runner.request(path + "/settings", "PUT", {
+      thinkingLevel: "max",
+    });
+    assert.equal(changedMax.status, 200);
+    assert.equal(changedMax.body.thinkingLevel, "max");
+
+    await runner.stop();
+    runner = await runnerFor(directory);
+    const restored = await runner.request(path + "/branches");
+    assert.equal(restored.status, 200);
+    assert.equal(
+      restored.body.activeConversationId,
+      selected.body.activeConversationId,
+    );
+    assert.equal(restored.body.branches.length, 2);
+    const settings = await runner.request(path + "/settings");
+    assert.equal(settings.body.thinkingLevel, "max");
+    const selectedController = new AbortController();
+    const selectedResponse = await fetch(
+      `${runner.url}${path}/events?after=0&conversationId=${restored.body.activeConversationId}`,
+      { signal: selectedController.signal },
+    );
+    const selectedClient = observeEvents(selectedResponse);
+    const followup = selectedClient.waitFor(
+      (frame) =>
+        frame.type === "message" &&
+        frame.data.kind === "assistant" &&
+        frame.data.data.text.includes("Echo: Continue on the restored branch"),
+    );
+    await runner.request(path + "/input", "POST", {
+      requestId: "restored-branch-followup",
+      message: "Continue on the restored branch",
+    });
+    await followup;
+    const selectedHistory = await runner.request(path + "/history?limit=100");
+    assert.ok(
+      selectedHistory.body.events.some(
+        (event) => event.data.text === "Continue on the restored branch",
+      ),
+    );
+    await selectedClient.waitFor(
+      (frame) =>
+        frame.type === "message" &&
+        frame.data.kind === "assistant" &&
+        frame.data.data.text.includes("Echo: Continue on the restored branch"),
+    );
+    selectedController.abort();
+    await selectedClient.done;
+    const resumed = await runner.request(path + "/branch", "PUT", {
+      conversationId: initial.body.activeConversationId,
+    });
+    assert.equal(resumed.status, 200);
+    assert.equal(
+      resumed.body.activeConversationId,
+      initial.body.activeConversationId,
+    );
+    const rootHistory = await runner.request(path + "/history?limit=100");
+    assert.ok(
+      rootHistory.body.events.every(
+        (event) => event.data.text !== "Continue on the restored branch",
+      ),
+    );
+    const reset = await runner.request(path + "/reset", "POST", {
+      handoff: "Start a fresh model context",
+    });
+    assert.equal(reset.status, 202);
+    assert.equal(
+      reset.body.activeConversationId,
+      initial.body.activeConversationId,
+    );
+    await runner.stop();
+    runner = await runnerFor(directory);
+    const afterReset = await runner.request(path + "/branches");
+    assert.equal(
+      afterReset.body.activeConversationId,
+      initial.body.activeConversationId,
+    );
+    assert.equal(afterReset.body.branches.length, 2);
+  },
+);
+
+test(
+  "bot public SSE hides live model and tool output while diagnostics can inspect it",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-bot-terminal-stream-"));
+    let runner = await runnerFor(directory, { defaultModel: false });
+    t.after(() => runner.stop());
+    const path = "/v1/workspaces/private-bot";
+    const registered = await runner.request(path, "PUT", {
+      id: "private-bot",
+      name: "private bot",
+      role: "bot",
+      environment: "local",
+    });
+    assert.equal(registered.status, 200);
+
+    const publicAbort = new AbortController();
+    const diagnosticAbort = new AbortController();
+    const publicResponse = await fetch(runner.url + path + "/events?after=0", {
+      signal: publicAbort.signal,
+    });
+    const diagnosticResponse = await fetch(
+      runner.url + path + "/events?after=0&diagnostics=true",
+      { signal: diagnosticAbort.signal },
+    );
+    const publicEvents = observeEvents(publicResponse);
+    const diagnosticEvents = observeEvents(diagnosticResponse);
+    t.after(() => {
+      publicAbort.abort();
+      diagnosticAbort.abort();
+    });
+
+    const published = publicEvents.waitFor(
+      (frame) =>
+        frame.type === "message" &&
+        frame.data.kind === "message" &&
+        frame.data.data?.text,
+    );
+    const inspected = diagnosticEvents.waitFor(
+      (frame) =>
+        frame.type === "message" &&
+        frame.data.kind === "assistant" &&
+        frame.data.data?.text?.includes("I am ready for setup details."),
+    );
+    const selected = await runner.request(path + "/model", "PUT", {
+      provider: "faux",
+      modelId: "faux-1",
+    });
+    assert.equal(selected.status, 200);
+    await published;
+    await inspected;
+
+    const publicFrames = JSON.stringify(publicEvents.frames);
+    assert.match(
+      publicFrames,
+      /What identity and purpose would you like me to have/,
+    );
+    assert.doesNotMatch(publicFrames, /I am ready for setup details\./);
+    assert.ok(
+      publicEvents.frames.every(
+        (frame) =>
+          frame.type === "message" &&
+          ["user", "message", "status"].includes(frame.data.kind),
+      ),
+    );
+    const diagnosticFrames = JSON.stringify(diagnosticEvents.frames);
+    assert.match(diagnosticFrames, /I am ready for setup details\./);
+    await diagnosticEvents.waitFor(
+      (frame) => frame.type === "live" && frame.data.data.type === "run_end",
+    );
+
+    const nextRun = diagnosticEvents.waitForAfter(
+      diagnosticEvents.frames.length,
+      (frame) => frame.type === "live" && frame.data.data.type === "run_end",
+    );
+    await runner.request(path + "/input", "POST", {
+      requestId: "save-profile",
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            {
+              tool: "codemode",
+              args: {
+                code: 'await tools.saveProfile({identity:"Release reviewer",purpose:"Track build health"})',
+              },
+            },
+          ],
+          answer: "Private profile update complete.",
+        }),
+    });
+    await nextRun;
+    let botStatus = await runner.request(path);
+    assert.equal(botStatus.body.profile.identity, "Release reviewer");
+    assert.equal(botStatus.body.profile.purpose, "Track build health");
+    const privateTool = (
+      await runner.request(path + "/history?diagnostics=true&limit=100")
+    ).body.events.findLast(
+      (event) => event.kind === "tool" && event.data.name === "codemode",
+    );
+    assert.ok(privateTool);
+    const forked = await runner.request(path + "/tree", "POST", {
+      entryId: privateTool.seq,
+    });
+    assert.equal(forked.status, 200);
+    await Promise.all([publicEvents.done, diagnosticEvents.done]);
+    botStatus = await runner.request(path);
+    assert.equal(
+      botStatus.body.conversationId,
+      forked.body.activeConversationId,
+    );
+    assert.equal(botStatus.body.profile.identity, "Release reviewer");
+    assert.equal(botStatus.body.profile.purpose, "Track build health");
+
+    await runner.stop();
+    runner = await runnerFor(directory, { defaultModel: false });
+    botStatus = await runner.request(path);
+    assert.equal(
+      botStatus.body.conversationId,
+      forked.body.activeConversationId,
+    );
+    assert.equal(botStatus.body.profile.identity, "Release reviewer");
+    assert.equal(botStatus.body.profile.purpose, "Track build health");
+    assert.equal(
+      (await runner.request(path + "/history?limit=100")).body.events.filter(
+        (event) =>
+          event.kind === "user" &&
+          event.data.text.includes("ADM bot onboarding:"),
+      ).length,
+      1,
+    );
+  },
+);
+
+test(
+  "branch and thinking changes are rejected while Durable work is active",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-terminal-busy-controls-"),
+    );
+    const runner = await runnerFor(directory);
+    t.after(() => runner.stop());
+    const path = "/v1/workspaces/busy-controls";
+    const registered = await runner.request(path, "PUT", {
+      id: "busy-controls",
+      name: "busy controls",
+      role: "coding",
+      environment: "local",
+      localRoot: directory,
+      model: { provider: "faux", id: "faux-1" },
+    });
+    assert.equal(registered.status, 200);
+    const branch = await runner.request(path + "/branches");
+    const controller = new AbortController();
+    const response = await fetch(
+      runner.url +
+        path +
+        `/events?after=0&conversationId=${branch.body.activeConversationId}`,
+      { signal: controller.signal },
+    );
+    const events = observeEvents(response);
+    const toolStarted = events.waitFor(
+      (frame) =>
+        frame.type === "live" &&
+        frame.data.data.type === "tool_execution_start" &&
+        frame.data.data.toolName === "bash",
+    );
+    const complete = events.waitFor(
+      (frame) => frame.type === "live" && frame.data.data.type === "run_end",
+    );
+    await runner.request(path + "/input", "POST", {
+      requestId: "hold-active-tool",
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            {
+              tool: "bash",
+              args: { command: "sleep 2; echo held" },
+            },
+          ],
+          answer: "The command completed.",
+        }),
+    });
+    await toolStarted;
+    const userEntry = (
+      await runner.request(path + "/history?limit=100")
+    ).body.events.find((event) => event.kind === "user");
+    assert.ok(userEntry);
+    for (const response of [
+      await runner.request(path + "/branch", "PUT", {
+        conversationId: branch.body.activeConversationId,
+      }),
+      await runner.request(path + "/tree", "POST", { entryId: userEntry.seq }),
+      await runner.request(path + "/settings", "PUT", {
+        thinkingLevel: "high",
+      }),
+    ]) {
+      assert.equal(response.status, 409);
+      assert.equal(response.body.error.code, "WORKSPACE_BUSY");
+    }
+    await complete;
+    controller.abort();
+    await events.done;
+  },
+);
