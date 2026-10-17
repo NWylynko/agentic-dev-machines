@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     net::TcpListener,
     os::unix::fs::{PermissionsExt, symlink},
     os::unix::net::UnixListener,
@@ -35,39 +35,22 @@ impl Drop for TestFixture {
 }
 
 #[test]
-fn fresh_runner_start_returns_and_daemon_survives_cli_exit() {
+fn start_rejects_host_agent_execution() {
     let root = tempfile::tempdir().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    drop(listener);
-    let invoke = |action: &str| {
-        Command::new("timeout")
-            .args(["15", env!("CARGO_BIN_EXE_adm"), "--state-dir"])
-            .arg(root.path())
-            .args(["--runner-url", &url, action])
-            .output()
-            .unwrap()
-    };
-    let started = invoke("start");
-    let health = reqwest::blocking::get(format!("{url}/health"))
-        .and_then(|response| response.json::<Value>());
-    // Clean up even when the regression makes `start` time out before recording its PID.
-    let owner = root.path().join("runner/owner.json");
-    if let Ok(contents) = fs::read(&owner)
-        && let Ok(value) = serde_json::from_slice::<Value>(&contents)
-        && let Some(pid) = value["pid"].as_i64()
-    {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-    }
-    let response = assert_ok(started);
-    assert_eq!(response["status"], "ready");
-    assert_eq!(
-        health.unwrap()["status"],
-        "ok",
-        "runner must outlive its launching CLI"
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .arg("--state-dir")
+        .arg(root.path())
+        .arg("--runner-url")
+        .arg("http://127.0.0.1:9")
+        .arg("start")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("workspace Pods"),
+        "start must direct the operator to workspace-Pod execution"
     );
+    assert!(!root.path().join("runner/owner.json").exists());
 }
 
 #[test]
@@ -289,75 +272,6 @@ fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output 
         .expect("run public CLI with runner fixture")
 }
 
-fn adm_with_runner_env(
-    root: &Path,
-    runner_url: &str,
-    arguments: &[&str],
-    git_config: (&str, &str),
-) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
-    command
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", git_config.0)
-        .env("GIT_CONFIG_VALUE_0", git_config.1)
-        .env("ADM_TEST_EXEC_ROOT", root.join("pv"))
-        .arg("--state-dir")
-        .arg(root.join("state"))
-        .arg("--kubectl")
-        .arg(root.join("kubectl"))
-        .arg("--runner-url")
-        .arg(runner_url)
-        .args(arguments);
-    configure_lifecycle(&mut command, root);
-    command
-        .output()
-        .expect("run public CLI with Git and runner fixtures")
-}
-
-fn serve_runner_status_fixture(listener: TcpListener) {
-    for _ in 0..3 {
-        let (stream, _) = listener.accept().unwrap();
-        let mut request = BufReader::new(stream);
-        let mut line = String::new();
-        request.read_line(&mut line).unwrap();
-        let path = line.split_whitespace().nth(1).unwrap().to_owned();
-        let mut content_length = 0;
-        loop {
-            line.clear();
-            request.read_line(&mut line).unwrap();
-            if line == "\r\n" || line.is_empty() {
-                break;
-            }
-            if let Some(value) = line.strip_prefix("content-length: ") {
-                content_length = value.trim().parse::<usize>().unwrap();
-            }
-        }
-        let mut body = vec![0; content_length];
-        request.read_exact(&mut body).unwrap();
-        let response = match path.as_str() {
-            "/health" => r#"{"status":"ok"}"#,
-            path if path.starts_with("/v1/workspaces/") => {
-                if content_length > 0 {
-                    "{}"
-                } else {
-                    r#"{"status":"error","error":"provider token expired"}"#
-                }
-            }
-            _ => panic!("unexpected runner path: {path}"),
-        };
-        let mut stream = request.into_inner();
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
-            response.len()
-        )
-        .unwrap();
-    }
-}
-
 fn adm_with_input(root: &Path, arguments: &[&str], input: &str) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
     command
@@ -414,6 +328,7 @@ fn fixture_with_runner(runner_override: Option<&str>) -> TestFixture {
     let runner_url = runner_override.unwrap_or(&default_runner_url);
     fs::write(root.path().join("runner-url"), runner_url).unwrap();
     let kubectl = root.path().join("kubectl");
+    fs::write(root.path().join("offline-token"), "fixture-token\n").unwrap();
     fs::write(&kubectl, r##"#!/usr/bin/env python3
 import json, os, pathlib, subprocess, sys
 path = pathlib.Path(__file__).parent / 'cluster.json'
@@ -485,7 +400,7 @@ elif args and args[0] == 'exec':
     exec_root = os.environ.get('ADM_TEST_EXEC_ROOT') or str(pathlib.Path(__file__).parent / 'pv')
     if exec_root:
         namespace = args[args.index('-n') + 1]
-        block = os.environ.get('ADM_TEST_BLOCK_EXEC')
+        block = os.environ.get('ADM_TEST_BLOCK_EXEC') or str(pathlib.Path(__file__).parent / 'block-repository-exec')
         if block and pathlib.Path(block).exists():
             pathlib.Path(block + '.entered').write_text('waiting')
             while not pathlib.Path(block + '.release').exists():
@@ -499,6 +414,8 @@ elif args and args[0] == 'exec':
         command = args[args.index('--') + 1:]
         command = [item.replace('/repos', str(repos)) for item in command]
         env=os.environ.copy()
+        test_env = pathlib.Path(__file__).parent / 'exec-env.json'
+        if test_env.exists(): env.update(json.loads(test_env.read_text()))
         rewrite=pathlib.Path(__file__).parent/'git-rewrite'
         if rewrite.exists():
             env.update({'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_CONFIG_COUNT':'1','GIT_CONFIG_KEY_0':rewrite.read_text(),'GIT_CONFIG_VALUE_0':'https://github.com/'})
@@ -777,13 +694,14 @@ fn list_uses_the_directory_and_keeps_full_records_with_json() {
             && table.contains("ROLE")
             && table.contains("PHASE")
             && table.contains("AGENT")
+            && table.contains("ACTIVITY")
             && table.contains("ID"),
         "{table}"
     );
     for (name, role, agent, record) in [
-        ("coding-agent", "coding", "enabled", &coding),
-        ("shell-only", "coding", "enabled", &shell),
-        ("observer", "bot", "enabled", &bot),
+        ("coding-agent", "coding", "unavailable", &coding),
+        ("shell-only", "coding", "unavailable", &shell),
+        ("observer", "bot", "unavailable", &bot),
     ] {
         assert!(table.contains(name), "{table}");
         assert!(table.contains(role), "{table}");
@@ -965,12 +883,11 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
 }
 
 #[test]
-fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let root = fixture_with_runner(Some(&runner_url));
+fn create_prepares_a_private_public_repository_inside_each_workspace_pod() {
+    let root = fixture();
     let upstreams = root.path().join("upstreams");
     let upstream = upstreams.join("owner/project.git");
+    let rewrite = format!("url.file://{}/.insteadOf", upstreams.display());
     fs::create_dir_all(upstream.parent().unwrap()).unwrap();
     let seed = root.path().join("seed");
     fs::create_dir_all(&seed).unwrap();
@@ -990,20 +907,12 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         upstream.to_str().unwrap(),
     ]);
     git(&["init", "--initial-branch=main", seed.to_str().unwrap()]);
-    git(&[
-        "-C",
-        seed.to_str().unwrap(),
-        "config",
-        "user.name",
-        "Fixture User",
-    ]);
-    git(&[
-        "-C",
-        seed.to_str().unwrap(),
-        "config",
-        "user.email",
-        "fixture@example.invalid",
-    ]);
+    for (key, value) in [
+        ("user.name", "Fixture User"),
+        ("user.email", "fixture@example.invalid"),
+    ] {
+        git(&["-C", seed.to_str().unwrap(), "config", key, value]);
+    }
     git(&["-C", seed.to_str().unwrap(), "add", "README.md"]);
     git(&["-C", seed.to_str().unwrap(), "commit", "-m", "fixture"]);
     git(&[
@@ -1018,255 +927,57 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
 
     let git_bin = root.path().join("git-bin");
     fs::create_dir_all(&git_bin).unwrap();
-    let fail_after_clone = root.path().join("fail-after-clone");
-    fs::write(&fail_after_clone, "once").unwrap();
     let git_path = String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout)
         .unwrap()
         .trim()
         .to_owned();
     let wrapper = git_bin.join("git");
+    fs::write(&wrapper, format!("#!/bin/sh\nexec {git_path} \"$@\"\n")).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = clone ] && [ -e \"$ADM_TEST_FAIL_AFTER_CLONE\" ]; then\n  shift\n  {git_path} clone --no-checkout \"$@\"\n  result=$?\n  rm \"$ADM_TEST_FAIL_AFTER_CLONE\"\n  [ \"$result\" -eq 0 ] || exit \"$result\"\n  exit 1\nfi\nexec {git_path} \"$@\"\n"
-        ),
+        root.path().join("exec-env.json"),
+        serde_json::json!({
+            "PATH": format!("{}:/usr/local/bin:/usr/bin:/bin", git_bin.display()),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": rewrite,
+            "GIT_CONFIG_VALUE_0": "https://github.com/"
+        })
+        .to_string(),
     )
     .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let registration_path = root.path().join("registration.json");
-    let server_path = registration_path.clone();
-    let server = std::thread::spawn(move || {
-        for request_number in 0..4 {
-            let (stream, _) = listener.accept().unwrap();
-            let mut request = BufReader::new(stream);
-            let mut line = String::new();
-            request.read_line(&mut line).unwrap();
-            let method = line.split_whitespace().next().unwrap().to_owned();
-            let mut content_length = 0;
-            loop {
-                line.clear();
-                request.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                if line.to_ascii_lowercase().starts_with("content-length:") {
-                    content_length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; content_length];
-            request.read_exact(&mut body).unwrap();
-            if method == "PUT" {
-                fs::write(&server_path, &body).unwrap();
-            }
-            let status = if request_number == 1 {
-                "500 Internal Server Error"
-            } else {
-                "200 OK"
-            };
-            let response = if method == "GET" {
-                r#"{"status":"ok"}"#
-            } else {
-                "{}"
-            };
-            let mut stream = request.into_inner();
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
-                response.len()
-            )
-            .unwrap();
-        }
-    });
-    let options = [
-        "create",
-        "repo-demo",
-        "--model",
-        "faux/faux-1",
-        "--repo",
-        "owner/project",
-    ];
-    let rewrite = format!("url.file://{}/.insteadOf", upstreams.display());
-    fs::write(root.path().join("git-rewrite"), &rewrite).unwrap();
-    let command = |arguments: &[&str]| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
-        command
-            .env("XDG_CONFIG_HOME", root.path().join("config"))
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", &rewrite)
-            .env("GIT_CONFIG_VALUE_0", "https://github.com/")
-            .env("ADM_TEST_EXEC_ROOT", root.path().join("pv"))
-            .env("ADM_TEST_FAIL_AFTER_CLONE", &fail_after_clone)
-            .env(
-                "PATH",
-                format!("{}:/usr/local/bin:/usr/bin:/bin", git_bin.display()),
-            )
-            .arg("--state-dir")
-            .arg(root.path().join("state"))
-            .arg("--kubectl")
-            .arg(root.path().join("kubectl"))
-            .arg("--runner-url")
-            .arg(&runner_url)
-            .args(arguments);
-        configure_lifecycle(&mut command, root.path());
-        command.output().unwrap()
-    };
-    let typo_options = [
-        "create",
-        "typo-demo",
-        "--model",
-        "faux/faux-1",
-        "--repo",
-        "owner/missing",
-    ];
-    let typo = command(&typo_options);
-    assert!(!typo.status.success());
-    let typo_stderr = String::from_utf8_lossy(&typo.stderr);
-    assert!(typo_stderr.contains("owner/missing"), "{typo_stderr}");
-    assert!(
-        typo_stderr.contains("preparing repository"),
-        "{typo_stderr}"
-    );
-    assert!(
-        typo_stderr.contains("does not appear to be a git repository"),
-        "{typo_stderr}"
-    );
-    assert!(typo_stderr.contains("inspect"), "{typo_stderr}");
-    assert!(typo_stderr.contains("destroy"), "{typo_stderr}");
-    assert!(!typo_stderr.contains("set -eu"), "{typo_stderr}");
-    let failed = assert_ok(adm(root.path(), &["list", "--json"]))
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|workspace| workspace["name"] == "typo-demo")
-        .unwrap()
-        .clone();
-    assert_eq!(failed["phase"], "failed");
-    let persisted_error = failed["last_error"].as_str().unwrap();
-    assert!(
-        persisted_error.contains("owner/missing"),
-        "{persisted_error}"
-    );
-    assert!(
-        persisted_error.contains("does not appear to be a git repository"),
-        "{persisted_error}"
-    );
-    assert!(!persisted_error.contains("set -eu"), "{persisted_error}");
-    assert!(
-        !registration_path.exists(),
-        "failed clone must not admit the agent"
-    );
-    let changed_repo = command(&[
-        "create",
-        "typo-demo",
-        "--model",
-        "faux/faux-1",
-        "--repo",
-        "owner/project",
-    ]);
-    assert!(!changed_repo.status.success());
-    let changed_repo_error = String::from_utf8_lossy(&changed_repo.stderr);
-    assert!(
-        changed_repo_error.contains("inspect"),
-        "{changed_repo_error}"
-    );
-    assert!(
-        changed_repo_error.contains("destroy"),
-        "{changed_repo_error}"
-    );
-    assert!(
-        changed_repo_error.contains("recreating"),
-        "{changed_repo_error}"
-    );
-    let no_repository = command(&["create", "typo-demo", "--model", "faux/faux-1"]);
-    assert!(!no_repository.status.success());
-    let no_repository_error = String::from_utf8_lossy(&no_repository.stderr);
-    assert!(
-        no_repository_error.contains("recreating without --repo"),
-        "{no_repository_error}"
-    );
-    assert!(
-        !no_repository_error.contains("--repo none"),
-        "{no_repository_error}"
-    );
-    fs::write(&fail_after_clone, "once").unwrap();
-
-    let interrupted = command(&options);
-    assert!(
-        !interrupted.status.success(),
-        "clone interruption must fail creation"
-    );
-    let workspace = assert_ok(adm(root.path(), &["list", "--json"]))
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|workspace| workspace["name"] == "repo-demo")
-        .unwrap()
-        .clone();
-    assert_eq!(workspace["phase"], "failed");
-    let repos = root
+    let host_runner = TcpListener::bind("127.0.0.1:0").unwrap();
+    host_runner.set_nonblocking(true).unwrap();
+    fs::write(
+        root.path().join("runner-url"),
+        format!("http://{}", host_runner.local_addr().unwrap()),
+    )
+    .unwrap();
+    let created = assert_ok(adm(
+        root.path(),
+        &[
+            "create",
+            "repo-demo",
+            "--model",
+            "faux/faux-1",
+            "--repo",
+            "owner/project",
+        ],
+    ));
+    assert_eq!(created["repository"], "owner/project");
+    assert_eq!(created["cwd"], "/repos/owner/project");
+    assert_eq!(created["phase"], "ready");
+    let first_checkout = root
         .path()
         .join("pv")
-        .join(workspace["namespace"].as_str().unwrap())
-        .join("repos");
-    let staging = repos
-        .join("owner")
-        .join(format!(".adm-clone-{}", workspace["id"].as_str().unwrap()));
-    assert!(
-        staging.join(".git").exists() && !staging.join("README.md").exists(),
-        "interrupted clone should retain Git metadata without a checkout"
-    );
-
-    let mut retry_options = options.to_vec();
-    retry_options.extend([
-        "--operation-id",
-        workspace["creation_operation_id"].as_str().unwrap(),
-    ]);
-    let failed_registration = command(&retry_options);
-    assert!(
-        !failed_registration.status.success(),
-        "runner failure must keep creation failed"
-    );
-    let checkout = repos.join("owner/project");
+        .join(created["namespace"].as_str().unwrap())
+        .join("repos/owner/project");
     assert_eq!(
-        fs::read_to_string(checkout.join("README.md")).unwrap_or_else(|error| panic!(
-            "{error}; workspace files={:?}, stdout={}, stderr={}",
-            fs::read_dir(&repos)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect::<Vec<_>>(),
-            String::from_utf8_lossy(&failed_registration.stdout),
-            String::from_utf8_lossy(&failed_registration.stderr)
-        )),
-        "fixture upstream\n",
-        "workspace files={:?}, stdout={}, stderr={}",
-        fs::read_dir(&repos)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>(),
-        String::from_utf8_lossy(&failed_registration.stdout),
-        String::from_utf8_lossy(&failed_registration.stderr)
+        fs::read_to_string(first_checkout.join("README.md")).unwrap(),
+        "fixture upstream\n"
     );
-    fs::write(checkout.join("README.md"), "local workspace edit\n").unwrap();
-
-    let ready = command(&retry_options);
-    assert!(
-        ready.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&ready.stdout),
-        String::from_utf8_lossy(&ready.stderr)
-    );
-    let create_guidance = String::from_utf8_lossy(&ready.stderr);
-    assert!(
-        create_guidance.contains("adm shell repo-demo"),
-        "{create_guidance}"
-    );
-    let workspace = assert_ok(ready);
-    assert_eq!(workspace["repository"], "owner/project");
-    assert_eq!(workspace["cwd"], "/repos/owner/project");
-    assert_eq!(workspace["phase"], "ready");
     let manifest: Value =
         serde_json::from_slice(&fs::read(root.path().join("last-manifest.json")).unwrap()).unwrap();
     let deployment = manifest["items"]
@@ -1275,83 +986,34 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         .iter()
         .find(|item| item["kind"] == "Deployment")
         .unwrap();
-    let pod = &deployment["spec"]["template"]["spec"];
-    assert_eq!(pod["containers"][0]["workingDir"], "/repos");
     assert_eq!(
-        pod["containers"].as_array().unwrap().len(),
-        1,
-        "normal checkout must not add the FUSE sidecar"
-    );
-    assert_eq!(
-        fs::read_to_string(checkout.join("README.md")).unwrap(),
-        "local workspace edit\n"
-    );
-    let branch = Command::new("git")
-        .args(["-C", checkout.to_str().unwrap(), "branch", "--show-current"])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
-    let registration: Value =
-        serde_json::from_slice(&fs::read(registration_path).unwrap()).unwrap();
-    assert_eq!(registration["cwd"], "/repos/owner/project");
-    server.join().unwrap();
-
-    let inspected = adm_with_runner(root.path(), &runner_url, &["inspect", "repo-demo"]);
-    assert!(
-        inspected.status.success(),
-        "{}",
-        String::from_utf8_lossy(&inspected.stderr)
-    );
-    let inspected = String::from_utf8_lossy(&inspected.stdout);
-    assert!(
-        inspected.contains("Repository: owner/project"),
-        "{inspected}"
-    );
-    assert!(
-        inspected.contains("Working directory: /repos/owner/project"),
-        "{inspected}"
+        deployment["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
 
-    let other = adm_with_runner_env(
+    let second = assert_ok(adm(
         root.path(),
-        &runner_url,
         &["create", "repo-other", "--repo", "owner/project"],
-        (&rewrite, "https://github.com/"),
-    );
-    let other_guidance = String::from_utf8_lossy(&other.stderr);
-    assert!(
-        other_guidance.contains("adm shell repo-other"),
-        "{other_guidance}"
-    );
-    assert!(
-        !other_guidance.contains("agent starts there"),
-        "{other_guidance}"
-    );
-    let other = assert_ok(other);
-    let other_readme = root
+    ));
+    let second_checkout = root
         .path()
         .join("pv")
-        .join(other["namespace"].as_str().unwrap())
-        .join("repos/owner/project/README.md");
+        .join(second["namespace"].as_str().unwrap())
+        .join("repos/owner/project");
     assert_eq!(
-        fs::read_to_string(other_readme).unwrap(),
+        fs::read_to_string(second_checkout.join("README.md")).unwrap(),
         "fixture upstream\n"
     );
-
-    let shell = adm(root.path(), &["shell", "repo-demo"]);
-    assert!(
-        shell.status.success(),
-        "{}",
-        String::from_utf8_lossy(&shell.stderr)
+    assert_ne!(
+        first_checkout, second_checkout,
+        "each workspace keeps a private checkout"
     );
-    let guidance = String::from_utf8_lossy(&shell.stderr);
-    assert!(guidance.contains("/repos/owner/project"), "{guidance}");
-    assert!(guidance.contains("private to this workspace"), "{guidance}");
-    let args: Value =
-        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
-    assert_eq!(
-        args.as_array().unwrap().last().unwrap(),
-        "/repos/owner/project"
+    assert!(
+        matches!(host_runner.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "repository preparation and agent registration must not contact a host runner"
     );
 }
 
@@ -1362,55 +1024,14 @@ fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace(
     let root = fixture();
     let block = root.path().join("block-repository-exec");
     fs::write(&block, "wait").unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let runner = std::thread::spawn(move || {
-        for _ in 0..2 {
-            let (stream, _) = listener.accept().unwrap();
-            let mut request = BufReader::new(stream);
-            let mut line = String::new();
-            request.read_line(&mut line).unwrap();
-            let method = line.split_whitespace().next().unwrap().to_owned();
-            let mut content_length = 0;
-            loop {
-                line.clear();
-                request.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                if line.to_ascii_lowercase().starts_with("content-length:") {
-                    content_length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; content_length];
-            request.read_exact(&mut body).unwrap();
-            let (status, response) = if method == "GET" {
-                ("200 OK", r#"{"status":"ok"}"#)
-            } else {
-                (
-                    "404 Not Found",
-                    r#"{"error":{"code":"WORKSPACE_NOT_FOUND","message":"Unknown workspace"}}"#,
-                )
-            };
-            let mut stream = request.into_inner();
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
-                response.len()
-            )
-            .unwrap();
-        }
-    });
-    let create = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut create = Command::new(env!("CARGO_BIN_EXE_adm"));
+    create
         .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("ADM_TEST_EXEC_ROOT", root.path().join("pv"))
         .env("ADM_TEST_BLOCK_EXEC", &block)
         .arg("--state-dir")
         .arg(root.path().join("state"))
         .arg("--kubectl")
         .arg(root.path().join("kubectl"))
-        .arg("--runner-url")
-        .arg(&runner_url)
         .args([
             "create",
             "delete-during-repo",
@@ -1420,9 +1041,9 @@ fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace(
             "owner/project",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    configure_lifecycle(&mut create, root.path());
+    let create = create.spawn().unwrap();
     let entered = root.path().join("block-repository-exec.entered");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !entered.exists() && Instant::now() < deadline {
@@ -1433,11 +1054,7 @@ fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace(
         "create never reached repository preparation"
     );
 
-    let deleted = adm_with_runner(
-        root.path(),
-        &runner_url,
-        &["destroy", "delete-during-repo", "--wait"],
-    );
+    let deleted = adm(root.path(), &["destroy", "delete-during-repo", "--wait"]);
     assert!(
         deleted.status.success(),
         "{}",
@@ -1451,90 +1068,36 @@ fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace(
     );
     let records = assert_ok(adm(root.path(), &["list", "--json", "--all"]));
     assert_eq!(records[0]["phase"], "deleted");
-    runner.join().unwrap();
 }
 
 #[test]
-fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
+fn destroy_does_not_call_a_host_runner_for_agent_cancellation() {
     let root = fixture();
-    let workspace = assert_ok(adm(
+    assert_ok(adm(
         root.path(),
         &["create", "runner-error", "--no-repositories"],
     ));
-    let database =
-        rusqlite::Connection::open(root.path().join("lifecycle-state/workspaces.sqlite")).unwrap();
-    let mut spec: Value = serde_json::from_str(
-        &database
-            .query_row(
-                "SELECT spec FROM workspaces WHERE name='runner-error'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-    )
-    .unwrap();
-    spec["agent_enabled"] = Value::Bool(true);
-    database
-        .execute(
-            "UPDATE workspaces SET spec=?1 WHERE name='runner-error'",
-            [spec.to_string()],
-        )
-        .unwrap();
-
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let runner = std::thread::spawn(move || {
-        for request_number in 0..2 {
-            let (stream, _) = listener.accept().unwrap();
-            let mut request = BufReader::new(stream);
-            let mut line = String::new();
-            request.read_line(&mut line).unwrap();
-            let method = line.split_whitespace().next().unwrap().to_owned();
-            loop {
-                line.clear();
-                request.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-            }
-            let (status, response) = if request_number == 0 && method == "GET" {
-                ("200 OK", r#"{"status":"ok"}"#)
-            } else {
-                (
-                    "500 Internal Server Error",
-                    r#"{"error":{"code":"INTERNAL","message":"upstream mentioned 410 while failing"}}"#,
-                )
-            };
-            let mut stream = request.into_inner();
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
-                response.len()
-            )
-            .unwrap();
-        }
-    });
+
     let deleted = adm_with_runner(
         root.path(),
         &runner_url,
         &["destroy", "runner-error", "--wait"],
     );
-    runner.join().unwrap();
     assert!(
-        !deleted.status.success(),
-        "a 500 mentioning 410 must not authorize runtime deletion"
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
     );
     assert_eq!(
         assert_ok(adm(root.path(), &["list", "--json", "--all"]))[0]["phase"],
-        "deleting"
+        "deleted"
     );
-    let cluster: Value =
-        serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
     assert!(
-        cluster
-            .get(workspace["namespace"].as_str().unwrap())
-            .is_some(),
-        "the namespace must remain while runner cancellation is unconfirmed"
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "destroy must not call a management-host agent runner"
     );
 }
 
@@ -1546,10 +1109,7 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
     let workspace: Value =
         serde_json::from_slice(&created.stdout).expect("create keeps its workspace JSON on stdout");
     assert_eq!(workspace["name"], "navigation");
-    let guidance = String::from_utf8_lossy(&created.stderr);
-    assert!(guidance.contains("/repos"), "{guidance}");
-    assert!(guidance.contains("clone"), "{guidance}");
-    assert!(guidance.contains("adm shell navigation"), "{guidance}");
+    assert_eq!(workspace["phase"], "ready");
 
     let exec_root = root.path().join("workspace-fixture");
     let mut populate = Command::new(env!("CARGO_BIN_EXE_adm"));
@@ -1604,15 +1164,6 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
         ],
     );
     assert!(catalog.status.success(), "{catalog:?}");
-    let catalog_guidance = String::from_utf8_lossy(&catalog.stderr);
-    assert!(
-        catalog_guidance.contains("Lazy catalog"),
-        "{catalog_guidance}"
-    );
-    assert!(
-        catalog_guidance.contains("cd /repos/OWNER/REPO"),
-        "{catalog_guidance}"
-    );
 
     let command = [
         "shell",
@@ -1741,6 +1292,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
             && status.contains("coding")
             && status.contains("NotReady (Running)")
             && status.contains("unavailable")
+            && status.contains("workspace Pod has no valid IP address")
             && status.contains("node-a")
             && status.contains("ContainersNotReady"),
         "{status}"
@@ -1817,9 +1369,8 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let bot_status = String::from_utf8_lossy(&bot_status.stdout);
     assert!(
         bot_status.contains("bot")
-            && bot_status.contains("n/a")
-            && bot_status.contains("management host")
-            && bot_status.contains("unavailable"),
+            && bot_status.contains("unavailable")
+            && bot_status.contains("workspace Pod has no valid IP address"),
         "{bot_status}"
     );
     assert_eq!(
@@ -1833,10 +1384,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         String::from_utf8_lossy(&bot_inspect.stderr)
     );
     let bot_inspect = String::from_utf8_lossy(&bot_inspect.stdout);
-    assert!(
-        bot_inspect.contains("Location: management host (no workspace Pod)"),
-        "{bot_inspect}"
-    );
+    assert!(bot_inspect.contains("Pod"), "{bot_inspect}");
 
     assert_eq!(
         assert_ok(adm(root.path(), &["destroy", "demo", "--wait"]))["phase"],
@@ -1869,15 +1417,14 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
 }
 
 #[test]
-fn status_distinguishes_agent_provider_errors_from_unavailable_runner() {
+fn status_uses_workspace_pod_data_instead_of_a_host_runner() {
     let root = fixture();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let server = std::thread::spawn(move || serve_runner_status_fixture(listener));
 
-    let created = adm_with_runner(
+    let created = adm(
         root.path(),
-        &runner_url,
         &[
             "create",
             "supervisor",
@@ -1900,14 +1447,15 @@ fn status_distinguishes_agent_provider_errors_from_unavailable_runner() {
         String::from_utf8_lossy(&status.stderr)
     );
     let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("Agent unavailable"), "{status}");
     assert!(
-        status.contains("AGENT")
-            && status.contains("error")
-            && status.contains("Agent failure: provider token expired"),
+        status.contains("workspace Pod has no valid IP address"),
         "{status}"
     );
-    assert!(!status.contains("Agent unavailable"), "{status}");
-    server.join().unwrap();
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "status must not query a management-host agent runner"
+    );
 }
 
 #[test]
@@ -1998,7 +1546,7 @@ fn destruction_refuses_a_namespace_whose_immutable_ownership_changed() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("ownership"));
     assert_eq!(
         assert_ok(adm(root.path(), &["list", "--json"]))[0]["phase"],
-        "ready"
+        "deleting"
     );
 }
 
@@ -2458,7 +2006,8 @@ fn repository_sidecar_runs_as_the_development_user_and_catalog_is_the_repos_view
     let pod = &deployment["spec"]["template"]["spec"];
     let dev = &pod["containers"][0];
     assert_eq!(dev["workingDir"], "/repos");
-    assert_eq!(dev["readinessProbe"]["exec"]["command"][2], "/repos");
+    assert_eq!(dev["readinessProbe"]["httpGet"]["path"], "/health");
+    assert_eq!(dev["readinessProbe"]["httpGet"]["port"], 7432);
     let sidecar = pod["containers"]
         .as_array()
         .unwrap()
@@ -2587,11 +2136,7 @@ fn start_rejects_a_checkout_without_the_runner() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--project-dir"),
-        "a published binary must say how to point at the checkout: {stderr}"
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("workspace Pods"));
 }
 
 #[test]
@@ -2639,12 +2184,17 @@ fn credential_environment_flags_emit_only_workspace_scoped_secret_references() {
         .find(|item| item["kind"] == "Deployment")
         .unwrap()["spec"]["template"]["spec"]["containers"][0]
         .clone();
-    assert_eq!(dev["env"][0]["name"], "API_KEY");
+    let api_key = dev["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "API_KEY")
+        .unwrap();
     assert_eq!(
-        dev["env"][0]["valueFrom"]["secretKeyRef"],
+        api_key["valueFrom"]["secretKeyRef"],
         serde_json::json!({"name":"provider-secret","key":"token"})
     );
-    assert!(dev["env"][0].get("value").is_none());
+    assert!(api_key.get("value").is_none());
 }
 
 #[test]

@@ -322,6 +322,16 @@ pub fn managed_shell(
     Ok(())
 }
 
+fn provider_login_args() -> [&'static str; 5] {
+    [
+        "--no-session",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+    ]
+}
+
 pub fn login(cli: &Cli, workspace: &Workspace) -> Result<()> {
     let (pod, _, container) = pod_identity(cli, workspace)?;
     let status = cli
@@ -339,11 +349,8 @@ pub fn login(cli: &Cli, workspace: &Workspace) -> Result<()> {
             "PI_CODING_AGENT_DIR=/workspace/.adm/pi",
             "node",
             "/opt/adm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
-            "--no-session",
-            "--no-extensions",
-            "--no-skills",
-            "--no-prompt-templates",
         ])
+        .args(provider_login_args())
         .status()
         .context("open provider login inside workspace Pod")?;
     ensure!(status.success(), "provider login exited with {status}");
@@ -353,6 +360,20 @@ pub fn login(cli: &Cli, workspace: &Workspace) -> Result<()> {
 #[cfg(test)]
 mod forward_pipe_tests {
     use super::*;
+
+    #[test]
+    fn provider_login_disables_all_coding_tools_and_persistent_sessions() {
+        assert_eq!(
+            provider_login_args(),
+            [
+                "--no-session",
+                "--no-tools",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+            ]
+        );
+    }
     use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Instant};
 
     #[test]
@@ -381,6 +402,7 @@ mod forward_pipe_tests {
             lifecycle_token_file: None,
             runtime_status_port: 7432,
             lifecycle_fence: None,
+            lifecycle_operation_id: None,
             project_dir: PathBuf::new(),
             command: crate::Action::LifecycleServe {
                 host: "127.0.0.1".into(),

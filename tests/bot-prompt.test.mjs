@@ -1,120 +1,188 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
 
 const [binary] = process.argv.slice(2);
 assert.ok(binary, "adm binary path is required");
-const root = await mkdtemp(join(tmpdir(), "adm-bot-prompt-"));
+const root = await mkdtemp(join(tmpdir(), "adm-bot-pod-prompt-"));
 const exec = promisify(execFile);
+const workspaceId = "bot-pod-prompt-001";
+const namespace = "adm-bot-pod-prompt";
+const podName = "workspace-bot";
+const podUid = "00000000-0000-4000-8000-000000000001";
+const lifecycleToken = "fixture-lifecycle-token";
+const runtimeToken = "fixture-pod-runtime-token";
+const tokenFile = join(root, "pod-token");
+const configFile = join(root, "workspace.json");
+await writeFile(tokenFile, `${runtimeToken}\n`, { mode: 0o600 });
+
+const workspace = {
+  id: workspaceId,
+  name: "fixture-bot",
+  role: "bot",
+  namespace,
+  phase: "ready",
+  image: "adm-dev:test",
+  storage_class: "adm-replicated",
+  storage_size: "1Gi",
+  cpu: "1",
+  memory: "1Gi",
+  agent_enabled: true,
+  repositories: false,
+  catalog: {},
+  model: { provider: "faux", id: "faux-1" },
+  allowed_agents: [],
+  herdr_space: null,
+  created_at: 1,
+  last_error: null,
+  runtime_status: {
+    podName,
+    podPhase: "Running",
+    ready: true,
+    activity: { status: "idle" },
+    selectedModel: { provider: "faux", id: "faux-1" },
+  },
+};
+const podRunnerConfig = { ...workspace, environment: "pod" };
+delete podRunnerConfig.namespace;
+await writeFile(configFile, JSON.stringify(podRunnerConfig));
+
+const lifecycleRequests = [];
+const lifecycle = createServer(async (request, response) => {
+  let raw = "";
+  for await (const chunk of request) raw += chunk;
+  const body = raw ? JSON.parse(raw) : {};
+  lifecycleRequests.push({
+    path: request.url,
+    authorization: request.headers.authorization,
+    body,
+  });
+  const path = new URL(request.url, "http://lifecycle").pathname;
+  let status = 200;
+  let value = {};
+  if (path === "/health") {
+    value = { status: "ok" };
+  } else if (path === "/v1/workspaces") {
+    if (request.headers.authorization !== `Bearer ${lifecycleToken}`) {
+      status = 401;
+      value = { error: { code: "UNAUTHORIZED" } };
+    } else {
+      value = [workspace];
+    }
+  } else if (path.endsWith("/runtime/authorize")) {
+    if (request.headers.authorization !== `Bearer ${runtimeToken}`) {
+      status = 401;
+      value = { error: { code: "UNAUTHORIZED" } };
+    } else {
+      value = { allowed: true };
+    }
+  } else if (path.endsWith("/runtime/lease")) {
+    value = {
+      workspaceId,
+      holder: body.holder,
+      fencingToken: 1,
+      expiresAt: Date.now() + 30_000,
+    };
+  } else if (
+    path.endsWith("/runtime/check") ||
+    path.endsWith("/runtime/lease/renew")
+  ) {
+    value = { valid: true };
+  } else {
+    status = 404;
+    value = { error: { code: "NOT_FOUND" } };
+  }
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(value));
+});
+await new Promise((resolve) => lifecycle.listen(0, "127.0.0.1", resolve));
+const lifecycleUrl = `http://127.0.0.1:${lifecycle.address().port}`;
+
 const kubectl = join(root, "kubectl");
-const mcpServer = join(root, "mcp-server.mjs");
-const mcpConfig = join(root, "mcp-config.json");
-const mcpInitialized = join(root, "mcp-initialized.txt");
 await writeFile(
   kubectl,
-  `#!/usr/bin/env python3
-import json, pathlib, sys
-path = pathlib.Path(__file__).parent / 'cluster.json'
-state = json.loads(path.read_text()) if path.exists() else {'namespaces': {}, 'resources': []}
-args = sys.argv[1:]
-if args[:2] == ['get', 'storageclass']:
-    print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
-elif args[0] == 'apply':
-    doc=json.load(sys.stdin)
-    for item in doc['items']:
-        state['resources'].append(item)
-        if item['kind']=='Namespace': state['namespaces'][item['metadata']['name']]=item
-    path.write_text(json.dumps(state)); print('applied')
-elif args[:2] == ['get','namespace']:
-    if args[2] in state['namespaces']: print(json.dumps(state['namespaces'][args[2]]))
-    else: print('Error from server (NotFound): namespaces not found',file=sys.stderr);sys.exit(1)
-elif args[:2] == ['delete','namespace']:
-    state['namespaces'].pop(args[2],None);path.write_text(json.dumps(state)); print('deleted')
-elif args[0] == 'wait': print('condition met')
-elif args[:2] == ['get','pods']:
-    namespace = args[args.index('-n')+1] if '-n' in args else None
-    pods = [item for item in state['resources'] if item['kind']=='Pod' and (namespace is None or item.get('metadata',{}).get('namespace')==namespace)]
-    print(json.dumps({'items':pods}))
-else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
+  `#!${process.execPath}
+import http from "node:http";
+const args = process.argv.slice(2);
+if (args[0] === "get" && args[1] === "pod") {
+  process.stdout.write(JSON.stringify({
+    metadata: { name: ${JSON.stringify(podName)}, namespace: ${JSON.stringify(namespace)}, uid: ${JSON.stringify(podUid)}, labels: { "adm.dev/workspace-id": ${JSON.stringify(workspaceId)}, "app.kubernetes.io/managed-by": "adm" } },
+    spec: { serviceAccountName: "adm-runtime" },
+    status: { phase: "Running", conditions: [{ type: "Ready", status: "True" }] }
+  }));
+} else if (args[0] === "exec") {
+  process.stdout.write(${JSON.stringify(runtimeToken + "\n")});
+} else if (args[0] === "port-forward") {
+  const upstream = new URL(${JSON.stringify("http://127.0.0.1:0")});
+  upstream.port = process.env.POD_RUNTIME_PORT;
+  const server = http.createServer((request, response) => {
+    const proxy = http.request(new URL(request.url, upstream), { method: request.method, headers: request.headers }, (remote) => {
+      response.writeHead(remote.statusCode ?? 502, remote.headers);
+      remote.pipe(response);
+    });
+    proxy.on("error", (error) => { response.writeHead(502); response.end(String(error)); });
+    request.pipe(proxy);
+  });
+  server.listen(0, "127.0.0.1", () => {
+    process.stdout.write("Forwarding from 127.0.0.1:" + server.address().port + " -> 7432\\n");
+  });
+  process.on("SIGTERM", () => server.close(() => process.exit(0)));
+} else {
+  process.stderr.write("unexpected kubectl arguments: " + JSON.stringify(args));
+  process.exit(2);
+}
 `,
 );
 await chmod(kubectl, 0o755);
-await writeFile(
-  mcpServer,
-  `#!${process.execPath}
-import { appendFileSync, readFileSync } from "node:fs";
-const registryPath = ${JSON.stringify(join(root, "runner", "workspaces.json"))};
-const initialized = ${JSON.stringify(join(root, "mcp-initialized.txt"))};
-let buffer = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("end", () => process.exit(0));
-process.stdin.on("data", (chunk) => {
-  buffer += chunk;
-  for (;;) {
-    const end = buffer.indexOf("\\n");
-    if (end < 0) break;
-    const message = JSON.parse(buffer.slice(0, end));
-    buffer = buffer.slice(end + 1);
-    if (!("id" in message)) continue;
-    let result;
-    if (message.method === "initialize") {
-      const registered = process.env.MCP_TOKEN === "cli-secret" && JSON.parse(readFileSync(registryPath, "utf8")).some((entry) => entry.mcpServers?.[0]?.tools?.includes("cli_ping"));
-      appendFileSync(initialized, String(registered));
-      result = { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "cli-fixture", version: "1" } };
-    } else if (message.method === "tools/list") {
-      result = { tools: [{ name: "cli_ping", description: "CLI fixture", inputSchema: { type: "object", properties: {} } }] };
-    } else {
-      result = { content: [{ type: "text", text: "pong" }] };
-    }
-    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
-  }
-});
-`,
-);
-await chmod(mcpServer, 0o755);
-await writeFile(
-  mcpConfig,
-  JSON.stringify([
-    {
-      id: "cli_fixture",
-      command: mcpServer,
-      tools: ["cli_ping"],
-      secretEnv: { MCP_TOKEN: "MCP_CLI_TOKEN" },
-    },
-  ]),
-);
 
-const runner = spawn(
+const podRunner = spawn(
   process.execPath,
   [
-    "--import",
-    "tsx",
     "packages/runner/src/main.ts",
+    "--host",
+    "127.0.0.1",
     "--port",
     "0",
     "--state-dir",
-    join(root, "runner"),
+    join(root, "pod-runtime"),
     "--provider",
     "faux",
+    "--model",
+    "faux-1",
+    "--workspace-config",
+    configFile,
+    "--token-file",
+    tokenFile,
+    "--lifecycle-url",
+    lifecycleUrl,
+    "--pod-uid",
+    podUid,
   ],
   {
     cwd: process.cwd(),
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, MCP_CLI_TOKEN: "cli-secret" },
+    env: { ...process.env, POD_RUNTIME_PORT: "0" },
   },
 );
-const runnerExited = once(runner, "exit");
-const lines = createInterface({ input: runner.stdout });
+const runnerExited = once(podRunner, "exit");
+const lines = createInterface({ input: podRunner.stdout });
 let runnerErrors = "";
-runner.stderr.on("data", (chunk) => (runnerErrors += chunk));
+podRunner.stderr.on("data", (chunk) => (runnerErrors += chunk));
 const ready = new Promise((resolve, reject) => {
-  runner.once("exit", (code) =>
-    reject(new Error(`runner exit ${code}: ${runnerErrors}`)),
+  podRunner.once("exit", (code) =>
+    reject(new Error(`workspace Pod runtime exited ${code}: ${runnerErrors}`)),
   );
   lines.on("line", (line) => {
     try {
@@ -126,7 +194,8 @@ const ready = new Promise((resolve, reject) => {
 
 try {
   const { url } = await ready;
-  const runCli = async (args, runnerUrl = url) =>
+  process.env.POD_RUNTIME_PORT = new URL(url).port;
+  const runCli = async (args) =>
     exec(
       binary,
       [
@@ -134,234 +203,81 @@ try {
         join(root, "cli-state"),
         "--kubectl",
         kubectl,
-        "--runner-url",
-        runnerUrl,
+        "--lifecycle-url",
+        lifecycleUrl,
+        "--lifecycle-token-file",
+        join(root, "lifecycle-token"),
         ...args,
       ],
       {
         cwd: process.cwd(),
-        env: { ...process.env, XDG_CONFIG_HOME: join(root, "config") },
+        env: { ...process.env, POD_RUNTIME_PORT: new URL(url).port },
       },
     );
-  const cli = async (args) => JSON.parse((await runCli(args)).stdout);
-  const createHelp = await runCli(["create", "--help"]);
-  assert.match(createHelp.stdout, /management-host runner/);
-  assert.match(createHelp.stdout, /no workspace Pod/);
-  const needsModel = await runCli(["create", "shell-bot", "--role", "bot"]);
-  const shellBot = JSON.parse(needsModel.stdout);
-  assert.equal(shellBot.agent_enabled, true);
-  assert.equal(shellBot.model, null);
-  assert.match(needsModel.stderr, /management-host runner/);
-  assert.match(
-    (await runCli(["status", "shell-bot"])).stdout,
-    /Model: needs selection/,
-  );
-  await cli(["destroy", "shell-bot"]);
-  const created = await runCli([
-    "create",
-    "fixture-bot",
-    "--role",
-    "bot",
-    "--model",
-    "faux/faux-1",
-    "--mcp-config",
-    mcpConfig,
-  ]);
-  const bot = JSON.parse(created.stdout);
-  assert.match(created.stderr, /management-host runner/);
-  assert.match(created.stderr, /namespace.*no.*Pod/i);
-  assert.ok(created.stderr.includes("adm attach fixture-bot"));
-  const cluster = JSON.parse(
-    await readFile(join(root, "cluster.json"), "utf8"),
-  );
-  assert.deepEqual(
-    cluster.resources.map(({ kind }) => kind),
-    ["Namespace", "Namespace"],
-    "bot creation applies only a Kubernetes namespace, never a Pod or workload",
-  );
-  const pods = await exec(kubectl, [
-    "get",
-    "pods",
-    "-n",
-    bot.namespace,
-    "-o",
-    "json",
-  ]);
-  assert.deepEqual(JSON.parse(pods.stdout).items, []);
-  const healthyStatus = (await runCli(["status", "fixture-bot"])).stdout;
-  assert.match(healthyStatus, /management host/);
-  assert.doesNotMatch(healthyStatus, /Agent unavailable/);
-  const offlineStatus = (
-    await runCli(["status", "fixture-bot"], "http://127.0.0.1:1")
-  ).stdout;
-  assert.match(offlineStatus, /management host/);
-  assert.match(offlineStatus, /Agent unavailable/);
-  const table = (await runCli(["list"], "http://127.0.0.1:1")).stdout;
-  assert.match(table, /NAME\s+ROLE\s+PHASE\s+AGENT CONFIG\s+ACTIVITY\s+ID/);
-  assert.match(
-    table,
-    new RegExp(
-      `fixture-bot\\s+bot\\s+ready\\s+enabled\\s+unavailable\\s+${bot.id}`,
-    ),
-    "default list shows configured agent state, live activity, and full immutable ID",
-  );
-  const registered = await fetch(`${url}/v1/workspaces/${bot.id}`);
-  const botStatus = await registered.json();
-  assert.ok(botStatus.tools.includes("mcp_cli_fixture_cli_ping"));
-  assert.equal(await readFile(mcpInitialized, "utf8"), "true");
-  const watch = await fetch(`${url}/v1/workspaces/${bot.id}/events`, {
-    signal: AbortSignal.timeout(10_000),
+  await writeFile(join(root, "lifecycle-token"), `${lifecycleToken}\n`, {
+    mode: 0o600,
   });
-  assert.equal(watch.status, 200);
-  const diagnosticWatch = await fetch(
-    `${url}/v1/workspaces/${bot.id}/events?diagnostics=true`,
-    {
-      signal: AbortSignal.timeout(10_000),
-    },
-  );
-  assert.equal(diagnosticWatch.status, 200);
-  const diagnosticAnswer = (async () => {
-    const reader = diagnosticWatch.body.getReader();
-    let buffer = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      buffer += Buffer.from(value).toString();
-      for (;;) {
-        const end = buffer.indexOf("\n\n");
-        if (end < 0) break;
-        const frame = buffer.slice(0, end);
-        buffer = buffer.slice(end + 2);
-        const data = frame
-          .split("\n")
-          .find((line) => line.startsWith("data: "));
-        if (!data) continue;
-        const event = JSON.parse(data.slice(6));
-        if (
-          event.kind === "assistant" &&
-          event.data.text.includes("Private diagnostic.")
-        ) {
-          await reader.cancel();
-          return event;
-        }
-      }
-    }
-  })();
-  const firstMessage = (async () => {
-    let buffer = "";
-    for await (const bytes of watch.body) {
-      buffer += Buffer.from(bytes).toString();
-      for (;;) {
-        const end = buffer.indexOf("\n\n");
-        if (end < 0) break;
-        const frame = buffer.slice(0, end);
-        buffer = buffer.slice(end + 2);
-        const data = frame
-          .split("\n")
-          .find((line) => line.startsWith("data: "));
-        if (data) {
-          const event = JSON.parse(data.slice(6));
-          if (
-            event.kind === "message" &&
-            event.data.text === "Prompt without request ID was delivered."
-          )
-            return event;
-        }
-      }
-    }
-  })();
-  const noIdMessage =
-    "/faux " +
-    JSON.stringify({
-      calls: [
-        {
-          tool: "sendMessage",
-          args: { text: "Prompt without request ID was delivered." },
-        },
-      ],
-      answer: "Private diagnostic.",
-    });
-  const noIdResponse = await cli(["prompt", "fixture-bot", noIdMessage]);
-  assert.equal(
-    noIdResponse.status,
-    "admitted",
-    "prompt without optional request ID must be admitted",
-  );
-  const published = await firstMessage;
-  assert.equal(published.data.text, "Prompt without request ID was delivered.");
-  await diagnosticAnswer;
-  const publicHistory = await fetch(
-    `${url}/v1/workspaces/${bot.id}/history?diagnostics=false`,
-  ).then((response) => response.json());
-  const diagnosticHistory = await fetch(
-    `${url}/v1/workspaces/${bot.id}/history?diagnostics=true`,
-  ).then((response) => response.json());
-  assert.ok(publicHistory.events.some((event) => event.kind === "message"));
-  assert.ok(
-    publicHistory.events.every((event) =>
-      ["user", "message", "status"].includes(event.kind),
-    ),
-    "ordinary bot history excludes diagnostic assistant records",
-  );
-  assert.ok(
-    diagnosticHistory.events.some(
-      (event) =>
-        event.kind === "assistant" && event.data.text === "Private diagnostic.",
-    ),
-    "diagnostic history opts in to the assistant record",
-  );
 
-  const explicitMessage =
+  const message =
     "/faux " +
     JSON.stringify({
       calls: [
         {
           tool: "sendMessage",
-          args: { text: "Explicit request ID was delivered once." },
+          args: { text: "Pod-owned bot message reached the terminal." },
         },
       ],
-      answer: "Private diagnostic.",
+      answer: "Private pod diagnostic.",
     });
-  const first = await cli([
-    "prompt",
-    "fixture-bot",
-    explicitMessage,
-    "--request-id",
-    "fixture-id",
-  ]);
-  const duplicate = await cli([
-    "prompt",
-    "fixture-bot",
-    explicitMessage,
-    "--request-id",
-    "fixture-id",
-  ]);
+  const first = JSON.parse(
+    (await runCli(["prompt", "fixture-bot", message, "--request-id", "fixture-id"]))
+      .stdout,
+  );
+  const duplicate = JSON.parse(
+    (await runCli(["prompt", "fixture-bot", message, "--request-id", "fixture-id"]))
+      .stdout,
+  );
   assert.equal(first.status, "admitted");
   assert.equal(duplicate.status, "admitted");
-  assert.equal(
-    first.submissionId,
-    duplicate.submissionId,
-    "repeated explicit request ID must deduplicate",
-  );
+  assert.equal(first.submissionId, duplicate.submissionId);
 
-  const malformed = await fetch(`${url}/v1/workspaces/${bot.id}/input`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message: "malformed request ID", requestId: null }),
-  });
-  assert.equal(
-    malformed.status,
-    400,
-    "runner must continue rejecting explicit null request IDs",
+  const historyResponse = await fetch(
+    `${url}/v1/workspaces/${workspaceId}/history?diagnostics=false`,
+    { headers: { authorization: `Bearer ${runtimeToken}` } },
   );
-  const malformedBody = await malformed.json();
-  assert.equal(malformedBody.error.message, "requestId must be a string");
-
-  await cli(["destroy", "fixture-bot"]);
-  console.log("CLI prompt request ID scenario passed");
+  assert.equal(historyResponse.status, 200);
+  const history = await historyResponse.json();
+  assert.ok(
+    history.events.some(
+      (event) =>
+        event.kind === "message" &&
+        event.data.text === "Pod-owned bot message reached the terminal.",
+    ),
+  );
+  assert.ok(
+    history.events.every((event) =>
+      ["user", "message", "status"].includes(event.kind),
+    ),
+    "the default bot history hides model and tool diagnostics",
+  );
+  assert.ok(
+    lifecycleRequests.some(
+      (entry) =>
+        entry.path === `/v1/workspaces/${workspaceId}/runtime/authorize` &&
+        entry.authorization === `Bearer ${runtimeToken}` &&
+        entry.body.action === "prompt",
+    ),
+    "the pod identity authorizes CLI prompts through the lifecycle service",
+  );
+  assert.ok(
+    lifecycleRequests.some((entry) => entry.path.endsWith("/runtime/lease")),
+    "the pod runner acquires its durable lifecycle fence",
+  );
+  console.log("Pod-owned bot prompt and lifecycle routing scenario passed");
 } finally {
-  runner.kill("SIGTERM");
+  podRunner.kill("SIGTERM");
   await runnerExited;
   lines.close();
+  await new Promise((resolve) => lifecycle.close(resolve));
   await rm(root, { recursive: true });
 }

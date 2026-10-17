@@ -8,7 +8,7 @@ mod setup;
 mod workspaces;
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -182,6 +182,8 @@ pub enum Action {
     },
     /// Configure workspace defaults, provider login, and the background service.
     Setup,
+    /// Generate shell completion scripts.
+    Completions { shell: CompletionShell },
     /// Log a provider into this workspace's private durable auth store.
     Login { name: String },
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
@@ -196,6 +198,12 @@ pub enum Action {
         #[arg(long)]
         screenshot: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum CompletionShell {
+    /// Z shell.
+    Zsh,
 }
 
 fn default_project_dir() -> PathBuf {
@@ -586,18 +594,19 @@ fn print_workspace_list(items: &[Value]) {
     });
     for row in std::iter::once(headers.as_slice()).chain(rows.iter().map(|row| row.as_slice())) {
         println!(
-            "{:<name$}  {:<role$}  {:<phase$}  {:<config$}  {:<activity$}  {id}",
+            "{:<name$}  {:<role$}  {:<phase$}  {:<config$}  {:<activity$}  {:<id$}",
             row[0],
             row[1],
             row[2],
             row[3],
             row[4],
+            row[5],
             name = widths[0],
             role = widths[1],
             phase = widths[2],
             config = widths[3],
             activity = widths[4],
-            id = row[5],
+            id = widths[5],
         );
     }
     for workspace in items {
@@ -633,7 +642,7 @@ fn workspace_list_report(items: &[workspaces::Workspace]) -> Result<Vec<Value>> 
 fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
     let workspace = cli.workspace(name, true)?;
     let cluster = if workspace.phase == "deleted" {
-        json!({"status":"deleted"})
+        Value::Null
     } else {
         match workspaces::cluster_status(cli, &workspace) {
             Ok(value) => value,
@@ -1163,6 +1172,18 @@ fn run(cli: &Cli) -> Result<()> {
             json,
         } => diagnostics::doctor(cli, storage_class, *json),
         Action::Setup => setup::run(cli),
+        Action::Completions { shell } => {
+            let mut command = Cli::command();
+            match shell {
+                CompletionShell::Zsh => clap_complete::generate(
+                    clap_complete::aot::Shell::Zsh,
+                    &mut command,
+                    "adm",
+                    &mut std::io::stdout(),
+                ),
+            }
+            Ok(())
+        }
         Action::Login { name } => {
             let workspace = cli.active_workspace(name)?;
             runtime_access::login(cli, &workspace)

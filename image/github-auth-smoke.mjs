@@ -167,6 +167,8 @@ async function createWorkspace({
     `type=bind,src=${fixtureDirectory},dst=/fixture,readonly`,
     ...(envFile ? ["--env-file", envFile] : []),
     image,
+    "sleep",
+    "infinity",
   );
   created.add(name);
   await docker("start", name);
@@ -429,6 +431,8 @@ export async function verifyGitHubPushAuthentication(image) {
       "--env",
       `GIT_CONFIG_VALUE_0=http://127.0.0.1:${proxyPort}`,
       image,
+      "sleep",
+      "infinity",
     );
     created.add(containerNames[2]);
     await docker("start", containerNames[2]);

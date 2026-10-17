@@ -441,7 +441,47 @@ impl WorkspaceStore {
             return Ok(receipt);
         }
         let created_workspace = match request {
-            OperationRequest::Create { spec, .. } => Some(spec.clone().allocate(operation_id)?),
+            OperationRequest::Create { spec, .. } => {
+                let requested = spec.clone().allocate(operation_id)?;
+                let existing = transaction
+                    .query_row(
+                        "SELECT spec FROM workspaces WHERE name=?1 AND phase!='deleted'",
+                        [&requested.name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|encoded| serde_json::from_str::<Workspace>(&encoded))
+                    .transpose()?;
+                match existing {
+                    Some(existing)
+                        if existing.phase == "failed" || existing.phase == "provisioning" =>
+                    {
+                        if existing.repository != requested.repository {
+                            let requested_repository = match requested.repository.as_deref() {
+                                Some(repository) => format!("recreating with --repo {repository}"),
+                                None => "recreating without --repo".into(),
+                            };
+                            bail!(
+                                "workspace {} has an unfinished creation for repository {}; inspect its status/error and deliberately destroy it before {} (failed workspace files are retained)",
+                                existing.name,
+                                existing.repository.as_deref().unwrap_or("none"),
+                                requested_repository
+                            );
+                        }
+                        ensure!(
+                            same_creation_spec(&existing, &requested),
+                            "workspace {} has an unfinished creation with different options; destroy it before changing its configuration",
+                            requested.name
+                        );
+                        Some(existing)
+                    }
+                    Some(_) => bail!(
+                        "workspace name {} already exists; inspect it and deliberately destroy it before recreating",
+                        requested.name
+                    ),
+                    None => Some(requested),
+                }
+            }
             OperationRequest::Delete { .. } => None,
         };
         let workspace_id = created_workspace
@@ -459,7 +499,10 @@ impl WorkspaceStore {
                 transaction.execute(
                     "INSERT INTO workspaces(id,name,phase,spec,fencing_token) VALUES(?1,?2,?3,?4,?5)",
                     params![spec.id, spec.name, spec.phase, serde_json::to_string(spec)?, self.fencing_token as i64],
-                ).with_context(|| format!("workspace name {} already exists", spec.name))?;
+                ).with_context(|| format!(
+                    "workspace name {} already exists; inspect it and deliberately destroy it before recreating",
+                    spec.name
+                ))?;
             }
             OperationRequest::Delete { workspace_id, .. } => {
                 let raw: String = transaction
@@ -753,7 +796,10 @@ impl WorkspaceStore {
                     self.fencing_token as i64
                 ],
             )
-            .with_context(|| format!("workspace name {} already exists", w.name))?;
+            .with_context(|| format!(
+                "workspace name {} already exists; inspect it and deliberately destroy it before recreating",
+                w.name
+            ))?;
         Ok(())
     }
     pub fn save(&self, w: &Workspace) -> Result<()> {
@@ -1041,7 +1087,42 @@ pub fn cluster_status(cli: &Cli, w: &Workspace) -> Result<Value> {
         ],
         None,
     )?)?;
-    Ok(json!({"namespace":w.namespace,"pods":pods["items"]}))
+    let first_pod = pods["items"].as_array().and_then(|items| items.first());
+    let waiting = first_pod.and_then(|pod| {
+        pod["status"]["initContainerStatuses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                pod["status"]["containerStatuses"]
+                    .as_array()
+                    .into_iter()
+                    .flatten(),
+            )
+            .find_map(|container| {
+                let state = &container["state"]["waiting"];
+                state["reason"].as_str().map(|reason| {
+                    state["message"]
+                        .as_str()
+                        .map(|message| format!("{reason}: {message}"))
+                        .unwrap_or_else(|| reason.to_owned())
+                })
+            })
+    });
+    let readiness = first_pod.and_then(|pod| {
+        pod["status"]["conditions"]
+            .as_array()?
+            .iter()
+            .find(|condition| condition["type"] == "Ready" && condition["status"] == "False")
+            .and_then(|condition| condition["reason"].as_str())
+            .map(str::to_owned)
+    });
+    let container_reason = waiting.or(readiness);
+    Ok(json!({
+        "namespace":w.namespace,
+        "pods":pods["items"],
+        "containerReason":container_reason
+    }))
 }
 
 pub fn navigation_guidance(workspace: &Workspace, opening_shell: bool) -> String {
@@ -1170,14 +1251,20 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
     }
     let provision = (|| -> Result<()> {
         let manifest = manifest(&w)?;
-        lifecycle_stage(cli, "create", &w.name, "applying workspace resources", || {
-            kubectl(
-                cli,
-                &["apply", "-f", "-"],
-                Some(&serde_json::to_vec(&manifest)?),
-            )?;
-            Ok(())
-        })?;
+        lifecycle_stage(
+            cli,
+            "create",
+            &w.name,
+            "applying workspace resources",
+            || {
+                kubectl(
+                    cli,
+                    &["apply", "-f", "-"],
+                    Some(&serde_json::to_vec(&manifest)?),
+                )?;
+                Ok(())
+            },
+        )?;
         if let Some(repository) = &w.repository {
             // Wait for the Pod to run so the private checkout exists before readiness.
             lifecycle_stage(cli, "create", &w.name, "waiting for workspace Pod", || {
@@ -1355,21 +1442,27 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
     )?;
     w.phase = "deleting".into();
     store.save(&w)?;
-    lifecycle_stage(cli, "destroy", &w.name, "waiting for namespace removal", || {
-        kubectl(
-            cli,
-            &[
-                "delete",
-                "namespace",
-                &w.namespace,
-                "--ignore-not-found=true",
-                "--wait=true",
-                "--timeout=180s",
-            ],
-            None,
-        )?;
-        Ok(())
-    })?;
+    lifecycle_stage(
+        cli,
+        "destroy",
+        &w.name,
+        "waiting for namespace removal",
+        || {
+            kubectl(
+                cli,
+                &[
+                    "delete",
+                    "namespace",
+                    &w.namespace,
+                    "--ignore-not-found=true",
+                    "--wait=true",
+                    "--timeout=180s",
+                ],
+                None,
+            )?;
+            Ok(())
+        },
+    )?;
     w.phase = "deleted".into();
     w.last_error = None;
     store.save(&w)?;

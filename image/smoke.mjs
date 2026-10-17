@@ -111,6 +111,7 @@ async function verifyPodOwnedRuntime() {
   const repoRoot = join(workspaceRoot, "repo");
   const configPath = join(runtimeRoot, "workspace.json");
   const tokenPath = join(runtimeRoot, "token");
+  const lifecyclePath = join(runtimeRoot, "lifecycle-fixture.mjs");
   const runtimeContainer = `${container}-runtime`;
   let exists = false;
   let running = false;
@@ -124,11 +125,41 @@ async function verifyPodOwnedRuntime() {
         name: "image-pod-runtime",
         role: "coding",
         environment: "pod",
-        localRoot: repoRoot,
-        cwd: repoRoot,
+        localRoot: "/workspace/repo",
+        cwd: "/workspace/repo",
         model: { provider: "faux", id: "faux-1" },
       }),
     );
+    await writeFile(lifecyclePath, String.raw`
+import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+const holder = "731db50f-237a-4f43-af54-a9d033e9c3b1";
+const server = createServer(async (request, response) => {
+  const chunks = []; for await (const chunk of request) chunks.push(chunk);
+  const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : {};
+  if (request.headers.authorization !== "Bearer pod-runtime-smoke-token") {
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { code: "UNAUTHORIZED", message: "fixture identity required" } })); return;
+  }
+  if (request.url.endsWith("/authorize")) {
+    response.writeHead(200, { "content-type": "application/json" }); response.end("{}"); return;
+  }
+  const initial = request.url.endsWith("/lease");
+  const valid = body.holder === holder && (initial || body.fencingToken === 1);
+  response.writeHead(valid ? 200 : 410, { "content-type": "application/json" });
+  response.end(JSON.stringify(valid ? { holder, fencingToken: 1 } : { error: { message: "stale fixture owner" } }));
+});
+server.listen(7433, "127.0.0.1", () => {
+  const child = spawn("/usr/local/bin/adm-dev-entrypoint", [], {
+    stdio: "inherit",
+    env: { ...process.env, ADM_LIFECYCLE_URL: "http://127.0.0.1:7433", ADM_POD_UID: holder },
+  });
+  process.on("SIGTERM", () => child.kill("SIGTERM"));
+  process.on("SIGINT", () => child.kill("SIGINT"));
+  child.on("error", (error) => { console.error(error); process.exitCode = 1; server.close(); });
+  child.on("exit", (code) => { process.exitCode = code ?? 1; server.close(); });
+});
+`);
     await docker(
       "create",
       "--name",
@@ -157,7 +188,10 @@ async function verifyPodOwnedRuntime() {
       `type=bind,src=${configPath},dst=/run/adm/workspace.json,readonly`,
       "--mount",
       `type=bind,src=${tokenPath},dst=/var/run/secrets/kubernetes.io/serviceaccount/token,readonly`,
+      "--mount",
+      `type=bind,src=${lifecyclePath},dst=/run/adm/lifecycle-fixture.mjs,readonly`,
       image,
+      "node", "/run/adm/lifecycle-fixture.mjs",
     );
     exists = true;
     await docker("start", runtimeContainer);
@@ -197,7 +231,7 @@ for (let attempt = 0; attempt < 100; attempt++) {
       await docker("exec", runtimeContainer, "node", "--input-type=module", "-e", probe);
     } catch (error) {
       const logs = await docker("logs", runtimeContainer).catch(() => ({ stdout: "" }));
-      throw new Error(`${error.message}\nworkspace runtime logs:\n${logs.stdout}`, { cause: error });
+      throw new Error(`${error.message}\nworkspace runtime logs:\n${logs.stdout}${logs.stderr ?? ""}`, { cause: error });
     }
     assert.equal(
       await readFile(join(repoRoot, "pod-owned.txt"), "utf8"),

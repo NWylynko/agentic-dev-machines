@@ -323,8 +323,12 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
     ensure!(!token.is_empty(), "lifecycle bearer token file is empty");
     let listener = TcpListener::bind((bind, port)).context("bind lifecycle service")?;
     let (wake, work) = mpsc::channel::<String>();
-    let worker_cli = cli.clone_for_lifecycle();
-    thread::spawn(move || lifecycle_worker(worker_cli, work));
+    let work = std::sync::Arc::new(std::sync::Mutex::new(work));
+    for _ in 0..4 {
+        let worker_cli = cli.clone_for_lifecycle();
+        let worker_work = work.clone();
+        thread::spawn(move || lifecycle_worker(worker_cli, worker_work));
+    }
     // Replay interrupted accepted/running work before accepting new requests.
     for (operation_id, _) in cli.store()?.pending_lifecycle_operations()? {
         let _ = wake.send(operation_id);
@@ -346,8 +350,18 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn lifecycle_worker(cli: crate::Cli, work: mpsc::Receiver<String>) {
-    for operation_id in work {
+fn lifecycle_worker(
+    cli: crate::Cli,
+    work: std::sync::Arc<std::sync::Mutex<mpsc::Receiver<String>>>,
+) {
+    loop {
+        let operation_id = match work.lock() {
+            Ok(receiver) => match receiver.recv() {
+                Ok(operation_id) => operation_id,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
         let mut cli = cli.clone_for_lifecycle();
         cli.lifecycle_operation_id = Some(operation_id.clone());
         let outcome = (|| -> Result<()> {

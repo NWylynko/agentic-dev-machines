@@ -230,12 +230,9 @@ async function assertActive(id: string) {
         fencingToken: runtimeLease.fencingToken,
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       await fenceLost(error);
-      throw new ApiError(
-        503,
-        "RUNTIME_OWNERSHIP_LOST",
-        runtimeLeaseError?.message ?? "Workspace runtime lost its lifecycle fence",
-      );
+      throw new ApiError(503, "RUNTIME_OWNERSHIP_LOST", message);
     }
   }
 }
