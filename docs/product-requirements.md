@@ -79,7 +79,7 @@ adm status my-project
 adm destroy my-project
 ```
 
-Agent workspaces require a model selected through `adm setup` or `--model`. `--no-agent` creates a shell-only workspace. Installed releases default to their matching published workspace image unless setup chooses another; source development defaults to the published `latest` image. Pass `--image adm-dev:0.1.0` for a local build. Without `--catalog`, `/repos` is an ordinary writable directory. Supplying a catalog opts in to lazy repository mounts; discovery and scoped private-repository fetch credentials are separate prerequisites.
+Every workspace has a durable agent. A model can be seeded through `adm setup` or `--model`, or selected later in `adm attach` with `/model`; requests wait until selection. Installed releases default to their matching published workspace image unless setup chooses another; source development defaults to the published `latest` image. Pass `--image adm-dev:0.1.0` for a local build. Without `--catalog`, `/repos` is an ordinary writable directory. Supplying a catalog opts in to lazy repository mounts; discovery and scoped private-repository fetch credentials are separate prerequisites.
 
 Creation and attachment are separate operations. Losing an attachment must not delete the workspace. Reattaching should resolve the current runtime from the workspace identity instead of remembering a particular Pod name.
 

@@ -10,6 +10,12 @@ import {
   stripTerminalSequences,
   Text,
 } from "@earendil-works/pi-tui";
+import {
+  ModelSelectorComponent,
+  initTheme,
+  type ModelRuntime,
+} from "@earendil-works/pi-coding-agent";
+import type { Model, ModelsRefreshResult } from "@earendil-works/pi-ai";
 export type WorkspaceEvent = {
   seq: number;
   workspaceId: string;
@@ -77,6 +83,8 @@ export class WorkspaceTerminal extends Container {
     requestId: string;
     whenBusy: string;
   };
+  private modelSelector?: ModelSelectorComponent;
+  private modelRuntime?: RemoteModelRuntime;
   constructor(options: TerminalOptions) {
     super();
     this.options = options;
@@ -150,13 +158,14 @@ export class WorkspaceTerminal extends Container {
       base,
     );
   }
-  private async request(
+  async request(
     path: string,
     body?: unknown,
     signal: AbortSignal | undefined = this.controller?.signal,
+    method?: "GET" | "POST" | "PUT",
   ) {
     const response = await fetch(this.endpoint(path), {
-      method: body === undefined ? "GET" : "POST",
+      method: method ?? (body === undefined ? "GET" : "POST"),
       ...(body === undefined
         ? {}
         : {
@@ -178,6 +187,7 @@ export class WorkspaceTerminal extends Container {
   }
   async connect() {
     if (this.connecting || this.closed) return;
+    this.closeModelSelector();
     this.connecting = true;
     this.connected = false;
     this.controller?.abort();
@@ -191,6 +201,12 @@ export class WorkspaceTerminal extends Container {
         throw new Error("Runner returned an invalid workspace role");
       this.role = workspace.role;
       this.workspaceName = workspace.name;
+      const catalog = await this.request(
+        "/models",
+        undefined,
+        controller.signal,
+      );
+      this.modelRuntime = new RemoteModelRuntime(this, catalog);
       const workspaceStatus =
         workspace.status === "error"
           ? `Provider error · ${clean(workspace.error ?? "The provider request failed")}`
@@ -229,6 +245,7 @@ export class WorkspaceTerminal extends Container {
       this.connected = true;
       this.status = `Connected · ${workspaceStatus}`;
       this.refresh();
+      if (!catalog.selected) this.openModelSelector();
       void this.consume(response, controller);
     } catch (error) {
       if (!controller.signal.aborted) {
@@ -296,6 +313,11 @@ export class WorkspaceTerminal extends Container {
     }
   }
   handleInput(data: string) {
+    if (this.modelSelector) {
+      this.modelSelector.handleInput(data);
+      this.options.onRender?.();
+      return;
+    }
     if (matchesKey(data, Key.ctrl("c"))) {
       this.close();
       this.options.onDetach?.();
@@ -324,7 +346,7 @@ export class WorkspaceTerminal extends Container {
     try {
       if (message === "/help") {
         this.status =
-          "/followup TEXT · /abort [all] · /resume · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\nPi-native /model, /compact, /tree, and /settings are unavailable in adm attach. /resume retries this workspace's safe failed turn.";
+          "/model · /followup TEXT · /abort [all] · /resume · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector. /resume retries this workspace's safe failed turn.";
         clearInput();
         return;
       }
@@ -346,6 +368,18 @@ export class WorkspaceTerminal extends Container {
             ? `Provider error · ${clean(workspace.error ?? "The provider request failed")}`
             : clean(workspace.status);
         this.status = `${status} · ${workspace.goals?.length ?? 0} goals · ${workspace.loops?.length ?? 0} loops`;
+        clearInput();
+        return;
+      }
+      if (message === "/model") {
+        if (!this.connected)
+          throw new Error("Reconnect before selecting a model");
+        if (!this.modelRuntime)
+          this.modelRuntime = new RemoteModelRuntime(
+            this,
+            await this.request("/models"),
+          );
+        this.openModelSelector();
         clearInput();
         return;
       }
@@ -452,6 +486,53 @@ export class WorkspaceTerminal extends Container {
       this.refresh();
     }
   }
+  private openModelSelector() {
+    if (this.modelSelector || !this.options.tui || !this.modelRuntime) return;
+    initTheme("dark");
+    const selected = this.modelRuntime.selected;
+    const current = selected
+      ? this.modelRuntime.getModel(selected.provider, selected.id)
+      : undefined;
+    const selector = new WorkspaceModelSelector(
+      this.options.tui,
+      current,
+      this.modelRuntime as unknown as ModelRuntime,
+      [],
+      (model) => {
+        void this.chooseModel(model);
+      },
+      () => this.closeModelSelector(),
+    );
+    this.modelSelector = selector;
+    this.input.focused = false;
+    this.addChild(selector);
+    this.options.onRender?.();
+  }
+  private async chooseModel(model: Model<any>) {
+    try {
+      const result = await this.request(
+        "/model",
+        { provider: model.provider, modelId: model.id },
+        this.controller?.signal,
+        "PUT",
+      );
+      if (this.modelRuntime) this.modelRuntime.selected = result.selected;
+      this.status = `Model selected · ${clean(model.provider)}/${clean(model.id)}`;
+    } catch (error) {
+      this.status = `Model selection failed: ${error instanceof Error ? error.message : error}`;
+    } finally {
+      this.closeModelSelector();
+    }
+  }
+  private closeModelSelector() {
+    if (this.modelSelector) {
+      this.modelSelector.dispose();
+      this.removeChild(this.modelSelector);
+      this.modelSelector = undefined;
+    }
+    this.input.focused = true;
+    this.refresh();
+  }
   private setInputText(value: string) {
     if (this.input instanceof Editor) this.input.setText(value);
     else this.input.setValue(value);
@@ -460,7 +541,73 @@ export class WorkspaceTerminal extends Container {
     this.closed = true;
     this.connected = false;
     this.controller?.abort();
+    this.modelSelector?.dispose();
+    this.modelSelector = undefined;
     this.status = "Detached; agents keep working";
     this.refresh();
+  }
+}
+
+class WorkspaceModelSelector extends ModelSelectorComponent {
+  render(width: number) {
+    return super
+      .render(width)
+      .map((line) =>
+        line.replace(
+          "Use /login to add providers.",
+          "Set workspace credentials.",
+        ),
+      );
+  }
+}
+
+class RemoteModelRuntime {
+  models: Model<any>[];
+  selected?: { provider: string; id: string };
+  private error?: string;
+
+  constructor(
+    private terminal: WorkspaceTerminal,
+    catalog: any,
+  ) {
+    this.models = Array.isArray(catalog.models) ? catalog.models : [];
+    this.selected = catalog.selected;
+    this.error = catalog.error;
+  }
+
+  getAvailableSnapshot() {
+    return this.models;
+  }
+
+  getModel(provider: string, id: string) {
+    return this.models.find(
+      (model) => model.provider === provider && model.id === id,
+    );
+  }
+
+  getError() {
+    return this.error;
+  }
+
+  async refresh(options: {
+    signal?: AbortSignal;
+  }): Promise<ModelsRefreshResult> {
+    const catalog = await this.terminal.request(
+      "/models?refresh=true",
+      undefined,
+      options.signal,
+    );
+    this.models = Array.isArray(catalog.models) ? catalog.models : [];
+    this.selected = catalog.selected;
+    this.error = catalog.error;
+    return {
+      aborted: catalog.refresh?.aborted === true,
+      errors: new Map(
+        (catalog.refresh?.errors ?? []).map((entry: any) => [
+          entry.provider,
+          new Error(entry.message),
+        ]),
+      ),
+    };
   }
 }

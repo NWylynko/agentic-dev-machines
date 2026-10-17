@@ -147,17 +147,15 @@ try {
   const createHelp = await runCli(["create", "--help"]);
   assert.match(createHelp.stdout, /management-host runner/);
   assert.match(createHelp.stdout, /no workspace Pod/);
-  const disabled = await runCli([
-    "create",
-    "shell-bot",
-    "--role",
-    "bot",
-    "--no-agent",
-  ]);
-  const shellBot = JSON.parse(disabled.stdout);
-  assert.equal(shellBot.agent_enabled, false);
-  assert.match(disabled.stderr, /no enabled agent/);
-  assert.doesNotMatch(disabled.stderr, /management-host runner/);
+  const needsModel = await runCli(["create", "shell-bot", "--role", "bot"]);
+  const shellBot = JSON.parse(needsModel.stdout);
+  assert.equal(shellBot.agent_enabled, true);
+  assert.equal(shellBot.model, null);
+  assert.match(needsModel.stderr, /management-host runner/);
+  assert.match(
+    (await runCli(["status", "shell-bot"])).stdout,
+    /Model: needs selection/,
+  );
   await cli(["destroy", "shell-bot"]);
   const created = await runCli([
     "create",
@@ -199,11 +197,13 @@ try {
   assert.match(offlineStatus, /management host/);
   assert.match(offlineStatus, /Agent unavailable/);
   const table = (await runCli(["list"], "http://127.0.0.1:1")).stdout;
-  assert.match(table, /NAME\s+ROLE\s+PHASE\s+AGENT\s+ID/);
+  assert.match(table, /NAME\s+ROLE\s+PHASE\s+AGENT CONFIG\s+ACTIVITY\s+ID/);
   assert.match(
     table,
-    new RegExp(`fixture-bot\\s+bot\\s+ready\\s+enabled\\s+${bot.id}`),
-    "default list shows the configured agent state and full immutable ID without contacting the runner",
+    new RegExp(
+      `fixture-bot\\s+bot\\s+ready\\s+enabled\\s+unavailable\\s+${bot.id}`,
+    ),
+    "default list shows configured agent state, live activity, and full immutable ID",
   );
   const registered = await fetch(`${url}/v1/workspaces/${bot.id}`);
   const botStatus = await registered.json();

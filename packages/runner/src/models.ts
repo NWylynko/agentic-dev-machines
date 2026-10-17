@@ -6,14 +6,26 @@ import {
   fauxToolCall,
   type FauxResponseFactory,
 } from "@earendil-works/pi-ai/providers/faux";
+import { join } from "node:path";
+import { workspaceCredentialRuntime } from "./credentials.ts";
 
 export async function workspaceModels(
   provider: string | undefined,
   authPath?: string,
+  workspaceRoot = "/workspace",
 ): Promise<Models> {
   if (provider !== "faux") {
+    if (!authPath)
+      return workspaceCredentialRuntime(workspaceRoot, {
+        allowModelNetwork: true,
+      });
     const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
-    return ModelRuntime.create(authPath ? { authPath } : {});
+    return ModelRuntime.create({
+      authPath,
+      modelsStorePath: join(workspaceRoot, ".adm", "pi", "models-store.json"),
+      allowModelNetwork: true,
+      refreshOnCreate: false,
+    });
   }
   const models = createModels();
   const faux = fauxProvider({ tokensPerSecond: 100_000 });

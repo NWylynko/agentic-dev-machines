@@ -184,6 +184,24 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
     assert_eq!(run(&["list", "--bad-flag"], true).status.code(), Some(2));
 }
 
+#[test]
+fn zsh_completions_are_generated_offline() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("ADM_STATE_DIR", root.path().join("state"))
+        .args(["completions", "zsh"])
+        .output()
+        .expect("generate completions through the public CLI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let script = String::from_utf8(output.stdout).unwrap();
+    assert!(script.contains("_adm"));
+    assert!(script.contains("lifecycle-serve"));
+}
+
 fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
     command

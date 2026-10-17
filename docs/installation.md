@@ -14,11 +14,11 @@ The script downloads `adm-linux-amd64.tar.gz` and verifies its checksum from the
 
 The commands are installed in `$HOME/.local/bin`. Add that directory to your PATH if needed. The installation lives under `$XDG_DATA_HOME/adm/install`, or `$HOME/.local/share/adm/install` when XDG_DATA_HOME is unset. Versioned runtime files are separate from workspace and runner state.
 
-First installation offers `adm setup` through the terminal. Setup configures the image, storage class, and optional default model, offers the installed Pi `/login` interface, and can create/start a systemd user service. With no terminal, installation prints the command to run later. `adm login` reopens provider authentication.
+First installation offers `adm setup` through the terminal. Setup configures the image, storage class, and optional default model, offers local Pi `/login`, and can create/start a systemd user service. Local `adm login` configures only the host's Pi store. Workspace login is performed in that workspace and is kept on its private volume. With no terminal, installation prints the command to run later.
 
-Settings are nonsecret JSON at `$XDG_CONFIG_HOME/adm/config.json`, normally `$HOME/.config/adm/config.json`. Explicit CLI flags override these defaults. Leaving the model unset means agent creation still requires `--model PROVIDER/MODEL_ID`; `--no-agent` disables the agent. Setup never changes your Kubernetes context or installs a storage backend. It saves an explicit image reference, so updates preserve your image choice too.
+Settings are nonsecret JSON at `$XDG_CONFIG_HOME/adm/config.json`, normally `$HOME/.config/adm/config.json`. Explicit CLI flags override these defaults. Workspaces always create their durable agent; a model can be selected later in `adm attach` with `/model`. Setup never changes your Kubernetes context or installs a storage backend. It saves an explicit image reference, so updates preserve your image choice too.
 
-Provider authentication stays in Pi's management-host auth store. API keys must be injected into the runner process from Infisical; do not put them in ADM config, a service file, or a project `.env`. The generated service does not inherit keys from your login shell. Persistent user services after logout require operator-configured systemd lingering; setup reports this requirement.
+The generated runner service does not inherit keys from your login shell. Configure each coding workspace's credentials with Pi login in that workspace or references to keys in a Secret in that workspace's namespace. For API keys, pass references such as `--credential-env OPENAI_API_KEY=provider-auth:openai`; ADM stores only the environment name and Secret/key reference and maps the value into that workspace's dev container. No particular secret manager is required. Do not put values in ADM config, service files, or project `.env` files. Persistent user services after logout require operator-configured systemd lingering; setup reports this requirement.
 
 ## In-cluster lifecycle owner
 
@@ -68,6 +68,25 @@ sh /tmp/adm-install.sh --version v0.1.0 --no-setup
 `v0.1.0` is an example: choose an existing version or `sha-<commit>` tag from [Releases](https://github.com/NWylynko/agentic-dev-machines/releases). `--base-url URL` selects an explicit alternative release asset directory. There is no source-build or provider fallback when a download or prerequisite fails.
 
 The installer refuses to overwrite an existing unmanaged `adm` or `adm-repositories` command. For an older manual installation, stop its runner, move those executables aside, install, then run `adm setup` to replace any checkout-based service. Keep the existing state directory. This migrates the runtime without moving your workspaces.
+
+## zsh completions
+
+Generate the completion file with the installed `adm` and add its directory to zsh's function path:
+
+```sh
+mkdir -p ~/.zfunc
+adm completions zsh > ~/.zfunc/_adm
+```
+
+Add these lines to `~/.zshrc` (or merge them with an existing completion setup), then open a new shell or run `source ~/.zshrc`:
+
+```zsh
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit
+compinit
+```
+
+After upgrading `adm`, regenerate `~/.zfunc/_adm` with `adm completions zsh > ~/.zfunc/_adm` to pick up new commands and options. The command prints the script to standard output and does not edit shell configuration.
 
 ## Developing from source
 

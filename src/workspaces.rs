@@ -642,38 +642,31 @@ impl WorkspaceStore {
         stage: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        ensure_store_fence(&self.connection, self.fencing_token)?;
-        let accepted_at: i64 = self.connection.query_row(
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        let accepted_at: i64 = transaction.query_row(
             "SELECT accepted_at FROM lifecycle_operations WHERE operation_id=?1",
             [operation_id],
             |row| row.get(0),
         )?;
         let elapsed = (now() as i64 - accepted_at).max(0);
-        let changed = self.connection.execute(
+        let changed = transaction.execute(
             "UPDATE lifecycle_operations SET status=?2,stage=?3,last_error=?4,updated_at=?5,timings=?6,fencing_token=?7 WHERE operation_id=?1 AND fencing_token<=?7",
             params![operation_id, status, stage, error, now() as i64, serde_json::to_string(&json!({"elapsedSeconds":elapsed}))?, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "lifecycle operation fencing token is stale");
+        transaction.commit()?;
         Ok(())
     }
     pub fn record_workspace_error(&self, workspace_id: &str, error: &str) -> Result<()> {
-        ensure_store_fence(&self.connection, self.fencing_token)?;
-        let raw: String = self.connection.query_row(
-            "SELECT spec FROM workspaces WHERE id=?1",
-            [workspace_id],
-            |row| row.get(0),
-        )?;
-        let mut workspace: Workspace = serde_json::from_str(&raw)?;
-        workspace.last_error = Some(error.to_owned());
-        let changed = self.connection.execute(
-            "UPDATE workspaces SET spec=?2,fencing_token=?3 WHERE id=?1 AND fencing_token<=?3",
-            params![
-                workspace.id,
-                serde_json::to_string(&workspace)?,
-                self.fencing_token as i64
-            ],
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        let changed = transaction.execute(
+            "UPDATE workspaces SET spec=json_set(spec,'$.last_error',?2),fencing_token=?3 WHERE id=?1 AND fencing_token<=?3",
+            params![workspace_id, error, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "workspace lifecycle fencing token is stale");
+        transaction.commit()?;
         Ok(())
     }
     pub fn bind_herdr_space(
@@ -712,8 +705,9 @@ impl WorkspaceStore {
         Ok(workspace)
     }
     pub fn insert(&self, w: &Workspace) -> Result<()> {
-        ensure_store_fence(&self.connection, self.fencing_token)?;
-        self.connection
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        transaction
             .execute(
                 "INSERT INTO workspaces(id,name,phase,spec,fencing_token) VALUES(?1,?2,?3,?4,?5)",
                 params![
@@ -725,23 +719,29 @@ impl WorkspaceStore {
                 ],
             )
             .with_context(|| format!("workspace name {} already exists", w.name))?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn save(&self, w: &Workspace) -> Result<()> {
-        ensure_store_fence(&self.connection, self.fencing_token)?;
-        let changed = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        let changed = transaction.execute(
             "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?4 WHERE id=?1 AND fencing_token<=?4",
             params![w.id, w.phase, serde_json::to_string(w)?, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "workspace lifecycle fencing token is stale");
+        transaction.commit()?;
         Ok(())
     }
     pub fn save_if_phase(&self, w: &Workspace, expected: &str) -> Result<bool> {
-        ensure_store_fence(&self.connection, self.fencing_token)?;
-        Ok(self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        let changed = transaction.execute(
             "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?5 WHERE id=?1 AND phase=?4 AND fencing_token<=?5",
             params![w.id, w.phase, serde_json::to_string(w)?, expected, self.fencing_token as i64],
-        )? == 1)
+        )? == 1;
+        transaction.commit()?;
+        Ok(changed)
     }
     pub fn admit_if_provisioning(
         &mut self,
@@ -1319,6 +1319,35 @@ mod lifecycle_fence_tests {
         assert!(
             stale
                 .lifecycle_operation("c0a0ad14-a514-4c27-9e4c-acb1a05b272c")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recording_a_provisioning_error_cannot_reopen_an_admitted_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = WorkspaceStore::open_fenced(directory.path(), 4).unwrap();
+        let mut workspace: Workspace = serde_json::from_value(json!({
+            "id":"e39f7d2667d64ca8a75c9c926611991d", "name":"deletion-race",
+            "role":"coding", "namespace":"adm-e39f7d2667d64ca8",
+            "phase":"provisioning", "image":"adm-dev:test", "storage_class":"adm-replicated",
+            "storage_size":"1Gi", "cpu":"1", "memory":"1Gi", "agent_enabled":true,
+            "repositories":false, "catalog":{}, "model":{"provider":"test","id":"model"},
+            "allowed_agents":[], "created_at":1, "last_error":null
+        }))
+        .unwrap();
+        store.insert(&workspace).unwrap();
+        workspace.phase = "deleting".into();
+        store.save(&workspace).unwrap();
+        store
+            .record_workspace_error(&workspace.id, "provisioning failed")
+            .unwrap();
+        let persisted = store.find(&workspace.id).unwrap();
+        assert_eq!(persisted.phase, "deleting");
+        assert_eq!(persisted.last_error.as_deref(), Some("provisioning failed"));
+        assert!(
+            store
+                .claim_runtime_lease(&workspace.id, "pod-uid", 30)
                 .is_err()
         );
     }
