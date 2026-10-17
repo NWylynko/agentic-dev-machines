@@ -88,8 +88,15 @@ fn prompt_omits_absent_request_id_and_preserves_explicit_id_deduplication() {
 
 fn adm(root: &Path, arguments: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    let herdr_bin = root.join("herdr-bin");
+    let fixture_path = format!(
+        "{}:{}",
+        herdr_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     command
         .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("PATH", fixture_path)
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
@@ -392,6 +399,17 @@ fn fixture() -> TestFixture {
 
 fn fixture_with_runner(runner_override: Option<&str>) -> TestFixture {
     let root = tempfile::tempdir().unwrap();
+    let herdr_bin = root.path().join("herdr-bin");
+    fs::create_dir_all(&herdr_bin).unwrap();
+    let herdr = herdr_bin.join("herdr");
+    fs::write(
+        &herdr,
+        "#!/bin/sh\nprintf '{\"result\":{\"workspace\":{\"workspace_id\":\"%s\"}}}\\n' \"$3\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&herdr).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&herdr, permissions).unwrap();
     let (default_runner_url, runner_port, runner) = start_runner_stub();
     let runner_url = runner_override.unwrap_or(&default_runner_url);
     fs::write(root.path().join("runner-url"), runner_url).unwrap();
@@ -2004,7 +2022,9 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::ConnectionReset
                 ) => {}
             Err(error) => panic!("failed while checking for unexpected requests: {error}"),
         }
@@ -2012,7 +2032,8 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
         expected_workspace
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_adm"));
+    watcher
         .arg("--state-dir")
         .arg(root.path().join("state"))
         .arg("--kubectl")
@@ -2020,16 +2041,28 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
         .args(["herdr", "watch", "--socket"])
         .arg(&socket)
         .env("HERDR_ENV", "1")
-        .env("HERDR_SOCKET_PATH", &socket)
-        .output()
-        .expect("run public Herdr watcher");
+        .env("HERDR_SOCKET_PATH", &socket);
+    configure_lifecycle(&mut watcher, root.path());
+    let output = watcher.output().expect("run public Herdr watcher");
     let expected_workspace = server.join().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"status\":\"watching\""), "{stdout}");
-    assert!(stdout.contains(&expected_workspace), "{stdout}");
+    assert!(
+        stdout.contains(&expected_workspace),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
-        stdout.matches("\"phase\":\"deleted\"").count(),
+        stdout.matches("\"status\":\"accepted\"").count(),
         2,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&workspace["id"].as_str().unwrap()),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&other_workspace["id"].as_str().unwrap()),
         "{stdout}"
     );
     assert!(
@@ -2038,13 +2071,16 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
         String::from_utf8_lossy(&output.stderr)
     );
     let remaining = assert_ok(adm(root.path(), &["list", "--json"]));
-    assert_eq!(remaining.as_array().unwrap().len(), 1);
-    assert_eq!(remaining[0]["id"], stale_workspace["id"]);
-    assert_eq!(remaining[0]["phase"], "ready");
-    assert_eq!(
-        assert_ok(adm(root.path(), &["status", "herdr-other", "--json"]))["workspace"]["phase"],
-        "deleted"
-    );
+    assert!(remaining.as_array().unwrap().iter().any(|workspace| {
+        workspace["id"] == stale_workspace["id"] && workspace["phase"] == "ready"
+    }));
+    for name in ["herdr-owned", "herdr-other"] {
+        let phase = assert_ok(adm(root.path(), &["status", name, "--json"]))["workspace"]["phase"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(matches!(phase.as_str(), "deleting" | "deleted"));
+    }
     assert_ne!(workspace["id"], other_workspace["id"]);
 }
 
@@ -2081,7 +2117,8 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     }
 
     fn watch(root: &Path, socket: &Path) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_adm"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+        command
             .arg("--state-dir")
             .arg(root.join("state"))
             .arg("--kubectl")
@@ -2089,9 +2126,9 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
             .args(["herdr", "watch", "--socket"])
             .arg(socket)
             .env("HERDR_ENV", "1")
-            .env("HERDR_SOCKET_PATH", socket)
-            .output()
-            .expect("run public Herdr watcher")
+            .env("HERDR_SOCKET_PATH", socket);
+        configure_lifecycle(&mut command, root);
+        command.output().expect("run public Herdr watcher")
     }
 
     let root = fixture();
@@ -2103,19 +2140,18 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
         root.path(),
         &["herdr", "bind", "journaled", "space-journal"],
     ));
-    let cluster_path = root.path().join("cluster.json");
-    let namespace = workspace["namespace"].as_str().unwrap();
-    let workspace_id = workspace["id"].as_str().unwrap();
-    let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
-    cluster[namespace]["metadata"]["labels"]["adm.dev/workspace-id"] = "foreign-owner".into();
-    fs::write(&cluster_path, serde_json::to_vec(&cluster).unwrap()).unwrap();
+    let lifecycle_url_path = root.path().join("lifecycle-url");
+    let lifecycle_url = fs::read_to_string(&lifecycle_url_path).unwrap();
+    fs::write(&lifecycle_url_path, "http://127.0.0.1:1").unwrap();
 
     let first_socket = root.path().join("herdr-first.sock");
     let first_server = fake_socket(&first_socket, Some("space-journal"));
     let failed_cleanup = watch(root.path(), &first_socket);
     first_server.join().unwrap();
     assert!(!failed_cleanup.status.success());
-    assert!(String::from_utf8_lossy(&failed_cleanup.stderr).contains("ownership mismatch"));
+    assert!(
+        String::from_utf8_lossy(&failed_cleanup.stderr).contains("lifecycle service unavailable")
+    );
     let journal = root.path().join("state/herdr-closed-events.jsonl");
     assert!(
         fs::read_to_string(&journal)
@@ -2123,20 +2159,21 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
             .contains("space-journal")
     );
 
-    let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
-    cluster[namespace]["metadata"]["labels"]["adm.dev/workspace-id"] = workspace_id.into();
-    fs::write(&cluster_path, serde_json::to_vec(&cluster).unwrap()).unwrap();
+    fs::write(&lifecycle_url_path, lifecycle_url).unwrap();
     let second_socket = root.path().join("herdr-second.sock");
     let second_server = fake_socket(&second_socket, None);
     let recovered_cleanup = watch(root.path(), &second_socket);
     second_server.join().unwrap();
     let stdout = String::from_utf8_lossy(&recovered_cleanup.stdout);
-    assert!(stdout.contains("\"phase\":\"deleted\""), "{stdout}");
+    assert!(stdout.contains("\"status\":\"accepted\""), "{stdout}");
     assert!(!journal.exists() || fs::read(&journal).unwrap().is_empty());
-    assert_eq!(
-        assert_ok(adm(root.path(), &["list", "--json"])),
-        serde_json::json!([])
-    );
+    let remaining = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(remaining.as_array().unwrap().len(), 1);
+    assert_eq!(remaining[0]["id"], workspace["id"]);
+    assert!(matches!(
+        remaining[0]["phase"].as_str().unwrap(),
+        "deleting" | "deleted"
+    ));
 }
 
 #[test]
@@ -2180,16 +2217,81 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        assert_ok(adm(root.path(), &["status", "herdr-owned", "--json"]))["workspace"]["phase"],
-        "deleted"
-    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(matches!(
+        receipt["status"].as_str().unwrap(),
+        "accepted" | "completed"
+    ));
+    let phase =
+        assert_ok(adm(root.path(), &["status", "herdr-owned", "--json"]))["workspace"]["phase"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    assert!(matches!(phase.as_str(), "deleting" | "deleted"));
     let cluster: Value =
         serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
     assert!(
         cluster
             .get(workspace["namespace"].as_str().unwrap())
             .is_none()
+    );
+}
+
+#[test]
+fn herdr_bind_requires_a_live_herdr_workspace_id() {
+    let root = fixture();
+    assert_ok(adm(
+        root.path(),
+        &["create", "herdr-owned", "--no-repositories"],
+    ));
+    let hook = adm(root.path(), &["herdr", "hook"]);
+    assert!(hook.status.success());
+    let hook = String::from_utf8(hook.stdout).unwrap();
+    assert!(hook.contains("HERDR_WORKSPACE_ID"), "{hook}");
+    assert!(
+        hook.contains("systemctl --user status adm-herdr-watch"),
+        "{hook}"
+    );
+    assert!(hook.contains("no replay cursor"), "{hook}");
+    let fake_bin = root.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let herdr = fake_bin.join("herdr");
+    fs::write(
+        &herdr,
+        "#!/bin/sh\nif [ \"$1\" = workspace ] && [ \"$2\" = get ] && [ \"$3\" = live-space ]; then\n  printf '%s\\n' '{\"result\":{\"workspace\":{\"workspace_id\":\"live-space\"}}}'\n  exit 0\nfi\nprintf '%s\\n' '{\"error\":{\"message\":\"workspace not found\"}}' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&herdr).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&herdr, permissions).unwrap();
+    let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+    let bind = |space: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+        command
+            .env("PATH", &path)
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .arg("--state-dir")
+            .arg(root.path().join("state"))
+            .arg("--kubectl")
+            .arg(root.path().join("kubectl"))
+            .args(["--runner-url", "http://127.0.0.1:1"]);
+        configure_lifecycle(&mut command, root.path());
+        command
+            .args(["herdr", "bind", "herdr-owned", space])
+            .output()
+            .unwrap()
+    };
+
+    let missing = bind("missing-space");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("workspace not found"));
+
+    let valid = bind("live-space");
+    assert!(
+        valid.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&valid.stdout),
+        String::from_utf8_lossy(&valid.stderr)
     );
 }
 

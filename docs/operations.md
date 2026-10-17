@@ -189,15 +189,38 @@ From your laptop, forward that management-host port over your normal SSH connect
 
 ## Herdr ownership and deletion
 
-Associate a workspace with the immutable Herdr workspace ID using `--herdr-space ID` during creation or `adm herdr bind NAME ID`. The removal bridge consumes actual Herdr `workspace_closed` events. Losing the event connection or restarting Herdr is not a removal event.
+Create or bind the ADM workspace from the management host, using the immutable Herdr workspace ID. `adm herdr bind` checks the ID with the installed Herdr CLI before saving the association. The removal bridge consumes actual Herdr `workspace_closed` events. Losing the event connection or restarting Herdr is not a removal event.
 
 ```sh
-adm herdr hook
-adm destroy my-project
-adm list --all
+# On the management host
+adm start
+adm doctor
+
+# In a pane of the Herdr workspace that should own the ADM workspace
+herdr workspace get "$HERDR_WORKSPACE_ID"
+adm create my-project
+adm herdr bind my-project "$HERDR_WORKSPACE_ID"
+
+# Open sibling shell and agent panes without changing focus
+herdr pane split --current --direction right --cwd "$PWD" --no-focus
+# Copy the returned .result.pane.pane_id, then run in that pane:
+adm shell my-project
+
+herdr pane split --current --direction down --cwd "$PWD" --no-focus
+# In that pane:
+adm attach my-project
+
+# Start a supervised watcher for this Herdr session
+systemd-run --user --unit=adm-herdr-watch --property=Restart=on-failure \
+  --property=RestartSec=3s --setenv=HERDR_ENV=1 \
+  --setenv="HERDR_SOCKET_PATH=$HERDR_SOCKET_PATH" \
+  adm herdr watch --socket "$HERDR_SOCKET_PATH"
+systemctl --user status adm-herdr-watch
 ```
 
-In a supervised pane inside the owning Herdr session, run `adm herdr watch --socket "$HERDR_SOCKET_PATH"`. The watcher requires `HERDR_ENV=1` and that exact session socket; it never attaches to another session by guessing its path. It journals every received close event before attempting cleanup, then replays unfinished cleanup on restart. Restart the watcher on failure. The current Herdr API has no replay cursor, so a close event missed while disconnected is not recoverable from its feed. The watcher never destroys a workspace merely because a list is empty after startup. Live Herdr installation and delivery remain an operator validation step.
+Run the watcher on the management host under the same user that runs Herdr, after entering the owning Herdr pane so `HERDR_SOCKET_PATH` names that session. It requires `HERDR_ENV=1` and that exact socket; it never attaches to another session by guessing a path. Check it with `systemctl --user status adm-herdr-watch`; recover it with `systemctl --user restart adm-herdr-watch`. The watcher journals every received close event before submitting durable deletion admission, then clears the journal after admission succeeds. On restart, it resubmits any close that was journaled but not admitted. The current Herdr API has no replay cursor, so a close event missed while disconnected is not recoverable from its feed. The watcher never destroys a workspace merely because a list is empty after startup. Live Herdr delivery remains an operator validation step.
+
+If you already have an ADM workspace, run `adm herdr bind NAME "$HERDR_WORKSPACE_ID"` from the management host instead of creating another one. To inspect ownership and cleanup, use `adm list --all` and `adm status NAME` from the management host. Removing the Herdr workspace is the explicit deletion action; closing a pane or disconnecting a terminal leaves the ADM workspace running.
 
 Deletion writes a durable tombstone before cancellation and runtime cleanup. Repeating it finishes interrupted cleanup, and recreating the same label gets a different ID. Old goals, loops, input, and supervision grants cannot attach to that new ID. Retained conversation history is passive; archive expiry is not implemented.
 
