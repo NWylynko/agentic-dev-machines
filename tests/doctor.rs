@@ -8,7 +8,7 @@ use std::{
 };
 
 #[test]
-fn doctor_reports_missing_storage_and_preserves_runner_failure_causes() {
+fn doctor_reports_missing_storage_and_preserves_lifecycle_failure_causes() {
     let root = tempfile::tempdir().unwrap();
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, r#"#!/usr/bin/python3
@@ -32,11 +32,11 @@ else: sys.exit(2)
     for (
         storage_class,
         expected_status,
-        healthy_runner,
+        healthy_lifecycle,
         failed_cluster,
         configured_class,
         healthy_tools,
-        missing_runner_status,
+        missing_lifecycle_status,
     ) in [
         (None, "unavailable", false, false, None, false, false),
         (
@@ -117,11 +117,15 @@ else: sys.exit(2)
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
                 let received = stream.read(&mut request).unwrap();
-                assert!(received > 0, "doctor must send a health request");
-                let (status, body) = if missing_runner_status {
+                assert!(received > 0, "doctor must send a lifecycle health request");
+                assert!(String::from_utf8_lossy(&request[..received]).starts_with("GET /health "));
+                let (status, body) = if missing_lifecycle_status {
                     ("200 OK", json!({}).to_string())
-                } else if healthy_runner {
-                    ("200 OK", json!({"status":"ok"}).to_string())
+                } else if healthy_lifecycle {
+                    (
+                        "200 OK",
+                        json!({"status":"ok","service":"adm-lifecycle"}).to_string(),
+                    )
                 } else {
                     ("503 Service Unavailable", json!({"error":{"code":"STORE_UNAVAILABLE","message":"session storage is temporarily unavailable"}}).to_string())
                 };
@@ -137,7 +141,7 @@ else: sys.exit(2)
                 .arg(root.path().join("state"))
                 .arg("--kubectl")
                 .arg(&kubectl)
-                .args(["--runner-url", &url, "doctor"]);
+                .args(["--lifecycle-url", &url, "doctor"]);
             if !healthy_tools {
                 command.env("PATH", &empty_path);
             }
@@ -175,14 +179,14 @@ else: sys.exit(2)
         } else {
             assert_eq!(report["cluster"][0]["ready"], true);
         }
-        if missing_runner_status {
-            assert_eq!(report["runner"]["status"], Value::Null);
-        } else if healthy_runner {
-            assert_eq!(report["runner"]["status"], "ok");
+        if missing_lifecycle_status {
+            assert_eq!(report["lifecycle"]["status"], Value::Null);
+        } else if healthy_lifecycle {
+            assert_eq!(report["lifecycle"]["status"], "ok");
         } else {
-            assert_eq!(report["runner"]["status"], "unavailable");
+            assert_eq!(report["lifecycle"]["status"], "unavailable");
             assert!(
-                report["runner"]["error"]
+                report["lifecycle"]["error"]
                     .as_str()
                     .unwrap()
                     .contains("session storage is temporarily unavailable")
@@ -220,7 +224,12 @@ else: sys.exit(2)
         );
         let human = String::from_utf8(human.stdout).unwrap();
         for label in [
-            "Tools:", "node:", "Cluster:", "Storage:", "Runner:", "State:",
+            "Tools:",
+            "node:",
+            "Cluster:",
+            "Storage:",
+            "Lifecycle service:",
+            "State:",
         ] {
             assert!(human.contains(label), "missing {label:?}: {human}");
         }
@@ -234,7 +243,7 @@ else: sys.exit(2)
         } else {
             assert!(human.contains("node-a: ready"), "{human}");
         }
-        if !healthy_runner {
+        if !healthy_lifecycle {
             assert!(
                 human.contains("session storage is temporarily unavailable"),
                 "{human}"
@@ -256,12 +265,15 @@ else: sys.exit(2)
                 "{human}"
             );
         }
-        if healthy_runner && !missing_runner_status {
-            assert!(human.contains("Runner:\n  ok"), "{human}");
+        if healthy_lifecycle && !missing_lifecycle_status {
+            assert!(human.contains("Lifecycle service:\n  ok"), "{human}");
         }
-        if missing_runner_status {
-            assert!(human.contains("Runner:\n  unknown"), "{human}");
-            assert!(!human.contains("Runner:\n  available"), "{human}");
+        if missing_lifecycle_status {
+            assert!(human.contains("Lifecycle service:\n  unknown"), "{human}");
+            assert!(
+                !human.contains("Lifecycle service:\n  available"),
+                "{human}"
+            );
         }
         let kubectl_calls = fs::read_to_string(root.path().join("kubectl.log")).unwrap();
         assert!(kubectl_calls.lines().all(|call| call.starts_with("get ")));

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, execFile as execFileCallback } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
@@ -21,6 +21,21 @@ function requiredImage() {
     "Set ADM_LIVE_IMAGE to a tagged image imported into every schedulable Kubernetes node.",
   );
   return image;
+}
+
+async function requiredLifecycleArgs() {
+  const url = process.env.ADM_LIFECYCLE_URL;
+  const tokenFile = process.env.ADM_LIFECYCLE_TOKEN_FILE;
+  assert.ok(
+    url,
+    "Set ADM_LIFECYCLE_URL to the installed lifecycle API when ADM_LIVE_CLUSTER=1.",
+  );
+  assert.ok(
+    tokenFile,
+    "Set ADM_LIFECYCLE_TOKEN_FILE to a protected client token file when ADM_LIVE_CLUSTER=1.",
+  );
+  await access(tokenFile);
+  return ["--lifecycle-url", url, "--lifecycle-token-file", tokenFile];
 }
 
 function imageAliases(reference) {
@@ -74,7 +89,14 @@ function name() {
 async function adm(binary, state, kubectl, args) {
   return run(
     binary,
-    ["--state-dir", state, "--kubectl", kubectl, ...args],
+    [
+      "--state-dir",
+      state,
+      "--kubectl",
+      kubectl,
+      ...(await requiredLifecycleArgs()),
+      ...args,
+    ],
     300_000,
   );
 }
@@ -185,7 +207,7 @@ async function reservePort() {
   return port;
 }
 
-function startForward(binary, state, kubectl, workspace, localPort) {
+async function startForward(binary, state, kubectl, workspace, localPort) {
   const child = spawn(
     binary,
     [
@@ -193,6 +215,7 @@ function startForward(binary, state, kubectl, workspace, localPort) {
       state,
       "--kubectl",
       kubectl,
+      ...(await requiredLifecycleArgs()),
       "port",
       workspace,
       "43117",
@@ -242,7 +265,13 @@ async function stopForward(child) {
 
 async function preview(binary, state, kubectl, workspace, children) {
   const localPort = await reservePort();
-  const child = startForward(binary, state, kubectl, workspace, localPort);
+  const child = await startForward(
+    binary,
+    state,
+    kubectl,
+    workspace,
+    localPort,
+  );
   children.add(child);
   const url = "http://127.0.0.1:" + localPort;
   const deadline = Date.now() + 30_000;
@@ -318,6 +347,7 @@ test(
   },
   async (t) => {
     const image = requiredImage();
+    await requiredLifecycleArgs();
     const binary = resolve(
       process.env.ADM_BIN || join(root, "target/debug/adm"),
     );
@@ -341,7 +371,6 @@ test(
       "--memory",
       "1Gi",
       "--allow-node-local-storage",
-      "--no-repositories",
     ];
     const createTracked = async () => {
       try {

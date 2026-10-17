@@ -2,6 +2,8 @@
 
 These notes distinguish confirmed requirements, implemented local behavior, and proposals that still need validation. For installation and everyday use, start with the [README](../README.md) and [operations guide](operations.md).
 
+The implementation target changed on 2026-10-16: all agent execution and durable state belong in workspace Pods; the management host is an access plane. Placement proposals in the earlier investigation below are historical.
+
 ## Confirmed behavior
 
 - Preserve repository work and agent history across runtime replacement. Installed tools are temporary or supplied by the base image.
@@ -235,7 +237,7 @@ Important integration findings:
 - Reopening a store must be followed by scheduling/resume. Closing the harness preserves recoverable work; ordinary abort excludes background tasks. Space destruction needs explicit admission revocation and cancellation including background work.
 - SQLite is a starting backend, not cluster replication or ownership fencing. Its WAL requirements rule out treating an arbitrary NFS mount as a ready solution. See the report for storage constraints and locally verified recovery behavior.
 
-The runner and terminal now implement this local proof. The runner lives on the management host, while coding tools run in the selected workspace environment. These tests do not establish cross-node filesystem durability or compatibility with every real provider account.
+The workspace runtime and terminal now run against a Pod-owned Durable harness. The management host routes authenticated access to that Pod and never owns agent execution. Tests do not establish cross-node filesystem durability, the node-failure loss window, or compatibility with every real provider account.
 
 [celld](https://github.com/denoland/celld) provides self-hosted, distributed Durable Objects and is a candidate for durable application state. Its role here would need to be demonstrated with the chosen agent harness. It does not establish recovery guarantees for this project's Linux filesystem or shell processes.
 
@@ -310,18 +312,18 @@ Use end-to-end tests first for implementation changes. Provisioning, scheduling,
 
 ## Decisions still open
 
-| Decision                                                    | Effect on the user                                                                                                                     |
-| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Exact recovery time and recent-work loss window             | Determines how long a failure interrupts work and how much recent progress may be lost                                                 |
-| Storage and lazy-filesystem implementation                  | Determines startup time, disk use, Git compatibility, and recovery behavior                                                            |
-| Agent backend and location of the supervised runner         | The runner is Pi Durable 1.2.0 on the management host, with coding tools sent into the workspace. Moving that owner has not been tried |
-| Attach transport and exact Herdr integration                | `adm herdr` consumes explicit removal events. A live Herdr plugin install is not part of the tests                                     |
-| Pi-style terminal adapter and inbound message transport     | The terminal client speaks the runner HTTP API. Herdr pane wiring beyond `adm attach` is still local to the management box             |
-| Bot ownership, permitted agents, and control-tool interface | A bot supervises only the agent ids it was given. Whether it has its own Herdr space is still open                                     |
-| Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop        |
-| Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                |
-| Browser automation and development-port transport           | Determines how browsers run and how client laptops reach development sites and ports                                                   |
-| Provider authentication and allowance handling              | Determines supported account connections and how unattended work waits when capacity or authentication is unavailable                  |
-| Image, resource, and cache configuration                    | Determines available tools, concurrent workloads, and capacity use                                                                     |
+| Decision                                                    | Effect on the user                                                                                                                                                              |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact recovery time and recent-work loss window             | Determines how long a failure interrupts work and how much recent progress may be lost                                                                                          |
+| Storage and lazy-filesystem implementation                  | Determines startup time, disk use, Git compatibility, and recovery behavior                                                                                                     |
+| Agent backend and location of the supervised runner         | Pi Durable 1.2.0 owns each coding or bot workspace inside its private Pod; the host is an access plane. Cross-node durable storage and the node-failure loss window remain open |
+| Attach transport and exact Herdr integration                | `adm herdr` consumes explicit removal events. A live Herdr plugin install is not part of the tests                                                                              |
+| Pi-style terminal adapter and inbound message transport     | The terminal client speaks the runner HTTP API. Herdr pane wiring beyond `adm attach` is still local to the management box                                                      |
+| Bot ownership, permitted agents, and control-tool interface | A bot supervises only the agent ids it was given. Whether it has its own Herdr space is still open                                                                              |
+| Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop                                                 |
+| Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                                                         |
+| Browser automation and development-port transport           | Determines how browsers run and how client laptops reach development sites and ports                                                                                            |
+| Provider authentication and allowance handling              | Determines supported account connections and how unattended work waits when capacity or authentication is unavailable                                                           |
+| Image, resource, and cache configuration                    | Determines available tools, concurrent workloads, and capacity use                                                                                                              |
 
 The first useful milestone is an isolated workspace whose agents keep working unattended, recover after replacement, and stop permanently when its Herdr space is removed.

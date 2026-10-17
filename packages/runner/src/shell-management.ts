@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
+import { promisify } from "node:util";
 
 const CLIENT_SOURCE = String.raw`#!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
@@ -161,6 +163,7 @@ process.stdin.on("end", () => void cleanup());
 
 const MAX_REQUEST_FRAME = 131072;
 const MAX_RESPONSE_FRAME = 1048576;
+const execFileAsync = promisify(execFile);
 
 const { values, positionals } = parseArgs({
   options: {
@@ -169,6 +172,7 @@ const { values, positionals } = parseArgs({
     "workspace-id": { type: "string" },
     cwd: { type: "string" },
     "runner-url": { type: "string" },
+    "identity-file": { type: "string" },
   },
   allowPositionals: true,
   strict: true,
@@ -179,11 +183,21 @@ const {
   "workspace-id": workspaceId,
   cwd,
   "runner-url": runnerUrl,
+  "identity-file": identityFile,
 } = values;
-if (!kubectl || !namespace || !workspaceId || !cwd || !runnerUrl)
+if (
+  !kubectl ||
+  !namespace ||
+  !workspaceId ||
+  !cwd ||
+  !runnerUrl ||
+  !identityFile
+)
   throw new Error(
-    "managed shell needs kubectl, namespace, workspace ID, and runner URL",
+    "managed shell needs kubectl, namespace, workspace ID, runner URL, and Pod identity",
   );
+const runtimeIdentityFile = identityFile!;
+const runtimeWorkspaceId = workspaceId!;
 if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(workspaceId))
   throw new Error("invalid immutable workspace ID");
 if (!cwd.startsWith("/") || cwd.includes("\0"))
@@ -389,11 +403,14 @@ lines.on("line", (line) => {
 
 async function runnerRequest(method: string, urlPath: string, body?: unknown) {
   const url = new URL(urlPath, runner);
+  const authorization = `Bearer ${await projectedPodToken(runtimeIdentityFile, runtimeWorkspaceId)}`;
   const response = await fetch(url, {
     method,
     signal: lifetime.signal,
-    headers:
-      body === undefined ? undefined : { "content-type": "application/json" },
+    headers: {
+      authorization,
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await response.text();
@@ -403,6 +420,88 @@ async function runnerRequest(method: string, urlPath: string, body?: unknown) {
       value.error?.message ?? "runner request failed (" + response.status + ")",
     );
   return value;
+}
+
+async function projectedPodToken(
+  identityPath: string,
+  expectedWorkspaceId: string,
+) {
+  const identity = JSON.parse(await readFile(identityPath, "utf8")) as {
+    workspaceId: string;
+    namespace: string;
+    podName: string;
+    podUid: string;
+    container: string;
+    kubectl: string;
+    kubeconfig: string;
+  };
+  if (
+    identity.workspaceId !== expectedWorkspaceId ||
+    identity.namespace !== namespace ||
+    !/^[a-z0-9][a-z0-9-]{0,62}$/.test(identity.namespace) ||
+    !/^[a-z0-9][a-z0-9-]{0,62}$/.test(identity.podName) ||
+    !/^[0-9a-f-]{36}$/i.test(identity.podUid) ||
+    !["dev", "bot"].includes(identity.container) ||
+    identity.kubectl !== kubectl ||
+    !identity.kubeconfig
+  )
+    throw new Error("Workspace Pod identity descriptor is invalid");
+  const options = {
+    encoding: "utf8" as const,
+    timeout: 10_000,
+    maxBuffer: 1024 * 1024,
+    env: { ...process.env, KUBECONFIG: identity.kubeconfig },
+  };
+  const podResult = await execFileAsync(
+    identity.kubectl,
+    ["get", "pod", identity.podName, "-n", identity.namespace, "-o", "json"],
+    options,
+  );
+  const pod = JSON.parse(podResult.stdout) as {
+    metadata?: {
+      uid?: string;
+      namespace?: string;
+      labels?: Record<string, string>;
+    };
+    spec?: { serviceAccountName?: string };
+    status?: {
+      phase?: string;
+      conditions?: Array<{ type?: string; status?: string }>;
+    };
+  };
+  const ready = pod.status?.conditions?.some(
+    (condition) => condition.type === "Ready" && condition.status === "True",
+  );
+  if (
+    pod.metadata?.uid !== identity.podUid ||
+    pod.metadata.namespace !== identity.namespace ||
+    pod.metadata.labels?.["adm.dev/workspace-id"] !== identity.workspaceId ||
+    pod.metadata.labels?.["app.kubernetes.io/managed-by"] !== "adm" ||
+    pod.spec?.serviceAccountName !== "adm-runtime" ||
+    pod.status?.phase !== "Running" ||
+    !ready
+  )
+    throw new Error(
+      "Workspace Pod identity changed or is not ready; reopen the managed shell",
+    );
+  const tokenResult = await execFileAsync(
+    identity.kubectl,
+    [
+      "exec",
+      "-n",
+      identity.namespace,
+      identity.podName,
+      "-c",
+      identity.container,
+      "--",
+      "cat",
+      "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    ],
+    options,
+  );
+  const token = tokenResult.stdout.trim();
+  if (!token) throw new Error("Workspace projected identity token is empty");
+  return token;
 }
 
 function exactKeys(value: Record<string, unknown>, keys: string[]) {

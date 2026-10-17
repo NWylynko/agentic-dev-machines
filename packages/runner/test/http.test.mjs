@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { createServer } from "node:http";
 import { test } from "node:test";
 
 const main = new URL("../src/main.ts", import.meta.url);
@@ -21,7 +22,14 @@ const main = new URL("../src/main.ts", import.meta.url);
 async function startRunner(
   directory,
   env = {},
-  { useFaux = true, defaultModel = true } = {},
+  {
+    useFaux = true,
+    defaultModel = true,
+    tokenFile,
+    workspaceConfigFile,
+    lifecycleUrl,
+    podUid,
+  } = {},
 ) {
   const child = spawn(
     process.execPath,
@@ -31,6 +39,12 @@ async function startRunner(
       "0",
       "--state-dir",
       directory,
+      ...(tokenFile ? ["--token-file", tokenFile] : []),
+      ...(workspaceConfigFile
+        ? ["--workspace-config", workspaceConfigFile]
+        : []),
+      ...(lifecycleUrl ? ["--lifecycle-url", lifecycleUrl] : []),
+      ...(podUid ? ["--pod-uid", podUid] : []),
       ...(useFaux
         ? ["--provider", "faux", ...(defaultModel ? ["--model", "faux-1"] : [])]
         : ["--auth-path", join(directory, "empty-auth.json")]),
@@ -84,6 +98,232 @@ async function startRunner(
     },
   };
 }
+
+test("a workspace runtime authenticates every management route while keeping health public", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-auth-"));
+  const tokenFile = join(directory, "runtime-token");
+  await writeFile(tokenFile, "workspace-runtime-secret\n", { mode: 0o600 });
+  const runner = await startRunner(directory, {}, { tokenFile });
+  t.after(() => runner.stop());
+
+  assert.deepEqual((await runner.request("/health")).body, {
+    status: "ok",
+    version: "0.1.0",
+  });
+  assert.equal((await runner.request("/v1/workspaces")).status, 401);
+  const authorized = await fetch(`${runner.url}/v1/workspaces`, {
+    headers: { authorization: "Bearer workspace-runtime-secret" },
+  });
+  assert.equal(authorized.status, 200);
+  assert.deepEqual(await authorized.json(), { workspaces: [] });
+});
+
+test("a pod runtime opens its immutable workspace directly from mounted runtime configuration", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-pod-"));
+  const configPath = join(directory, "workspace.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      id: "workspace-pod-runtime",
+      name: "pod-runtime",
+      role: "bot",
+      environment: "pod",
+    }),
+  );
+  const runner = await startRunner(
+    directory,
+    {},
+    { workspaceConfigFile: configPath, defaultModel: false },
+  );
+  t.after(() => runner.stop());
+
+  const response = await runner.request("/v1/workspaces/workspace-pod-runtime");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.id, "workspace-pod-runtime");
+  assert.equal(response.body.role, "bot");
+  assert.equal(response.body.status, "needs_model");
+});
+
+test("a mounted bot runtime keeps its identity when the Pod restarts", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-mounted-bot-restart-"));
+  const configPath = join(directory, "workspace.json");
+  await writeFile(configPath, JSON.stringify({
+    id: "mounted-bot-restart",
+    name: "watcher",
+    role: "bot",
+    environment: "pod",
+  }));
+  let runner = await startRunner(directory, {}, { workspaceConfigFile: configPath, defaultModel: false });
+  assert.equal((await runner.request("/v1/workspaces/mounted-bot-restart")).status, 200);
+  await runner.stop();
+  runner = await startRunner(directory, {}, { workspaceConfigFile: configPath, defaultModel: false });
+  t.after(() => runner.stop());
+  assert.equal((await runner.request("/v1/workspaces/mounted-bot-restart")).status, 200);
+});
+
+test("workspace requests are authorized by lifecycle against the caller's projected identity", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-lifecycle-auth-"));
+  const tokenFile = join(directory, "service-account-token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  await writeFile(tokenFile, "rotating-pod-identity-token\n", { mode: 0o600 });
+  await writeFile(
+    workspaceConfigFile,
+    JSON.stringify({
+      id: "workspace-lifecycle-auth",
+      name: "lifecycle-auth",
+      role: "bot",
+      environment: "pod",
+      model: { provider: "faux", id: "faux-1" },
+    }),
+  );
+  const authorizations = [];
+  let deleting = false;
+  const control = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    authorizations.push({
+      path: request.url,
+      authorization: request.headers.authorization,
+      body,
+    });
+    const authorized =
+      request.headers.authorization === "Bearer rotating-pod-identity-token";
+    const leasePath = request.url?.endsWith("/runtime/lease");
+    const checkPath = request.url?.endsWith("/runtime/check");
+    const status = !authorized ? 401 : checkPath && deleting ? 410 : 200;
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify(
+        !authorized
+          ? { error: { code: "UNAUTHORIZED" } }
+          : leasePath
+            ? {
+                workspaceId: "workspace-lifecycle-auth",
+                holder: body.holder,
+                fencingToken: 7,
+                expiresAt: Date.now() + 30_000,
+              }
+            : checkPath && deleting
+              ? {
+                  error: {
+                    code: "WORKSPACE_DELETED",
+                    message: "Workspace is deleting",
+                  },
+                }
+              : checkPath
+                ? { valid: true }
+                : { allowed: true },
+      ),
+    );
+  });
+  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+  const controlUrl = `http://127.0.0.1:${control.address().port}`;
+  const runner = await startRunner(
+    directory,
+    {},
+    {
+      tokenFile,
+      workspaceConfigFile,
+      lifecycleUrl: controlUrl,
+      podUid: "a1b2c3d4-e5f6-47a8-9012-123456789abc",
+    },
+  );
+  t.after(async () => {
+    await runner.stop();
+    await new Promise((resolve) => control.close(resolve));
+  });
+
+  const denied = await fetch(`${runner.url}/v1/workspaces`);
+  assert.equal(denied.status, 401);
+  const response = await fetch(`${runner.url}/v1/workspaces`, {
+    headers: { authorization: "Bearer rotating-pod-identity-token" },
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    authorizations.filter((entry) => entry.path.endsWith("/authorize")),
+    [
+      {
+        path: "/v1/workspaces/workspace-lifecycle-auth/runtime/authorize",
+        authorization: "",
+        body: { action: "read" },
+      },
+      {
+        path: "/v1/workspaces/workspace-lifecycle-auth/runtime/authorize",
+        authorization: "Bearer rotating-pod-identity-token",
+        body: { action: "read" },
+      },
+    ],
+  );
+  assert.ok(
+    authorizations.some((entry) => entry.path.endsWith("/runtime/check")),
+    "Durable commits and requests must check the lifecycle fence",
+  );
+  const projectedStatus = await fetch(
+    `${runner.url}/v1/workspaces/workspace-lifecycle-auth/runtime-status`,
+    { headers: { authorization: "Bearer rotating-pod-identity-token" } },
+  );
+  assert.equal(projectedStatus.status, 200);
+  const projectedBody = await projectedStatus.json();
+  assert.ok(["idle", "running"].includes(projectedBody.activity.status));
+  assert.deepEqual(projectedBody.selectedModel, { provider: "faux", id: "faux-1" });
+  assert.ok(
+    authorizations.some((entry) => entry.path.endsWith("/authorize") && entry.authorization === "Bearer rotating-pod-identity-token" && entry.body.action === "read"),
+    "runtime status is available only to an identity scoped to this workspace Pod",
+  );
+  assert.ok(
+    !authorizations.some((entry) => entry.authorization === "Bearer lifecycle-controller-token"),
+    "the controller credential never crosses into the workspace Pod",
+  );
+  const admitted = await fetch(
+    `${runner.url}/v1/workspaces/workspace-lifecycle-auth/input`,
+    {
+      method: "POST",
+      headers: {
+        authorization: "Bearer rotating-pod-identity-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        message: "Persist this request",
+        requestId: "fenced-commit",
+      }),
+    },
+  );
+  assert.equal(admitted.status, 202);
+  const commitChecks = authorizations.filter((entry) =>
+    entry.path.endsWith("/runtime/check"),
+  ).length;
+  assert.ok(
+    commitChecks >= 2,
+    "workspace admission and the Durable SQLite commit both check the lifecycle fence",
+  );
+  deleting = true;
+  const fenced = await fetch(
+    `${runner.url}/v1/workspaces/workspace-lifecycle-auth/input`,
+    {
+      method: "POST",
+      headers: {
+        authorization: "Bearer rotating-pod-identity-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        message: "Must not be admitted",
+        requestId: "after-delete",
+      }),
+    },
+  );
+  assert.equal(fenced.status, 503);
+  assert.equal((await fenced.json()).error.code, "RUNTIME_OWNERSHIP_LOST");
+  const readiness = await fetch(`${runner.url}/health`);
+  assert.equal(readiness.status, 503);
+  assert.equal((await readiness.json()).status, "error");
+  const closed = await fetch(
+    `${runner.url}/v1/workspaces/workspace-lifecycle-auth`,
+    { headers: { authorization: "Bearer rotating-pod-identity-token" } },
+  );
+  assert.equal(closed.status, 503);
+  assert.equal((await closed.json()).error.code, "RUNTIME_OWNERSHIP_LOST");
+});
 
 async function nextEvent(
   runner,

@@ -27,11 +27,11 @@ pub fn doctor(cli: &Cli, storage_class: &str, json_output: bool) -> Result<()> {
             "action": "Configure a replicated StorageClass as described in deploy/storage.md, or inspect an existing class with adm doctor --storage-class NAME.",
         }),
     };
-    let runner = match cli.request("GET", "/health", None) {
+    let lifecycle = match cli.request_lifecycle("GET", "/health", None) {
         Ok(health) => health,
         Err(error) => json!({"status":"unavailable", "error":format!("{error:#}")}),
     };
-    let report = json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"runner":runner,"state":cli.state_path()});
+    let report = json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"lifecycle":lifecycle,"state":cli.state_path()});
     if json_output {
         print_json(&report)
     } else {
@@ -95,14 +95,14 @@ fn print_doctor_report(report: &Value) {
         println!("  Next: {action}");
     }
 
-    println!("Runner:");
+    println!("Lifecycle service:");
     println!(
         "  {}",
-        report["runner"]["status"].as_str().unwrap_or("unknown")
+        report["lifecycle"]["status"].as_str().unwrap_or("unknown")
     );
-    if let Some(error) = report["runner"]["error"].as_str() {
+    if let Some(error) = report["lifecycle"]["error"].as_str() {
         println!("  Error: {error}");
-        println!("  Next: Check the runner process and its logs.");
+        println!("  Next: Check the in-cluster lifecycle service and its logs.");
     }
     println!("State: {}", report["state"].as_str().unwrap_or("unknown"));
 }

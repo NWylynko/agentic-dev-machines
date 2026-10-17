@@ -219,9 +219,11 @@ export class Workspace {
     try {
       if (config.role === "coding") {
         registry.install(CodingTools);
-        if (config.environment === "local") {
+        if (config.environment === "local" || config.environment === "pod") {
           await mkdir(config.localRoot!, { recursive: true });
-          localEnv = new NodeExecutionEnv({ cwd: config.localRoot! });
+          localEnv = new NodeExecutionEnv({
+            cwd: config.cwd ?? config.localRoot!,
+          });
         } else if (!passive) {
           kubeEnv = new KubernetesExecutionEnv({
             kubectl: config.kubectl ?? "kubectl",
@@ -278,8 +280,19 @@ export class Workspace {
         authPath,
         config.localRoot ?? "/workspace",
       );
+      const fencedStorage = new Proxy(storage, {
+        get(target, property) {
+          if (property === "commit")
+            return async (...args: Parameters<typeof target.commit>) => {
+              if (config.environment === "pod") await assertActive();
+              return target.commit(...args);
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
       const harness = await Harness.open(
-        storage,
+        fencedStorage,
         {
           models,
           registry,
