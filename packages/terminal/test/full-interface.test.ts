@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { WorkspaceTerminal } from "../src/terminal.ts";
+import { SettingsSelectorComponent } from "@earendil-works/pi-coding-agent";
 import {
   ProcessTerminal,
   stripTerminalSequences,
@@ -11,6 +12,7 @@ import {
 
 test("Pi command aliases open their Durable-backed controls and hotkey help", async () => {
   let stream: import("node:http").ServerResponse | undefined;
+  let activeConversationId = 9;
   const server = createServer(async (request, response) => {
     const url = new URL(request.url!, "http://localhost");
     response.setHeader("content-type", "application/json");
@@ -31,14 +33,14 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
     } else if (url.pathname.endsWith("/branches")) {
       response.end(
         JSON.stringify({
-          activeConversationId: 9,
-          branches: [{ conversationId: 9 }],
+          activeConversationId,
+          branches: [{ conversationId: 9 }, { conversationId: 10 }],
         }),
       );
     } else if (url.pathname.endsWith("/tree")) {
       response.end(
         JSON.stringify({
-          activeConversationId: 9,
+          activeConversationId,
           events: [
             {
               seq: 1,
@@ -60,6 +62,14 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
       stream = response;
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.write(": attached\n\n");
+    } else if (url.pathname.endsWith("/new")) {
+      activeConversationId = 10;
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          model: { provider: "faux", id: "faux-1" },
+        }),
+      );
     } else if (request.method === "GET") {
       response.end(
         JSON.stringify({
@@ -108,6 +118,28 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
     const rendered = stripTerminalSequences(terminal.render(100).join("\n"));
     assert.match(rendered, /Ctrl\+O/);
     assert.match(rendered, /Shift\+Tab/);
+
+    await terminal.submit("/settings");
+    const settingsWrapper = (terminal as any).activeSelector;
+    assert.ok(settingsWrapper.children[0] instanceof SettingsSelectorComponent);
+    const settingsText = stripTerminalSequences(
+      terminal.render(100).join("\n"),
+    );
+    assert.match(settingsText, /Auto-compact/);
+    terminal.handleInput("\r");
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /Auto-compact is not configurable through adm attach/,
+    );
+
+    await terminal.submit("/new");
+    assert.equal(activeConversationId, 10);
+    assert.equal((terminal as any).cursor, 0);
+    assert.equal((terminal as any).records.length, 0);
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /New workspace session 10/,
+    );
   } finally {
     terminal.close();
     stream?.end();

@@ -952,6 +952,22 @@ test(
           );
           assert.equal(afterControls.loops[0].status, "cancelled");
 
+          const priorConversationId = afterControls.conversationId;
+          firstOutput = "";
+          second.stdin.write("/new\r");
+          await waitForOutput(second, "New workspace session");
+          const newBranches = await fetch(`${runnerUrl}${path}/branches`);
+          const newNavigation = await newBranches.json();
+          assert.notEqual(
+            newNavigation.activeConversationId,
+            priorConversationId,
+          );
+          const newHistoryResponse = await fetch(
+            `${runnerUrl}${path}/history?limit=1000`,
+          );
+          const newHistory = await newHistoryResponse.json();
+          assert.deepEqual(newHistory.events, []);
+
           const detachedAgain = once(second, "exit");
           second.stdin.write("\x03");
           assert.equal((await detachedAgain)[0], 0);
