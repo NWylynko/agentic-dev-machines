@@ -1675,11 +1675,11 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
         "{stdout}"
     );
     assert!(
-        stdout.contains(&workspace["id"].as_str().unwrap()),
+        stdout.contains(workspace["id"].as_str().unwrap()),
         "{stdout}"
     );
     assert!(
-        stdout.contains(&other_workspace["id"].as_str().unwrap()),
+        stdout.contains(other_workspace["id"].as_str().unwrap()),
         "{stdout}"
     );
     assert!(
@@ -1859,6 +1859,13 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
 #[test]
 fn herdr_bind_requires_a_live_herdr_workspace_id() {
     let root = fixture();
+    let setup = adm(root.path(), &["herdr"]);
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    assert!(String::from_utf8_lossy(&setup.stdout).contains("HERDR_WORKSPACE_ID"));
     assert_ok(adm(
         root.path(),
         &["create", "herdr-owned", "--no-repositories"],

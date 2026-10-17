@@ -199,7 +199,7 @@ From your laptop, forward that management-host port over your normal SSH connect
 
 ## Herdr ownership and deletion
 
-Create or bind the ADM workspace from the management host, using the immutable Herdr workspace ID. `adm herdr bind` checks the ID with the installed Herdr CLI before saving the association. The removal bridge consumes actual Herdr `workspace_closed` events. Losing the event connection or restarting Herdr is not a removal event.
+Run `adm herdr` for the worked setup. Create or bind the ADM workspace from the management host, using the immutable Herdr workspace ID. `adm herdr bind` checks the ID with the installed Herdr CLI before saving the association. The removal bridge consumes actual Herdr `workspace_closed` events. Losing the event connection or restarting Herdr is not a removal event.
 
 ```sh
 # On the management host

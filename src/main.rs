@@ -189,7 +189,7 @@ pub enum Action {
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
     Herdr {
         #[command(subcommand)]
-        command: herdr::HerdrAction,
+        command: Option<herdr::HerdrAction>,
     },
     /// Run Chromium automation inside a development workspace.
     Browser {
@@ -1188,7 +1188,9 @@ fn run(cli: &Cli) -> Result<()> {
             let workspace = cli.active_workspace(name)?;
             runtime_access::login(cli, &workspace)
         }
-        Action::Herdr { command } => herdr::run(cli, command),
+        Action::Herdr { command } => {
+            herdr::run(cli, command.as_ref().unwrap_or(&herdr::HerdrAction::Hook))
+        }
         Action::Browser {
             name,
             url,

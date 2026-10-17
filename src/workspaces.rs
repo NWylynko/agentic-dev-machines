@@ -688,6 +688,21 @@ impl WorkspaceStore {
         tx.commit()?;
         Ok(())
     }
+    pub fn check_runtime_owner(&self, workspace_id: &str, holder: &str) -> Result<()> {
+        let (active_holder, expires_at): (String, i64) = self
+            .connection
+            .query_row(
+                "SELECT holder,expires_at FROM runtime_leases WHERE workspace_id=?1",
+                [workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .with_context(|| "runtime caller is not authorized for workspace")?;
+        ensure!(
+            active_holder == holder && expires_at as u64 > now(),
+            "runtime caller is not authorized for workspace"
+        );
+        Ok(())
+    }
     pub fn pending_lifecycle_operations(&self) -> Result<Vec<(String, String)>> {
         let mut statement = self.connection.prepare(
             "SELECT operation_id,request FROM lifecycle_operations WHERE status IN ('accepted','running','failed') ORDER BY accepted_at,operation_id",
@@ -1441,7 +1456,18 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
         },
     )?;
     w.phase = "deleting".into();
-    store.save(&w)?;
+    if !store.save_if_phase(&w, "deleting")? {
+        w = store.find(&w.id)?;
+        if w.phase == "deleted" {
+            lifecycle_complete("destroy", &w.name, "already deleted", started);
+            return Ok(w);
+        }
+        anyhow::ensure!(
+            w.phase == "deleting",
+            "workspace {} changed lifecycle phase before namespace cleanup",
+            w.name
+        );
+    }
     lifecycle_stage(
         cli,
         "destroy",
