@@ -886,7 +886,7 @@ test(
             stripTerminalSequences(firstOutput),
             /Provider error · Authentication credentials are invalid/,
           );
-          second.stdin.write("/resume\r");
+          second.stdin.write("/retry\r");
           await waitForOutput(second, "Provider retry queued");
           await waitForOutput(
             second,
