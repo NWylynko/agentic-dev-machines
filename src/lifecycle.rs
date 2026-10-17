@@ -200,6 +200,7 @@ impl CreateIntent {
             namespace: format!("adm-{}", &id[..16]),
             phase: "provisioning".into(),
             creation_operation_id: Some(operation_id.to_owned()),
+            deletion_operation_id: None,
             runtime_status: None,
             image: self.image,
             storage_class: self.storage_class,
@@ -347,6 +348,8 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
 
 fn lifecycle_worker(cli: crate::Cli, work: mpsc::Receiver<String>) {
     for operation_id in work {
+        let mut cli = cli.clone_for_lifecycle();
+        cli.lifecycle_operation_id = Some(operation_id.clone());
         let outcome = (|| -> Result<()> {
             cli.check_lifecycle_fence()?;
             let store = cli.store()?;

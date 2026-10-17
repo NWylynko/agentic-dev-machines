@@ -457,6 +457,8 @@ elif args[:2] == ['get','pods']:
         items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':{'phase':'Running','containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:2] == ['get', 'storageclass']:
+    if (pathlib.Path(__file__).parent / 'missing-storage').exists():
+        print('Error from server (NotFound): storageclass adm-replicated not found',file=sys.stderr);sys.exit(1)
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
 elif args[0] == 'apply':
     doc=json.load(sys.stdin)
@@ -634,6 +636,19 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         wait_for_stage(&create_progress, "waiting for deployment readiness started");
     let during_create = assert_ok(adm(root.path(), &["list", "--json"]));
     assert_eq!(during_create[0]["phase"], "provisioning");
+    let receipt = |operation_id: &str| -> Value {
+        let url = fs::read_to_string(root.path().join("lifecycle-url")).unwrap();
+        let token = fs::read_to_string(root.path().join("lifecycle-token")).unwrap();
+        reqwest::blocking::Client::new()
+            .get(format!("{url}/v1/operations/{operation_id}"))
+            .bearer_auth(token.trim())
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
     fs::write(&readiness, "continue").unwrap();
     let created = create.wait_with_output().unwrap();
     let create_diagnostics = create_stderr.join().unwrap();
@@ -652,6 +667,16 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let ready: Value =
         serde_json::from_slice(&created.stdout).expect("create JSON remains on stdout");
     assert_eq!(ready["phase"], "ready");
+    let creation = receipt(ready["creation_operation_id"].as_str().unwrap());
+    assert_eq!(
+        creation["timings"]["stages"]["waiting for deployment readiness"]["status"],
+        "completed"
+    );
+    assert!(
+        creation["timings"]["stages"]["waiting for deployment readiness"]["elapsedSeconds"]
+            .as_f64()
+            .is_some()
+    );
     assert!(
         create_diagnostics.contains("waiting for deployment readiness completed in"),
         "{create_diagnostics}"
@@ -664,7 +689,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let removal = root.path().join("release-delete");
     fs::write(root.path().join("delay-delete"), "delay").unwrap();
     let (destroy, destroy_progress, destroy_stderr) =
-        launch(root.path(), &["destroy", "progress-demo"]);
+        launch(root.path(), &["destroy", "progress-demo", "--wait"]);
     wait_for_file(&root.path().join("entered-delete"));
     let active_destroy_stage =
         wait_for_stage(&destroy_progress, "waiting for namespace removal started");
@@ -694,6 +719,11 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let deleted: Value =
         serde_json::from_slice(&deleted.stdout).expect("destroy JSON remains on stdout");
     assert_eq!(deleted["phase"], "deleted");
+    let deletion = receipt(deleted["deletion_operation_id"].as_str().unwrap());
+    assert_eq!(
+        deletion["timings"]["stages"]["waiting for namespace removal"]["status"],
+        "completed"
+    );
     assert!(
         destroy_diagnostics.contains("waiting for namespace removal completed in"),
         "{destroy_diagnostics}"
@@ -707,7 +737,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
 }
 
 #[test]
-fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
+fn list_uses_the_directory_and_keeps_full_records_with_json() {
     let root = fixture();
 
     let empty = adm(root.path(), &["list"]);
@@ -776,7 +806,7 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
     );
 
     assert_eq!(
-        assert_ok(adm(root.path(), &["destroy", "shell-only"]))["phase"],
+        assert_ok(adm(root.path(), &["destroy", "shell-only", "--wait"]))["phase"],
         "deleted"
     );
     let active = assert_ok(adm(root.path(), &["list", "--json"]));
@@ -789,9 +819,9 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
         3
     );
 
-    // Listing is local even when both external dependencies are unavailable.
+    // The access CLI reads the lifecycle directory without invoking its own kubectl.
     let marker = root.path().join("kubectl-contacted");
-    let kubectl = root.path().join("kubectl");
+    let kubectl = root.path().join("access-kubectl");
     fs::write(
         &kubectl,
         format!(
@@ -801,15 +831,21 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
     )
     .unwrap();
     fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    let offline = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut offline = Command::new(env!("CARGO_BIN_EXE_adm"));
+    offline
         .arg("--state-dir")
         .arg(root.path().join("state"))
         .arg("--kubectl")
         .arg(&kubectl)
-        .args(["--runner-url", "http://127.0.0.1:1", "list", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(assert_ok(offline).as_array().unwrap().len(), 2);
+        .args(["--runner-url", "http://127.0.0.1:1", "list", "--json"]);
+    configure_lifecycle(&mut offline, root.path());
+    assert_eq!(
+        assert_ok(offline.output().unwrap())
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert!(!marker.exists(), "list must not contact kubectl");
 }
 
@@ -831,7 +867,10 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
         .iter()
         .map(|value| value.as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(&command[..3], ["bash", "-l", "-c"]);
+    assert_eq!(
+        &command[..5],
+        ["env", "ZDOTDIR=/workspace/.adm/zsh", "zsh", "-l", "-c"]
+    );
     assert_eq!(command.last().map(String::as_str), Some("/repos"));
 
     let backing = root.path().join("workspace/.adm/catalog");
@@ -840,6 +879,7 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
     fs::create_dir_all(&backing).unwrap();
     fs::create_dir_all(&home).unwrap();
     symlink(&backing, &public).unwrap();
+    command[1] = format!("ZDOTDIR={}", home.display());
     *command.last_mut().unwrap() = public.to_string_lossy().into_owned();
     let mut runtime = Command::new(&command[0])
         .args(&command[1..])
@@ -852,13 +892,13 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run the Bash argv emitted by adm shell");
+        .expect("run the zsh argv emitted by adm shell");
     runtime
         .stdin
         .take()
         .unwrap()
         .write_all(
-            b"printf 'PWD=%s\\n' \"$PWD\"; printf 'pwd=%s\\n' \"$(pwd)\"; printf 'physical=%s\\n' \"$(pwd -P)\"; PS1='\\w'; printf 'prompt=%s\\n' \"${PS1@P}\"\n",
+            b"printf 'PWD=%s\\n' \"$PWD\"; printf 'pwd=%s\\n' \"$(pwd)\"; printf 'physical=%s\\n' \"$(pwd -P)\"; PS1='%~'; printf 'prompt=%s\\n' \"${(%)PS1}\"\n",
         )
         .unwrap();
     let runtime = runtime.wait_with_output().unwrap();
@@ -900,6 +940,27 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
     assert_eq!(
         actual,
         [Some("bash"), Some("-lc"), Some("printf '%s' \"$PWD\""),]
+    );
+
+    let executed = adm(
+        root.path(),
+        &[
+            "exec",
+            "shell-cwd",
+            "--",
+            "printf",
+            "%s",
+            "argument with spaces",
+        ],
+    );
+    assert!(executed.status.success(), "{executed:?}");
+    let args: Value =
+        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
+    let actual = args.as_array().unwrap();
+    let command_start = actual.iter().position(|arg| arg == "--").unwrap() + 1;
+    assert_eq!(
+        &actual[command_start..],
+        ["printf", "%s", "argument with spaces"]
     );
 }
 
@@ -1372,7 +1433,11 @@ fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace(
         "create never reached repository preparation"
     );
 
-    let deleted = adm_with_runner(root.path(), &runner_url, &["destroy", "delete-during-repo"]);
+    let deleted = adm_with_runner(
+        root.path(),
+        &runner_url,
+        &["destroy", "delete-during-repo", "--wait"],
+    );
     assert!(
         deleted.status.success(),
         "{}",
@@ -1449,7 +1514,11 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
             .unwrap();
         }
     });
-    let deleted = adm_with_runner(root.path(), &runner_url, &["destroy", "runner-error"]);
+    let deleted = adm_with_runner(
+        root.path(),
+        &runner_url,
+        &["destroy", "runner-error", "--wait"],
+    );
     runner.join().unwrap();
     assert!(
         !deleted.status.success(),
@@ -1630,7 +1699,7 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
         first["id"]
     );
     assert_eq!(
-        assert_ok(adm(root.path(), &["destroy", "demo"]))["phase"],
+        assert_ok(adm(root.path(), &["destroy", "demo", "--wait"]))["phase"],
         "deleted"
     );
     assert_eq!(
@@ -1770,7 +1839,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     );
 
     assert_eq!(
-        assert_ok(adm(root.path(), &["destroy", "demo"]))["phase"],
+        assert_ok(adm(root.path(), &["destroy", "demo", "--wait"]))["phase"],
         "deleted"
     );
     let deleted = adm(root.path(), &["status", "demo"]);
@@ -1924,7 +1993,7 @@ fn destruction_refuses_a_namespace_whose_immutable_ownership_changed() {
     cluster[workspace["namespace"].as_str().unwrap()]["metadata"]["labels"]["adm.dev/workspace-id"] =
         "someone-else".into();
     fs::write(cluster_path, serde_json::to_vec(&cluster).unwrap()).unwrap();
-    let output = adm(root.path(), &["destroy", "safe"]);
+    let output = adm(root.path(), &["destroy", "safe", "--wait"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("ownership"));
     assert_eq!(
@@ -2230,11 +2299,13 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
     assert!(matches!(phase.as_str(), "deleting" | "deleted"));
     let cluster: Value =
         serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
-    assert!(
-        cluster
-            .get(workspace["namespace"].as_str().unwrap())
-            .is_none()
-    );
+    if phase == "deleted" {
+        assert!(
+            cluster
+                .get(workspace["namespace"].as_str().unwrap())
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -2363,6 +2434,7 @@ fn manifest_exposes_the_workspace_security_profile_and_isolated_storage() {
     assert_eq!(deployment["spec"]["strategy"]["type"], "Recreate");
     assert!(pod["containers"].as_array().unwrap().len() == 1);
     assert_eq!(pod["initContainers"][0]["command"][1], "plain");
+    assert_eq!(pod["initContainers"][0]["securityContext"]["runAsUser"], 0);
 }
 
 #[test]
@@ -2524,20 +2596,20 @@ fn start_rejects_a_checkout_without_the_runner() {
 
 #[test]
 fn missing_replicated_storage_points_at_the_deploy_note() {
-    let root = tempfile::tempdir().unwrap();
-    let kubectl = root.path().join("kubectl");
-    fs::write(&kubectl, "#!/bin/sh\necho 'Error from server (NotFound): storageclasses.storage.k8s.io \"adm-replicated\" not found' >&2\nexit 1\n").unwrap();
-    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let root = fixture();
+    fs::write(root.path().join("missing-storage"), "missing").unwrap();
     let output = adm(root.path(), &["create", "demo"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("deploy/storage.md"), "{stderr}");
-    assert_eq!(
-        assert_ok(adm(root.path(), &["list", "--json"]))
-            .as_array()
+    let failed = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(failed.as_array().unwrap().len(), 1);
+    assert_eq!(failed[0]["phase"], "failed");
+    assert!(
+        failed[0]["last_error"]
+            .as_str()
             .unwrap()
-            .len(),
-        0
+            .contains("deploy/storage.md")
     );
 }
 

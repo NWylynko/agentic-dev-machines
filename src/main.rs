@@ -60,6 +60,8 @@ pub struct Cli {
     pub runtime_status_port: u16,
     #[arg(skip)]
     pub lifecycle_fence: Option<lease::LeaseFence>,
+    #[arg(skip)]
+    pub lifecycle_operation_id: Option<String>,
     /// Runtime installation or development checkout containing the runner and terminal.
     #[arg(long, global = true, env = "ADM_PROJECT_DIR", default_value_os_t = default_project_dir())]
     pub project_dir: PathBuf,
@@ -101,6 +103,9 @@ pub enum Action {
         /// Stable lifecycle operation UUID used to replay this deletion request.
         #[arg(long)]
         operation_id: Option<String>,
+        /// Wait for the lifecycle owner to finish removing the workspace.
+        #[arg(long)]
+        wait: bool,
     },
     /// Rebind a Kubernetes coding workspace to the selected host connection without replacing it.
     Reconnect { name: String },
@@ -237,6 +242,7 @@ impl Cli {
             lifecycle_token_file: self.lifecycle_token_file.clone(),
             runtime_status_port: self.runtime_status_port,
             lifecycle_fence: self.lifecycle_fence.clone(),
+            lifecycle_operation_id: self.lifecycle_operation_id.clone(),
             project_dir: self.project_dir.clone(),
             command: Action::LifecycleServe {
                 host: "0.0.0.0".into(),
@@ -403,10 +409,20 @@ impl Cli {
     ) -> Result<workspaces::Workspace> {
         let items: Vec<workspaces::Workspace> =
             serde_json::from_value(self.request_lifecycle("GET", "/v1/workspaces", None)?)?;
+        if let Some(workspace) = items.iter().find(|workspace| {
+            workspace.id == name_or_id && (include_deleted || workspace.phase != "deleted")
+        }) {
+            return Ok(workspace.clone());
+        }
+        if let Some(workspace) = items
+            .iter()
+            .find(|workspace| workspace.name == name_or_id && workspace.phase != "deleted")
+        {
+            return Ok(workspace.clone());
+        }
         items
             .into_iter()
-            .filter(|workspace| include_deleted || workspace.phase != "deleted")
-            .find(|workspace| workspace.name == name_or_id || workspace.id == name_or_id)
+            .find(|workspace| include_deleted && workspace.name == name_or_id)
             .with_context(|| format!("workspace not found: {name_or_id}"))
     }
     pub fn active_workspace(&self, name_or_id: &str) -> Result<workspaces::Workspace> {
@@ -456,6 +472,20 @@ impl Cli {
             if stage != last_stage {
                 eprintln!("adm: {action} {name}: {stage}");
                 last_stage = stage.to_owned();
+            }
+            if matches!(receipt["status"].as_str(), Some("completed" | "failed")) {
+                if let Some(stages) = receipt["timings"]["stages"].as_object() {
+                    for (stage, timing) in stages {
+                        if let (Some(outcome), Some(elapsed)) =
+                            (timing["status"].as_str(), timing["elapsedSeconds"].as_f64())
+                        {
+                            eprintln!("adm: {action} {name}: {stage} {outcome} in {elapsed:.3}s");
+                        }
+                    }
+                }
+                if let Some(elapsed) = receipt["timings"]["elapsedSeconds"].as_f64() {
+                    eprintln!("adm: {action} {name}: {stage} in {elapsed:.3}s");
+                }
             }
             match receipt["status"].as_str() {
                 Some("completed") => {
@@ -572,7 +602,7 @@ fn print_workspace_list(items: &[Value]) {
             phase = widths[2],
             config = widths[3],
             activity = widths[4],
-            id = widths[5],
+            id = row[5],
         );
     }
     for workspace in items {
@@ -919,13 +949,34 @@ fn run(cli: &Cli) -> Result<()> {
                 print_inspect(&status)
             }
         }
-        Action::Destroy { name, operation_id } => {
+        Action::Destroy {
+            name,
+            operation_id,
+            wait,
+        } => {
             let workspace = cli.workspace(name, true)?;
-            if workspace.phase == "deleted" {
+            if workspace.phase == "deleted" && workspace.deletion_operation_id.is_none() {
                 return print_json(&workspace);
+            }
+            if let Some(existing_operation) = workspace.deletion_operation_id.as_deref()
+                && let Some(requested) = operation_id.as_deref()
+                && requested != existing_operation
+            {
+                let admitted = cli.request_lifecycle(
+                    "GET", &format!("/v1/operations/{requested}"), None,
+                ).with_context(|| format!(
+                    "workspace {} is already tracked by destroy operation {}; resume that operation",
+                    workspace.name, existing_operation,
+                ))?;
+                anyhow::ensure!(
+                    admitted["kind"] == "delete" && admitted["workspaceId"] == workspace.id,
+                    "operation {requested} does not delete workspace {}",
+                    workspace.id,
+                );
             }
             let operation_id = operation_id
                 .clone()
+                .or_else(|| workspace.deletion_operation_id.clone())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let receipt = cli.request_lifecycle(
                 "POST",
@@ -943,13 +994,17 @@ fn run(cli: &Cli) -> Result<()> {
             let workspace_id = receipt["workspaceId"]
                 .as_str()
                 .context("lifecycle receipt omitted workspaceId")?;
-            let workspace = cli.wait_for_lifecycle_workspace(
-                operation_id,
-                workspace_id,
-                "destroy",
-                &workspace.name,
-            )?;
-            print_json(&workspace)
+            if *wait {
+                let workspace = cli.wait_for_lifecycle_workspace(
+                    operation_id,
+                    workspace_id,
+                    "destroy",
+                    &workspace.name,
+                )?;
+                print_json(&workspace)
+            } else {
+                print_json(&receipt)
+            }
         }
         Action::Reconnect { name } => {
             let workspace = cli.active_workspace(name)?;
@@ -1034,10 +1089,12 @@ fn run(cli: &Cli) -> Result<()> {
             if command.is_empty() {
                 let working_directory = &workspace.cwd;
                 child.args([
-                    "bash",
+                    "env",
+                    "ZDOTDIR=/workspace/.adm/zsh",
+                    "zsh",
                     "-l",
                     "-c",
-                    "cd -- \"$1\" && export PWD=\"$1\" && exec bash -l",
+                    "cd -- \"$1\" && export PWD=\"$1\" && exec zsh -l",
                     "adm-shell",
                     working_directory,
                 ]);

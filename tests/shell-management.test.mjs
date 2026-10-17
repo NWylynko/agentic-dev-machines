@@ -17,6 +17,7 @@ const adm = process.argv[2];
 assert.ok(adm, "pass the public adm executable");
 const root = await mkdtemp(join(tmpdir(), "adm-managed-shell-"));
 const stateFile = join(root, "cluster.json");
+const leaseFile = join(root, "lifecycle-lease.json");
 const execLog = join(root, "exec.jsonl");
 const hostEnvLog = join(root, "host-env.jsonl");
 const envLog = join(root, "remote-env.jsonl");
@@ -30,6 +31,7 @@ let agentStatus = "running";
 let abortCount = 0;
 let releaseHeldRequest;
 let releaseHeldClose;
+let lifecycleProcess;
 const heldRequest = new Promise((resolve) => (releaseHeldRequest = resolve));
 const heldClose = new Promise((resolve) => (releaseHeldClose = resolve));
 async function waitFor(promise, message) {
@@ -120,16 +122,24 @@ const args = process.argv.slice(2);
 await appendFile(${JSON.stringify(execLog)}, JSON.stringify(args) + "\\n");
 await appendFile(${JSON.stringify(hostEnvLog)}, JSON.stringify(process.env.KUBECONFIG ?? "<unset>") + "\\n");
 const statePath = ${JSON.stringify(stateFile)};
+const leasePath = ${JSON.stringify(leaseFile)};
 const shellPidPath = ${JSON.stringify(join(root, "shell.pid"))};
 let state = {};
 try { state = JSON.parse(await readFile(statePath, "utf8")); } catch {}
-if (args[0] === "get" && args[1] === "storageclass") process.stdout.write(JSON.stringify({provisioner:"driver.longhorn.io"}));
+if (args[0] === "get" && args[1] === "lease") {
+  try { process.stdout.write(await readFile(leasePath, "utf8")); }
+  catch { process.stderr.write("Error from server (NotFound): leases.coordination.k8s.io \\\"adm-lifecycle-owner\\\" not found\\n"); process.exitCode = 1; }
+} else if ((args[0] === "create" || args[0] === "replace") && args[1] === "-f" && args[2] === "-") {
+  let input = ""; for await (const chunk of process.stdin) input += chunk;
+  await writeFile(leasePath, input);
+  process.stdout.write("lease saved\\n");
+} else if (args[0] === "get" && args[1] === "storageclass") process.stdout.write(JSON.stringify({provisioner:"driver.longhorn.io"}));
 else if (args[0] === "apply") {
   let input = ""; for await (const chunk of process.stdin) input += chunk;
   const manifest = JSON.parse(input); const ns = manifest.items.find(x => x.kind === "Namespace");
   state[ns.metadata.name] = ns; await writeFile(statePath, JSON.stringify(state)); process.stdout.write("applied\\n");
 } else if (args[0] === "get" && args[1] === "namespace") {
-  if (!state[args[2]]) { process.stderr.write("namespace not found\\n"); process.exitCode = 1; }
+  if (!state[args[2]]) { process.stderr.write("Error from server (NotFound): namespaces \\\"" + args[2] + "\\\" not found\\n"); process.exitCode = 1; }
   else process.stdout.write(JSON.stringify(state[args[2]]));
 } else if (args[0] === "wait") process.stdout.write("condition met\\n");
 else if (args[0] === "exec") {
@@ -198,6 +208,46 @@ else if (args[0] === "exec") {
     `export PATH=${dirname(process.execPath)}:/usr/bin:/bin\n`,
   );
   const runnerUrl = `http://127.0.0.1:${server.address().port}`;
+  const lifecyclePortProbe = createServer();
+  lifecyclePortProbe.listen(0, "127.0.0.1");
+  await once(lifecyclePortProbe, "listening");
+  const lifecyclePort = lifecyclePortProbe.address().port;
+  await new Promise((resolve) => lifecyclePortProbe.close(resolve));
+  const lifecycleUrl = `http://127.0.0.1:${lifecyclePort}`;
+  const lifecycleTokenFile = join(root, "lifecycle-token");
+  await writeFile(lifecycleTokenFile, "test-only-lifecycle-token\n", {
+    mode: 0o600,
+  });
+  lifecycleProcess = spawn(
+    adm,
+    [
+      "--state-dir",
+      join(root, "lifecycle-state"),
+      "--kubectl",
+      kube,
+      "--kubeconfig",
+      selectedKubeconfig,
+      "--runner-url",
+      runnerUrl,
+      "--lifecycle-token-file",
+      lifecycleTokenFile,
+      "lifecycle-serve",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(lifecyclePort),
+    ],
+    { stdio: "ignore" },
+  );
+  const lifecycleReady = Date.now() + 5000;
+  while (true) {
+    try {
+      const response = await fetch(`${lifecycleUrl}/health`);
+      if (response.ok) break;
+    } catch {}
+    assert.ok(Date.now() < lifecycleReady, "isolated lifecycle fixture did not start");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   const env = {
     ...process.env,
     XDG_CONFIG_HOME: join(root, "config"),
@@ -217,6 +267,10 @@ else if (args[0] === "exec") {
           kube,
           "--runner-url",
           runnerUrl,
+          "--lifecycle-url",
+          lifecycleUrl,
+          "--lifecycle-token-file",
+          lifecycleTokenFile,
           "--kubeconfig",
           selectedKubeconfig,
           ...args,
@@ -248,6 +302,10 @@ else if (args[0] === "exec") {
           kube,
           "--runner-url",
           runnerUrl,
+          "--lifecycle-url",
+          lifecycleUrl,
+          "--lifecycle-token-file",
+          lifecycleTokenFile,
           "--kubeconfig",
           selectedKubeconfig,
           ...args,
@@ -441,6 +499,10 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
       kube,
       "--runner-url",
       runnerUrl,
+      "--lifecycle-url",
+      lifecycleUrl,
+      "--lifecycle-token-file",
+      lifecycleTokenFile,
       "--kubeconfig",
       selectedKubeconfig,
       "shell",
@@ -502,6 +564,10 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
   assert.equal(allHostKubeconfigs.length, allKubectlCalls.length);
   assert.ok(allHostKubeconfigs.every((value) => value === selectedKubeconfig));
 } finally {
+  if (lifecycleProcess && lifecycleProcess.exitCode === null) {
+    lifecycleProcess.kill("SIGTERM");
+    await once(lifecycleProcess, "exit");
+  }
   await new Promise((resolve) => server.close(resolve));
   await rm(root, { recursive: true });
 }
