@@ -2,6 +2,7 @@ keep this file up to date
 
 # Project notes
 
+- Current verification and live image-distribution/Herdr prerequisites are recorded in `docs/validation-2026-10-17.md`. Fixture/container evidence does not establish current-image Kubernetes rollout or sudden-node-loss durability.
 - `adm destroy NAME` returns its durable lifecycle operation receipt after admission; `--wait` observes confirmed cleanup and returns the deleted workspace record. Repeating destroy resumes the original operation, including after service restart; immutable workspace IDs protect reused names.
 - Interactive plain/managed workspace shells run zsh with pinned Oh My Zsh. Editable `.zshrc` and history live in `/workspace/.adm/zsh` and are seeded once; explicit shell/exec command arguments retain their semantics. GitHub HTTPS pushes use only the workspace's explicit `GH_TOKEN` through the image's GitHub-scoped helper.
 - Confirmed target, not yet implemented (2026-10-16): all coding/bot agent execution belongs in workspace pods; the host is an access plane only. Bots broadly control coding-agent lifecycles, and agents have unattended root/sudo inside their own pods. Older host-runner, individual-grant, and opt-in-sudo notes below describe current implementation, not the target policy.
