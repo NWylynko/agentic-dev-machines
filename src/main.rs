@@ -101,6 +101,9 @@ pub enum Action {
         /// Stable lifecycle operation UUID used to replay this deletion request.
         #[arg(long)]
         operation_id: Option<String>,
+        /// Wait for the lifecycle owner to finish removing the workspace.
+        #[arg(long)]
+        wait: bool,
     },
     /// Rebind a Kubernetes coding workspace to the selected host connection without replacing it.
     Reconnect { name: String },
@@ -395,10 +398,20 @@ impl Cli {
     ) -> Result<workspaces::Workspace> {
         let items: Vec<workspaces::Workspace> =
             serde_json::from_value(self.request_lifecycle("GET", "/v1/workspaces", None)?)?;
+        if let Some(workspace) = items.iter().find(|workspace| {
+            workspace.id == name_or_id && (include_deleted || workspace.phase != "deleted")
+        }) {
+            return Ok(workspace.clone());
+        }
+        if let Some(workspace) = items
+            .iter()
+            .find(|workspace| workspace.name == name_or_id && workspace.phase != "deleted")
+        {
+            return Ok(workspace.clone());
+        }
         items
             .into_iter()
-            .filter(|workspace| include_deleted || workspace.phase != "deleted")
-            .find(|workspace| workspace.name == name_or_id || workspace.id == name_or_id)
+            .find(|workspace| include_deleted && workspace.name == name_or_id)
             .with_context(|| format!("workspace not found: {name_or_id}"))
     }
     pub fn active_workspace(&self, name_or_id: &str) -> Result<workspaces::Workspace> {
@@ -893,13 +906,34 @@ fn run(cli: &Cli) -> Result<()> {
                 print_inspect(&status)
             }
         }
-        Action::Destroy { name, operation_id } => {
+        Action::Destroy {
+            name,
+            operation_id,
+            wait,
+        } => {
             let workspace = cli.workspace(name, true)?;
-            if workspace.phase == "deleted" {
+            if workspace.phase == "deleted" && workspace.deletion_operation_id.is_none() {
                 return print_json(&workspace);
+            }
+            if let Some(existing_operation) = workspace.deletion_operation_id.as_deref()
+                && let Some(requested) = operation_id.as_deref()
+                && requested != existing_operation
+            {
+                let admitted = cli.request_lifecycle(
+                    "GET", &format!("/v1/operations/{requested}"), None,
+                ).with_context(|| format!(
+                    "workspace {} is already tracked by destroy operation {}; resume that operation",
+                    workspace.name, existing_operation,
+                ))?;
+                anyhow::ensure!(
+                    admitted["kind"] == "delete" && admitted["workspaceId"] == workspace.id,
+                    "operation {requested} does not delete workspace {}",
+                    workspace.id,
+                );
             }
             let operation_id = operation_id
                 .clone()
+                .or_else(|| workspace.deletion_operation_id.clone())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let receipt = cli.request_lifecycle(
                 "POST",
@@ -917,13 +951,17 @@ fn run(cli: &Cli) -> Result<()> {
             let workspace_id = receipt["workspaceId"]
                 .as_str()
                 .context("lifecycle receipt omitted workspaceId")?;
-            let workspace = cli.wait_for_lifecycle_workspace(
-                operation_id,
-                workspace_id,
-                "destroy",
-                &workspace.name,
-            )?;
-            print_json(&workspace)
+            if *wait {
+                let workspace = cli.wait_for_lifecycle_workspace(
+                    operation_id,
+                    workspace_id,
+                    "destroy",
+                    &workspace.name,
+                )?;
+                print_json(&workspace)
+            } else {
+                print_json(&receipt)
+            }
         }
         Action::Reconnect { name } => {
             let workspace = cli.active_workspace(name)?;

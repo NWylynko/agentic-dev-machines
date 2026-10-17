@@ -53,6 +53,9 @@ RUN apt-get update \
  && printf '#1000 ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/adm \
  && chmod 0440 /etc/sudoers.d/adm \
  && rm -rf /var/lib/apt/lists/*
+COPY image/adm-git-credential /usr/local/bin/adm-git-credential
+RUN chmod 0755 /usr/local/bin/adm-git-credential \
+ && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential'
 COPY --from=go-build /out/adm-repositories /usr/local/bin/adm-repositories
 COPY --from=go-build /go/bin/artifact-fs /usr/local/bin/artifact-fs
 COPY --from=js-build /out/runner.mjs /opt/adm/runner.mjs

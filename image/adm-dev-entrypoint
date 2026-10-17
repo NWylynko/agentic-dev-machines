@@ -12,6 +12,7 @@ if [ "${1:-}" = "--check" ]; then
   test -x /usr/local/bin/adm-repositories
   test -x /usr/local/bin/artifact-fs
   test -x /usr/local/bin/adm-init-workspace
+  test -x /usr/local/bin/adm-git-credential
   test -x /usr/local/lib/adm-repositories/git
   exit 0
 fi
