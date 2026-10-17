@@ -85,7 +85,7 @@ for (const close of ["eof", "sigterm", "stdout"]) {
       const marker = "released-after-close";
       const markerPath = join(directory, marker);
       const pidPath = join(directory, "shell-pid");
-      const source = `trap 'printf leaked > ${markerPath}' USR1; ${close === "stdout" ? `echo $$ > ${pidPath}; echo ready` : "echo $$"}; sleep 60 & wait`;
+      const source = `trap 'printf leaked > ${markerPath}' USR1; ${close === "stdout" ? `echo $$ > ${pidPath}.tmp; mv ${pidPath}.tmp ${pidPath}; echo ready` : "echo $$"}; sleep 60 & wait`;
       const server = spawn(
         process.execPath,
         ["--import", "tsx", remoteEnv, "--cwd", directory],
@@ -161,6 +161,10 @@ for (const close of ["eof", "sigterm", "stdout"]) {
         close === "stdout"
           ? Number((await waitForFile(directory, "shell-pid")).trim())
           : await pidReady;
+      assert.ok(
+        Number.isSafeInteger(group) && group > 1,
+        "the fixture must identify its detached command group before signaling",
+      );
       if (close === "eof") server.stdin.end();
       else if (close === "sigterm") server.kill("SIGTERM");
       const [code, signal] = await exited;
