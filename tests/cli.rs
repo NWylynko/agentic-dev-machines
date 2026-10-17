@@ -13,6 +13,8 @@ use tempfile::TempDir;
 struct TestFixture {
     root: TempDir,
     lifecycle: std::process::Child,
+    runner_port: u16,
+    runner: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TestFixture {
@@ -25,6 +27,10 @@ impl Drop for TestFixture {
     fn drop(&mut self) {
         let _ = self.lifecycle.kill();
         let _ = self.lifecycle.wait();
+        let _ = reqwest::blocking::get(format!("http://127.0.0.1:{}/shutdown", self.runner_port));
+        if let Some(runner) = self.runner.take() {
+            let _ = runner.join();
+        }
     }
 }
 
@@ -88,8 +94,14 @@ fn adm(root: &Path, arguments: &[&str]) -> Output {
         .arg(root.join("state"))
         .arg("--kubectl")
         .arg(root.join("kubectl"))
-        .args(arguments);
+        // Public CLI fixtures must not contact a host or shared runner.
+        .args(["--runner-url"])
+        .arg(
+            fs::read_to_string(root.join("runner-url"))
+                .unwrap_or_else(|_| "http://127.0.0.1:1".into()),
+        );
     configure_lifecycle(&mut command, root);
+    command.args(arguments);
     command.output().expect("run public CLI")
 }
 
@@ -102,6 +114,57 @@ fn configure_lifecycle(command: &mut Command, root: &Path) {
             .arg("--lifecycle-token-file")
             .arg(root.join("lifecycle-token"));
     }
+}
+
+fn start_runner_stub() -> (String, u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(end + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first_line = headers.lines().next().unwrap_or("");
+            if first_line.starts_with("GET /shutdown ") {
+                break;
+            }
+            let body = if first_line.starts_with("GET /health ") {
+                r#"{"status":"ok"}"#
+            } else {
+                r#"{"ok":true}"#
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), port, server)
 }
 
 #[test]
@@ -324,13 +387,21 @@ fn assert_ok(output: Output) -> Value {
 }
 
 fn fixture() -> TestFixture {
+    fixture_with_runner(None)
+}
+
+fn fixture_with_runner(runner_override: Option<&str>) -> TestFixture {
     let root = tempfile::tempdir().unwrap();
+    let (default_runner_url, runner_port, runner) = start_runner_stub();
+    let runner_url = runner_override.unwrap_or(&default_runner_url);
+    fs::write(root.path().join("runner-url"), runner_url).unwrap();
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, r##"#!/usr/bin/env python3
 import json, os, pathlib, subprocess, sys
 path = pathlib.Path(__file__).parent / 'cluster.json'
 state = json.loads(path.read_text()) if path.exists() else {}
 args = sys.argv[1:]
+args = [arg for arg in args if not arg.startswith('--request-timeout=')]
 def wait_for_release(stage):
     if not (pathlib.Path(__file__).parent / ('delay-'+stage)).exists(): return
     entered=pathlib.Path(__file__).parent / ('entered-'+stage)
@@ -353,6 +424,14 @@ elif args[:2] == ['replace','-f']:
         print('Error from server (Conflict): resourceVersion conflict',file=sys.stderr);sys.exit(1)
     lease['metadata']['resourceVersion']=str(int(current['metadata']['resourceVersion'])+1)
     leasepath.write_text(json.dumps(lease));print(json.dumps(lease))
+elif args[:2] == ['get','pods'] and '-n' in args:
+    ready = (pathlib.Path(__file__).parent / 'ready-pod').exists()
+    init_waiting = (pathlib.Path(__file__).parent / 'init-waiting').exists()
+    condition = {'type':'Ready','status':'True' if ready else 'False','reason':'ContainersNotReady'}
+    status = {'phase':'Running','conditions':[condition], 'containerStatuses':[{'name':'dev','ready':ready}]}
+    if init_waiting:
+        status['initContainerStatuses']=[{'name':'setup','ready':False,'state':{'waiting':{'reason':'ImagePullBackOff','message':'could not pull setup image'}}}]
+    print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':status}]}))
 elif args[:2] == ['get','pods']:
     items=[]
     for namespace, resource in state.items():
@@ -381,17 +460,9 @@ elif args[0] == 'wait':
     if failure.exists():
         failure.unlink(); print('deployment did not become available',file=sys.stderr); sys.exit(1)
     print('condition met')
-elif args[:2] == ['get','pods']:
-    ready = (pathlib.Path(__file__).parent / 'ready-pod').exists()
-    init_waiting = (pathlib.Path(__file__).parent / 'init-waiting').exists()
-    condition = {'type':'Ready','status':'True' if ready else 'False','reason':'ContainersNotReady'}
-    status = {'phase':'Running','conditions':[condition], 'containerStatuses':[{'name':'dev','ready':ready}]}
-    if init_waiting:
-        status['initContainerStatuses']=[{'name':'setup','ready':False,'state':{'waiting':{'reason':'ImagePullBackOff','message':'could not pull setup image'}}}]
-    print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':status}]}))
 elif args and args[0] == 'exec':
     (pathlib.Path(__file__).parent / 'exec-args.json').write_text(json.dumps(args))
-    exec_root = os.environ.get('ADM_TEST_EXEC_ROOT')
+    exec_root = os.environ.get('ADM_TEST_EXEC_ROOT') or str(pathlib.Path(__file__).parent / 'pv')
     if exec_root:
         namespace = args[args.index('-n') + 1]
         block = os.environ.get('ADM_TEST_BLOCK_EXEC')
@@ -405,7 +476,17 @@ elif args and args[0] == 'exec':
             sys.exit(1)
         repos = pathlib.Path(exec_root) / namespace / 'repos'
         repos.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run(args[args.index('--') + 1:], cwd=repos)
+        command = args[args.index('--') + 1:]
+        command = [item.replace('/repos', str(repos)) for item in command]
+        env=os.environ.copy()
+        rewrite=pathlib.Path(__file__).parent/'git-rewrite'
+        if rewrite.exists():
+            env.update({'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_CONFIG_COUNT':'1','GIT_CONFIG_KEY_0':rewrite.read_text(),'GIT_CONFIG_VALUE_0':'https://github.com/'})
+        git_bin=pathlib.Path(__file__).parent/'git-bin'
+        if git_bin.exists(): env['PATH']=str(git_bin)+':'+env['PATH']
+        fail_after_clone=pathlib.Path(__file__).parent/'fail-after-clone'
+        if fail_after_clone.exists(): env['ADM_TEST_FAIL_AFTER_CLONE']=str(fail_after_clone)
+        result = subprocess.run(command, cwd=repos, env=env)
         sys.exit(result.returncode)
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
 "##).unwrap();
@@ -425,9 +506,10 @@ else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exi
     .unwrap();
     let lifecycle = Command::new(env!("CARGO_BIN_EXE_adm"))
         .args(["--state-dir"])
-        .arg(root.path().join("state"))
+        .arg(root.path().join("lifecycle-state"))
         .args(["--kubectl"])
         .arg(root.path().join("kubectl"))
+        .args(["--runner-url", runner_url])
         .args(["--lifecycle-token-file"])
         .arg(root.path().join("lifecycle-token"))
         .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
@@ -445,7 +527,12 @@ else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exi
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    TestFixture { root, lifecycle }
+    TestFixture {
+        root,
+        lifecycle,
+        runner_port,
+        runner: Some(runner),
+    }
 }
 
 #[test]
@@ -522,7 +609,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let readiness = root.path().join("release-readiness");
     let (create, create_progress, create_stderr) = launch(
         root.path(),
-        &["create", "progress-demo", "--no-agent", "--no-repositories"],
+        &["create", "progress-demo", "--no-repositories"],
     );
     wait_for_file(&root.path().join("entered-readiness"));
     let active_create_stage =
@@ -622,16 +709,13 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
 
     let coding = assert_ok(adm(
         root.path(),
-        &["create", "coding-agent", "--no-agent", "--no-repositories"],
+        &["create", "coding-agent", "--no-repositories"],
     ));
     let shell = assert_ok(adm(
         root.path(),
-        &["create", "shell-only", "--no-agent", "--no-repositories"],
+        &["create", "shell-only", "--no-repositories"],
     ));
-    let bot = assert_ok(adm(
-        root.path(),
-        &["create", "observer", "--role", "bot", "--no-agent"],
-    ));
+    let bot = assert_ok(adm(root.path(), &["create", "observer", "--role", "bot"]));
 
     let table = adm(root.path(), &["list"]);
     assert!(
@@ -649,9 +733,9 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
         "{table}"
     );
     for (name, role, agent, record) in [
-        ("coding-agent", "coding", "disabled", &coding),
-        ("shell-only", "coding", "disabled", &shell),
-        ("observer", "bot", "disabled", &bot),
+        ("coding-agent", "coding", "enabled", &coding),
+        ("shell-only", "coding", "enabled", &shell),
+        ("observer", "bot", "enabled", &bot),
     ] {
         assert!(table.contains(name), "{table}");
         assert!(table.contains(role), "{table}");
@@ -716,7 +800,7 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
     let root = fixture();
     assert_ok(adm(
         root.path(),
-        &["create", "shell-cwd", "--no-agent", "--no-repositories"],
+        &["create", "shell-cwd", "--no-repositories"],
     ));
 
     let shell = adm(root.path(), &["shell", "shell-cwd"]);
@@ -803,7 +887,9 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
 
 #[test]
 fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
-    let root = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let root = fixture_with_runner(Some(&runner_url));
     let upstreams = root.path().join("upstreams");
     let upstream = upstreams.join("owner/project.git");
     fs::create_dir_all(upstream.parent().unwrap()).unwrap();
@@ -869,8 +955,6 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
     let registration_path = root.path().join("registration.json");
     let server_path = registration_path.clone();
     let server = std::thread::spawn(move || {
@@ -924,8 +1008,10 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         "owner/project",
     ];
     let rewrite = format!("url.file://{}/.insteadOf", upstreams.display());
+    fs::write(root.path().join("git-rewrite"), &rewrite).unwrap();
     let command = |arguments: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_adm"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+        command
             .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -944,9 +1030,9 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
             .arg(root.path().join("kubectl"))
             .arg("--runner-url")
             .arg(&runner_url)
-            .args(arguments)
-            .output()
-            .unwrap()
+            .args(arguments);
+        configure_lifecycle(&mut command, root.path());
+        command.output().unwrap()
     };
     let typo_options = [
         "create",
@@ -1054,7 +1140,12 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         "interrupted clone should retain Git metadata without a checkout"
     );
 
-    let failed_registration = command(&options);
+    let mut retry_options = options.to_vec();
+    retry_options.extend([
+        "--operation-id",
+        workspace["creation_operation_id"].as_str().unwrap(),
+    ]);
+    let failed_registration = command(&retry_options);
     assert!(
         !failed_registration.status.success(),
         "runner failure must keep creation failed"
@@ -1081,7 +1172,7 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
     );
     fs::write(checkout.join("README.md"), "local workspace edit\n").unwrap();
 
-    let ready = command(&options);
+    let ready = command(&retry_options);
     assert!(
         ready.status.success(),
         "stdout={} stderr={}",
@@ -1145,13 +1236,7 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
     let other = adm_with_runner_env(
         root.path(),
         &runner_url,
-        &[
-            "create",
-            "repo-other",
-            "--no-agent",
-            "--repo",
-            "owner/project",
-        ],
+        &["create", "repo-other", "--repo", "owner/project"],
         (&rewrite, "https://github.com/"),
     );
     let other_guidance = String::from_utf8_lossy(&other.stderr);
@@ -1291,9 +1376,10 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "runner-error", "--no-agent", "--no-repositories"],
+        &["create", "runner-error", "--no-repositories"],
     ));
-    let database = rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
+    let database =
+        rusqlite::Connection::open(root.path().join("lifecycle-state/workspaces.sqlite")).unwrap();
     let mut spec: Value = serde_json::from_str(
         &database
             .query_row(
@@ -1368,10 +1454,7 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
 #[test]
 fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
     let root = fixture();
-    let created = adm(
-        root.path(),
-        &["create", "navigation", "--no-agent", "--no-repositories"],
-    );
+    let created = adm(root.path(), &["create", "navigation", "--no-repositories"]);
     assert!(created.status.success(), "{created:?}");
     let workspace: Value =
         serde_json::from_slice(&created.stdout).expect("create keeps its workspace JSON on stdout");
@@ -1382,16 +1465,17 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
     assert!(guidance.contains("adm shell navigation"), "{guidance}");
 
     let exec_root = root.path().join("workspace-fixture");
-    let populate = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut populate = Command::new(env!("CARGO_BIN_EXE_adm"));
+    populate
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("ADM_TEST_EXEC_ROOT", &exec_root)
         .arg("--state-dir")
         .arg(root.path().join("state"))
         .arg("--kubectl")
-        .arg(root.path().join("kubectl"))
-        .args(["exec", "navigation", "--", "touch", "existing-work"])
-        .output()
-        .unwrap();
+        .arg(root.path().join("kubectl"));
+    configure_lifecycle(&mut populate, root.path());
+    populate.args(["exec", "navigation", "--", "touch", "existing-work"]);
+    let populate = populate.output().unwrap();
     assert!(populate.status.success(), "{populate:?}");
     assert!(
         exec_root
@@ -1399,15 +1483,17 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
             .join("repos/existing-work")
             .exists()
     );
-    let shell = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut shell = Command::new(env!("CARGO_BIN_EXE_adm"));
+    shell
         .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("ADM_TEST_EXEC_ROOT", &exec_root)
         .arg("--state-dir")
         .arg(root.path().join("state"))
         .arg("--kubectl")
         .arg(root.path().join("kubectl"))
-        .args(["shell", "navigation"])
-        .output()
-        .unwrap();
+        .args(["shell", "navigation"]);
+    configure_lifecycle(&mut shell, root.path());
+    let shell = shell.output().unwrap();
     assert!(shell.status.success(), "{shell:?}");
     let shell_guidance = String::from_utf8_lossy(&shell.stderr);
     assert!(
@@ -1426,7 +1512,6 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
         &[
             "create",
             "catalog-navigation",
-            "--no-agent",
             "--catalog",
             catalog.to_str().unwrap(),
         ],
@@ -1482,48 +1567,42 @@ fn managed_shell_client_is_scoped_and_closes_without_aborting_the_agent() {
 fn public_cli_rejects_unsafe_names_before_touching_the_cluster() {
     let root = tempfile::tempdir().unwrap();
     for name in ["../escape", "UPPER", "a/b", "", "bad name"] {
-        let output = adm(
-            root.path(),
-            &["create", name, "--no-agent", "--no-repositories"],
-        );
+        let output = adm(root.path(), &["create", name, "--no-repositories"]);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("name"));
     }
 }
 
 #[test]
-fn agent_workspace_requires_an_explicit_model_before_provisioning() {
+fn agent_workspace_can_be_created_before_a_model_is_selected() {
     let root = fixture();
     let output = adm(root.path(), &["create", "needs-model"]);
-    assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("--model PROVIDER/MODEL_ID"),
+        output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let workspace: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(workspace["phase"], "ready");
+    assert_eq!(workspace["agent_enabled"], true);
+    assert!(workspace["model"].is_null());
     assert!(
         !root.path().join("state/workspaces.sqlite").exists(),
-        "invalid agent configuration must fail before local or cluster provisioning"
+        "the lifecycle service, not the management host, owns workspace state"
     );
 }
 
 #[test]
 fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() {
     let root = fixture();
-    let first = assert_ok(adm(
-        root.path(),
-        &["create", "demo", "--no-agent", "--no-repositories"],
-    ));
+    let first = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
     assert_eq!(first["name"], "demo");
     assert_eq!(first["phase"], "ready");
     assert_eq!(
         assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"],
         first["id"]
     );
-    let duplicate = adm(
-        root.path(),
-        &["create", "demo", "--no-agent", "--no-repositories"],
-    );
+    let duplicate = adm(root.path(), &["create", "demo", "--no-repositories"]);
     assert!(
         !duplicate.status.success(),
         "duplicate names must be explicit errors"
@@ -1544,24 +1623,15 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
         assert_ok(adm(root.path(), &["list", "--json", "--all"]))[0]["phase"],
         "deleted"
     );
-    let second = assert_ok(adm(
-        root.path(),
-        &["create", "demo", "--no-agent", "--no-repositories"],
-    ));
+    let second = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
     assert_ne!(first["id"], second["id"]);
 }
 
 #[test]
 fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let root = fixture();
-    let coding = assert_ok(adm(
-        root.path(),
-        &["create", "demo", "--no-agent", "--no-repositories"],
-    ));
-    let bot = assert_ok(adm(
-        root.path(),
-        &["create", "supervisor", "--role", "bot", "--no-agent"],
-    ));
+    let coding = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
+    let bot = assert_ok(adm(root.path(), &["create", "supervisor", "--role", "bot"]));
 
     let status = adm(root.path(), &["status", "demo"]);
     assert!(
@@ -1574,8 +1644,8 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         status.contains("NAME")
             && status.contains("ROLE")
             && status.contains("PHASE")
-            && status.contains("POD")
-            && status.contains("AGENT")
+            && status.contains("RUNTIME")
+            && status.contains("ACTIVITY")
             && status.contains("NODE"),
         "{status}"
     );
@@ -1583,7 +1653,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         status.contains("demo")
             && status.contains("coding")
             && status.contains("NotReady (Running)")
-            && status.contains("disabled")
+            && status.contains("unavailable")
             && status.contains("node-a")
             && status.contains("ContainersNotReady"),
         "{status}"
@@ -1625,7 +1695,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let full = assert_ok(adm(root.path(), &["status", "demo", "--json"]));
     assert_eq!(full["workspace"]["id"], coding["id"]);
     assert_eq!(full["cluster"]["pods"][0]["status"]["phase"], "Running");
-    assert_eq!(full["agent"]["status"], "disabled");
+    assert_eq!(full["agent"]["status"], "unavailable");
     assert_eq!(
         assert_ok(adm(root.path(), &["inspect", "demo", "--json"])),
         full
@@ -1662,7 +1732,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         bot_status.contains("bot")
             && bot_status.contains("n/a")
             && bot_status.contains("management host")
-            && bot_status.contains("disabled"),
+            && bot_status.contains("unavailable"),
         "{bot_status}"
     );
     assert_eq!(
@@ -1758,10 +1828,7 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     let root = fixture();
     fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
 
-    let first = adm(
-        root.path(),
-        &["create", "retry-me", "--no-agent", "--no-repositories"],
-    );
+    let first = adm(root.path(), &["create", "retry-me", "--no-repositories"]);
     assert!(
         !first.status.success(),
         "stdout={} stderr={}",
@@ -1782,7 +1849,6 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
         &[
             "create",
             "retry-me",
-            "--no-agent",
             "--no-repositories",
             "--operation-id",
             failed[0]["creation_operation_id"].as_str().unwrap(),
@@ -1800,10 +1866,7 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
 fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
     let root = fixture();
     fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
-    let first = adm(
-        root.path(),
-        &["create", "retry-safe", "--no-agent", "--no-repositories"],
-    );
+    let first = adm(root.path(), &["create", "retry-safe", "--no-repositories"]);
     assert!(!first.status.success());
     let failed = assert_ok(adm(root.path(), &["list", "--json"]));
     let namespace = failed[0]["namespace"].as_str().unwrap();
@@ -1817,7 +1880,6 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
         &[
             "create",
             "retry-safe",
-            "--no-agent",
             "--no-repositories",
             "--operation-id",
             failed[0]["creation_operation_id"].as_str().unwrap(),
@@ -1838,10 +1900,7 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
 #[test]
 fn destruction_refuses_a_namespace_whose_immutable_ownership_changed() {
     let root = fixture();
-    let workspace = assert_ok(adm(
-        root.path(),
-        &["create", "safe", "--no-agent", "--no-repositories"],
-    ));
+    let workspace = assert_ok(adm(root.path(), &["create", "safe", "--no-repositories"]));
     let cluster_path = root.path().join("cluster.json");
     let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
     cluster[workspace["namespace"].as_str().unwrap()]["metadata"]["labels"]["adm.dev/workspace-id"] =
@@ -1863,15 +1922,15 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-owned", "--no-agent", "--no-repositories"],
+        &["create", "herdr-owned", "--no-repositories"],
     ));
     let other_workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-other", "--no-agent", "--no-repositories"],
+        &["create", "herdr-other", "--no-repositories"],
     ));
     let stale_workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-stale", "--no-agent", "--no-repositories"],
+        &["create", "herdr-stale", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2038,7 +2097,7 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "journaled", "--no-agent", "--no-repositories"],
+        &["create", "journaled", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2085,7 +2144,7 @@ fn browser_refuses_to_enter_a_namespace_whose_immutable_ownership_changed() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "browser-safe", "--no-agent", "--no-repositories"],
+        &["create", "browser-safe", "--no-repositories"],
     ));
     let cluster_path = root.path().join("cluster.json");
     let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
@@ -2106,7 +2165,7 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-owned", "--no-agent", "--no-repositories"],
+        &["create", "herdr-owned", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2139,12 +2198,7 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &[
-            "create",
-            "offline-status",
-            "--no-agent",
-            "--no-repositories",
-        ],
+        &["create", "offline-status", "--no-repositories"],
     ));
     fs::write(root.path().join("fail-status"), "offline").unwrap();
 
@@ -2287,20 +2341,13 @@ fn repository_catalog_options_must_match_the_workspace_role() {
     let fixture = fixture();
     for (args, error) in [
         (
-            vec![
-                "create",
-                "bad-repo",
-                "--no-agent",
-                "--repo",
-                "owner//project",
-            ],
+            vec!["create", "bad-repo", "--repo", "owner//project"],
             "repository name",
         ),
         (
             vec![
                 "create",
                 "no-repos",
-                "--no-agent",
                 "--no-repositories",
                 "--repo",
                 "owner/project",
@@ -2311,7 +2358,6 @@ fn repository_catalog_options_must_match_the_workspace_role() {
             vec![
                 "create",
                 "bot-repo",
-                "--no-agent",
                 "--role",
                 "bot",
                 "--repo",
@@ -2323,7 +2369,6 @@ fn repository_catalog_options_must_match_the_workspace_role() {
             vec![
                 "create",
                 "catalog-repo",
-                "--no-agent",
                 "--catalog",
                 catalog.to_str().unwrap(),
                 "--repo",
@@ -2350,13 +2395,7 @@ fn repository_catalog_options_must_match_the_workspace_role() {
     );
     assert_ok(adm(
         fixture.path(),
-        &[
-            "manifest",
-            "punctuation",
-            "--no-agent",
-            "--repo",
-            "_owner/project.",
-        ],
+        &["manifest", "punctuation", "--repo", "_owner/project."],
     ));
 }
 
@@ -2387,7 +2426,7 @@ fn missing_replicated_storage_points_at_the_deploy_note() {
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, "#!/bin/sh\necho 'Error from server (NotFound): storageclasses.storage.k8s.io \"adm-replicated\" not found' >&2\nexit 1\n").unwrap();
     fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    let output = adm(root.path(), &["create", "demo", "--no-agent"]);
+    let output = adm(root.path(), &["create", "demo"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("deploy/storage.md"), "{stderr}");
@@ -2408,7 +2447,6 @@ fn credential_environment_flags_emit_only_workspace_scoped_secret_references() {
         &[
             "manifest",
             "credentials",
-            "--no-agent",
             "--credential-env",
             "API_KEY=provider-secret:token",
         ],

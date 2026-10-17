@@ -50,6 +50,14 @@ pub struct Cli {
     /// File containing the lifecycle service bearer token.
     #[arg(long, global = true, env = "ADM_LIFECYCLE_TOKEN_FILE")]
     pub lifecycle_token_file: Option<PathBuf>,
+    /// Workspace runtime HTTP port used for in-cluster status reads.
+    #[arg(
+        long,
+        global = true,
+        env = "ADM_RUNTIME_STATUS_PORT",
+        default_value_t = 7432
+    )]
+    pub runtime_status_port: u16,
     #[arg(skip)]
     pub lifecycle_fence: Option<lease::LeaseFence>,
     /// Runtime installation or development checkout containing the runner and terminal.
@@ -227,6 +235,7 @@ impl Cli {
             lifecycle_url: self.lifecycle_url.clone(),
             lifecycle_namespace: self.lifecycle_namespace.clone(),
             lifecycle_token_file: self.lifecycle_token_file.clone(),
+            runtime_status_port: self.runtime_status_port,
             lifecycle_fence: self.lifecycle_fence.clone(),
             project_dir: self.project_dir.clone(),
             command: Action::LifecycleServe {
@@ -479,6 +488,12 @@ impl Cli {
         }
         Ok(())
     }
+    pub fn check_lifecycle_fence_bounded(&self) -> Result<()> {
+        if let Some(fence) = &self.lifecycle_fence {
+            lease::verify_bounded(self, fence)?;
+        }
+        Ok(())
+    }
     pub fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         runner::request(&self.runner_url, method, path, body)
     }
@@ -489,7 +504,28 @@ pub fn print_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
-fn print_workspace_list(items: &[workspaces::Workspace]) {
+fn workspace_activity(workspace: &workspaces::Workspace) -> Value {
+    if workspace.phase == "deleted" {
+        json!({"status":"deleted"})
+    } else {
+        workspace
+            .runtime_status
+            .as_ref()
+            .and_then(|status| status.get("activity"))
+            .cloned()
+            .unwrap_or_else(
+                || json!({"status":"unavailable","error":"runtime status is unavailable"}),
+            )
+    }
+}
+
+fn workspace_list_value(workspace: &workspaces::Workspace) -> Result<Value> {
+    let mut value = serde_json::to_value(workspace)?;
+    value["activity"] = workspace_activity(workspace);
+    Ok(value)
+}
+
+fn print_workspace_list(items: &[Value]) {
     if items.is_empty() {
         println!("No workspaces");
         return;
@@ -499,20 +535,23 @@ fn print_workspace_list(items: &[workspaces::Workspace]) {
         .iter()
         .map(|workspace| {
             [
-                workspace.name.as_str(),
-                workspace.role.as_str(),
-                workspace.phase.as_str(),
-                if workspace.agent_enabled {
+                workspace["name"].as_str().unwrap_or("unknown"),
+                workspace["role"].as_str().unwrap_or("unknown"),
+                workspace["phase"].as_str().unwrap_or("unknown"),
+                if workspace["agent_enabled"] == true {
                     "enabled"
                 } else {
                     "disabled"
                 },
-                workspace.id.as_str(),
+                workspace["activity"]["status"]
+                    .as_str()
+                    .unwrap_or("unavailable"),
+                workspace["id"].as_str().unwrap_or("unknown"),
             ]
         })
         .collect::<Vec<_>>();
-    let headers = ["NAME", "ROLE", "PHASE", "AGENT", "ID"];
-    let widths = std::array::from_fn::<_, 5, _>(|column| {
+    let headers = ["NAME", "ROLE", "PHASE", "AGENT CONFIG", "ACTIVITY", "ID"];
+    let widths = std::array::from_fn::<_, 6, _>(|column| {
         rows.iter()
             .map(|row| row[column].len())
             .max()
@@ -522,7 +561,7 @@ fn print_workspace_list(items: &[workspaces::Workspace]) {
 
     for row in std::iter::once(headers.as_slice()).chain(rows.iter().map(|row| row.as_slice())) {
         println!(
-            "{:<name$}  {:<role$}  {:<phase$}  {:<agent$}  {}",
+            "{:<name$}  {:<role$}  {:<phase$}  {:<config$}  {:<activity$}  {id}",
             row[0],
             row[1],
             row[2],
@@ -531,8 +570,18 @@ fn print_workspace_list(items: &[workspaces::Workspace]) {
             name = widths[0],
             role = widths[1],
             phase = widths[2],
-            agent = widths[3],
+            config = widths[3],
+            activity = widths[4],
+            id = widths[5],
         );
+    }
+    for workspace in items {
+        if let Some(error) = workspace["activity"]["error"].as_str() {
+            println!(
+                "Agent {}: {error}",
+                workspace["name"].as_str().unwrap_or("unknown")
+            );
+        }
     }
 }
 
@@ -541,20 +590,20 @@ fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
     let cluster = if workspace.role == "coding" && workspace.phase != "deleted" {
         match workspaces::cluster_status(cli, &workspace) {
             Ok(value) => value,
-            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
+            Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
         }
     } else {
         Value::Null
     };
-    let agent = if workspace.agent_enabled && workspace.phase != "deleted" {
-        match cli.request("GET", &format!("/v1/workspaces/{}", workspace.id), None) {
-            Ok(value) => value,
-            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
-        }
+    let activity = workspace_activity(&workspace);
+    let agent = if workspace.phase == "deleted" {
+        json!({"status":"deleted"})
+    } else if workspace.agent_enabled {
+        json!({"status":activity["status"],"error":activity["error"],"selectedModel":workspace.runtime_status.as_ref().and_then(|status|status.get("selectedModel"))})
     } else {
         json!({"status":"disabled"})
     };
-    Ok(json!({"workspace":workspace,"cluster":cluster,"agent":agent}))
+    Ok(json!({"workspace":workspace,"cluster":cluster,"agent":agent,"activity":activity}))
 }
 
 fn pod_summary(status: &Value) -> (String, String) {
@@ -613,7 +662,9 @@ fn status_row(status: &Value) -> [String; 6] {
     } else {
         pod_summary(status)
     };
-    let agent = status["agent"]["status"].as_str().unwrap_or("unknown");
+    let agent = status["activity"]["status"]
+        .as_str()
+        .unwrap_or("unavailable");
     [
         workspace["name"].as_str().unwrap_or("unknown").into(),
         role.into(),
@@ -625,7 +676,7 @@ fn status_row(status: &Value) -> [String; 6] {
 }
 
 fn print_status(status: &Value) {
-    let headers = ["NAME", "ROLE", "PHASE", "POD", "AGENT", "NODE"];
+    let headers = ["NAME", "ROLE", "PHASE", "RUNTIME", "ACTIVITY", "NODE"];
     let row = status_row(status);
     let widths =
         std::array::from_fn::<_, 6, _>(|column| row[column].len().max(headers[column].len()));
@@ -816,7 +867,7 @@ fn run(cli: &Cli) -> Result<()> {
                 Some(&serde_json::to_value(
                     lifecycle::OperationRequest::Create {
                         operation_id,
-                        spec: lifecycle::CreateIntent::from_workspace(&workspace),
+                        spec: Box::new(lifecycle::CreateIntent::from_workspace(&workspace)),
                     },
                 )?),
             )?;
@@ -832,15 +883,22 @@ fn run(cli: &Cli) -> Result<()> {
                 "create",
                 &workspace.name,
             )?;
+            if workspace.role == "coding" {
+                eprintln!("{}", workspaces::navigation_guidance(&workspace, false));
+            }
             print_json(&workspace)
         }
         Action::Manifest(options) => print_json(&workspaces::manifest(&options.workspace()?)?),
         Action::List { all, json } => {
             let items = cli.workspaces(*all)?;
+            let reports = items
+                .iter()
+                .map(workspace_list_value)
+                .collect::<Result<Vec<_>>>()?;
             if *json {
-                print_json(&items)
+                print_json(&reports)
             } else {
-                print_workspace_list(&items);
+                print_workspace_list(&reports);
                 Ok(())
             }
         }
@@ -913,10 +971,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Action::Attach { name, diagnostics } => {
             let workspace = cli.active_workspace(name)?;
-            anyhow::ensure!(
-                workspace.agent_enabled,
-                "workspace has no agent; use adm shell"
-            );
+            anyhow::ensure!(workspace.agent_enabled, "workspace agent is unavailable");
             runner::ensure_started(cli)?;
             let mut command = cli.runtime_command("terminal")?;
             command.args(["--url", &cli.runner_url, "--workspace", &workspace.id]);
@@ -1058,7 +1113,7 @@ fn run(cli: &Cli) -> Result<()> {
             request_id,
         } => {
             let workspace = cli.active_workspace(name)?;
-            anyhow::ensure!(workspace.agent_enabled, "workspace has no agent");
+            anyhow::ensure!(workspace.agent_enabled, "workspace agent is unavailable");
             runner::ensure_started(cli)?;
             let body = match request_id {
                 Some(request_id) => json!({"message":message,"requestId":request_id}),
@@ -1190,7 +1245,7 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
             {
                 options.storage_class = storage_class;
             }
-            if options.model.is_none() && !options.no_agent {
+            if options.model.is_none() {
                 options.model = config.model;
             }
             if let Some(model) = &options.model {

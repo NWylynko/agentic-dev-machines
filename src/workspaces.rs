@@ -120,8 +120,6 @@ pub struct CreateOptions {
     #[arg(long, default_value = "2Gi")]
     pub memory: String,
     #[arg(long)]
-    pub no_agent: bool,
-    #[arg(long)]
     pub no_repositories: bool,
     #[arg(long)]
     pub catalog: Option<std::path::PathBuf>,
@@ -316,7 +314,7 @@ impl CreateOptions {
             storage_size: self.storage_size.clone(),
             cpu: self.cpu.clone(),
             memory: self.memory.clone(),
-            agent_enabled: !self.no_agent,
+            agent_enabled: true,
             allow_node_local_storage: self.allow_node_local_storage,
             repositories: self.catalog.is_some() && !self.no_repositories && self.role == "coding",
             catalog,
@@ -442,10 +440,38 @@ impl WorkspaceStore {
                 let spec = created_workspace
                     .as_ref()
                     .expect("create workspace was allocated");
+                let existing = transaction
+                    .query_row(
+                        "SELECT phase,spec FROM workspaces WHERE name=?1 AND phase!='deleted'",
+                        [&spec.name],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                if let Some((phase, encoded)) = existing {
+                    let previous: Workspace = serde_json::from_str(&encoded)?;
+                    if phase == "failed" || phase == "provisioning" {
+                        let requested_repository = match spec.repository.as_deref() {
+                            Some(repository) => format!("recreating with --repo {repository}"),
+                            None => "recreating without --repo".to_owned(),
+                        };
+                        ensure!(
+                            previous.repository == spec.repository,
+                            "workspace {} has an unfinished creation for repository {}; inspect its status/error and deliberately destroy it before {} (failed workspace files are retained)",
+                            spec.name,
+                            previous.repository.as_deref().unwrap_or("none"),
+                            requested_repository
+                        );
+                        anyhow::bail!(
+                            "workspace {} has an unfinished creation; retry the same operation ID or inspect its status and deliberately destroy it",
+                            spec.name
+                        );
+                    }
+                    anyhow::bail!("workspace name {} already exists", spec.name);
+                }
                 transaction.execute(
                     "INSERT INTO workspaces(id,name,phase,spec,fencing_token) VALUES(?1,?2,?3,?4,?5)",
                     params![spec.id, spec.name, spec.phase, serde_json::to_string(spec)?, self.fencing_token as i64],
-                ).with_context(|| format!("workspace name {} already exists", spec.name))?;
+                )?;
             }
             OperationRequest::Delete { workspace_id, .. } => {
                 let raw: String = transaction
@@ -642,31 +668,25 @@ impl WorkspaceStore {
         stage: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        let transaction = self.connection.unchecked_transaction()?;
-        ensure_store_fence(&transaction, self.fencing_token)?;
-        let accepted_at: i64 = transaction.query_row(
+        let accepted_at: i64 = self.connection.query_row(
             "SELECT accepted_at FROM lifecycle_operations WHERE operation_id=?1",
             [operation_id],
             |row| row.get(0),
         )?;
         let elapsed = (now() as i64 - accepted_at).max(0);
-        let changed = transaction.execute(
-            "UPDATE lifecycle_operations SET status=?2,stage=?3,last_error=?4,updated_at=?5,timings=?6,fencing_token=?7 WHERE operation_id=?1 AND fencing_token<=?7",
+        let changed = self.connection.execute(
+            "UPDATE lifecycle_operations SET status=?2,stage=?3,last_error=?4,updated_at=?5,timings=?6,fencing_token=?7 WHERE operation_id=?1 AND fencing_token<=?7 AND ?7>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
             params![operation_id, status, stage, error, now() as i64, serde_json::to_string(&json!({"elapsedSeconds":elapsed}))?, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "lifecycle operation fencing token is stale");
-        transaction.commit()?;
         Ok(())
     }
     pub fn record_workspace_error(&self, workspace_id: &str, error: &str) -> Result<()> {
-        let transaction = self.connection.unchecked_transaction()?;
-        ensure_store_fence(&transaction, self.fencing_token)?;
-        let changed = transaction.execute(
-            "UPDATE workspaces SET spec=json_set(spec,'$.last_error',?2),fencing_token=?3 WHERE id=?1 AND fencing_token<=?3",
+        let changed = self.connection.execute(
+            "UPDATE workspaces SET spec=json_set(spec,'$.last_error',?2),fencing_token=?3 WHERE id=?1 AND fencing_token<=?3 AND ?3>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
             params![workspace_id, error, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "workspace lifecycle fencing token is stale");
-        transaction.commit()?;
         Ok(())
     }
     pub fn bind_herdr_space(
@@ -705,11 +725,8 @@ impl WorkspaceStore {
         Ok(workspace)
     }
     pub fn insert(&self, w: &Workspace) -> Result<()> {
-        let transaction = self.connection.unchecked_transaction()?;
-        ensure_store_fence(&transaction, self.fencing_token)?;
-        transaction
-            .execute(
-                "INSERT INTO workspaces(id,name,phase,spec,fencing_token) VALUES(?1,?2,?3,?4,?5)",
+        let changed = self.connection.execute(
+                "INSERT INTO workspaces(id,name,phase,spec,fencing_token) SELECT ?1,?2,?3,?4,?5 WHERE ?5>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
                 params![
                     w.id,
                     w.name,
@@ -717,30 +734,23 @@ impl WorkspaceStore {
                     serde_json::to_string(w)?,
                     self.fencing_token as i64
                 ],
-            )
-            .with_context(|| format!("workspace name {} already exists", w.name))?;
-        transaction.commit()?;
+            ).with_context(|| format!("workspace name {} already exists or lifecycle fence is stale", w.name))?;
+        ensure!(changed == 1, "workspace lifecycle fencing token is stale");
         Ok(())
     }
     pub fn save(&self, w: &Workspace) -> Result<()> {
-        let transaction = self.connection.unchecked_transaction()?;
-        ensure_store_fence(&transaction, self.fencing_token)?;
-        let changed = transaction.execute(
-            "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?4 WHERE id=?1 AND fencing_token<=?4",
+        let changed = self.connection.execute(
+            "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?4 WHERE id=?1 AND fencing_token<=?4 AND ?4>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
             params![w.id, w.phase, serde_json::to_string(w)?, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "workspace lifecycle fencing token is stale");
-        transaction.commit()?;
         Ok(())
     }
     pub fn save_if_phase(&self, w: &Workspace, expected: &str) -> Result<bool> {
-        let transaction = self.connection.unchecked_transaction()?;
-        ensure_store_fence(&transaction, self.fencing_token)?;
-        let changed = transaction.execute(
-            "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?5 WHERE id=?1 AND phase=?4 AND fencing_token<=?5",
+        let changed = self.connection.execute(
+            "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?5 WHERE id=?1 AND phase=?4 AND fencing_token<=?5 AND ?5>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
             params![w.id, w.phase, serde_json::to_string(w)?, expected, self.fencing_token as i64],
         )? == 1;
-        transaction.commit()?;
         Ok(changed)
     }
     pub fn admit_if_provisioning(
@@ -802,12 +812,30 @@ impl WorkspaceStore {
 }
 
 pub fn kubectl(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
-    cli.check_lifecycle_fence()?;
+    kubectl_with_timeout(cli, args, input, false)
+}
+
+pub fn kubectl_bounded(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    kubectl_with_timeout(cli, args, input, true)
+}
+
+fn kubectl_with_timeout(
+    cli: &Cli,
+    args: &[&str],
+    input: Option<&[u8]>,
+    bounded: bool,
+) -> Result<Vec<u8>> {
+    if bounded {
+        cli.check_lifecycle_fence_bounded()?;
+    } else {
+        cli.check_lifecycle_fence()?;
+    }
     let mut command = cli.kubectl_command()?;
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args);
+    if bounded && !args.iter().any(|arg| arg.starts_with("--request-timeout=")) {
+        command.arg("--request-timeout=1s");
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if input.is_some() {
         command.stdin(Stdio::piped());
     } else {
@@ -837,7 +865,11 @@ pub fn kubectl(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
         display_args,
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    cli.check_lifecycle_fence()?;
+    if bounded {
+        cli.check_lifecycle_fence_bounded()?;
+    } else {
+        cli.check_lifecycle_fence()?;
+    }
     Ok(output.stdout)
 }
 
@@ -961,10 +993,6 @@ pub fn navigation_guidance(workspace: &Workspace, opening_shell: bool) -> String
 pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
     let allow_node_local_storage = requested.allow_node_local_storage;
     let started = Instant::now();
-    ensure!(
-        !requested.agent_enabled || requested.model.is_some(),
-        "agent workspaces require a selected model"
-    );
     let mut store = cli.store()?;
     let existing = store
         .list(false)?
@@ -1173,7 +1201,7 @@ mv -- "$staging" "$target"
         )
         .with_context(|| {
             format!(
-                "repository {repository} preparation failed; verify the OWNER/REPO spelling and whether the repository is public or accessible from the workspace. Retry the same repository after transient failures. Correcting it requires inspecting and deliberately destroying this failed workspace, then recreating with --repo OWNER/REPO"
+                "preparing repository {repository} failed; verify the OWNER/REPO spelling and whether the repository is public or accessible from the workspace. Retry the same repository after transient failures. Correcting it requires inspecting and deliberately destroying this failed workspace, then recreating with --repo OWNER/REPO"
             )
         })?;
         Ok(())
