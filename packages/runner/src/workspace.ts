@@ -11,6 +11,7 @@ import {
   Harness,
   ToolTask,
   type EntryRecord,
+  type ConversationId,
   type TaskInspection,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -195,7 +196,7 @@ export class Workspace {
     };
     const registry = createRegistry();
     const schedule = createScheduleExtension(
-      (message, requestId, loopId, generation, call) => {
+      (message, requestId, loopId, generation, conversationId, call) => {
         if (!openedWorkspace)
           throw new Error("Workspace is not ready to admit scheduled input");
         return openedWorkspace.admitLoopInput(
@@ -203,6 +204,7 @@ export class Workspace {
           requestId,
           loopId,
           generation,
+          conversationId,
           call,
         );
       },
@@ -634,12 +636,13 @@ export class Workspace {
     requestId: string,
     loopId: string,
     generation: number,
+    conversationId: ConversationId,
     call: Context,
   ) {
     return this.withAdmission(async () => {
       const schedule = await this.harness.snapshot(
         scheduleDocument,
-        this.conversation.id,
+        conversationId,
         call,
       );
       const loop = schedule?.loops.find((entry) => entry.id === loopId);
@@ -650,7 +653,9 @@ export class Workspace {
         loop.pendingRequestId !== requestId
       )
         return false;
-      await this.conversation.submit(
+      const owner = await this.harness.conversation(conversationId, call);
+      if (!owner) return false;
+      await owner.submit(
         { type: "input", content: message, requestId, whenBusy: "followUp" },
         call,
       );
