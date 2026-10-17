@@ -60,6 +60,8 @@ pub struct Cli {
     pub runtime_status_port: u16,
     #[arg(skip)]
     pub lifecycle_fence: Option<lease::LeaseFence>,
+    #[arg(skip)]
+    pub lifecycle_operation_id: Option<String>,
     /// Runtime installation or development checkout containing the runner and terminal.
     #[arg(long, global = true, env = "ADM_PROJECT_DIR", default_value_os_t = default_project_dir())]
     pub project_dir: PathBuf,
@@ -240,6 +242,7 @@ impl Cli {
             lifecycle_token_file: self.lifecycle_token_file.clone(),
             runtime_status_port: self.runtime_status_port,
             lifecycle_fence: self.lifecycle_fence.clone(),
+            lifecycle_operation_id: self.lifecycle_operation_id.clone(),
             project_dir: self.project_dir.clone(),
             command: Action::LifecycleServe {
                 host: "0.0.0.0".into(),
@@ -470,6 +473,20 @@ impl Cli {
                 eprintln!("adm: {action} {name}: {stage}");
                 last_stage = stage.to_owned();
             }
+            if matches!(receipt["status"].as_str(), Some("completed" | "failed")) {
+                if let Some(stages) = receipt["timings"]["stages"].as_object() {
+                    for (stage, timing) in stages {
+                        if let (Some(outcome), Some(elapsed)) =
+                            (timing["status"].as_str(), timing["elapsedSeconds"].as_f64())
+                        {
+                            eprintln!("adm: {action} {name}: {stage} {outcome} in {elapsed:.3}s");
+                        }
+                    }
+                }
+                if let Some(elapsed) = receipt["timings"]["elapsedSeconds"].as_f64() {
+                    eprintln!("adm: {action} {name}: {stage} in {elapsed:.3}s");
+                }
+            }
             match receipt["status"].as_str() {
                 Some("completed") => {
                     let value = self.request_lifecycle(
@@ -585,7 +602,7 @@ fn print_workspace_list(items: &[Value]) {
             phase = widths[2],
             config = widths[3],
             activity = widths[4],
-            id = widths[5],
+            id = row[5],
         );
     }
     for workspace in items {

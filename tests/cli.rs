@@ -439,6 +439,8 @@ elif args[:2] == ['get','pods']:
         items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':{'phase':'Running','containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:2] == ['get', 'storageclass']:
+    if (pathlib.Path(__file__).parent / 'missing-storage').exists():
+        print('Error from server (NotFound): storageclass adm-replicated not found',file=sys.stderr);sys.exit(1)
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
 elif args[0] == 'apply':
     doc=json.load(sys.stdin)
@@ -616,6 +618,19 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         wait_for_stage(&create_progress, "waiting for deployment readiness started");
     let during_create = assert_ok(adm(root.path(), &["list", "--json"]));
     assert_eq!(during_create[0]["phase"], "provisioning");
+    let receipt = |operation_id: &str| -> Value {
+        let url = fs::read_to_string(root.path().join("lifecycle-url")).unwrap();
+        let token = fs::read_to_string(root.path().join("lifecycle-token")).unwrap();
+        reqwest::blocking::Client::new()
+            .get(format!("{url}/v1/operations/{operation_id}"))
+            .bearer_auth(token.trim())
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
     fs::write(&readiness, "continue").unwrap();
     let created = create.wait_with_output().unwrap();
     let create_diagnostics = create_stderr.join().unwrap();
@@ -634,6 +649,16 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let ready: Value =
         serde_json::from_slice(&created.stdout).expect("create JSON remains on stdout");
     assert_eq!(ready["phase"], "ready");
+    let creation = receipt(ready["creation_operation_id"].as_str().unwrap());
+    assert_eq!(
+        creation["timings"]["stages"]["waiting for deployment readiness"]["status"],
+        "completed"
+    );
+    assert!(
+        creation["timings"]["stages"]["waiting for deployment readiness"]["elapsedSeconds"]
+            .as_f64()
+            .is_some()
+    );
     assert!(
         create_diagnostics.contains("waiting for deployment readiness completed in"),
         "{create_diagnostics}"
@@ -676,6 +701,11 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let deleted: Value =
         serde_json::from_slice(&deleted.stdout).expect("destroy JSON remains on stdout");
     assert_eq!(deleted["phase"], "deleted");
+    let deletion = receipt(deleted["deletion_operation_id"].as_str().unwrap());
+    assert_eq!(
+        deletion["timings"]["stages"]["waiting for namespace removal"]["status"],
+        "completed"
+    );
     assert!(
         destroy_diagnostics.contains("waiting for namespace removal completed in"),
         "{destroy_diagnostics}"
@@ -689,7 +719,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
 }
 
 #[test]
-fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
+fn list_uses_the_directory_and_keeps_full_records_with_json() {
     let root = fixture();
 
     let empty = adm(root.path(), &["list"]);
@@ -771,9 +801,9 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
         3
     );
 
-    // Listing is local even when both external dependencies are unavailable.
+    // The access CLI reads the lifecycle directory without invoking its own kubectl.
     let marker = root.path().join("kubectl-contacted");
-    let kubectl = root.path().join("kubectl");
+    let kubectl = root.path().join("access-kubectl");
     fs::write(
         &kubectl,
         format!(
@@ -783,15 +813,21 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
     )
     .unwrap();
     fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    let offline = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut offline = Command::new(env!("CARGO_BIN_EXE_adm"));
+    offline
         .arg("--state-dir")
         .arg(root.path().join("state"))
         .arg("--kubectl")
         .arg(&kubectl)
-        .args(["--runner-url", "http://127.0.0.1:1", "list", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(assert_ok(offline).as_array().unwrap().len(), 2);
+        .args(["--runner-url", "http://127.0.0.1:1", "list", "--json"]);
+    configure_lifecycle(&mut offline, root.path());
+    assert_eq!(
+        assert_ok(offline.output().unwrap())
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert!(!marker.exists(), "list must not contact kubectl");
 }
 
@@ -2430,20 +2466,20 @@ fn start_rejects_a_checkout_without_the_runner() {
 
 #[test]
 fn missing_replicated_storage_points_at_the_deploy_note() {
-    let root = tempfile::tempdir().unwrap();
-    let kubectl = root.path().join("kubectl");
-    fs::write(&kubectl, "#!/bin/sh\necho 'Error from server (NotFound): storageclasses.storage.k8s.io \"adm-replicated\" not found' >&2\nexit 1\n").unwrap();
-    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let root = fixture();
+    fs::write(root.path().join("missing-storage"), "missing").unwrap();
     let output = adm(root.path(), &["create", "demo"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("deploy/storage.md"), "{stderr}");
-    assert_eq!(
-        assert_ok(adm(root.path(), &["list", "--json"]))
-            .as_array()
+    let failed = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(failed.as_array().unwrap().len(), 1);
+    assert_eq!(failed[0]["phase"], "failed");
+    assert!(
+        failed[0]["last_error"]
+            .as_str()
             .unwrap()
-            .len(),
-        0
+            .contains("deploy/storage.md")
     );
 }
 
