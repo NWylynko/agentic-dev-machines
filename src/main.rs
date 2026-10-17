@@ -1,5 +1,7 @@
 mod diagnostics;
 mod herdr;
+mod lease;
+mod lifecycle;
 mod runner;
 mod setup;
 mod workspaces;
@@ -10,6 +12,8 @@ use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 use workspaces::{CreateOptions, WorkspaceStore};
 
@@ -29,6 +33,25 @@ pub struct Cli {
     pub kubeconfig: Option<String>,
     #[arg(long, global = true, default_value = "http://127.0.0.1:7432")]
     pub runner_url: String,
+    #[arg(
+        long,
+        global = true,
+        env = "ADM_LIFECYCLE_URL",
+        default_value = "http://127.0.0.1:7433"
+    )]
+    pub lifecycle_url: String,
+    #[arg(
+        long,
+        global = true,
+        env = "ADM_LIFECYCLE_NAMESPACE",
+        default_value = "adm-system"
+    )]
+    pub lifecycle_namespace: String,
+    /// File containing the lifecycle service bearer token.
+    #[arg(long, global = true, env = "ADM_LIFECYCLE_TOKEN_FILE")]
+    pub lifecycle_token_file: Option<PathBuf>,
+    #[arg(skip)]
+    pub lifecycle_fence: Option<lease::LeaseFence>,
     /// Runtime installation or development checkout containing the runner and terminal.
     #[arg(long, global = true, env = "ADM_PROJECT_DIR", default_value_os_t = default_project_dir())]
     pub project_dir: PathBuf,
@@ -65,7 +88,12 @@ pub enum Action {
         json: bool,
     },
     /// Permanently stop a workspace and remove its owned resources.
-    Destroy { name: String },
+    Destroy {
+        name: String,
+        /// Stable lifecycle operation UUID used to replay this deletion request.
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
     /// Rebind a Kubernetes coding workspace to the selected host connection without replacing it.
     Reconnect { name: String },
     /// Open the reconnectable Pi-style terminal client.
@@ -121,6 +149,13 @@ pub enum Action {
     Start,
     /// Run the durable runner in the foreground.
     Serve,
+    /// Run the in-cluster lifecycle owner.
+    LifecycleServe {
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        #[arg(long, default_value_t = 7433)]
+        port: u16,
+    },
     /// Stop only the runner process, preserving recoverable work.
     Stop,
     /// Check prerequisites, cluster access, storage, and runner health.
@@ -175,6 +210,23 @@ fn default_project_dir() -> PathBuf {
 }
 
 impl Cli {
+    fn clone_for_lifecycle(&self) -> Self {
+        Self {
+            state_dir: self.state_dir.clone(),
+            kubectl: self.kubectl.clone(),
+            kubeconfig: self.kubeconfig.clone(),
+            runner_url: self.runner_url.clone(),
+            lifecycle_url: self.lifecycle_url.clone(),
+            lifecycle_namespace: self.lifecycle_namespace.clone(),
+            lifecycle_token_file: self.lifecycle_token_file.clone(),
+            lifecycle_fence: self.lifecycle_fence.clone(),
+            project_dir: self.project_dir.clone(),
+            command: Action::LifecycleServe {
+                host: "0.0.0.0".into(),
+                port: 7433,
+            },
+        }
+    }
     fn help_command() -> clap::Command {
         const WORKSPACE: &[&str] = &[
             "create",
@@ -193,7 +245,16 @@ impl Cli {
             "browser",
         ];
         const MANAGEMENT: &[&str] = &[
-            "manifest", "setup", "login", "start", "serve", "stop", "doctor", "herdr", "help",
+            "manifest",
+            "setup",
+            "login",
+            "start",
+            "serve",
+            "lifecycle-serve",
+            "stop",
+            "doctor",
+            "herdr",
+            "help",
         ];
         let mut command = Self::command();
         command.build();
@@ -310,7 +371,104 @@ impl Cli {
         Ok(command)
     }
     pub fn store(&self) -> Result<WorkspaceStore> {
-        WorkspaceStore::open(&self.state_path())
+        WorkspaceStore::open_fenced(
+            &self.state_path(),
+            self.lifecycle_fence
+                .as_ref()
+                .map_or(0, lease::LeaseFence::epoch),
+        )
+    }
+    pub fn workspace(
+        &self,
+        name_or_id: &str,
+        include_deleted: bool,
+    ) -> Result<workspaces::Workspace> {
+        let items: Vec<workspaces::Workspace> =
+            serde_json::from_value(self.request_lifecycle("GET", "/v1/workspaces", None)?)?;
+        items
+            .into_iter()
+            .filter(|workspace| include_deleted || workspace.phase != "deleted")
+            .find(|workspace| workspace.name == name_or_id || workspace.id == name_or_id)
+            .with_context(|| format!("workspace not found: {name_or_id}"))
+    }
+    pub fn active_workspace(&self, name_or_id: &str) -> Result<workspaces::Workspace> {
+        let workspace = self.workspace(name_or_id, false)?;
+        anyhow::ensure!(
+            workspace.phase != "deleting",
+            "workspace {} has been deleted",
+            workspace.name
+        );
+        Ok(workspace)
+    }
+    pub fn workspaces(&self, include_deleted: bool) -> Result<Vec<workspaces::Workspace>> {
+        let items: Vec<workspaces::Workspace> =
+            serde_json::from_value(self.request_lifecycle("GET", "/v1/workspaces", None)?)?;
+        Ok(items
+            .into_iter()
+            .filter(|workspace| include_deleted || workspace.phase != "deleted")
+            .collect())
+    }
+    pub fn request_lifecycle(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        lifecycle::request(
+            &self.lifecycle_url,
+            self.lifecycle_token_file.as_deref(),
+            method,
+            path,
+            body,
+        )
+    }
+    pub fn wait_for_lifecycle_workspace(
+        &self,
+        operation_id: &str,
+        workspace_id: &str,
+        action: &str,
+        name: &str,
+    ) -> Result<workspaces::Workspace> {
+        let deadline = Instant::now() + Duration::from_secs(210);
+        let mut last_stage = String::new();
+        loop {
+            let receipt =
+                self.request_lifecycle("GET", &format!("/v1/operations/{operation_id}"), None)?;
+            let stage = receipt["stage"].as_str().unwrap_or("pending");
+            if stage != last_stage {
+                eprintln!("adm: {action} {name}: {stage}");
+                last_stage = stage.to_owned();
+            }
+            match receipt["status"].as_str() {
+                Some("completed") => {
+                    let value = self.request_lifecycle(
+                        "GET",
+                        &format!("/v1/workspaces/{workspace_id}"),
+                        None,
+                    )?;
+                    return serde_json::from_value(value)
+                        .context("decode completed lifecycle workspace");
+                }
+                Some("failed") => anyhow::bail!(
+                    "{}",
+                    receipt["lastError"]
+                        .as_str()
+                        .unwrap_or("lifecycle operation failed")
+                ),
+                _ => {}
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "{action} {name} is still pending; operation {operation_id} can be inspected or replayed"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    pub fn check_lifecycle_fence(&self) -> Result<()> {
+        if let Some(fence) = &self.lifecycle_fence {
+            lease::verify(self, fence)?;
+        }
+        Ok(())
     }
     pub fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         runner::request(&self.runner_url, method, path, body)
@@ -370,7 +528,7 @@ fn print_workspace_list(items: &[workspaces::Workspace]) {
 }
 
 fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
-    let workspace = cli.store()?.find(name)?;
+    let workspace = cli.workspace(name, true)?;
     let cluster = if workspace.role == "coding" && workspace.phase != "deleted" {
         match workspaces::cluster_status(cli, &workspace) {
             Ok(value) => value,
@@ -638,31 +796,38 @@ fn print_inspect(status: &Value) -> Result<()> {
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Action::Create(options) => {
-            let workspace = workspaces::create(cli, options)?;
-            if workspace.role == "bot" {
-                if workspace.agent_enabled {
-                    eprintln!(
-                        "adm: bot {} runs in the management-host runner at {}. Its namespace has no workspace Pod.",
-                        workspace.name, cli.runner_url
-                    );
-                    eprintln!(
-                        "adm: use `adm attach {}` for chat or `adm inspect {}` for diagnostics on the management host.",
-                        workspace.name, workspace.name
-                    );
-                } else {
-                    eprintln!(
-                        "adm: bot {} has no enabled agent. Its namespace has no workspace Pod.",
-                        workspace.name
-                    );
-                }
-            } else {
-                eprintln!("{}", workspaces::navigation_guidance(&workspace, false));
-            }
+            let workspace = options.workspace()?;
+            let operation_id = options
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let receipt = cli.request_lifecycle(
+                "POST",
+                "/v1/operations",
+                Some(&serde_json::to_value(
+                    lifecycle::OperationRequest::Create {
+                        operation_id,
+                        spec: lifecycle::CreateIntent::from_workspace(&workspace),
+                    },
+                )?),
+            )?;
+            let operation_id = receipt["operationId"]
+                .as_str()
+                .context("lifecycle receipt omitted operationId")?;
+            let workspace_id = receipt["workspaceId"]
+                .as_str()
+                .context("lifecycle receipt omitted workspaceId")?;
+            let workspace = cli.wait_for_lifecycle_workspace(
+                operation_id,
+                workspace_id,
+                "create",
+                &workspace.name,
+            )?;
             print_json(&workspace)
         }
         Action::Manifest(options) => print_json(&workspaces::manifest(&options.workspace()?)?),
         Action::List { all, json } => {
-            let items = cli.store()?.list(*all)?;
+            let items = cli.workspaces(*all)?;
             if *json {
                 print_json(&items)
             } else {
@@ -687,9 +852,40 @@ fn run(cli: &Cli) -> Result<()> {
                 print_inspect(&status)
             }
         }
-        Action::Destroy { name } => print_json(&workspaces::destroy(cli, name)?),
+        Action::Destroy { name, operation_id } => {
+            let workspace = cli.workspace(name, true)?;
+            if workspace.phase == "deleted" {
+                return print_json(&workspace);
+            }
+            let operation_id = operation_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let receipt = cli.request_lifecycle(
+                "POST",
+                "/v1/operations",
+                Some(&serde_json::to_value(
+                    lifecycle::OperationRequest::Delete {
+                        operation_id,
+                        workspace_id: workspace.id,
+                    },
+                )?),
+            )?;
+            let operation_id = receipt["operationId"]
+                .as_str()
+                .context("lifecycle receipt omitted operationId")?;
+            let workspace_id = receipt["workspaceId"]
+                .as_str()
+                .context("lifecycle receipt omitted workspaceId")?;
+            let workspace = cli.wait_for_lifecycle_workspace(
+                operation_id,
+                workspace_id,
+                "destroy",
+                &workspace.name,
+            )?;
+            print_json(&workspace)
+        }
         Action::Reconnect { name } => {
-            let workspace = cli.store()?.active(name)?;
+            let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(
                 workspace.role == "coding",
                 "only Kubernetes coding workspaces have a host connection to reconnect"
@@ -707,7 +903,7 @@ fn run(cli: &Cli) -> Result<()> {
             )?)
         }
         Action::Attach { name, diagnostics } => {
-            let workspace = cli.store()?.active(name)?;
+            let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(
                 workspace.agent_enabled,
                 "workspace has no agent; use adm shell"
@@ -727,7 +923,7 @@ fn run(cli: &Cli) -> Result<()> {
             manage,
             command,
         } => {
-            let workspace = cli.store()?.active(name)?;
+            let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(
                 workspace.role == "coding",
                 "bots have no development shell or repository access"
@@ -789,7 +985,7 @@ fn run(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Action::Exec { name, command } => {
-            let workspace = cli.store()?.active(name)?;
+            let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(
                 workspace.role == "coding",
                 "bots have no development shell or repository access"
@@ -822,7 +1018,7 @@ fn run(cli: &Cli) -> Result<()> {
                 bind == "127.0.0.1" || bind == "::1",
                 "port forwarding must bind to loopback; use SSH forwarding from your MacBook"
             );
-            let workspace = cli.store()?.active(name)?;
+            let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(workspace.role == "coding", "bots have no development ports");
             workspaces::verify_ownership(cli, &workspace)?;
             let local = local_port.unwrap_or(*port);
@@ -852,7 +1048,7 @@ fn run(cli: &Cli) -> Result<()> {
             message,
             request_id,
         } => {
-            let workspace = cli.store()?.active(name)?;
+            let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(workspace.agent_enabled, "workspace has no agent");
             runner::ensure_started(cli)?;
             let body = match request_id {
@@ -866,7 +1062,7 @@ fn run(cli: &Cli) -> Result<()> {
             )?)
         }
         Action::Abort { name, background } => {
-            let workspace = cli.store()?.active(name)?;
+            let workspace = cli.active_workspace(name)?;
             print_json(&cli.request(
                 "POST",
                 &format!("/v1/workspaces/{}/abort", workspace.id),
@@ -874,7 +1070,7 @@ fn run(cli: &Cli) -> Result<()> {
             )?)
         }
         Action::History { name, after } => {
-            let workspace = cli.store()?.find(name)?;
+            let workspace = cli.workspace(name, true)?;
             print_json(&cli.request(
                 "GET",
                 &format!("/v1/workspaces/{}/history?after={after}", workspace.id),
@@ -886,6 +1082,9 @@ fn run(cli: &Cli) -> Result<()> {
             print_json(&json!({"status":"ready","url":cli.runner_url}))
         }
         Action::Serve => runner::serve(cli),
+        Action::LifecycleServe { host, port } => {
+            lifecycle::serve(cli.clone_for_lifecycle(), host, *port)
+        }
         Action::Stop => runner::stop(cli),
         Action::Doctor {
             storage_class,
@@ -899,7 +1098,7 @@ fn run(cli: &Cli) -> Result<()> {
             url,
             screenshot,
         } => {
-            let workspace = cli.store()?.active(name)?;
+            let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(
                 workspace.role == "coding",
                 "bots have no coding browser environment"

@@ -10,6 +10,24 @@ use std::{
 };
 use tempfile::TempDir;
 
+struct TestFixture {
+    root: TempDir,
+    lifecycle: std::process::Child,
+}
+
+impl TestFixture {
+    fn path(&self) -> &Path {
+        self.root.path()
+    }
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        let _ = self.lifecycle.kill();
+        let _ = self.lifecycle.wait();
+    }
+}
+
 #[test]
 fn fresh_runner_start_returns_and_daemon_survives_cli_exit() {
     let root = tempfile::tempdir().unwrap();
@@ -63,15 +81,27 @@ fn prompt_omits_absent_request_id_and_preserves_explicit_id_deduplication() {
 }
 
 fn adm(root: &Path, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
         .arg(root.join("kubectl"))
-        .args(arguments)
-        .output()
-        .expect("run public CLI")
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    command.output().expect("run public CLI")
+}
+
+fn configure_lifecycle(command: &mut Command, root: &Path) {
+    let url = root.join("lifecycle-url");
+    if url.exists() {
+        command
+            .arg("--lifecycle-url")
+            .arg(fs::read_to_string(url).unwrap())
+            .arg("--lifecycle-token-file")
+            .arg(root.join("lifecycle-token"));
+    }
 }
 
 #[test]
@@ -155,7 +185,8 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
 }
 
 fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
@@ -163,7 +194,9 @@ fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output 
         .arg(root.join("kubectl"))
         .arg("--runner-url")
         .arg(runner_url)
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    command
         .output()
         .expect("run public CLI with runner fixture")
 }
@@ -174,7 +207,8 @@ fn adm_with_runner_env(
     arguments: &[&str],
     git_config: (&str, &str),
 ) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -188,7 +222,9 @@ fn adm_with_runner_env(
         .arg(root.join("kubectl"))
         .arg("--runner-url")
         .arg(runner_url)
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    command
         .output()
         .expect("run public CLI with Git and runner fixtures")
 }
@@ -235,13 +271,16 @@ fn serve_runner_status_fixture(listener: TcpListener) {
 }
 
 fn adm_with_input(root: &Path, arguments: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
         .arg(root.join("kubectl"))
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -266,7 +305,7 @@ fn assert_ok(output: Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON response")
 }
 
-fn fixture() -> TempDir {
+fn fixture() -> TestFixture {
     let root = tempfile::tempdir().unwrap();
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, r##"#!/usr/bin/env python3
@@ -282,7 +321,27 @@ def wait_for_release(stage):
     entered.write_text('waiting')
     while not release.exists():
         __import__('time').sleep(0.01)
-if args[:2] == ['get', 'storageclass']:
+if args[:2] == ['get','lease']:
+    lease=pathlib.Path(__file__).parent / 'lease.json'
+    if not lease.exists(): print('Error from server (NotFound): leases not found',file=sys.stderr);sys.exit(1)
+    print(lease.read_text())
+elif args[:2] == ['create','-f']:
+    lease=json.load(sys.stdin); lease['metadata']['resourceVersion']='1'
+    (pathlib.Path(__file__).parent / 'lease.json').write_text(json.dumps(lease));print(json.dumps(lease))
+elif args[:2] == ['replace','-f']:
+    lease=json.load(sys.stdin); leasepath=pathlib.Path(__file__).parent / 'lease.json'
+    current=json.loads(leasepath.read_text())
+    if lease['metadata'].get('resourceVersion') != current['metadata']['resourceVersion']:
+        print('Error from server (Conflict): resourceVersion conflict',file=sys.stderr);sys.exit(1)
+    lease['metadata']['resourceVersion']=str(int(current['metadata']['resourceVersion'])+1)
+    leasepath.write_text(json.dumps(lease));print(json.dumps(lease))
+elif args[:2] == ['get','pods']:
+    items=[]
+    for namespace, resource in state.items():
+        workspace_id=resource['metadata'].get('labels',{}).get('adm.dev/workspace-id')
+        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':{'phase':'Running','containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
+    print(json.dumps({'kind':'PodList','items':items}))
+elif args[:2] == ['get', 'storageclass']:
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
 elif args[0] == 'apply':
     doc=json.load(sys.stdin)
@@ -333,7 +392,42 @@ elif args and args[0] == 'exec':
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
 "##).unwrap();
     fs::set_permissions(kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    root
+    fs::write(
+        root.path().join("lifecycle-token"),
+        "fixture-lifecycle-token\n",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    fs::write(
+        root.path().join("lifecycle-url"),
+        format!("http://127.0.0.1:{port}"),
+    )
+    .unwrap();
+    let lifecycle = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("lifecycle-token"))
+        .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("start lifecycle service fixture");
+    let url = format!("http://127.0.0.1:{port}/health");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while reqwest::blocking::get(&url).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lifecycle fixture failed to start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    TestFixture { root, lifecycle }
 }
 
 #[test]
@@ -352,13 +446,16 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         mpsc::Receiver<String>,
         std::thread::JoinHandle<String>,
     ) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+        command
             .env("XDG_CONFIG_HOME", root.join("config"))
             .arg("--state-dir")
             .arg(root.join("state"))
             .arg("--kubectl")
             .arg(root.join("kubectl"))
-            .args(args)
+            .args(args);
+        configure_lifecycle(&mut command, root);
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1664,45 +1761,20 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
 
     let retried = assert_ok(adm(
         root.path(),
-        &["create", "retry-me", "--no-agent", "--no-repositories"],
+        &[
+            "create",
+            "retry-me",
+            "--no-agent",
+            "--no-repositories",
+            "--operation-id",
+            failed[0]["creation_operation_id"].as_str().unwrap(),
+        ],
     ));
     assert_eq!(retried["phase"], "ready");
     assert_eq!(retried["id"], original_id);
     assert_eq!(
         assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"],
         original_id
-    );
-}
-
-#[test]
-fn retrying_creation_cannot_change_the_workspace_sudo_choice() {
-    let root = fixture();
-    fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
-
-    let first = adm(
-        root.path(),
-        &[
-            "create",
-            "sudo-choice",
-            "--no-agent",
-            "--no-repositories",
-            "--allow-sudo",
-        ],
-    );
-    assert!(!first.status.success());
-    let saved = assert_ok(adm(root.path(), &["list", "--json"]));
-    assert_eq!(saved[0]["allow_sudo"], true);
-
-    let retry = adm(
-        root.path(),
-        &["create", "sudo-choice", "--no-agent", "--no-repositories"],
-    );
-    assert!(!retry.status.success());
-    assert!(String::from_utf8_lossy(&retry.stderr).contains("different options"));
-    assert_eq!(
-        assert_ok(adm(root.path(), &["list", "--json"]))[0]["allow_sudo"],
-        true,
-        "retry must not silently downgrade or rewrite the persisted security choice"
     );
 }
 
@@ -1724,7 +1796,14 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
 
     let retry = adm(
         root.path(),
-        &["create", "retry-safe", "--no-agent", "--no-repositories"],
+        &[
+            "create",
+            "retry-safe",
+            "--no-agent",
+            "--no-repositories",
+            "--operation-id",
+            failed[0]["creation_operation_id"].as_str().unwrap(),
+        ],
     );
     assert!(
         !retry.status.success(),
@@ -2077,7 +2156,7 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
 }
 
 #[test]
-fn manifest_exposes_only_a_deprivileged_development_container_and_isolated_storage() {
+fn manifest_exposes_the_workspace_security_profile_and_isolated_storage() {
     let root = tempfile::tempdir().unwrap();
     let manifest = assert_ok(adm(root.path(), &["manifest", "example"]));
     let items = manifest["items"].as_array().unwrap();
@@ -2094,8 +2173,13 @@ fn manifest_exposes_only_a_deprivileged_development_container_and_isolated_stora
         None,
         "Kubernetes must preserve the workspace image's tini entrypoint so it forwards termination signals"
     );
-    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], false);
+    assert_eq!(dev["securityContext"]["runAsUser"], 1000);
+    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
     assert_eq!(dev["securityContext"]["capabilities"]["drop"][0], "ALL");
+    assert_eq!(
+        dev["securityContext"]["capabilities"]["add"],
+        serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
+    );
     assert!(
         items
             .iter()
@@ -2105,140 +2189,6 @@ fn manifest_exposes_only_a_deprivileged_development_container_and_isolated_stora
     assert_eq!(deployment["spec"]["strategy"]["type"], "Recreate");
     assert!(pod["containers"].as_array().unwrap().len() == 1);
     assert_eq!(pod["initContainers"][0]["command"][1], "plain");
-}
-
-#[test]
-fn allow_sudo_is_an_explicit_coding_workspace_security_choice() {
-    let root = tempfile::tempdir().unwrap();
-    let normal = assert_ok(adm(root.path(), &["manifest", "normal"]));
-    let opted = adm(root.path(), &["manifest", "packages", "--allow-sudo"]);
-    assert!(
-        opted.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&opted.stdout),
-        String::from_utf8_lossy(&opted.stderr)
-    );
-    let opted: Value = serde_json::from_slice(&opted.stdout).unwrap();
-
-    let dev = |manifest: &Value| {
-        let deployment = manifest["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|item| item["kind"] == "Deployment")
-            .unwrap();
-        deployment["spec"]["template"]["spec"]["containers"][0].clone()
-    };
-    let normal_dev = dev(&normal);
-    assert_eq!(
-        normal_dev["securityContext"]["allowPrivilegeEscalation"],
-        false
-    );
-    assert_eq!(
-        normal_dev["securityContext"]["capabilities"]["drop"],
-        serde_json::json!(["ALL"])
-    );
-    assert_eq!(
-        normal_dev["securityContext"]["capabilities"]["add"],
-        Value::Null
-    );
-
-    let opted_dev = dev(&opted);
-    assert_eq!(opted_dev["securityContext"]["runAsUser"], 1000);
-    assert_eq!(
-        opted_dev["securityContext"]["allowPrivilegeEscalation"],
-        true
-    );
-    assert_eq!(
-        opted_dev["securityContext"]["capabilities"]["drop"],
-        serde_json::json!(["ALL"])
-    );
-    assert_eq!(
-        opted_dev["securityContext"]["capabilities"]["add"],
-        serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
-    );
-    assert_eq!(
-        opted_dev["securityContext"]["seccompProfile"]["type"],
-        "RuntimeDefault"
-    );
-    let pod = &opted["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["kind"] == "Deployment")
-        .unwrap()["spec"]["template"]["spec"];
-    assert_eq!(pod["automountServiceAccountToken"], false);
-    assert_eq!(pod["containers"].as_array().unwrap().len(), 1);
-
-    let bot = adm(
-        root.path(),
-        &["manifest", "bot", "--role", "bot", "--allow-sudo"],
-    );
-    assert!(!bot.status.success(), "bots must reject workspace sudo");
-    assert!(String::from_utf8_lossy(&bot.stderr).contains("coding workspaces"));
-
-    let persistent = fixture();
-    let created = assert_ok(adm(
-        persistent.path(),
-        &[
-            "create",
-            "package-workspace",
-            "--no-agent",
-            "--no-repositories",
-            "--allow-sudo",
-        ],
-    ));
-    assert_eq!(created["allow_sudo"], true);
-    let listed = assert_ok(adm(persistent.path(), &["list", "--json"]));
-    assert_eq!(listed[0]["allow_sudo"], true);
-}
-
-#[test]
-fn workspaces_created_before_allow_sudo_default_to_the_restricted_profile() {
-    let root = tempfile::tempdir().unwrap();
-    let state = root.path().join("state");
-    fs::create_dir_all(&state).unwrap();
-    let database = rusqlite::Connection::open(state.join("workspaces.sqlite")).unwrap();
-    database
-        .execute_batch(
-            "CREATE TABLE workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,phase TEXT NOT NULL,spec TEXT NOT NULL);",
-        )
-        .unwrap();
-    let old_spec = serde_json::json!({
-        "id":"legacy-workspace",
-        "name":"legacy-workspace",
-        "role":"coding",
-        "namespace":"adm-legacy-workspace",
-        "phase":"ready",
-        "image":"adm-dev:0.1.0",
-        "storage_class":"adm-replicated",
-        "storage_size":"4Gi",
-        "cpu":"2",
-        "memory":"2Gi",
-        "agent_enabled":false,
-        "repositories":false,
-        "catalog":{"repositories":[]},
-        "model":null,
-        "allowed_agents":[],
-        "herdr_space":null,
-        "created_at":1,
-        "last_error":null
-    });
-    database
-        .execute(
-            "INSERT INTO workspaces(id,name,phase,spec) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![
-                "legacy-workspace",
-                "legacy-workspace",
-                "ready",
-                old_spec.to_string()
-            ],
-        )
-        .unwrap();
-    drop(database);
-
-    let listed = assert_ok(adm(root.path(), &["list", "--json"]));
-    assert_eq!(listed[0]["allow_sudo"], false);
 }
 
 #[test]
@@ -2430,4 +2380,39 @@ fn missing_replicated_storage_points_at_the_deploy_note() {
             .len(),
         0
     );
+}
+
+#[test]
+fn credential_environment_flags_emit_only_workspace_scoped_secret_references() {
+    let root = tempfile::tempdir().unwrap();
+    let output = adm(
+        root.path(),
+        &[
+            "manifest",
+            "credentials",
+            "--no-agent",
+            "--credential-env",
+            "API_KEY=provider-secret:token",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dev = manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"]["containers"][0]
+        .clone();
+    assert_eq!(dev["env"][0]["name"], "API_KEY");
+    assert_eq!(
+        dev["env"][0]["valueFrom"]["secretKeyRef"],
+        serde_json::json!({"name":"provider-secret","key":"token"})
+    );
+    assert!(dev["env"][0].get("value").is_none());
 }

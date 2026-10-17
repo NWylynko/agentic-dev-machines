@@ -1,0 +1,204 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: adm-system
+  labels:
+    app.kubernetes.io/part-of: adm
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: adm-lifecycle
+  namespace: adm-system
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: adm-lifecycle
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "configmaps", "pods", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: adm-lifecycle
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: adm-lifecycle
+subjects:
+  - kind: ServiceAccount
+    name: adm-lifecycle
+    namespace: adm-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adm-lifecycle-kubeconfig
+  namespace: adm-system
+data:
+  config: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: in-cluster
+        cluster:
+          server: https://kubernetes.default.svc
+          certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    users:
+      - name: lifecycle
+        user:
+          tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    contexts:
+      - name: lifecycle
+        context:
+          cluster: in-cluster
+          user: lifecycle
+          namespace: adm-system
+    current-context: lifecycle
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: adm-lifecycle-state
+  namespace: adm-system
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: adm-replicated
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adm-lifecycle
+  namespace: adm-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: adm-lifecycle
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: adm-lifecycle
+    spec:
+      serviceAccountName: adm-lifecycle
+      securityContext:
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: prepare-state
+          image: ghcr.io/nwylynko/agentic-dev-machines:latest
+          command: ["chown", "-R", "1000:1000", "/var/lib/adm"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/adm
+      containers:
+        - name: lifecycle
+          image: ghcr.io/nwylynko/agentic-dev-machines:latest
+          imagePullPolicy: IfNotPresent
+          command: ["adm"]
+          args: ["--state-dir", "/var/lib/adm/lifecycle", "--lifecycle-token-file", "/var/run/adm-secret/token", "lifecycle-serve", "--host", "0.0.0.0", "--port", "7433"]
+          env:
+            - name: KUBECONFIG
+              value: /etc/adm/kubeconfig
+            - name: ADM_LIFECYCLE_IDENTITY_TOKEN_FILE
+              value: /var/run/adm-identity/token
+            - name: ADM_LIFECYCLE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: http
+              containerPort: 7433
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/adm
+            - name: kubeconfig
+              mountPath: /etc/adm
+              readOnly: true
+            - name: token
+              mountPath: /var/run/adm-secret
+              readOnly: true
+            - name: identity
+              mountPath: /var/run/adm-identity
+              readOnly: true
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: adm-lifecycle-state
+        - name: kubeconfig
+          configMap:
+            name: adm-lifecycle-kubeconfig
+        - name: token
+          secret:
+            secretName: adm-lifecycle-token
+            defaultMode: 0440
+        - name: identity
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: adm-lifecycle
+                  expirationSeconds: 3600
+                  path: token
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adm-lifecycle
+  namespace: adm-system
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: adm-lifecycle
+  ports:
+    - name: http
+      port: 7433
+      targetPort: http
