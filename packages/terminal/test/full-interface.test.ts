@@ -3,11 +3,150 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { WorkspaceTerminal } from "../src/terminal.ts";
+import { SettingsSelectorComponent } from "@earendil-works/pi-coding-agent";
 import {
   ProcessTerminal,
   stripTerminalSequences,
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
+
+test("Pi command aliases open their Durable-backed controls and hotkey help", async () => {
+  let stream: import("node:http").ServerResponse | undefined;
+  let activeConversationId = 9;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history")) {
+      response.end(
+        JSON.stringify({ events: [], nextAfter: 0, hasMore: false }),
+      );
+    } else if (url.pathname.endsWith("/models")) {
+      response.end(
+        JSON.stringify({
+          selected: { provider: "faux", id: "faux-1" },
+          providers: [],
+          models: [{ provider: "faux", id: "faux-1", reasoning: true }],
+        }),
+      );
+    } else if (url.pathname.endsWith("/settings")) {
+      response.end(JSON.stringify({ thinkingLevel: "off" }));
+    } else if (url.pathname.endsWith("/branches")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          branches: [{ conversationId: 9 }, { conversationId: 10 }],
+        }),
+      );
+    } else if (url.pathname.endsWith("/tree")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          events: [
+            {
+              seq: 1,
+              kind: "user",
+              timestamp: new Date().toISOString(),
+              data: {
+                message: {
+                  role: "user",
+                  content: [{ type: "text", text: "hello" }],
+                },
+              },
+            },
+          ],
+          nextAfter: 1,
+          hasMore: false,
+        }),
+      );
+    } else if (url.pathname.endsWith("/events")) {
+      stream = response;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else if (url.pathname.endsWith("/new")) {
+      activeConversationId = 10;
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          model: { provider: "faux", id: "faux-1" },
+        }),
+      );
+    } else if (request.method === "GET") {
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          role: "coding",
+          status: "idle",
+        }),
+      );
+    } else {
+      response.end(JSON.stringify({ status: "accepted" }));
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const ui = new TuiMainScreen(new ProcessTerminal());
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+    tui: ui,
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit("/thinking");
+    assert.ok(
+      (terminal as any).activeSelector,
+      "/thinking should open the Pi selector",
+    );
+    terminal.handleInput("\x1b");
+
+    await terminal.submit("/session");
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /Workspace session 9/,
+    );
+
+    await terminal.submit("/fork");
+    assert.ok(
+      (terminal as any).activeSelector,
+      "/fork should open the Durable tree selector",
+    );
+    terminal.handleInput("\x1b");
+
+    await terminal.submit("/hotkeys");
+    const rendered = stripTerminalSequences(terminal.render(100).join("\n"));
+    assert.match(rendered, /Ctrl\+O/);
+    assert.match(rendered, /Shift\+Tab/);
+
+    await terminal.submit("/settings");
+    const settingsWrapper = (terminal as any).activeSelector;
+    assert.ok(settingsWrapper.children[0] instanceof SettingsSelectorComponent);
+    const settingsText = stripTerminalSequences(
+      terminal.render(100).join("\n"),
+    );
+    assert.match(settingsText, /Auto-compact/);
+    terminal.handleInput("\r");
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /Auto-compact is not configurable through adm attach/,
+    );
+
+    await terminal.submit("/new");
+    assert.equal(activeConversationId, 10);
+    assert.equal((terminal as any).cursor, 0);
+    assert.equal((terminal as any).records.length, 0);
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /New workspace session 10/,
+    );
+  } finally {
+    terminal.close();
+    stream?.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 
 test("Pi compact and retry controls call the Durable workspace operations", async () => {
   const requests: { method: string; path: string; body: string }[] = [];

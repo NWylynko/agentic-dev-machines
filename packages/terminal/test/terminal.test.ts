@@ -941,6 +941,17 @@ test(
             /Echo: The runner continued after terminal detach/,
           );
 
+          firstOutput = "";
+          second.stdin.write("/session\r");
+          await waitForOutput(second, "Workspace session");
+          firstOutput = "";
+          second.stdin.write("/hotkeys\r");
+          await waitForOutput(second, "Keyboard shortcuts");
+          await waitForOutput(second, "Ctrl+O");
+          await waitForOutput(second, "Shift+Tab");
+          assert.match(stripTerminalSequences(firstOutput), /Ctrl\+O/);
+          assert.match(stripTerminalSequences(firstOutput), /Shift\+Tab/);
+
           const failedInput = await fetch(`${runnerUrl}${path}/input`, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -1022,6 +1033,22 @@ test(
             ["completed", "cancelled"],
           );
           assert.equal(afterControls.loops[0].status, "cancelled");
+
+          const priorConversationId = afterControls.conversationId;
+          firstOutput = "";
+          second.stdin.write("/new\r");
+          await waitForOutput(second, "New workspace session");
+          const newBranches = await fetch(`${runnerUrl}${path}/branches`);
+          const newNavigation = await newBranches.json();
+          assert.notEqual(
+            newNavigation.activeConversationId,
+            priorConversationId,
+          );
+          const newHistoryResponse = await fetch(
+            `${runnerUrl}${path}/history?limit=1000`,
+          );
+          const newHistory = await newHistoryResponse.json();
+          assert.deepEqual(newHistory.events, []);
 
           const detachedAgain = once(second, "exit");
           second.stdin.write("\x03");

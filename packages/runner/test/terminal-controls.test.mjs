@@ -363,11 +363,101 @@ test(
       initial.body.activeConversationId,
     );
     assert.equal(afterReset.body.branches.length, 2);
+    const previousSession = await runner.request(path);
+
+    const newSession = await runner.request(path + "/new", "POST", {});
+    assert.equal(newSession.status, 200);
+    assert.notEqual(
+      newSession.body.activeConversationId,
+      initial.body.activeConversationId,
+    );
+    const newBranches = await runner.request(path + "/branches");
+    assert.equal(
+      newBranches.body.activeConversationId,
+      newSession.body.activeConversationId,
+    );
+    assert.deepEqual(
+      (await runner.request(path)).body.tools,
+      previousSession.body.tools,
+    );
+    assert.equal(newBranches.body.branches.length, 3);
+    const newHistory = await runner.request(path + "/history?limit=100");
+    assert.deepEqual(newHistory.body.events, []);
+    const oldBranch = newBranches.body.branches.find(
+      (branch) => branch.conversationId === initial.body.activeConversationId,
+    );
+    const createdBranch = newBranches.body.branches.find(
+      (branch) =>
+        branch.conversationId === newSession.body.activeConversationId,
+    );
+    assert.ok(oldBranch);
+    assert.equal(
+      createdBranch.parentConversationId,
+      initial.body.activeConversationId,
+    );
+    assert.equal(createdBranch.forkEntryId, undefined);
+
+    await runner.stop();
+    runner = await runnerFor(directory);
+    const persistedNewSession = await runner.request(path + "/branches");
+    assert.equal(
+      persistedNewSession.body.activeConversationId,
+      newSession.body.activeConversationId,
+    );
+    assert.equal(persistedNewSession.body.branches.length, 3);
+    assert.deepEqual(
+      (await runner.request(path + "/history?limit=100")).body.events,
+      [],
+    );
+    const newSessionStatus = await runner.request(path);
+    assert.deepEqual(newSessionStatus.body.model, previousSession.body.model);
+    assert.deepEqual(newSessionStatus.body.tools, previousSession.body.tools);
+    const newSessionController = new AbortController();
+    const newSessionResponse = await fetch(
+      `${runner.url}${path}/events?after=0&conversationId=${newSession.body.activeConversationId}`,
+      { signal: newSessionController.signal },
+    );
+    const newSessionClient = observeEvents(newSessionResponse);
+    const newSessionTool = newSessionClient.waitFor(
+      (frame) => frame.type === "message" && frame.data.kind === "tool",
+    );
+    const newSessionAnswer = newSessionClient.waitFor(
+      (frame) =>
+        frame.type === "message" &&
+        frame.data.kind === "assistant" &&
+        frame.data.data.text.includes("Synthetic task complete."),
+    );
+    const newTurn = await runner.request(path + "/input", "POST", {
+      requestId: "new-session-turn",
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [{ tool: "bash", args: { command: "printf fresh-session" } }],
+          answer: "Synthetic task complete.",
+        }),
+    });
+    assert.equal(newTurn.status, 202);
+    const toolEvent = await newSessionTool;
+    assert.equal(toolEvent.data.data.name, "bash");
+    assert.equal(toolEvent.data.data.message.isError, false);
+    await newSessionAnswer;
+    newSessionController.abort();
+    await newSessionClient.done;
+    await runner.request(path + "/branch", "PUT", {
+      conversationId: initial.body.activeConversationId,
+    });
+    assert.ok(
+      (await runner.request(path + "/history?limit=100")).body.events.some(
+        (event) =>
+          event.kind === "user" &&
+          event.data.text === "Write one concise greeting",
+      ),
+    );
   },
 );
 
 test(
-  "a root-owned loop delivers to its Durable owner while a fork is selected across restart",
+  "a root-owned loop delivers to its Durable owner while a new session is selected across restart",
   { timeout: 20000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-terminal-loop-owner-"));
@@ -425,6 +515,19 @@ test(
       (await runner.request(path)).body.conversationId,
       fork.body.activeConversationId,
     );
+    const fresh = await runner.request(path + "/new", "POST", {});
+    assert.equal(fresh.status, 200);
+    assert.notEqual(fresh.body.activeConversationId, rootId);
+    assert.notEqual(
+      fresh.body.activeConversationId,
+      fork.body.activeConversationId,
+    );
+    await runner.stop();
+    runner = await runnerFor(directory);
+    assert.equal(
+      (await runner.request(path)).body.conversationId,
+      fresh.body.activeConversationId,
+    );
 
     await new Promise((resolve) => setTimeout(resolve, 3500));
     const selectRoot = await runner.request(path + "/branch", "PUT", {
@@ -449,12 +552,17 @@ test(
       "the originating conversation must complete the scheduled turn",
     );
     await runner.request(path + "/branch", "PUT", {
-      conversationId: fork.body.activeConversationId,
+      conversationId: fresh.body.activeConversationId,
     });
-    assert.deepEqual((await runner.request(path)).body.loops, []);
+    assert.equal(
+      (await runner.request(path)).body.conversationId,
+      fresh.body.activeConversationId,
+    );
     const childHistory = await runner.request(path + "/history?limit=100");
     assert.ok(
-      childHistory.body.events.every((event) => event.data.text !== loopPrompt),
+      childHistory.body.events.every(
+        (event) => event.data?.text !== loopPrompt,
+      ),
       "the scheduled prompt must never enter the selected child conversation",
     );
   },
@@ -590,6 +698,99 @@ test(
           event.data.text.includes("ADM bot onboarding:"),
       ).length,
       1,
+    );
+    const savedProfile = botStatus.body.profile;
+    const newBotSession = await runner.request(path + "/new", "POST", {});
+    assert.equal(newBotSession.status, 200);
+    assert.notEqual(
+      newBotSession.body.activeConversationId,
+      botStatus.body.conversationId,
+    );
+    botStatus = await runner.request(path);
+    assert.equal(
+      botStatus.body.conversationId,
+      newBotSession.body.activeConversationId,
+    );
+    assert.deepEqual(botStatus.body.profile, savedProfile);
+    assert.deepEqual(
+      (await runner.request(path + "/history?limit=100")).body.events,
+      [],
+    );
+
+    const publicController = new AbortController();
+    const diagnosticController = new AbortController();
+    const newPublicResponse = await fetch(
+      `${runner.url}${path}/events?after=0&conversationId=${newBotSession.body.activeConversationId}`,
+      { signal: publicController.signal },
+    );
+    const newDiagnosticResponse = await fetch(
+      `${runner.url}${path}/events?after=0&conversationId=${newBotSession.body.activeConversationId}&diagnostics=true`,
+      { signal: diagnosticController.signal },
+    );
+    const newPublicClient = observeEvents(newPublicResponse);
+    const newDiagnosticClient = observeEvents(newDiagnosticResponse);
+    const explicitMessage = newPublicClient.waitFor(
+      (frame) =>
+        frame.type === "message" &&
+        frame.data.kind === "message" &&
+        frame.data.data.text === "Explicit message survives a new session.",
+    );
+    const privateOutput = newDiagnosticClient.waitFor(
+      (frame) =>
+        frame.type === "message" &&
+        frame.data.kind === "assistant" &&
+        frame.data.data.text === "Private model output after new session.",
+    );
+    await runner.request(path + "/input", "POST", {
+      requestId: "new-bot-session-visibility",
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            {
+              tool: "sendMessage",
+              args: { text: "Explicit message survives a new session." },
+            },
+          ],
+          answer: "Private model output after new session.",
+        }),
+    });
+    await Promise.all([explicitMessage, privateOutput]);
+    assert.ok(
+      newPublicClient.frames.every(
+        (frame) =>
+          frame.type === "message" &&
+          !["assistant", "tool"].includes(frame.data.kind),
+      ),
+      "bot streams may publish explicit messages only",
+    );
+    assert.ok(
+      newDiagnosticClient.frames.some(
+        (frame) =>
+          frame.type === "message" &&
+          frame.data.kind === "assistant" &&
+          frame.data.data.text === "Private model output after new session.",
+      ),
+    );
+    publicController.abort();
+    diagnosticController.abort();
+    await Promise.all([newPublicClient.done, newDiagnosticClient.done]);
+
+    await runner.stop();
+    runner = await runnerFor(directory, { defaultModel: false });
+    botStatus = await runner.request(path);
+    assert.equal(
+      botStatus.body.conversationId,
+      newBotSession.body.activeConversationId,
+    );
+    assert.deepEqual(botStatus.body.profile, savedProfile);
+    assert.equal(
+      (await runner.request(path + "/history?limit=100")).body.events.filter(
+        (event) =>
+          event.kind === "user" &&
+          event.data.text.includes("ADM bot onboarding:"),
+      ).length,
+      0,
     );
   },
 );

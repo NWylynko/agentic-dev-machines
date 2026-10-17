@@ -24,6 +24,7 @@ import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { workspaceModels } from "./models.ts";
 import {
   activeWorkspaceConversation,
+  createWorkspaceConversation,
   forkWorkspaceBranch,
   initializeNavigation,
   selectWorkspaceBranch,
@@ -760,6 +761,52 @@ export class Workspace {
 
   async branches() {
     return workspaceBranches(this.harness);
+  }
+
+  async newSession() {
+    return this.withAdmission(async () => {
+      await this.assertIdleForNavigation();
+      const active = this.conversation;
+      const agent = await active.agent(context);
+      const botProfile =
+        this.config.role === "bot"
+          ? await this.harness.snapshot(BotProfileDocument, active.id, context)
+          : undefined;
+      const result = await createWorkspaceConversation(
+        this.harness,
+        Number(active.id),
+        {
+          ...(agent.model
+            ? {
+                model: {
+                  provider: agent.model.provider,
+                  modelId: agent.model.modelId,
+                },
+              }
+            : {}),
+          thinkingLevel: agent.thinkingLevel,
+        },
+        botProfile
+          ? async (tx, conversationId) => {
+              const profile = await tx.doc(BotProfileDocument, conversationId);
+              profile.state = botProfile.state;
+              profile.identity = botProfile.identity;
+              profile.purpose = botProfile.purpose;
+              profile.approvedToolGrants = botProfile.approvedToolGrants;
+            }
+          : undefined,
+      );
+      this.conversation = await activeWorkspaceConversation(this.harness);
+      const selected = (await this.conversation.agent(context)).model;
+      this.config = {
+        ...this.config,
+        model: selected
+          ? { provider: selected.provider, id: selected.modelId }
+          : undefined,
+      };
+      this.events.emit("branch");
+      return { ...result, model: this.config.model };
+    });
   }
 
   async selectBranch(conversationId: number) {

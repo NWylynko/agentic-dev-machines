@@ -24,8 +24,11 @@ import {
   ToolExecutionComponent,
   TreeSelectorComponent,
   UserMessageComponent,
+  SettingsSelectorComponent,
   initTheme,
   type ModelRuntime,
+  type SettingsCallbacks,
+  type SettingsConfig,
   type SessionTreeNode,
 } from "@earendil-works/pi-coding-agent";
 import type { Model, ModelsRefreshResult } from "@earendil-works/pi-ai";
@@ -299,7 +302,7 @@ export class WorkspaceTerminal extends Container {
       }
     }
     this.statusLine.setText(
-      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · Ctrl+O: tool details · Ctrl+T: thinking · Shift+Tab: cycle thinking · /model · /settings · /tree · /resume · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
+      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · Ctrl+O: tool details · Ctrl+T: thinking · Shift+Tab: cycle thinking · /model · /settings · /thinking · /session · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
     );
     this.options.onRender?.();
   }
@@ -695,7 +698,7 @@ export class WorkspaceTerminal extends Container {
     try {
       if (message === "/help") {
         this.status =
-          "/model · /settings · /tree · /resume · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /resume selects a durable workspace branch; /retry retries a safe failed provider turn.";
+          "/model · /settings · /thinking · /session · /resume · /new · /fork · /tree · /hotkeys · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /thinking changes the durable thinking level; /session shows the selected workspace conversation; /resume selects a durable branch; /new creates an empty durable conversation in this workspace; /fork opens the durable tree; /retry retries a safe failed provider turn.";
         clearInput();
         return;
       }
@@ -739,6 +742,29 @@ export class WorkspaceTerminal extends Container {
         clearInput();
         return;
       }
+      if (message === "/thinking") {
+        if (!this.connected)
+          throw new Error("Reconnect before changing settings");
+        this.openThinkingSelector();
+        clearInput();
+        return;
+      }
+      if (message === "/session") {
+        if (!this.connected)
+          throw new Error("Reconnect before viewing session information");
+        const navigation = await this.request("/branches");
+        if (
+          !Number.isSafeInteger(navigation.activeConversationId) ||
+          !Array.isArray(navigation.branches)
+        )
+          throw new Error(
+            "Runner returned invalid workspace session information",
+          );
+        const branches = navigation.branches;
+        this.status = `Workspace session ${clean(navigation.activeConversationId)} · ${branches.length} durable conversations`;
+        clearInput();
+        return;
+      }
       if (message === "/resume") {
         if (!this.connected)
           throw new Error("Reconnect before selecting a branch");
@@ -746,10 +772,42 @@ export class WorkspaceTerminal extends Container {
         clearInput();
         return;
       }
+      if (message === "/new") {
+        if (!this.connected)
+          throw new Error("Reconnect before creating a new session");
+        const result = await this.request("/new", {});
+        if (!Number.isSafeInteger(result.activeConversationId))
+          throw new Error("Runner returned an invalid new conversation ID");
+        this.records = [];
+        this.cursor = 0;
+        this.liveMessage = undefined;
+        this.liveTools.clear();
+        this.currentModel = result.model
+          ? `${result.model.provider}/${result.model.id}`
+          : "model unavailable";
+        clearInput();
+        await this.connect();
+        this.status = `Connected · New workspace session ${result.activeConversationId}`;
+        this.refresh();
+        return;
+      }
+      if (message === "/fork") {
+        if (!this.connected)
+          throw new Error("Reconnect before opening the tree");
+        await this.openTreeSelector();
+        clearInput();
+        return;
+      }
       if (message === "/tree") {
         if (!this.connected)
           throw new Error("Reconnect before opening the tree");
         await this.openTreeSelector();
+        clearInput();
+        return;
+      }
+      if (message === "/hotkeys") {
+        this.status =
+          "Keyboard shortcuts\nEnter: send or steer · Shift+Enter: new line · Ctrl+O: expand tool details · Ctrl+T: toggle thinking · Shift+Tab: cycle thinking · Esc: abort · Ctrl+R: reconnect · Ctrl+C: detach\nCommands: /model · /settings · /thinking · /session · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry";
         clearInput();
         return;
       }
@@ -913,28 +971,123 @@ export class WorkspaceTerminal extends Container {
   }
   private async openSettingsSelector() {
     initTheme("dark");
-    const selector = new SelectList(
-      [
-        { value: "thinking", label: `Thinking level · ${this.thinkingLevel}` },
-        {
-          value: "thinking-visibility",
-          label: `Thinking blocks · ${this.hideThinking ? "hidden" : "shown"}`,
-        },
-      ],
-      6,
-      selectorTheme,
+    const model = this.modelRuntime?.getModel(
+      this.modelRuntime.selected?.provider ?? "",
+      this.modelRuntime.selected?.id ?? "",
     );
-    selector.onSelect = (item) => {
-      this.closeSelector();
-      if (item.value === "thinking") this.openThinkingSelector();
-      else {
-        this.hideThinking = !this.hideThinking;
-        this.status = `Thinking blocks ${this.hideThinking ? "hidden" : "shown"} on this terminal`;
-        this.refresh();
-      }
+    const config: SettingsConfig = {
+      autoCompact: false,
+      defaultModel: model ? `${model.provider}/${model.id}` : "",
+      currentModel: model,
+      availableDefaultModels: model ? [model] : [],
+      showImages: false,
+      imageWidthCells: 80,
+      autoResizeImages: true,
+      blockImages: false,
+      enableSkillCommands: false,
+      steeringMode: "all",
+      followUpMode: "all",
+      transport: "auto",
+      httpIdleTimeoutMs: 300_000,
+      cacheWarmingMode: "off",
+      thinkingLevel: this.thinkingLevel as SettingsConfig["thinkingLevel"],
+      availableThinkingLevels: [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ],
+      modelThinkingLevels: {},
+      currentTheme: "dark",
+      terminalTheme: "dark",
+      availableThemes: ["dark"],
+      hideThinkingBlock: this.hideThinking,
+      mermaidRenderingMode: "final",
+      showCacheMissNotices: false,
+      collapseChangelog: false,
+      enableInstallTelemetry: false,
+      doubleEscapeAction: "none",
+      treeFilterMode: "default",
+      showHardwareCursor: false,
+      editorPaddingX: 0,
+      outputPad: 0,
+      autocompleteMaxVisible: 10,
+      quietStartup: false,
+      defaultProjectTrust: "ask",
+      clearOnShrink: false,
+      showTerminalProgress: true,
+      tuiMode: "regular",
+      fullscreenExitOutput: "transcript",
+      fullscreenScrollbar: "auto",
+      fullscreenCopyOnSelect: false,
+      fullscreenWheelScrollLines: "auto",
+      warnings: {},
     };
-    selector.onCancel = () => this.closeSelector();
-    this.showSelector(selector);
+    const unavailable = (setting: string) => {
+      this.status = `${setting} is not configurable through adm attach`;
+      this.closeSelector();
+    };
+    const callbacks: SettingsCallbacks = {
+      onAutoCompactChange: () => unavailable("Auto-compact"),
+      onShowImagesChange: () => unavailable("Image display"),
+      onImageWidthCellsChange: () => unavailable("Image width"),
+      onAutoResizeImagesChange: () => unavailable("Image resizing"),
+      onBlockImagesChange: () => unavailable("Image blocking"),
+      onEnableSkillCommandsChange: () => unavailable("Skill commands"),
+      onSteeringModeChange: () => unavailable("Steering mode"),
+      onFollowUpModeChange: () => unavailable("Follow-up mode"),
+      onTransportChange: () => unavailable("Provider transport"),
+      onHttpIdleTimeoutMsChange: () => unavailable("HTTP idle timeout"),
+      onCacheWarmingModeChange: () => unavailable("Cache warming"),
+      onModelThinkingLevelChange: (provider, modelId, level) => {
+        if (provider === model?.provider && modelId === model.id)
+          void this.chooseThinkingLevel(level);
+        else unavailable("Per-model thinking overrides");
+      },
+      onModelThinkingLevelRemove: () =>
+        unavailable("Per-model thinking overrides"),
+      onThemeChange: () => unavailable("Themes"),
+      onHideThinkingBlockChange: (hidden) => {
+        this.hideThinking = hidden;
+        for (const assistant of this.assistantViews)
+          assistant.setHideThinkingBlock(hidden);
+        this.status = `Thinking blocks ${hidden ? "hidden" : "shown"} on this terminal`;
+        this.refresh();
+      },
+      onMermaidRenderingModeChange: () => unavailable("Mermaid rendering"),
+      onShowCacheMissNoticesChange: () => unavailable("Cache notices"),
+      onCollapseChangelogChange: () => unavailable("Changelog display"),
+      onEnableInstallTelemetryChange: () => unavailable("Telemetry"),
+      onDoubleEscapeActionChange: () => unavailable("Double Escape action"),
+      onTreeFilterModeChange: () => unavailable("Tree filter"),
+      onShowHardwareCursorChange: () => unavailable("Hardware cursor"),
+      onEditorPaddingXChange: () => unavailable("Editor padding"),
+      onOutputPadChange: () => unavailable("Output padding"),
+      onAutocompleteMaxVisibleChange: () => unavailable("Autocomplete size"),
+      onQuietStartupChange: () => unavailable("Startup display"),
+      onDefaultProjectTrustChange: () => unavailable("Project trust"),
+      onClearOnShrinkChange: () => unavailable("Terminal clearing"),
+      onShowTerminalProgressChange: () => unavailable("Terminal progress"),
+      onTuiModeChange: () => unavailable("TUI mode"),
+      onFullscreenExitOutputChange: () => unavailable("Fullscreen output"),
+      onFullscreenScrollbarChange: () => unavailable("Fullscreen scrollbar"),
+      onFullscreenCopyOnSelectChange: () => unavailable("Fullscreen copy"),
+      onFullscreenWheelScrollLinesChange: () =>
+        unavailable("Fullscreen scrolling"),
+      onWarningsChange: () => unavailable("Warnings"),
+      onCancel: () => this.closeSelector(),
+    };
+    const selector = new SettingsSelectorComponent(config, callbacks);
+    const interactiveSelector = new Container() as Container & {
+      handleInput(data: string): void;
+    };
+    interactiveSelector.addChild(selector);
+    interactiveSelector.handleInput = (data) =>
+      selector.getSettingsList().handleInput(data);
+    this.showSelector(interactiveSelector);
   }
   private openThinkingSelector() {
     initTheme("dark");
