@@ -367,6 +367,100 @@ test(
 );
 
 test(
+  "a root-owned loop delivers to its Durable owner while a fork is selected across restart",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-terminal-loop-owner-"));
+    let runner = await runnerFor(directory);
+    t.after(() => runner.stop());
+    const path = "/v1/workspaces/loop-owner";
+    const registered = await runner.request(path, "PUT", {
+      id: "loop-owner",
+      name: "loop owner",
+      role: "coding",
+      environment: "local",
+      localRoot: directory,
+      model: { provider: "faux", id: "faux-1" },
+    });
+    assert.equal(registered.status, 200);
+    const rootId = registered.body.conversationId;
+    const seedController = new AbortController();
+    const seedResponse = await fetch(
+      `${runner.url}${path}/events?after=0&conversationId=${rootId}`,
+      { signal: seedController.signal },
+    );
+    const seedEvents = observeEvents(seedResponse);
+    const seedAnswer = seedEvents.waitFor(
+      (frame) =>
+        frame.type === "message" &&
+        frame.data.kind === "assistant" &&
+        frame.data.data.text.includes("Echo: Seed the root conversation"),
+    );
+    await runner.request(path + "/input", "POST", {
+      requestId: "loop-fork-seed",
+      message: "Seed the root conversation",
+    });
+    await seedAnswer;
+    seedController.abort();
+    await seedEvents.done;
+    const rootHistory = await runner.request(path + "/history?limit=100");
+    const seed = rootHistory.body.events.find((event) => event.kind === "user");
+    assert.ok(seed);
+    const loopPrompt = "Deliver this occurrence to the root owner";
+    const loop = await runner.request(path + "/loops", "POST", {
+      prompt: loopPrompt,
+      intervalMs: 60000,
+      nextAt: Date.now() + 1500,
+    });
+    assert.equal(loop.status, 200);
+    const fork = await runner.request(path + "/tree", "POST", {
+      entryId: seed.seq,
+    });
+    assert.equal(fork.status, 200);
+    assert.notEqual(fork.body.activeConversationId, rootId);
+
+    await runner.stop();
+    runner = await runnerFor(directory);
+    assert.equal(
+      (await runner.request(path)).body.conversationId,
+      fork.body.activeConversationId,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 3500));
+    const selectRoot = await runner.request(path + "/branch", "PUT", {
+      conversationId: rootId,
+    });
+    assert.equal(selectRoot.status, 200);
+    const rootStatus = await runner.request(path);
+    assert.ok(rootStatus.body.loops.some((entry) => entry.id === loop.body.id));
+    const delivered = await runner.request(path + "/history?limit=100");
+    assert.ok(
+      delivered.body.events.some(
+        (event) => event.kind === "user" && event.data.text === loopPrompt,
+      ),
+      "the scheduled prompt must reach its originating conversation after restart",
+    );
+    assert.ok(
+      delivered.body.events.some(
+        (event) =>
+          event.kind === "assistant" &&
+          event.data.text.includes(`Echo: ${loopPrompt}`),
+      ),
+      "the originating conversation must complete the scheduled turn",
+    );
+    await runner.request(path + "/branch", "PUT", {
+      conversationId: fork.body.activeConversationId,
+    });
+    assert.deepEqual((await runner.request(path)).body.loops, []);
+    const childHistory = await runner.request(path + "/history?limit=100");
+    assert.ok(
+      childHistory.body.events.every((event) => event.data.text !== loopPrompt),
+      "the scheduled prompt must never enter the selected child conversation",
+    );
+  },
+);
+
+test(
   "bot public SSE hides live model and tool output while diagnostics can inspect it",
   { timeout: 20000 },
   async (t) => {
