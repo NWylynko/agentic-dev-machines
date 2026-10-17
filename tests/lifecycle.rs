@@ -202,7 +202,7 @@ fn workspace_spec(name: &str) -> Value {
         "name":name,"role":"coding","image":"test-image","storage_class":"test-storage",
         "storage_size":"1Gi","cpu":"1","memory":"1Gi","agent_enabled":true,
         "repositories":false,"catalog":{"repositories":[]},"repository":null,
-        "cwd":"/repos","model":null,"allowed_agents":[],"mcp_servers":null,"herdr_space":null
+        "cwd":"/repos","model":null,"mcp_servers":null,"herdr_space":null
     })
 }
 
@@ -392,7 +392,7 @@ else:
         "name":"forged","role":"coding","image":"test-image","storage_class":"test-storage",
         "storage_size":"1Gi","cpu":"1","memory":"1Gi","agent_enabled":false,
         "allow_sudo":false,"allow_node_local_storage":false,"repositories":false,"catalog":{"repositories":[]},
-        "repository":null,"cwd":"/repos","model":null,"allowed_agents":[],"mcp_servers":null,
+        "repository":null,"cwd":"/repos","model":null,"mcp_servers":null,
         "herdr_space":null,"id":"foreign-id","namespace":"somebody-elses-namespace","phase":"ready"
     }});
     let forged_response = request_with_token(
@@ -1298,6 +1298,147 @@ else:
         .status(),
         200
     );
+    let runtime_directory = request_with_token(
+        &url,
+        "GET",
+        "/v1/runtime/workspaces",
+        None,
+        Some("bot-token"),
+    )
+    .unwrap();
+    assert_eq!(runtime_directory.status(), 200);
+    let runtime_directory: Value = runtime_directory.json().unwrap();
+    assert!(runtime_directory.as_array().is_some());
+    assert!(runtime_directory.as_array().unwrap().iter().any(|entry| {
+        entry["id"] == runtime_id
+            && entry["name"] == "runtime-test"
+            && entry["role"] == "coding"
+            && entry["namespace"].as_str().is_some()
+            && entry["runtime_status"]["podIP"].as_str().is_some()
+    }));
+    assert!(
+        runtime_directory
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["role"] == "coding")
+    );
+    for private_field in ["credential_env", "mcp_servers", "kubeconfig"] {
+        assert!(
+            runtime_directory
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.as_object().unwrap().contains_key(private_field))
+        );
+    }
+    let bot_create_id = "35fbadcf-82a1-49e1-8e8a-10cf8d5ae831";
+    let bot_create_spec = workspace_spec("bot-created");
+    let bot_create = json!({"operationId":bot_create_id,"kind":"create","spec":bot_create_spec});
+    let bot_create_receipt: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&bot_create),
+        Some("bot-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(bot_create_receipt["operationId"], bot_create_id);
+    let bot_operation_path = format!("/v1/runtime/operations/{bot_create_id}");
+    let observed =
+        request_with_token(&url, "GET", &bot_operation_path, None, Some("bot-token")).unwrap();
+    assert_eq!(observed.status(), 200);
+    let observed: Value = observed.json().unwrap();
+    assert_eq!(observed["workspaceId"], bot_create_receipt["workspaceId"]);
+    assert_eq!(observed["operationId"], bot_create_id);
+    assert_eq!(
+        request_with_token(
+            &url,
+            "GET",
+            &bot_operation_path,
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap()
+        .status(),
+        403,
+        "a coding Pod cannot read global lifecycle receipts"
+    );
+    let replay_create: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&bot_create),
+        Some("bot-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(
+        replay_create["operationId"],
+        bot_create_receipt["operationId"]
+    );
+    assert_eq!(
+        replay_create["workspaceId"],
+        bot_create_receipt["workspaceId"]
+    );
+    let mut invalid_bot_create = bot_create.clone();
+    invalid_bot_create["operationId"] = json!("4f39074a-609b-485e-8aec-b4d416b15f5c");
+    invalid_bot_create["spec"]["role"] = json!("bot");
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/operations",
+            Some(&invalid_bot_create),
+            Some("bot-token"),
+        )
+        .unwrap()
+        .status(),
+        403,
+        "the runtime endpoint rejects bot creation"
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/workspaces",
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap()
+        .status(),
+        403,
+        "coding agents cannot discover the global runtime directory"
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/workspaces",
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .status(),
+        403,
+        "the lifecycle bearer token is not a bot runtime identity"
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/operations",
+            Some(&bot_create),
+            Some("runtime-token"),
+        )
+        .unwrap()
+        .status(),
+        403,
+        "coding agents cannot admit global lifecycle operations"
+    );
     assert_eq!(
         request_with_token(
             &url,
@@ -1483,6 +1624,8 @@ else:
     });
     let busy_delete_id = "2c7edb0b-cf82-4563-8faa-7756ff8b4f61";
     let busy_delete = json!({"operationId":busy_delete_id,"kind":"delete","workspaceId":busy_receipt["workspaceId"]});
+    fs::remove_file(root.path().join("delete-release")).unwrap();
+    fs::remove_file(root.path().join("deleting-entered")).unwrap();
     fs::write(root.path().join("hold-delete"), "yes").unwrap();
     request_with_token(
         &url,
@@ -1504,6 +1647,17 @@ else:
         Some("synthetic-lifecycle-token"),
     )
     .unwrap();
+    let in_flight_bot_replay: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&queued_delete),
+        Some(&fresh_bot_token),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(in_flight_bot_replay["operationId"], queued_delete_id);
     let unavailable: Value = request_with_token(
         &url,
         "GET",
@@ -1545,6 +1699,30 @@ else:
             .filter(|receipt| receipt["status"] == "completed")
         });
     }
+    let completed_bot_replay: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&queued_delete),
+        Some(&fresh_bot_token),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(completed_bot_replay["operationId"], queued_delete_id);
+    assert_eq!(completed_bot_replay["status"], "completed");
+    let completed_status = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/runtime/operations/{queued_delete_id}"),
+        None,
+        Some(&fresh_bot_token),
+    )
+    .unwrap();
+    assert_eq!(completed_status.status(), 200);
+    let completed_status: Value = completed_status.json().unwrap();
+    assert_eq!(completed_status["status"], "completed");
+    assert_eq!(completed_status["workspaceId"], runtime_id);
     fs::remove_file(root.path().join("hold-delete")).unwrap();
     fs::remove_file(root.path().join("delete-release")).unwrap();
     fs::write(root.path().join("hold-apply"), "yes").unwrap();

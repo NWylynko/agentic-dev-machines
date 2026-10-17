@@ -414,7 +414,7 @@ mod forward_pipe_tests {
             "name":"pipe-test", "role":"coding", "namespace":"adm-pipe-test",
             "phase":"ready", "image":"adm-dev:test", "storage_class":"test",
             "storage_size":"1Gi", "cpu":"1", "memory":"1Gi", "agent_enabled":true,
-            "repositories":false, "catalog":{}, "model":null, "allowed_agents":[],
+            "repositories":false, "catalog":{}, "model":null,
             "created_at":1
         }))
         .unwrap();

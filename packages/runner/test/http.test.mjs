@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
+import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import {
@@ -14,7 +15,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { createServer } from "node:http";
 import { test } from "node:test";
 
 const main = new URL("../src/main.ts", import.meta.url);
@@ -25,6 +25,8 @@ async function startRunner(
   {
     useFaux = true,
     defaultModel = true,
+    port = 0,
+    host = "127.0.0.1",
     tokenFile,
     workspaceConfigFile,
     lifecycleUrl,
@@ -36,7 +38,9 @@ async function startRunner(
     [
       main.pathname,
       "--port",
-      "0",
+      String(port),
+      "--host",
+      host,
       "--state-dir",
       directory,
       ...(tokenFile ? ["--token-file", tokenFile] : []),
@@ -87,15 +91,212 @@ async function startRunner(
       }
       lines.close();
     },
-    async request(path, method = "GET", body, signal) {
+    async request(path, method = "GET", body, signal, token) {
       const response = await fetch(url + path, {
         method,
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
         ...(signal ? { signal } : {}),
       });
       return { status: response.status, body: await response.json() };
     },
+  };
+}
+
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = server.address().port;
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+
+async function startPodRunner(root, lifecycle, { id, name, role, host, podUid, port = 7432 }) {
+  const workspace = {
+    id,
+    name,
+    role,
+    phase: "ready",
+    namespace: `fixture-${id}`,
+    runtime_status: {
+      podIP: host,
+      ready: true,
+      activity: { status: "idle" },
+    },
+  };
+  const token = `token-${id}`;
+  const tokenFile = await lifecycle.addWorkspace(workspace, token);
+  const workspaceConfigFile = join(root, `${id}.json`);
+  await writeFile(
+    workspaceConfigFile,
+    JSON.stringify({
+      id,
+      name,
+      role,
+      environment: "pod",
+      ...(role === "coding" ? { localRoot: join(root, id, "repos") } : {}),
+      model: { provider: "faux", id: "faux-1" },
+    }),
+    { mode: 0o600 },
+  );
+  const runner = await startRunner(join(root, id), { ADM_RUNTIME_PORT: String(port) }, {
+    host,
+    port,
+    tokenFile,
+    workspaceConfigFile,
+    lifecycleUrl: lifecycle.url,
+    podUid,
+  });
+  return { runner, token, workspace };
+}
+
+async function startBotLifecycle(
+  directory,
+  workspaces,
+  { holdDirectory = false } = {},
+) {
+  await mkdir(directory, { recursive: true });
+  const tokenFile = join(directory, "projected-token");
+  await writeFile(tokenFile, "fixture-runtime-token\n", { mode: 0o600 });
+  const authorizations = [];
+  const operations = new Map();
+  const tokens = new Map([['fixture-runtime-token', 'fixture-source']]);
+  let signalDirectoryRequest;
+  let signalDirectoryAbort;
+  const directoryRequest = new Promise((resolve) => {
+    signalDirectoryRequest = resolve;
+  });
+  const directoryAbort = new Promise((resolve) => {
+    signalDirectoryAbort = resolve;
+  });
+  const server = createServer(async (request, response) => {
+    const headers = { "content-type": "application/json" };
+    const sourceId = tokens.get(
+      request.headers.authorization?.replace(/^Bearer /, ""),
+    );
+    if (!sourceId) {
+      response
+        .writeHead(403, headers)
+        .end(JSON.stringify({ error: { message: "forbidden" } }));
+      return;
+    }
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    const value = body ? JSON.parse(body) : {};
+    if (request.method === "GET" && request.url === "/v1/runtime/workspaces") {
+      if (holdDirectory) {
+        signalDirectoryRequest();
+        response.once("close", signalDirectoryAbort);
+        return;
+      }
+      response.writeHead(200, headers).end(JSON.stringify(workspaces.filter((workspace) => workspace.role === "coding" && workspace.phase !== "deleted" && workspace.phase !== "deleting")));
+      return;
+    }
+    const runtime = /^\/v1\/workspaces\/([^/]+)\/runtime\/(authorize|lease|lease\/renew|check)$/.exec(request.url ?? "");
+    if (request.method === "POST" && runtime) {
+      const id = decodeURIComponent(runtime[1]);
+      const action = runtime[2];
+      if (action === "authorize") {
+        const target = workspaces.find((workspace) => workspace.id === id);
+        const allowed = target && target.phase !== "deleted" && target.phase !== "deleting" && (sourceId === id || (target.role === "coding" && workspaces.some((workspace) => workspace.id === sourceId && workspace.role === "bot")));
+        authorizations.push({ id, action: value.action, sourceId });
+        response.writeHead(allowed ? 200 : 403, headers).end(JSON.stringify(allowed ? { allowed: true } : { error: { message: "not authorized" } }));
+        return;
+      }
+      const own = workspaces.find((workspace) => workspace.id === sourceId);
+      if (id !== sourceId || !own) {
+        response.writeHead(403, headers).end(JSON.stringify({ error: { message: "not authorized" } }));
+        return;
+      }
+      response.writeHead(200, headers).end(JSON.stringify({ workspaceId: id, holder: value.holder, fencingToken: 1, expiresAt: Date.now() + 60000 }));
+      return;
+    }
+    const authorize = /^\/v1\/workspaces\/([^/]+)\/runtime\/authorize$/.exec(
+      request.url ?? "",
+    );
+    if (request.method === "POST" && authorize) {
+      const id = decodeURIComponent(authorize[1]);
+      authorizations.push({ id, action: value.action });
+      const allowed = workspaces.some((workspace) => workspace.id === id);
+      response
+        .writeHead(allowed ? 200 : 403, headers)
+        .end(
+          JSON.stringify(
+            allowed
+              ? { allowed: true }
+              : { error: { message: "not authorized" } },
+          ),
+        );
+      return;
+    }
+    if (request.method === "POST" && request.url === "/v1/runtime/operations") {
+      const previous = operations.get(value.operationId);
+      if (
+        previous &&
+        JSON.stringify(previous.request) !== JSON.stringify(value)
+      ) {
+        response.writeHead(409, headers).end(
+          JSON.stringify({
+            error: {
+              message: "operationId was already used with a different request",
+            },
+          }),
+        );
+        return;
+      }
+      const receipt = previous?.receipt ?? {
+        operationId: value.operationId,
+        kind: value.kind,
+        status: "accepted",
+        workspaceId: value.workspaceId ?? `created-${value.operationId}`,
+      };
+      operations.set(value.operationId, { request: value, receipt });
+      response.writeHead(202, headers).end(JSON.stringify(receipt));
+      return;
+    }
+    const operationStatus = /^\/v1\/runtime\/operations\/([^/]+)$/.exec(request.url ?? "");
+    if (request.method === "GET" && operationStatus) {
+      const receipt = operations.get(decodeURIComponent(operationStatus[1]))?.receipt;
+      response.writeHead(receipt ? 200 : 404, headers).end(JSON.stringify(receipt ?? { error: { message: "not found" } }));
+      return;
+    }
+    response
+      .writeHead(404, headers)
+      .end(JSON.stringify({ error: { message: "not found" } }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    tokenFile,
+    addWorkspace(workspace, token) {
+      const tokenPath = join(directory, `${workspace.id}-token`);
+      return writeFile(tokenPath, `${token}\n`, { mode: 0o600 }).then(() => {
+        tokens.set(token, workspace.id);
+        const existing = workspaces.findIndex((item) => item.id === workspace.id);
+        if (existing < 0) workspaces.push(workspace);
+        else workspaces[existing] = workspace;
+        return tokenPath;
+      });
+    },
+    authorizations,
+    operations,
+    directoryRequest,
+    directoryAbort,
+    close: () =>
+      new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      ),
   };
 }
 
@@ -332,6 +533,7 @@ async function nextEvent(
   after = 0,
   diagnostics = false,
   timeoutMs = 0,
+  token,
 ) {
   const controller = new AbortController();
   const timeout = timeoutMs
@@ -339,7 +541,7 @@ async function nextEvent(
     : undefined;
   const response = await fetch(
     `${runner.url}/v1/workspaces/${id}/events?after=${after}&diagnostics=${diagnostics}`,
-    { signal: controller.signal },
+    { signal: controller.signal, headers: token ? { authorization: `Bearer ${token}` } : {} },
   );
   assert.equal(response.status, 200);
   let buffer = "";
@@ -1416,7 +1618,89 @@ process.stdin.on("data", (chunk) => {
 );
 
 test(
-  "a bot publishes only explicit messages, cannot use coding tools through Code Mode, and supervises only permitted agents",
+  "goal and loop request receipts survive retries and reject request ID reuse",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-schedule-receipts-"),
+    );
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const config = {
+      id: "receipt-coder",
+      name: "receipt coder",
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, "repo"),
+      model: { provider: "faux", id: "faux-1" },
+    };
+    assert.equal(
+      (await runner.request(`/v1/workspaces/${config.id}`, "PUT", config))
+        .status,
+      200,
+    );
+    async function receiptRequest(path, value) {
+      const response = await fetch(
+        `${runner.url}/v1/workspaces/${config.id}/${path}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(value),
+        },
+      );
+      const text = await response.text();
+      return {
+        status: response.status,
+        body: text ? JSON.parse(text) : undefined,
+      };
+    }
+    const goal = { description: "Ship the durable feature" };
+    const firstGoal = await receiptRequest("goals", {
+      requestId: "goal-create-1",
+      value: goal,
+    });
+    const replayGoal = await receiptRequest("goals", {
+      requestId: "goal-create-1",
+      value: goal,
+    });
+    assert.equal(firstGoal.status, 200, JSON.stringify(firstGoal));
+    assert.equal(replayGoal.status, 200, JSON.stringify(replayGoal));
+    assert.deepEqual(
+      replayGoal.body,
+      firstGoal.body,
+      `replay=${JSON.stringify(replayGoal)}`,
+    );
+    const reusedGoal = await receiptRequest("goals", {
+      requestId: "goal-create-1",
+      value: { description: "Different request" },
+    });
+    assert.equal(reusedGoal.status, 409);
+
+    const loop = {
+      prompt: "Review progress",
+      intervalMs: 60000,
+      nextAt: 2000000000000,
+    };
+    const firstLoop = await receiptRequest("loops", {
+      requestId: "loop-create-1",
+      value: loop,
+    });
+    const replayLoop = await receiptRequest("loops", {
+      requestId: "loop-create-1",
+      value: loop,
+    });
+    assert.equal(firstLoop.status, 200);
+    assert.deepEqual(replayLoop.body, firstLoop.body);
+    const reusedLoop = await receiptRequest("loops", {
+      requestId: "loop-create-1",
+      value: { ...loop, prompt: "Different request" },
+    });
+    assert.equal(reusedLoop.status, 409);
+  },
+);
+
+test(
+  "a bot publishes only explicit messages and cannot use coding tools through Code Mode",
   { timeout: 20000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-"));
@@ -1435,7 +1719,6 @@ test(
       name: "bot",
       role: "bot",
       environment: "local",
-      allowedAgents: ["allowed-coder"],
       model: { provider: "faux", id: "faux-1" },
     };
     assert.equal(
@@ -1488,44 +1771,6 @@ test(
       true,
     );
     assert.equal(codeResult.data.isError, true);
-    const supervise = {
-      calls: [
-        {
-          tool: "promptAgent",
-          args: {
-            agentId: coding.id,
-            message: "Please summarize your progress.",
-          },
-        },
-      ],
-      answer: "Private supervision result.",
-    };
-    await runner.request("/v1/workspaces/private-bot/input", "POST", {
-      message: "/faux " + JSON.stringify(supervise),
-      requestId: "supervision",
-    });
-    await nextEvent(
-      runner,
-      coding.id,
-      (event) =>
-        event.kind === "assistant" && event.data.text.includes("summarize"),
-    );
-    const forbidden = {
-      calls: [{ tool: "monitorAgent", args: { agentId: "unpermitted-coder" } }],
-      answer: "Private unauthorized result.",
-    };
-    await runner.request("/v1/workspaces/private-bot/input", "POST", {
-      message: "/faux " + JSON.stringify(forbidden),
-      requestId: "denied-target",
-    });
-    const forbiddenResult = await nextEvent(
-      runner,
-      bot.id,
-      (event) => event.kind === "tool" && event.data.name === "monitorAgent",
-      codeResult.seq,
-      true,
-    );
-    assert.equal(forbiddenResult.data.isError, true);
     const history = await runner.request(
       "/v1/workspaces/private-bot/history?limit=1000",
     );
@@ -1542,203 +1787,174 @@ test(
 );
 
 test(
-  "a bot discovers only its live coding grants across Code Mode, deletion, and restart",
-  { timeout: 30000 },
+  "a pod bot controls isolated coding runtimes, observes durable operations, and keeps broad discovery after restart",
+  { timeout: 45000 },
   async (t) => {
-    const directory = await mkdtemp(
-      join(tmpdir(), "adm-runner-agent-directory-"),
-    );
-    let runner = await startRunner(directory);
-    t.after(() => runner.stop());
-    const coder = (id, name) => ({
-      id,
-      name,
-      role: "coding",
-      environment: "local",
-      localRoot: join(directory, id),
-      model: { provider: "faux", id: "faux-1" },
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-agent-directory-"));
+    const workspaces = [];
+    const port = await freePort();
+    const lifecycle = await startBotLifecycle(join(directory, "management"), workspaces);
+    const botId = "directory-bot";
+    const botWorkspace = { id: botId, name: "bot", role: "bot", phase: "ready", namespace: "fixture-directory-bot" };
+    const botPod = await startPodRunner(directory, lifecycle, {
+      ...botWorkspace,
+      host: "127.0.0.1", port,
+      podUid: "11111111-1111-4111-8111-111111111111",
     });
-    const bot = {
-      id: "directory-bot",
-      name: "bot",
-      role: "bot",
-      environment: "local",
-      allowedAgents: ["granted-coder"],
-      model: { provider: "faux", id: "faux-1" },
+    const targets = new Map();
+    async function addTarget(id, name, host) {
+      const target = await startPodRunner(directory, lifecycle, {
+        id, name, role: "coding", host, port,
+        podUid: id === "alpha" ? "22222222-2222-4222-8222-222222222222" : "33333333-3333-4333-8333-333333333333",
+      });
+      targets.set(id, target);
+      return target;
+    }
+    await addTarget("alpha", "project-albatross", "127.0.0.2");
+    await addTarget("beta", "project-bee", "127.0.0.3");
+    const bot = botPod.runner;
+    const targetRunner = (id) => targets.get(id)?.runner;
+    t.after(async () => {
+      await Promise.all([bot.stop(), ...[...targets.values()].map(({ runner }) => runner.stop())]);
+      await lifecycle.close();
+    });
+    const authRequest = async (runner, token, path, method = "GET", body) => {
+      const response = await fetch(runner.url + path, {
+        method,
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() };
     };
-    for (const config of [
-      coder("granted-coder", "project-albatross"),
-      coder("ungranted-coder", "project-bee"),
-    ])
-      assert.equal(
-        (await runner.request(`/v1/workspaces/${config.id}`, "PUT", config))
-          .status,
-        200,
-      );
-    const registration = await runner.request(
-      `/v1/workspaces/${bot.id}`,
-      "PUT",
-      bot,
-    );
-    assert.equal(registration.status, 200);
-    assert.ok(registration.body.tools.includes("listAgents"));
-    assert.ok(registration.body.tools.includes("monitorAgent"));
-    assert.ok(registration.body.tools.includes("promptAgent"));
-
     let cursor = 0;
     async function call(tool, args, requestId, code = false) {
       const calls = code
-        ? [
-            {
-              tool: "codemode",
-              args: {
-                code: `return await tools.${tool}(${JSON.stringify(args)})`,
-              },
-            },
-          ]
+        ? [{ tool: "codemode", args: { code: `return await tools.${tool}(${JSON.stringify(args)})` } }]
         : [{ tool, args }];
-      await runner.request(`/v1/workspaces/${bot.id}/input`, "POST", {
-        message:
-          "/faux " +
-          JSON.stringify({ calls, answer: "Private directory result." }),
-        requestId,
+      const input = await authRequest(bot, botPod.token, `/v1/workspaces/${botId}/input`, "POST", {
+        message: "/faux " + JSON.stringify({ calls, answer: "Private lifecycle result." }), requestId,
       });
-      const event = await nextEvent(
-        runner,
-        bot.id,
-        (value) =>
-          value.kind === "tool" &&
-          value.data.name === (code ? "codemode" : tool),
-        cursor,
-        true,
-      );
+      assert.equal(input.status, 202);
+      const event = await nextEvent(bot, botId,
+        (value) => value.kind === "tool" && value.data.name === (code ? "codemode" : tool),
+        cursor, true, 0, botPod.token);
       cursor = event.seq;
       return event.data;
     }
-    function toolText(result) {
-      return result.text;
-    }
+    const listed = JSON.parse((await call("listAgents", {}, "list")).text);
+    assert.deepEqual(listed.agents.map(({ id, name }) => ({ id, name })), [
+      { id: "alpha", name: "project-albatross" }, { id: "beta", name: "project-bee" },
+    ]);
+    const codeMode = await call("listAgents", {}, "list-code", true);
+    assert.equal(codeMode.isError, false);
+    assert.match(codeMode.text, /project-bee/);
 
-    const listed = JSON.parse(toolText(await call("listAgents", {}, "list")));
-    assert.deepEqual(listed, {
-      agents: [
-        { id: "granted-coder", name: "project-albatross", status: "idle" },
-      ],
-      unavailable: [],
-      message: "",
+    const target = targetRunner("alpha");
+    const remoteInput = await authRequest(target, targets.get("alpha").token, "/v1/workspaces/alpha/input", "POST", {
+      message: "/faux " + JSON.stringify({ calls: [{ tool: "write", args: { path: join(directory, "tool.txt"), content: "done" } }], answer: "written" }),
+      requestId: "history-with-tool",
     });
-    const codeModeText = toolText(
-      await call("listAgents", {}, "list-codemode", true),
-    );
-    assert.match(codeModeText, /\"id\":\"granted-coder\"/);
-    assert.match(codeModeText, /\"name\":\"project-albatross\"/);
-    assert.doesNotMatch(codeModeText, /ungranted-coder|project-bee/);
+    assert.equal(remoteInput.status, 202);
+    await nextEvent(target, "alpha", (event) => event.kind === "tool" && event.data.name === "write", 0, true, 0, targets.get("alpha").token);
+    const monitored = JSON.parse((await call("monitorAgent", { agentId: "alpha", after: 0, limit: 2 }, "monitor")).text);
+    assert.equal(monitored.id, "alpha");
+    let historyEvents = monitored.history.events;
+    let nextAfter = monitored.history.nextAfter;
+    while (monitored.history.hasMore) {
+      const page = JSON.parse((await call("monitorAgent", { agentId: "alpha", after: nextAfter, limit: 100 }, `monitor-${nextAfter}`)).text).history;
+      historyEvents = [...historyEvents, ...page.events];
+      nextAfter = page.nextAfter;
+      if (!page.hasMore) break;
+    }
+    assert.ok(historyEvents.some((event) => event.kind === "tool" && event.data.name === "write"));
 
-    const monitored = JSON.parse(
-      toolText(
-        await call("monitorAgent", { agentId: listed.agents[0].id }, "monitor"),
-      ),
-    );
-    assert.equal(monitored.id, "granted-coder");
-    await call(
-      "promptAgent",
-      { agentId: listed.agents[0].id, message: "Report your status." },
-      "prompt",
-    );
-    await nextEvent(
-      runner,
-      "granted-coder",
-      (event) =>
-        event.kind === "assistant" &&
-        event.data.text.includes("Report your status."),
-    );
+    const prompt = JSON.parse((await call("promptAgent", { agentId: "alpha", message: "Report your status." }, "prompt")).text);
+    assert.equal(prompt.status, "admitted");
+    await nextEvent(target, "alpha", (event) => event.kind === "assistant" && event.data.text.includes("Report your status."), 0, true, 0, targets.get("alpha").token);
+    assert.equal(JSON.parse((await call("saveAgentGoal", { agentId: "alpha", goal: { description: "Ship it" } }, "goal")).text).description, "Ship it");
+    assert.equal(JSON.parse((await call("saveAgentLoop", { agentId: "beta", loop: { prompt: "Check progress", intervalMs: 60000, nextAt: 2000000000000 } }, "loop")).text).prompt, "Check progress");
+    assert.equal((await call("configureAgentModel", { agentId: "beta", provider: "faux", modelId: "faux-1" }, "model")).isError, false);
 
-    const ungranted = await call(
-      "monitorAgent",
-      { agentId: "ungranted-coder" },
-      "monitor-ungranted",
-    );
-    assert.equal(ungranted.isError, true);
-    const deniedCodeMode = await call(
-      "monitorAgent",
-      { agentId: "ungranted-coder" },
-      "monitor-ungranted-codemode",
-      true,
-    );
-    assert.equal(deniedCodeMode.isError, true);
+    const created = JSON.parse((await call("createAgent", {
+      name: "new-agent", image: "adm-dev:0.1.0", storageClass: "fast", storageSize: "10Gi", cpu: "2", memory: "4Gi", model: { provider: "faux", id: "faux-1" },
+    }, "create")).text);
+    assert.equal(created.status, "accepted");
+    const operation = JSON.parse((await call("monitorAgentOperation", { operationId: created.operationId }, "create-status")).text);
+    assert.equal(operation.operationId, created.operationId);
+    const destroyed = JSON.parse((await call("destroyAgent", { agentId: "beta" }, "destroy")).text);
+    assert.equal(destroyed.kind, "delete");
+    assert.equal(destroyed.workspaceId, "beta");
+    assert.equal(JSON.parse((await call("monitorAgentOperation", { operationId: destroyed.operationId }, "delete-status")).text).operationId, destroyed.operationId);
 
-    assert.equal(
-      (await runner.request("/v1/workspaces/granted-coder", "DELETE")).status,
-      200,
-    );
-    const afterDelete = JSON.parse(
-      toolText(await call("listAgents", {}, "list-deleted")),
-    );
-    assert.deepEqual(afterDelete.agents, []);
-    assert.deepEqual(afterDelete.unavailable, ["granted-coder"]);
-    assert.match(afterDelete.message, /unavailable/i);
+    await bot.stop();
+    const restarted = await startPodRunner(directory, lifecycle, { ...botWorkspace, host: "127.0.0.1", port, podUid: "11111111-1111-4111-8111-111111111111" });
+    t.after(() => restarted.runner.stop());
+    const persisted = await authRequest(restarted.runner, restarted.token, `/v1/workspaces/${botId}`);
+    assert.equal(persisted.status, 200);
+    const afterRestart = await authRequest(restarted.runner, restarted.token, `/v1/workspaces/${botId}/input`, "POST", {
+      message: "/faux " + JSON.stringify({ calls: [{ tool: "listAgents", args: {} }], answer: "Private." }), requestId: "restart-list",
+    });
+    assert.equal(afterRestart.status, 202);
+    const afterEvent = await nextEvent(restarted.runner, botId, (event) => event.kind === "tool" && event.data.name === "listAgents", 0, true, 0, restarted.token);
+    assert.match(afterEvent.data.text, /project-albatross/);
+  },
+);
 
-    assert.equal(
-      (
-        await runner.request(
-          "/v1/workspaces/replacement-coder",
-          "PUT",
-          coder("replacement-coder", "project-albatross"),
-        )
-      ).status,
-      200,
-    );
-    const afterReuse = JSON.parse(
-      toolText(await call("listAgents", {}, "list-reused-name")),
-    );
-    assert.deepEqual(afterReuse.agents, []);
-    assert.deepEqual(afterReuse.unavailable, ["granted-coder"]);
+test(
+  "aborting a bot turn cancels its in-flight lifecycle request",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-cancel-"));
+    const port = await freePort();
+    const lifecycle = await startBotLifecycle(join(directory, "management"), [], { holdDirectory: true });
+    const pod = await startPodRunner(directory, lifecycle, {
+      id: "cancel-bot", name: "bot", role: "bot", host: "127.0.0.1", port,
+      podUid: "11111111-1111-4111-8111-111111111111",
+    });
+    t.after(async () => { await pod.runner.stop(); await lifecycle.close(); });
+    const call = await pod.runner.request("/v1/workspaces/cancel-bot/input", "POST", {
+      message: `/faux ${JSON.stringify({ calls: [{ tool: "listAgents", args: {} }] })}`,
+      requestId: "cancel-management-request",
+    }, undefined, pod.token);
+    assert.equal(call.status, 202);
+    await lifecycle.directoryRequest;
+    assert.equal((await pod.runner.request("/v1/workspaces/cancel-bot/abort", "POST", {}, undefined, pod.token)).status, 200);
+    await lifecycle.directoryAbort;
+  },
+);
 
-    await runner.stop();
-    runner = await startRunner(directory);
-    const afterRestart = await runner.request(`/v1/workspaces/${bot.id}`);
-    assert.equal(afterRestart.status, 200);
-    const persisted = JSON.parse(
-      toolText(await call("listAgents", {}, "list-after-restart")),
-    );
-    assert.deepEqual(persisted.agents, []);
-    assert.deepEqual(persisted.unavailable, ["granted-coder"]);
-
-    const emptyBot = {
-      ...bot,
-      id: "empty-directory-bot",
-      allowedAgents: [],
-    };
-    assert.equal(
-      (await runner.request(`/v1/workspaces/${emptyBot.id}`, "PUT", emptyBot))
-        .status,
-      200,
-    );
-    const emptyRequest = await runner.request(
-      `/v1/workspaces/${emptyBot.id}/input`,
-      "POST",
-      {
-        message:
-          "/faux " +
-          JSON.stringify({
-            calls: [{ tool: "listAgents", args: {} }],
-            answer: "Private empty directory result.",
-          }),
-        requestId: "list-empty-grants",
-      },
-    );
-    assert.equal(emptyRequest.status, 202);
-    const emptyResult = await nextEvent(
-      runner,
-      emptyBot.id,
-      (event) => event.kind === "tool" && event.data.name === "listAgents",
-      0,
-      true,
-    );
-    const emptyListing = JSON.parse(toolText(emptyResult.data));
-    assert.deepEqual(emptyListing.agents, []);
-    assert.deepEqual(emptyListing.unavailable, []);
-    assert.match(emptyListing.message, /no coding agents are assigned/i);
+test(
+  "a pod bot discovers coding agents created later through direct tools and Code Mode",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-late-agent-"));
+    const port = await freePort();
+    const lifecycle = await startBotLifecycle(join(directory, "management"), []);
+    const bot = await startPodRunner(directory, lifecycle, {
+      id: "late-agent-bot", name: "bot", role: "bot", host: "127.0.0.1", port,
+      podUid: "11111111-1111-4111-8111-111111111111",
+    });
+    const target = await startPodRunner(directory, lifecycle, {
+      id: "created-after-bot", name: "new-project", role: "coding", host: "127.0.0.2", port,
+      podUid: "22222222-2222-4222-8222-222222222222",
+    });
+    t.after(async () => { await bot.runner.stop(); await target.runner.stop(); await lifecycle.close(); });
+    let cursor = 0;
+    async function call(tool, args, requestId, code = false) {
+      const calls = code ? [{ tool: "codemode", args: { code: `return await tools.${tool}(${JSON.stringify(args)})` } }] : [{ tool, args }];
+      assert.equal((await bot.runner.request("/v1/workspaces/late-agent-bot/input", "POST", {
+        message: "/faux " + JSON.stringify({ calls, answer: "Private lifecycle result." }), requestId,
+      }, undefined, bot.token)).status, 202);
+      const event = await nextEvent(bot.runner, "late-agent-bot", (value) => value.kind === "tool" && value.data.name === (code ? "codemode" : tool), cursor, true, 0, bot.token);
+      cursor = event.seq;
+      return event.data;
+    }
+    const direct = JSON.parse((await call("listAgents", {}, "late-list")).text);
+    assert.deepEqual(direct.agents, [{ id: "created-after-bot", name: "new-project", status: "idle", phase: "ready", ready: true }]);
+    const throughCodeMode = await call("listAgents", {}, "late-list-codemode", true);
+    assert.equal(throughCodeMode.isError, false);
+    assert.match(throughCodeMode.text, /created-after-bot/);
+    assert.equal((await target.runner.request("/v1/workspaces/created-after-bot", "GET", undefined, undefined, bot.token)).status, 200);
   },
 );
 

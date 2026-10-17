@@ -97,7 +97,7 @@ sudo apt-get update
 sudo apt-get install -y ripgrep
 ```
 
-The workspace and ordinary commands still run as UID 1000. The container gets the capabilities needed for sudo and apt; it does not grant host access or a service-account token. Bots use the same profile when TASK-22 provides their workspace Pods. Installed packages and other operating-system changes live in the replaceable container and disappear when Kubernetes replaces its Pod. Repository files, Git state, and agent history follow their separate persistence rules.
+The workspace and ordinary commands still run as UID 1000. The container gets the capabilities needed for sudo and apt; it does not grant host access. Each Pod receives only its own projected lifecycle identity. Installed packages and other operating-system changes live in the replaceable container and disappear when Kubernetes replaces its Pod. Repository files, Git state, and agent history follow their separate persistence rules.
 
 To seed the catalog without cloning repository contents:
 
@@ -148,11 +148,11 @@ Use names actually present in your catalog. The root and owner listings are read
 ## Bot workspaces
 
 ```sh
-adm create supervisor --role bot --model PROVIDER/MODEL_ID --allow-agent CODING_WORKSPACE_ID
+adm create supervisor --role bot --model PROVIDER/MODEL_ID
 adm attach supervisor
 ```
 
-Bots use the same isolated Pod and private persistent volume model as coding agents. They have no repository checkout, coding tools, or shell, including through Code Mode. They can manage only explicitly granted coding workspace IDs through the lifecycle service and publish chat text only with `sendMessage`.
+Bots execute their model and tools in their own workspace Pod. They can discover and control all live coding-agent workspaces through the authenticated lifecycle and runtime APIs, without repository, shell, or general cross-workspace access. `adm status supervisor` reports runtime readiness; `adm inspect supervisor` provides detailed diagnostics.
 
 New bot conversations start one durable setup turn. The bot asks for an identity and purpose and publishes the setup question through `sendMessage`; its saved profile appears in future model instructions and survives Pod replacement. Ordinary model output remains private in diagnostics.
 
@@ -176,7 +176,7 @@ adm create supervisor --role bot --model PROVIDER/MODEL_ID --mcp-config /etc/adm
 
 The config stores only the environment reference name, never its value. Only listed tools are registered for the bot and Code Mode. Read-only MCP tools may replay after recovery when the server marks them read-only; other calls are not replayed after interruption. Unsupported transports or malformed grants fail registration, while connection failures remain visible in status.
 
-Use immutable IDs from `adm list` for supervision grants. A bot can use `listAgents` to discover the names and status of its live permitted coding agents, then observe and prompt those targets. Deleted or missing grants are reported as unavailable and never transfer to a workspace that reuses the same name. The bot can also manage goals and loops and publish through `sendMessage`. It has no coding filesystem, shell, or development browser, including through Code Mode. `adm attach supervisor --diagnostics` explicitly opts in to seeing diagnostics.
+Bots discover all live coding agents with `listAgents` and address them by immutable workspace ID. They can inspect status and paginated history (including tool events), prompt, steer or follow up, resume or abort foreground/background work, manage goals and loops, change models, and admit create/delete operations. Operation IDs provide durable receipts; `monitorAgentOperation` reads completion and failure after admission. Every target call is authorized against the caller's current Pod identity and lease. A deleted target's receipt remains tied to its immutable ID if a name is reused. Bots have no coding filesystem, shell, or development browser, including through Code Mode. `adm attach supervisor --diagnostics` explicitly opts in to seeing diagnostics.
 
 `adm list` shows persisted workspace phase alongside live Pod readiness and agent activity. The lifecycle service makes one bounded Pod-directory request and performs bounded, deadline-limited per-Pod runtime status reads using a short-lived TokenRequest bound to that Pod's UID. A failed status read stays `unavailable` with its cause. `adm list --json` includes an `activity` object; add `--all` to include deleted workspaces. `adm status NAME` reports namespace, requested and selected model, resources, Pod readiness/node, activity, and available failure causes. `adm inspect NAME` provides the same labeled diagnostics, and JSON modes preserve the full payload. Deleted state takes precedence over any stale Pod/runtime report.
 
@@ -236,7 +236,7 @@ Run the watcher on the management host under the same user that runs Herdr, afte
 
 If you already have an ADM workspace, run `adm herdr bind NAME "$HERDR_WORKSPACE_ID"` from the management host instead of creating another one. To inspect ownership and cleanup, use `adm list --all` and `adm status NAME` from the management host. Removing the Herdr workspace is the explicit deletion action; closing a pane or disconnecting a terminal leaves the ADM workspace running.
 
-Deletion writes a durable tombstone before cancellation and runtime cleanup. Repeating it finishes interrupted cleanup, and recreating the same label gets a different ID. Old goals, loops, input, and supervision grants cannot attach to that new ID. Retained conversation history is passive; archive expiry is not implemented.
+Deletion writes a durable tombstone before cancellation and runtime cleanup. Repeating it finishes interrupted cleanup, and recreating the same label gets a different ID. Old goals, loops, input, and operation receipts remain bound to the deleted immutable ID and cannot attach to the replacement. Retained conversation history is passive; archive expiry is not implemented.
 
 ## Verification
 

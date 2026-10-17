@@ -20,6 +20,7 @@ import { timingSafeEqual } from "node:crypto";
 import { parseArgs } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Workspace } from "./workspace.ts";
+import { botAgentManagementFromEnvironment } from "./bot-management.ts";
 import { ApiError, workspaceIdPattern, type WorkspaceConfig } from "./types.ts";
 import { watchEvents } from "@earendil-works/pi-durable";
 import {
@@ -194,6 +195,11 @@ async function acquireOwner() {
 await acquireOwner();
 const registryPath = join(stateDirectory, "workspaces.json");
 const configs = new Map<string, WorkspaceConfig>();
+const botAgents = botAgentManagementFromEnvironment({
+  lifecycleUrl,
+  tokenFile: values["token-file"],
+  runtimePort: process.env.ADM_RUNTIME_PORT,
+});
 try {
   for (const config of JSON.parse(
     await readFile(registryPath, "utf8"),
@@ -365,17 +371,7 @@ async function openWorkspace(
     join(stateDirectory, "sessions", config.id),
     () => assertActive(config.id),
     values["auth-path"],
-    async (id) => {
-      await assertActive(id);
-      const workspace = workspaces.get(id);
-      if (!workspace || workspace.passive)
-        throw new ApiError(
-          404,
-          "WORKSPACE_NOT_FOUND",
-          "Unknown supervision target",
-        );
-      return workspace;
-    },
+    botAgents,
     passive,
     deferActivation,
     values.provider,
@@ -1088,14 +1084,28 @@ const server = createServer(async (request, response) => {
       const data = await body(request);
       return await serialized(async () => {
         await assertActive(id);
-        return json(response, 200, await workspace.saveGoal(data));
+        return json(
+          response,
+          200,
+          await workspace.saveGoal(
+            "value" in data ? data.value : data,
+            typeof data.requestId === "string" ? data.requestId : undefined,
+          ),
+        );
       });
     }
     if (request.method === "POST" && action === "loops") {
       const data = await body(request);
       return await serialized(async () => {
         await assertActive(id);
-        return json(response, 200, await workspace.saveLoop(data));
+        return json(
+          response,
+          200,
+          await workspace.saveLoop(
+            "value" in data ? data.value : data,
+            typeof data.requestId === "string" ? data.requestId : undefined,
+          ),
+        );
       });
     }
     if (request.method === "POST" && action === "input") {

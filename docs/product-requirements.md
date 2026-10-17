@@ -127,7 +127,7 @@ This diagram shows the proposed container implementation. Persisting the whole o
 | Repository filesystem        | Discover repositories, fetch contents on demand, and enforce private writable views and Git state                               |
 | Persistent storage           | Make selected workspace state recoverable on another node                                                                       |
 | Agent runner / backend       | Execute unattended with role-specific tools, persist history and goals, schedule work, and recover independently of attachments |
-| Bot control interface        | Expose permitted monitoring and prompting operations without development filesystem or shell access                             |
+| Bot control interface        | Expose authenticated discovery and lifecycle/runtime controls without development filesystem or shell access                    |
 | Terminal message adapter     | Deliver explicit bot messages to its Pi-style conversation in Herdr                                                             |
 | Preview access               | Route client connections to development sites and selected ports in the current runtime                                         |
 
@@ -196,7 +196,7 @@ GitHub repository at commit X
 
 Both workspaces see the same repository path, while edits remain independent. This applies equally to `main` and to any other branch name. Branch names, refs, indexes, local commits, and writable filesystem metadata are private to each workspace. Published upstream content can be shared; unpushed work must not become visible through a shared mutable cache.
 
-Isolation must be enforced by mounts and access permissions. A coding workspace must not be able to mount, inspect, modify, or attach to another workspace through filesystem access or management credentials. A bot's explicitly permitted monitoring/prompting interface is a separate capability; it must not grant direct repository access or general cross-workspace credentials. The implementation must satisfy this without relying on agents to follow instructions.
+Isolation must be enforced by mounts and access permissions. A coding workspace must not be able to mount, inspect, modify, or attach to another workspace through filesystem access or management credentials. A bot's broad lifecycle/runtime interface is a separate capability; it permits monitoring and control of live coding agents by immutable ID while denying direct repository access, shell access, and general cross-workspace credentials. Lifecycle APIs verify the bot's current Pod UID and runtime lease before granting those actions. The implementation must satisfy this without relying on agents to follow instructions.
 
 “Only store the differences” is a storage goal, not a promise of byte-level patches. The chosen filesystem may copy an entire changed file. Untracked files, dependencies, build outputs, metadata, and replicas also consume space. Shared data may be cached separately on different nodes.
 
@@ -252,9 +252,9 @@ Coding agents and bots can reuse durable execution infrastructure, but have diff
 | Role         | User interaction                                                                           | Tools and access                                                                                                       |
 | ------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
 | Coding agent | Normal visible Pi-style terminal interaction in Herdr                                      | Its own repositories and development tools; works unattended                                                           |
-| Bot          | Pi-style terminal conversation in Herdr; only `sendMessage` publishes AI-authored messages | No repository access or coding tools; can monitor and prompt permitted agents, use Code Mode, and maintain goals/loops |
+| Bot          | Pi-style terminal conversation in Herdr; only `sendMessage` publishes AI-authored messages | No repository access or coding tools; can discover and control all live coding-agent lifecycles, use Code Mode, and maintain goals/loops |
 
-The optional bot acts as a supervisor and general assistant with explicitly permitted monitoring, prompting, messaging, and goal/loop tools. This role does not select a particular model provider.
+The bot acts as a supervisor and general assistant with broad monitoring, prompting, lifecycle, messaging, and goal/loop tools. Runtime APIs enforce bot identity and coding-agent role while denying repository, shell, and general cross-workspace access. This role does not select a particular model provider.
 
 In bot mode, streaming tokens, ordinary responses, intermediate notes, and raw tool results are not automatically forwarded to the user. Finishing a model turn does not itself send a chat message. The agent must explicitly call `sendMessage` when it decides there is something to communicate.
 
@@ -262,7 +262,7 @@ The runner records message delivery state alongside the session so recovery can 
 
 The bot can use Code Mode to combine its permitted tools and process their results. Pi's [Code Mode](https://pi.dev/docs/latest/codemode) runs JavaScript in a sandbox without direct filesystem or network access, but can call the session's tools. Therefore the bot's tool registry must exclude repository, shell, Git, editing, and other coding tools, including tools hidden from the model but discoverable through Code Mode. Disabling their UI display is insufficient.
 
-Monitoring and prompting must use an explicit interface to permitted coding agents, not a mount or shell connection into their workspace. Observation and prompting should target stable agent identities. The exact bot-to-agent assignments and visibility of agent events remain to be designed.
+Monitoring and control use lifecycle-authorized runtime APIs, not a mount or shell connection into coding workspaces. Bots discover all live coding agents and target immutable workspace IDs; lifecycle checks the bot Pod identity and current runtime lease for each call. The interface includes status, full cursor-paginated history, steering/follow-up, resume/abort, goals/loops, model selection, and durable create/delete receipts. It grants no repository, shell, or general workspace access.
 
 ### Goals and recurring work
 
@@ -304,7 +304,7 @@ Build in small stages, proving each through real CLI, shell, and cluster behavio
 3. **Filesystem recovery:** edit files and create local commits, then drain the hosting node. Recover repository and Git state on another node. Separately simulate an unexpected failure and measure the interruption and loss window.
 4. **Lazy repositories and isolation:** expose a catalog and verify that unused repositories do not hydrate. Open the same repository on `main` in two spaces; edits, branch changes, and local commits must stay private, and attempts to access the other space's files must fail. Measure actual disk use.
 5. **Unattended agent recovery:** disconnect every client while a real agent works, replace its runtime, and demonstrate automatic recovery of its conversation and pending work without blindly repeating a partially completed action.
-6. **Bot role:** verify that normal model output produces no terminal chat delivery, `sendMessage` delivers an explicit message, and a self-created goal and loop survive replacement. Verify permitted monitoring/prompting works while direct and Code Mode access to coding tools and repositories is unavailable. Remove the owning space and verify that queued or future work cannot recreate it or a deliberately removed target.
+6. **Bot role:** verify that normal model output produces no terminal chat delivery, `sendMessage` delivers an explicit message, and goals/loops survive replacement. Verify broad lifecycle/runtime controls and durable operation receipts work through direct tools and Code Mode, while coding tools and repository/shell access remain unavailable. Remove the owning space and verify queued work cannot recreate it or a deliberately removed target.
 7. **Browser and preview access:** automate a real browser against a workspace's development site and open its exposed site/port from a client laptop. Verify routing after replacement and cleanup on removal.
 8. **Custom image:** bake in the tools that the proven workflows need. Allow image and resource configuration for the management box and development workspaces independently.
 

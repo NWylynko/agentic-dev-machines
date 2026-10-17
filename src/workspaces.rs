@@ -93,7 +93,6 @@ pub struct Workspace {
     pub model: Option<Value>,
     #[serde(default)]
     pub credential_env: Vec<CredentialEnvRef>,
-    pub allowed_agents: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Option<Value>,
     pub herdr_space: Option<String>,
@@ -151,8 +150,6 @@ pub struct CreateOptions {
     pub allow_node_local_storage: bool,
     #[arg(long)]
     pub herdr_space: Option<String>,
-    #[arg(long)]
-    pub allow_agent: Vec<String>,
     /// JSON file containing host-configured stdio MCP servers and exact tool grants.
     #[arg(long)]
     pub mcp_config: Option<std::path::PathBuf>,
@@ -338,7 +335,6 @@ impl CreateOptions {
             cwd,
             model,
             credential_env,
-            allowed_agents: self.allow_agent.clone(),
             mcp_servers,
             herdr_space: self.herdr_space.clone(),
             created_at: now(),
@@ -996,7 +992,6 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         "role":w.role,
         "environment":"pod",
         "model":w.model,
-        "allowedAgents":w.allowed_agents,
         "mcpServers":w.mcp_servers,
     });
     if workspace_config["mcpServers"].is_null() {
@@ -1425,7 +1420,6 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.cwd == requested.cwd
         && existing.model == requested.model
         && existing.credential_env == requested.credential_env
-        && existing.allowed_agents == requested.allowed_agents
         && existing.mcp_servers == requested.mcp_servers
         && existing.herdr_space == requested.herdr_space
 }
@@ -1520,6 +1514,35 @@ mod lifecycle_fence_tests {
         assert!(
             stale
                 .lifecycle_operation("c0a0ad14-a514-4c27-9e4c-acb1a05b272c")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recording_a_provisioning_error_cannot_reopen_an_admitted_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = WorkspaceStore::open_fenced(directory.path(), 4).unwrap();
+        let mut workspace: Workspace = serde_json::from_value(json!({
+            "id":"e39f7d2667d64ca8a75c9c926611991d", "name":"deletion-race",
+            "role":"coding", "namespace":"adm-e39f7d2667d64ca8",
+            "phase":"provisioning", "image":"adm-dev:test", "storage_class":"adm-replicated",
+            "storage_size":"1Gi", "cpu":"1", "memory":"1Gi", "agent_enabled":true,
+            "repositories":false, "catalog":{}, "model":{"provider":"test","id":"model"},
+            "created_at":1, "last_error":null
+        }))
+        .unwrap();
+        store.insert(&workspace).unwrap();
+        workspace.phase = "deleting".into();
+        store.save(&workspace).unwrap();
+        store
+            .record_workspace_error(&workspace.id, "provisioning failed")
+            .unwrap();
+        let persisted = store.find(&workspace.id).unwrap();
+        assert_eq!(persisted.phase, "deleting");
+        assert_eq!(persisted.last_error.as_deref(), Some("provisioning failed"));
+        assert!(
+            store
+                .claim_runtime_lease(&workspace.id, "pod-uid", 30)
                 .is_err()
         );
     }

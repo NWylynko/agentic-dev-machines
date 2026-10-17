@@ -43,7 +43,6 @@ const workspace = {
   repositories: false,
   catalog: {},
   model: { provider: "faux", id: "faux-1" },
-  allowed_agents: [],
   herdr_space: null,
   created_at: 1,
   last_error: null,
