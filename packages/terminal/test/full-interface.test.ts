@@ -2,7 +2,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile as writeFileFs,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WorkspaceTerminal } from "../src/terminal.ts";
+import {
+  configureTerminalKeybindings,
+  terminalKeybindings,
+} from "../src/keybindings.ts";
 import { SettingsSelectorComponent } from "@earendil-works/pi-coding-agent";
 import {
   ProcessTerminal,
@@ -261,9 +274,12 @@ test("/copy copies the selected assistant reply and only explicit bot messages",
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address() as import("node:net").AddressInfo;
+  const directory = await mkdtemp(join(tmpdir(), "adm-bot-export-"));
+  const exportPath = join(directory, "bot.md");
   const terminal = new WorkspaceTerminal({
     url: `http://127.0.0.1:${address.port}`,
     workspaceId: "work",
+    diagnostics: true,
     writeClipboard: async (text) => void copied.push(text),
   });
   try {
@@ -280,10 +296,164 @@ test("/copy copies the selected assistant reply and only explicit bot messages",
       "Workspace session 1 · 1 durable conversations · 0 prompts",
       "bot session stats must not reveal private replies, tool output, or usage",
     );
+    await terminal.submit(`/export "${exportPath}"`);
+    const botExport = await readFile(exportPath, "utf8");
+    assert.match(botExport, /Published bot message/);
+    assert.doesNotMatch(botExport, /Private bot reasoning/);
   } finally {
     terminal.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("/export writes the selected Durable transcript as local Markdown", async () => {
+  let stream: import("node:http").ServerResponse | undefined;
+  const server = createServer((request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId: 1,
+          events: [
+            {
+              seq: 1,
+              workspaceId: "work",
+              kind: "user",
+              data: { text: "Please inspect" },
+              timestamp: 1,
+            },
+            {
+              seq: 2,
+              workspaceId: "work",
+              kind: "assistant",
+              data: { text: "I inspected it." },
+              timestamp: 2,
+            },
+            {
+              seq: 3,
+              workspaceId: "work",
+              kind: "tool",
+              data: { name: "read", text: "file contents", isError: false },
+              timestamp: 3,
+            },
+          ],
+          nextAfter: 3,
+          hasMore: false,
+        }),
+      );
+    } else if (url.pathname.endsWith("/events")) {
+      stream = response;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else if (request.method === "GET")
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          conversationId: 1,
+          role: "coding",
+          status: "idle",
+        }),
+      );
+    else response.end(JSON.stringify({ status: "accepted" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const directory = await mkdtemp(join(tmpdir(), "adm-export-"));
+  const path = join(directory, "session notes.md");
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit(`/export "${path}"`);
+    const contents =
+      "# Workspace session 1\n\n## You\n\nPlease inspect\n\n## Assistant\n\nI inspected it.\n\n## Tool: read\n\nfile contents\n";
+    assert.equal(await readFile(path, "utf8"), contents);
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+    assert.match((terminal as any).status, /Exported transcript to/);
+    await terminal.submit(`/export "${path}"`);
+    assert.match((terminal as any).status, /EEXIST/);
+    assert.equal(await readFile(path, "utf8"), contents);
+  } finally {
+    terminal.close();
+    stream?.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("Pi keybindings.json configures mapped shortcuts while detach stays fixed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-keybindings-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = directory;
+  try {
+    await writeFileFs(
+      join(directory, "keybindings.json"),
+      JSON.stringify({
+        "app.tools.expand": "ctrl+e",
+        "app.thinking.toggle": "ctrl+g",
+        "app.clear": "ctrl+x",
+      }),
+    );
+    await configureTerminalKeybindings();
+    assert.deepEqual(terminalKeybindings.getKeys("app.tools.expand" as any), [
+      "ctrl+e",
+    ]);
+    assert.deepEqual(
+      terminalKeybindings.getKeys("app.thinking.toggle" as any),
+      ["ctrl+g"],
+    );
+    assert.deepEqual(terminalKeybindings.getKeys("app.thinking.cycle" as any), [
+      "shift+tab",
+    ]);
+    assert.deepEqual(terminalKeybindings.getKeys("app.clear" as any), []);
+    const remapped = new WorkspaceTerminal({
+      url: "http://127.0.0.1",
+      workspaceId: "work",
+    });
+    remapped.handleInput("\x05");
+    assert.equal((remapped as any).toolsExpanded, true);
+    remapped.close();
+    let detached = false;
+    const detachTerminal = new WorkspaceTerminal({
+      url: "http://127.0.0.1",
+      workspaceId: "work",
+      onDetach: () => {
+        detached = true;
+      },
+    });
+    detachTerminal.handleInput("\x03");
+    assert.equal(
+      detached,
+      true,
+      "Ctrl+C must always detach even when app.clear is configured",
+    );
+    await writeFileFs(
+      join(directory, "keybindings.json"),
+      JSON.stringify({ "app.tools.expand": [] }),
+    );
+    await configureTerminalKeybindings();
+    assert.deepEqual(
+      terminalKeybindings.getKeys("app.tools.expand" as any),
+      [],
+    );
+    await writeFileFs(join(directory, "keybindings.json"), "[]");
+    await assert.rejects(
+      configureTerminalKeybindings(),
+      /expected a JSON object/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    terminalKeybindings.setUserBindings({});
+    await rm(directory, { recursive: true });
   }
 });
 

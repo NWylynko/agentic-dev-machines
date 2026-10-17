@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
+import { terminalKeybindings } from "./keybindings.ts";
 import {
   Container,
   type Component,
@@ -90,6 +92,20 @@ const editorTheme = {
     scrollInfo: (text: string) => text,
     noMatch: (text: string) => text,
   },
+};
+const shortcut = (id: string) => {
+  const keys = terminalKeybindings.getKeys(id as any);
+  return keys.length
+    ? keys
+        .map((key) =>
+          key.replace(
+            /(^|\+)([a-z])/g,
+            (_match, separator, letter) =>
+              `${separator}${letter.toUpperCase()}`,
+          ),
+        )
+        .join(" / ")
+    : "unbound";
 };
 const selectorTheme: SelectListTheme = {
   selectedPrefix: (text) => text,
@@ -304,7 +320,7 @@ export class WorkspaceTerminal extends Container {
       }
     }
     this.statusLine.setText(
-      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · Ctrl+O: tool details · Ctrl+T: thinking · Shift+Tab: cycle thinking · /model · /settings · /thinking · /session · /copy · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
+      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · ${shortcut("app.tools.expand")}: tool details · ${shortcut("app.thinking.toggle")}: thinking · ${shortcut("app.thinking.cycle")}: cycle thinking · /model · /settings · /thinking · /session · /copy · /export · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
     );
     this.options.onRender?.();
   }
@@ -643,13 +659,13 @@ export class WorkspaceTerminal extends Container {
       void this.connect();
       return;
     }
-    if (matchesKey(data, "ctrl+o")) {
+    if (terminalKeybindings.matches(data, "app.tools.expand" as any)) {
       this.toolsExpanded = !this.toolsExpanded;
       for (const tool of this.toolViews) tool.setExpanded(this.toolsExpanded);
       this.options.onRender?.();
       return;
     }
-    if (matchesKey(data, "ctrl+t")) {
+    if (terminalKeybindings.matches(data, "app.thinking.toggle" as any)) {
       this.hideThinking = !this.hideThinking;
       for (const assistant of this.assistantViews)
         assistant.setHideThinkingBlock(this.hideThinking);
@@ -657,7 +673,7 @@ export class WorkspaceTerminal extends Container {
       this.refresh();
       return;
     }
-    if (matchesKey(data, "shift+tab")) {
+    if (terminalKeybindings.matches(data, "app.thinking.cycle" as any)) {
       const selected = this.modelRuntime?.selected;
       const model =
         selected && this.modelRuntime?.getModel(selected.provider, selected.id);
@@ -700,7 +716,7 @@ export class WorkspaceTerminal extends Container {
     try {
       if (message === "/help") {
         this.status =
-          "/model · /settings · /thinking · /session · /copy · /resume · /new · /fork · /tree · /hotkeys · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /thinking changes the durable thinking level; /session shows the selected workspace conversation; /copy copies the latest assistant reply or explicit bot message; /resume selects a durable branch; /new creates an empty durable conversation in this workspace; /fork opens the durable tree; /retry retries a safe failed provider turn.";
+          "/model · /settings · /thinking · /session · /copy · /export [PATH] · /resume · /new · /fork · /tree · /hotkeys · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /thinking changes the durable thinking level; /session shows the selected workspace conversation; /copy copies the latest assistant reply or explicit bot message; /export writes this Durable transcript to a local Markdown file; /resume selects a durable branch; /new creates an empty durable conversation in this workspace; /fork opens the durable tree; /retry retries a safe failed provider turn.";
         clearInput();
         return;
       }
@@ -826,6 +842,57 @@ export class WorkspaceTerminal extends Container {
         clearInput();
         return;
       }
+      if (message === "/export" || message.startsWith("/export ")) {
+        if (!this.connected)
+          throw new Error("Reconnect before exporting the selected transcript");
+        const suppliedPath = message
+          .slice(7)
+          .trim()
+          .replace(/^(?:"(.*)"|'(.*)')$/, "$1$2");
+        const path = resolve(
+          suppliedPath || `adm-session-${this.conversationId ?? "current"}.md`,
+        );
+        const exported = this.records
+          .filter(
+            (record) =>
+              this.role !== "bot" || ["user", "message"].includes(record.kind),
+          )
+          .map((record) => {
+            const heading =
+              record.kind === "user"
+                ? "You"
+                : record.kind === "message"
+                  ? "Bot"
+                  : record.kind === "tool"
+                    ? `Tool: ${clean(record.data?.name || "unknown")}`
+                    : record.kind === "status"
+                      ? "Status"
+                      : "Assistant";
+            const body =
+              record.data?.text ??
+              record.data?.message?.content
+                ?.map((part: any) =>
+                  part?.type === "text"
+                    ? part.text
+                    : part?.type === "image"
+                      ? "[image]"
+                      : "",
+                )
+                .filter(Boolean)
+                .join("\n") ??
+              record.data?.message ??
+              "";
+            return `## ${heading}\n\n${clean(body)}\n`;
+          });
+        await writeFile(
+          path,
+          `# Workspace session ${this.conversationId ?? "unknown"}\n\n${exported.join("\n")}`,
+          { encoding: "utf8", flag: "wx", mode: 0o600 },
+        );
+        this.status = `Exported transcript to ${path}`;
+        clearInput();
+        return;
+      }
       if (message === "/resume") {
         if (!this.connected)
           throw new Error("Reconnect before selecting a branch");
@@ -867,8 +934,7 @@ export class WorkspaceTerminal extends Container {
         return;
       }
       if (message === "/hotkeys") {
-        this.status =
-          "Keyboard shortcuts\nEnter: send or steer · Shift+Enter: new line · Ctrl+O: expand tool details · Ctrl+T: toggle thinking · Shift+Tab: cycle thinking · Esc: abort · Ctrl+R: reconnect · Ctrl+C: detach\nCommands: /model · /settings · /thinking · /session · /copy · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry";
+        this.status = `Keyboard shortcuts\nEnter: send or steer · Shift+Enter: new line · ${shortcut("app.tools.expand")}: expand tool details · ${shortcut("app.thinking.toggle")}: toggle thinking · ${shortcut("app.thinking.cycle")}: cycle thinking · Esc: abort · Ctrl+R: reconnect · Ctrl+C: detach (fixed)\nCommands: /model · /settings · /thinking · /session · /copy · /export · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry`;
         clearInput();
         return;
       }
