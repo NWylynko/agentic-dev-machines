@@ -1,7 +1,7 @@
 # Validation — 2026-10-17
 
 This run resumed the existing Linear worktrees with GPT-6 Luna agents. The
-management checkout is integrated on local `main`; publication is separate.
+completed commits are integrated on local `main`; publication is separate.
 
 ## Verified behavior
 
@@ -51,7 +51,7 @@ Herdr 0.9.3/protocol 22 is installed, but this process has no owning Herdr pane
 or session socket. The installed `herdr --skill` requires an agent to run inside
 Herdr and says, “Do not inspect or control the focused Herdr session from outside
 Herdr.” No live space was modified. The owning-pane setup is documented in
-[operations](operations.md#herdr-integration).
+[operations](operations.md#herdr-ownership-and-deletion).
 
 Actual Kubernetes Pod replacement, unattended work during access-plane loss,
 live Herdr close delivery, and sudden-node-loss durability are not established
