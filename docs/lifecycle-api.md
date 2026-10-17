@@ -6,7 +6,7 @@
 
 `GET /health` is public and reports whether the service currently holds its Kubernetes Lease. Operator and CLI lifecycle routes use `Authorization: Bearer <client-token>`, read from a protected file supplied by `--lifecycle-token-file` or `ADM_LIFECYCLE_TOKEN_FILE`. Keep the Service private and the client token outside workspace Pods.
 
-Runtime routes use a different credential: a projected ServiceAccount token with audience `adm-lifecycle`, bound to the calling Pod UID. The service verifies it with Kubernetes TokenReview, checks the `adm-runtime` account and canonical workspace namespace, matches the bound UID to exactly one current Pod with the immutable workspace label, and checks the unexpired runtime lease. Runtime tokens do not grant control-plane bearer access. A bot may act across live coding workspaces; a coding runtime can act only on itself. The lifecycle service does not use per-agent grants.
+Runtime routes use a different credential: a projected ServiceAccount token with audience `adm-lifecycle`, bound to the calling Pod UID. The service verifies it with Kubernetes TokenReview and checks the `adm-runtime` account and canonical workspace namespace. Management authorization also matches the bound UID to exactly one current Pod with the immutable workspace label and checks its unexpired runtime lease. Initial lease acquisition establishes that lease. Runtime tokens do not grant control-plane bearer access. A bot may act across live coding workspaces; a coding runtime can act only on itself. The lifecycle service does not use per-agent grants.
 
 ## Durable lifecycle routes
 
