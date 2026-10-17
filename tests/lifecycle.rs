@@ -9,11 +9,17 @@ use std::{
 };
 
 fn start_service(root: &Path, port: u16) -> Child {
+    let status_port =
+        fs::read_to_string(root.join("runtime-status-port")).unwrap_or_else(|_| "7432".into());
+    let runner_url = fs::read_to_string(root.join("runner-url")).unwrap();
     Command::new(env!("CARGO_BIN_EXE_adm"))
         .args(["--state-dir"])
         .arg(root.join("state"))
         .args(["--kubectl"])
         .arg(root.join("kubectl"))
+        // The service fixture must never fall through to a shared host runner.
+        .args(["--runner-url", runner_url.trim()])
+        .args(["--runtime-status-port", status_port.trim()])
         .args(["--lifecycle-token-file"])
         .arg(root.join("token"))
         .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
@@ -22,6 +28,109 @@ fn start_service(root: &Path, port: u16) -> Child {
         .stderr(Stdio::inherit())
         .spawn()
         .expect("start lifecycle service")
+}
+
+fn start_runner_stub() -> (String, u16, thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(end + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first_line = headers.lines().next().unwrap_or("");
+            if first_line.starts_with("GET /shutdown ") {
+                break;
+            }
+            let (status, body) = if first_line.starts_with("GET /health ") {
+                ("200 OK", r#"{"status":"ok"}"#)
+            } else if first_line.starts_with("PUT /v1/workspaces/")
+                || first_line.starts_with("DELETE /v1/workspaces/")
+            {
+                ("200 OK", r#"{"ok":true}"#)
+            } else {
+                ("404 Not Found", r#"{"error":{"code":"NOT_FOUND"}}"#)
+            };
+            write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), port, server)
+}
+
+fn stop_http_stub(port: u16, server: thread::JoinHandle<()>) {
+    let _ = reqwest::blocking::get(format!("http://127.0.0.1:{port}/shutdown"));
+    server.join().unwrap();
+}
+
+fn start_runtime_status_server() -> (u16, thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            if request.starts_with("GET /shutdown ") {
+                break;
+            }
+            assert!(request.starts_with("GET /v1/workspaces/"), "{request}");
+            assert!(request.contains("/runtime-status HTTP/1.1"), "{request}");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer target-token:"),
+                "{request}"
+            );
+            let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    (port, server)
+}
+
+fn stop_runtime_status_server(port: u16, server: thread::JoinHandle<()>) {
+    let _ = reqwest::blocking::get(format!("http://127.0.0.1:{port}/shutdown"));
+    server.join().unwrap();
 }
 
 fn lifecycle_url() -> (String, u16) {
@@ -61,12 +170,13 @@ fn request_with_token(
 fn workspace_spec(name: &str) -> Value {
     json!({
         "name":name,"role":"coding","image":"test-image","storage_class":"test-storage",
-        "storage_size":"1Gi","cpu":"1","memory":"1Gi","agent_enabled":false,
+        "storage_size":"1Gi","cpu":"1","memory":"1Gi","agent_enabled":true,
         "repositories":false,"catalog":{"repositories":[]},"repository":null,
         "cwd":"/repos","model":null,"allowed_agents":[],"mcp_servers":null,"herdr_space":null
     })
 }
 
+#[track_caller]
 fn wait_for<T>(mut read: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -84,12 +194,15 @@ fn wait_for<T>(mut read: impl FnMut() -> Option<T>) -> T {
 #[test]
 fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() {
     let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner_server) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
     fs::write(
         root.path().join("kubectl"),
         r##"#!/usr/bin/env python3
 import json, pathlib, sys, time
 root=pathlib.Path(__file__).parent
 args=sys.argv[1:]
+args=[arg for arg in args if not arg.startswith('--request-timeout=')]
 state_path=root/'cluster.json'
 state=json.loads(state_path.read_text()) if state_path.exists() else {}
 lease_path=root/'lease.json'
@@ -107,6 +220,10 @@ elif args[:3] == ['create','--raw','/apis/authentication.k8s.io/v1/tokenreviews'
     if request['spec']['token']=='runtime-token':
         user={'username':'system:serviceaccount:'+expected_namespace+':adm-runtime','extra':{'authentication.kubernetes.io/pod-uid':[pod_uid]}}
         print(json.dumps({'status':{'authenticated':True,'audiences':['adm-lifecycle'],'user':user}}))
+    elif request['spec']['token'].startswith('target-token:'):
+        _,namespace,uid=request['spec']['token'].split(':')
+        user={'username':'system:serviceaccount:'+namespace+':adm-runtime','extra':{'authentication.kubernetes.io/pod-uid':[uid]}}
+        print(json.dumps({'status':{'authenticated':True,'audiences':['adm-lifecycle'],'user':user}}))
     elif request['spec']['token']=='bot-token':
         namespace=(root/'expected-bot-namespace').read_text()
         uid=(root/'expected-bot-pod-uid').read_text()
@@ -123,15 +240,29 @@ elif args[:3] == ['create','--raw','/apis/authentication.k8s.io/v1/tokenreviews'
         print(json.dumps({'status':{'authenticated':True,'audiences':['adm-lifecycle'],'user':user}}))
     else:
         print(json.dumps({'status':{'authenticated':False,'audiences':['adm-lifecycle']}}))
+elif args[:2] == ['create','--raw'] and args[2].endswith('/serviceaccounts/adm-runtime/token'):
+    request=json.load(sys.stdin)
+    expected_uid=(root/'expected-pod-uid').read_text() if (root/'expected-pod-uid').exists() else '4b53eaa6-4e4d-42dd-9a02-4702a842155a'
+    namespace=args[2].split('/')[4]
+    assert args[2] == '/api/v1/namespaces/'+namespace+'/serviceaccounts/adm-runtime/token'
+    assert request['spec']['audiences'] == ['adm-lifecycle']
+    assert request['spec']['expirationSeconds'] == 600
+    assert request['spec']['boundObjectRef'] == {'apiVersion':'v1','kind':'Pod','name':'workspace-pod','uid':expected_uid}
+    print(json.dumps({'status':{'token':'target-token:'+namespace+':'+expected_uid}}))
 elif args[:2] == ['get','storageclass']:
     entered=root/'storage-entered'; entered.write_text('yes')
     while not (root/'storage-release').exists(): time.sleep(.01)
     print(json.dumps({'provisioner':'test.csi','metadata':{'name':args[2]}}))
 elif args[:2] == ['get','pods']:
+    count_path=root/'pod-list-requests'
+    count=int(count_path.read_text()) if count_path.exists() else 0
+    count_path.write_text(str(count+1))
     items=[]
+    runtime_ip=(root/'runtime-ip').read_text() if (root/'runtime-ip').exists() else None
     for namespace, resource in state.items():
         workspace_id=resource['metadata']['labels'].get('adm.dev/workspace-id')
-        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'test-node'},'status':{'phase':'Running','containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
+        pod_uid=(root/'expected-pod-uid').read_text() if (root/'expected-pod-uid').exists() else '4b53eaa6-4e4d-42dd-9a02-4702a842155a'
+        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'test-node'},'status':{'phase':'Running','podIP':runtime_ip,'containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:2] == ['get','namespace']:
     if args[2] not in state:
@@ -140,6 +271,11 @@ elif args[:2] == ['get','namespace']:
     if (root/'wrong-owner').exists(): doc['metadata']['labels']['adm.dev/workspace-id']='not-the-owner'
     print(json.dumps(doc))
 elif args[0] == 'apply':
+    if (root/'hold-apply').exists():
+        (root/'applying-entered').write_text('yes')
+        while not (root/'apply-release').exists(): time.sleep(.01)
+        if (root/'fail-apply').exists():
+            print('injected deployment admission failure',file=sys.stderr); sys.exit(1)
     doc=json.load(sys.stdin)
     (root/'applied').write_text(json.dumps(doc))
     for item in doc.get('items',[]):
@@ -170,6 +306,12 @@ else:
     )
     .unwrap();
     fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    let (status_port, status_server) = start_runtime_status_server();
+    fs::write(
+        root.path().join("runtime-status-port"),
+        status_port.to_string(),
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(
         root.path().join("kubectl"),
@@ -308,6 +450,11 @@ else:
     .json()
     .unwrap();
     assert_eq!(workspace["phase"], "provisioning");
+    assert_eq!(workspace["agent_enabled"], true);
+    assert!(
+        workspace["model"].is_null(),
+        "model selection is optional at admission"
+    );
     assert_eq!(
         workspace["namespace"],
         format!("adm-{}", &workspace_id[..16])
@@ -411,6 +558,11 @@ else:
         400,
         "stale owner must not admit more work"
     );
+    assert_eq!(
+        request(&url, "GET", "/health", None).unwrap().status(),
+        503,
+        "liveness must fail immediately when the Kubernetes Lease changes owners"
+    );
     fs::write(root.path().join("storage-release"), "go").unwrap();
     wait_for(|| {
         fs::read_to_string(root.path().join("lease-gets"))
@@ -496,9 +648,10 @@ else:
         .arg(root.path().join("state"))
         .args(["--kubectl"])
         .arg(root.path().join("kubectl"))
+        .args(["--runner-url", &runner_url])
         .args(["--lifecycle-url", &url, "--lifecycle-token-file"])
         .arg(root.path().join("token"))
-        .args(["create", "cli-created", "--no-agent", "--no-repositories"])
+        .args(["create", "cli-created", "--no-repositories"])
         .output()
         .expect("run public CLI against lifecycle service");
     assert!(
@@ -535,6 +688,11 @@ else:
     .json()
     .unwrap();
     assert_eq!(stale_replay["workspaceId"], workspace_id);
+    fs::write(root.path().join("runtime-ip"), "127.0.0.1").unwrap();
+    let pod_list_before = fs::read_to_string(root.path().join("pod-list-requests"))
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
     let directory: Vec<Value> = request_with_token(
         &url,
         "GET",
@@ -545,6 +703,15 @@ else:
     .unwrap()
     .json()
     .unwrap();
+    let pod_list_after = fs::read_to_string(root.path().join("pod-list-requests"))
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    assert_eq!(
+        pod_list_after - pod_list_before,
+        1,
+        "one API directory request performs one Pod list"
+    );
     assert_eq!(directory.len(), 3);
     assert!(
         directory
@@ -563,6 +730,18 @@ else:
         .unwrap();
     assert_eq!(replacement_entry["runtime_status"]["ready"], true);
     assert_eq!(replacement_entry["runtime_status"]["nodeName"], "test-node");
+    assert_eq!(
+        replacement_entry["runtime_status"]["activity"]["status"], "running",
+        "{replacement_entry}"
+    );
+    assert_eq!(
+        replacement_entry["runtime_status"]["selectedModel"]["provider"],
+        "openai"
+    );
+    assert_eq!(
+        replacement_entry["runtime_status"]["selectedModel"]["id"],
+        "gpt-test"
+    );
     let failed_delete_id = "30af635c-32af-4b26-a35d-738aa991f90a";
     let failed_delete =
         json!({"operationId":failed_delete_id,"kind":"delete","workspaceId":replacement_id});
@@ -757,6 +936,32 @@ else:
             &url,
             "POST",
             &authorize_path,
+            Some(&json!({"action":"status"})),
+            Some("lifecycle-token")
+        )
+        .unwrap()
+        .status(),
+        403,
+        "a reusable lifecycle identity cannot be sent to a workspace runtime"
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &authorize_path,
+            Some(&json!({"action":"status"})),
+            Some("runtime-token")
+        )
+        .unwrap()
+        .status(),
+        200,
+        "the target-bound runtime identity can read its own status"
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &authorize_path,
             Some(&prompt_action),
             Some("runtime-token")
         )
@@ -812,6 +1017,19 @@ else:
     )
     .unwrap();
     let bot_id = bot_receipt["workspaceId"].as_str().unwrap();
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &authorize_path,
+            Some(&json!({"action":"status"})),
+            Some("bot-token")
+        )
+        .unwrap()
+        .status(),
+        403,
+        "a valid token bound to a different workspace cannot read this runtime status"
+    );
     let cross_authorize = format!("/v1/workspaces/{bot_id}/runtime/authorize");
     assert_eq!(
         request_with_token(
@@ -847,7 +1065,8 @@ else:
         )
         .unwrap()
         .status(),
-        200
+        403,
+        "lifecycle service credentials are not workspace runtime credentials"
     );
     assert_eq!(
         request_with_token(
@@ -962,6 +1181,142 @@ else:
             .filter(|receipt| receipt["status"] == "completed")
         });
     }
+    fs::remove_file(root.path().join("hold-delete")).unwrap();
+    fs::remove_file(root.path().join("delete-release")).unwrap();
+    fs::write(root.path().join("hold-apply"), "yes").unwrap();
+    fs::write(root.path().join("fail-apply"), "yes").unwrap();
+    let failing_create_id = "eb58a800-45f0-4a26-b36e-a89d7451e6db";
+    let failing_create = json!({
+        "operationId":failing_create_id,
+        "kind":"create",
+        "spec":workspace_spec("create-delete-error-race")
+    });
+    let accepted: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&failing_create),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    let failing_workspace_id = accepted["workspaceId"].as_str().unwrap();
+    wait_for(|| root.path().join("applying-entered").exists().then_some(()));
+    let detail: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/workspaces/{failing_workspace_id}"),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    fs::write(
+        root.path().join("expected-namespace"),
+        detail["namespace"].as_str().unwrap(),
+    )
+    .unwrap();
+    let pod_uid = "4b53eaa6-4e4d-42dd-9a02-4702a842155a";
+    fs::write(root.path().join("expected-pod-uid"), pod_uid).unwrap();
+    let runtime_path = format!("/v1/workspaces/{failing_workspace_id}/runtime/lease");
+    request_with_token(
+        &url,
+        "POST",
+        &runtime_path,
+        Some(&json!({"holder":pod_uid})),
+        Some("runtime-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let failing_delete_id = "33cc226f-1f4f-4375-aa8e-3ea1fbc8e075";
+    let failing_delete = json!({
+        "operationId":failing_delete_id,
+        "kind":"delete",
+        "workspaceId":failing_workspace_id
+    });
+    fs::write(root.path().join("hold-delete"), "yes").unwrap();
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&failing_delete),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let runtime_check = format!("/v1/workspaces/{failing_workspace_id}/runtime/check");
+    let check_body = json!({"holder":pod_uid,"fencingToken":1});
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &runtime_check,
+            Some(&check_body),
+            Some("runtime-token")
+        )
+        .unwrap()
+        .status(),
+        410,
+        "deletion admission fences a runtime while create provisioning is still blocked"
+    );
+    fs::write(root.path().join("apply-release"), "go").unwrap();
+    wait_for(|| root.path().join("deleting-entered").exists().then_some(()));
+    let failed_create_receipt: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{failing_create_id}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "failed")
+    });
+    assert_eq!(failed_create_receipt["workspaceId"], failing_workspace_id);
+    let still_deleting: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/workspaces/{failing_workspace_id}"),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(still_deleting["phase"], "deleting");
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &runtime_check,
+            Some(&check_body),
+            Some("runtime-token")
+        )
+        .unwrap()
+        .status(),
+        410,
+        "a create failure after delete admission cannot re-enable runtime access"
+    );
+    fs::write(root.path().join("delete-release"), "go").unwrap();
+    wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{failing_delete_id}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "completed")
+    });
     restarted.kill().unwrap();
     restarted.wait().unwrap();
+    stop_runtime_status_server(status_port, status_server);
+    stop_http_stub(runner_port, runner_server);
 }

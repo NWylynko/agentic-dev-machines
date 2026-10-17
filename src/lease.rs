@@ -81,6 +81,20 @@ fn get(cli: &Cli) -> Result<Value> {
     )?)?)
 }
 
+fn get_bounded(cli: &Cli) -> Result<Value> {
+    let mut args = vec![
+        "get",
+        "lease",
+        NAME,
+        "-n",
+        &cli.lifecycle_namespace,
+        "-o",
+        "json",
+    ];
+    args.push("--request-timeout=1s");
+    Ok(serde_json::from_slice(&run(cli, &args, None)?)?)
+}
+
 fn timestamp() -> String {
     let seconds = unix_now() as libc::time_t;
     let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
@@ -177,13 +191,16 @@ pub fn acquire(cli: &Cli) -> Result<LeaseFence> {
                 ensure!(
                     lease["spec"]["holderIdentity"] == renew_fence.holder
                         && lease["metadata"]["annotations"]["adm.dev/fencing-token"]
-                            == renew_fence.epoch.to_string()
+                            .as_str()
+                            .and_then(|token| token.parse::<u64>().ok())
+                            == Some(renew_fence.epoch)
                         && lease_is_fresh(&lease),
                     "lifecycle Lease fencing token changed"
                 );
                 replace(&renew_cli, lease, &renew_fence.holder, renew_fence.epoch)
             });
-            if result.is_err() {
+            if let Err(error) = result {
+                eprintln!("adm lifecycle lost Kubernetes Lease ownership: {error:#}");
                 renew_fence.owned.store(false, Ordering::Release);
                 break;
             }
@@ -193,22 +210,39 @@ pub fn acquire(cli: &Cli) -> Result<LeaseFence> {
 }
 
 pub fn verify(cli: &Cli, fence: &LeaseFence) -> Result<()> {
+    verify_with(cli, fence, get)
+}
+
+pub fn verify_bounded(cli: &Cli, fence: &LeaseFence) -> Result<()> {
+    verify_with(cli, fence, get_bounded)
+}
+
+fn verify_with(
+    cli: &Cli,
+    fence: &LeaseFence,
+    read_lease: impl FnOnce(&Cli) -> Result<Value>,
+) -> Result<()> {
     ensure!(
         fence.is_owned(),
         "lifecycle service lost its Kubernetes Lease"
     );
-    let result = get(cli).and_then(|lease| {
+    let result = read_lease(cli).and_then(|lease| {
         ensure!(
             lease["spec"]["holderIdentity"] == fence.holder
                 && lease["metadata"]["annotations"]["adm.dev/fencing-token"]
-                    == fence.epoch.to_string()
+                    .as_str()
+                    .and_then(|token| token.parse::<u64>().ok())
+                    == Some(fence.epoch)
                 && lease_is_fresh(&lease),
             "lifecycle service lost or expired its Kubernetes Lease fencing token"
         );
         Ok(())
     });
-    if result.is_err() {
-        fence.owned.store(false, Ordering::Release);
+    if let Err(error) = result {
+        if fence.owned.swap(false, Ordering::AcqRel) {
+            eprintln!("adm lifecycle lost Kubernetes Lease ownership: {error:#}");
+        }
+        return Err(error);
     }
-    result
+    Ok(())
 }

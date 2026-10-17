@@ -51,6 +51,13 @@ pub struct Cli {
     /// File containing the lifecycle service bearer token.
     #[arg(long, global = true, env = "ADM_LIFECYCLE_TOKEN_FILE")]
     pub lifecycle_token_file: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        env = "ADM_RUNTIME_STATUS_PORT",
+        default_value_t = 7432
+    )]
+    pub runtime_status_port: u16,
     #[arg(skip)]
     pub lifecycle_fence: Option<lease::LeaseFence>,
     /// Runtime installation or development checkout containing the runner and terminal.
@@ -220,6 +227,7 @@ impl Cli {
             lifecycle_url: self.lifecycle_url.clone(),
             lifecycle_namespace: self.lifecycle_namespace.clone(),
             lifecycle_token_file: self.lifecycle_token_file.clone(),
+            runtime_status_port: self.runtime_status_port,
             lifecycle_fence: self.lifecycle_fence.clone(),
             project_dir: self.project_dir.clone(),
             command: Action::LifecycleServe {
@@ -255,6 +263,7 @@ impl Cli {
             "stop",
             "doctor",
             "herdr",
+            "completions",
             "help",
         ];
         let mut command = Self::command();
@@ -471,6 +480,12 @@ impl Cli {
         }
         Ok(())
     }
+    pub fn check_lifecycle_fence_bounded(&self) -> Result<()> {
+        if let Some(fence) = &self.lifecycle_fence {
+            lease::verify_bounded(self, fence)?;
+        }
+        Ok(())
+    }
     pub fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         let id = path
             .strip_prefix("/v1/workspaces/")
@@ -486,34 +501,52 @@ pub fn print_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
-fn print_workspace_list(items: &[workspaces::Workspace]) {
+fn workspace_activity(workspace: &workspaces::Workspace) -> Value {
+    if workspace.phase == "deleted" {
+        json!({"status":"deleted"})
+    } else {
+        workspace
+            .runtime_status
+            .as_ref()
+            .and_then(|status| status.get("activity"))
+            .cloned()
+            .unwrap_or_else(
+                || json!({"status":"unavailable","error":"runtime status is unavailable"}),
+            )
+    }
+}
+
+fn workspace_list_value(workspace: &workspaces::Workspace) -> Result<Value> {
+    let mut value = serde_json::to_value(workspace)?;
+    value["activity"] = workspace_activity(workspace);
+    Ok(value)
+}
+
+fn print_workspace_list(items: &[Value]) {
     if items.is_empty() {
         println!("No workspaces");
         return;
     }
-
     let rows = items
         .iter()
         .map(|workspace| {
             [
-                workspace.name.as_str(),
-                workspace.role.as_str(),
-                workspace.phase.as_str(),
-                workspace
-                    .runtime_status
-                    .as_ref()
-                    .and_then(|status| status["activity"]["status"].as_str())
+                workspace["name"].as_str().unwrap_or("unknown"),
+                workspace["role"].as_str().unwrap_or("unknown"),
+                workspace["phase"].as_str().unwrap_or("unknown"),
+                if workspace["agent_enabled"] == true {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                workspace["activity"]["status"]
+                    .as_str()
                     .unwrap_or("unavailable"),
-                workspace
-                    .runtime_status
-                    .as_ref()
-                    .and_then(|status| status["ready"].as_bool())
-                    .map_or("unknown", |ready| if ready { "Ready" } else { "NotReady" }),
-                workspace.id.as_str(),
+                workspace["id"].as_str().unwrap_or("unknown"),
             ]
         })
         .collect::<Vec<_>>();
-    let headers = ["NAME", "ROLE", "PHASE", "AGENT", "POD", "ID"];
+    let headers = ["NAME", "ROLE", "PHASE", "AGENT CONFIG", "ACTIVITY", "ID"];
     let widths = std::array::from_fn::<_, 6, _>(|column| {
         rows.iter()
             .map(|row| row[column].len())
@@ -521,22 +554,29 @@ fn print_workspace_list(items: &[workspaces::Workspace]) {
             .unwrap_or(0)
             .max(headers[column].len())
     });
-
     for row in std::iter::once(headers.as_slice()).chain(rows.iter().map(|row| row.as_slice())) {
         println!(
-            "{:<name$}  {:<role$}  {:<phase$}  {:<agent$}  {:<pod$}  {}",
+            "{:<name$}  {:<role$}  {:<phase$}  {:<config$}  {:<activity$}  {id}",
             row[0],
             row[1],
             row[2],
             row[3],
             row[4],
-            row[5],
             name = widths[0],
             role = widths[1],
             phase = widths[2],
-            agent = widths[3],
-            pod = widths[4],
+            config = widths[3],
+            activity = widths[4],
+            id = widths[5],
         );
+    }
+    for workspace in items {
+        if let Some(error) = workspace["activity"]["error"].as_str() {
+            println!(
+                "Agent {}: {error}",
+                workspace["name"].as_str().unwrap_or("unknown")
+            );
+        }
     }
 }
 
@@ -546,13 +586,7 @@ fn workspace_list_report(items: &[workspaces::Workspace]) -> Result<Vec<Value>> 
         .map(|workspace| {
             let mut report = serde_json::to_value(workspace)?;
             report["requested_model"] = report["model"].clone();
-            let activity = workspace
-                .runtime_status
-                .as_ref()
-                .and_then(|status| status.get("activity"))
-                .cloned()
-                .unwrap_or_else(|| json!({"status":"unavailable"}));
-            report["activity"] = activity;
+            report["activity"] = workspace_activity(workspace);
             let selected_model = workspace
                 .runtime_status
                 .as_ref()
@@ -568,68 +602,67 @@ fn workspace_list_report(items: &[workspaces::Workspace]) -> Result<Vec<Value>> 
 
 fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
     let workspace = cli.workspace(name, true)?;
-    let cluster = match (&workspace.runtime_status, workspace.phase.as_str()) {
-        (_, "deleted") => json!({"status":"deleted"}),
-        (Some(status), _) => status.clone(),
-        (None, _) => {
-            json!({"status":"unavailable","ready":null,"error":"runtime status has not been observed"})
-        }
-    };
-    let mut agent = if workspace.phase == "deleted" {
-        json!({"status":"stopped"})
+    let cluster = if workspace.phase == "deleted" {
+        json!({"status":"deleted"})
     } else {
-        match cli.request("GET", &format!("/v1/workspaces/{}", workspace.id), None) {
+        match workspaces::cluster_status(cli, &workspace) {
             Ok(value) => value,
             Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
         }
     };
-    let mut selected_model = Value::Null;
-    let mut model_state = "unavailable";
-    if agent["status"] != "unavailable" && workspace.phase != "deleted" {
-        match cli.request(
-            "GET",
-            &format!("/v1/workspaces/{}/models", workspace.id),
-            None,
-        ) {
-            Ok(catalog) => {
-                selected_model = catalog["selected"].clone();
-                model_state = if selected_model.is_null() {
-                    "needs_model"
-                } else {
-                    "selected"
-                };
-                agent["model"] = selected_model.clone();
-            }
-            Err(error) => agent["model_error"] = json!(format!("{error:#}")),
-        }
-    }
-    let mut workspace_value = serde_json::to_value(&workspace)?;
-    workspace_value["requested_model"] = workspace_value["model"].clone();
-    workspace_value["model"] = selected_model;
-    workspace_value["model_state"] = json!(model_state);
-    Ok(json!({"workspace":workspace_value,"cluster":cluster,"agent":agent}))
+    let activity = workspace_activity(&workspace);
+    let agent = if workspace.phase == "deleted" {
+        json!({"status":"deleted"})
+    } else if workspace.agent_enabled {
+        json!({
+            "status": activity["status"],
+            "error": activity["error"],
+            "selectedModel": workspace.runtime_status.as_ref().and_then(|status| status.get("selectedModel")),
+        })
+    } else {
+        json!({"status":"disabled"})
+    };
+    Ok(json!({"workspace":workspace,"cluster":cluster,"agent":agent,"activity":activity}))
 }
 
 fn pod_summary(status: &Value) -> (String, String) {
-    let runtime = &status["cluster"];
-    let readiness = if runtime["status"] == "deleted" {
-        "deleted".to_owned()
-    } else if runtime["ready"] == true {
-        "Ready".to_owned()
-    } else if runtime["ready"] == false {
-        format!(
-            "NotReady ({})",
-            runtime["podPhase"].as_str().unwrap_or("Unknown")
-        )
-    } else if runtime["status"] == "unavailable" {
-        "unavailable".to_owned()
-    } else {
-        "unknown".to_owned()
+    let Some(pod) = status["cluster"]["pods"]
+        .as_array()
+        .and_then(|pods| pods.first())
+    else {
+        return ("missing".into(), "—".into());
     };
-    (
-        readiness,
-        runtime["nodeName"].as_str().unwrap_or("—").to_owned(),
-    )
+    let phase = pod["status"]["phase"].as_str().unwrap_or("Unknown");
+    let ready = pod["status"]["conditions"]
+        .as_array()
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition["type"] == "Ready")
+        });
+    let containers = pod["status"]["containerStatuses"].as_array();
+    let containers_ready = containers.is_none_or(|containers| {
+        containers
+            .iter()
+            .all(|container| container["ready"] == true)
+    });
+    let readiness =
+        if ready.is_some_and(|condition| condition["status"] == "True") && containers_ready {
+            "Ready".to_owned()
+        } else if ready.is_some_and(|condition| condition["status"] == "False")
+            || containers.is_some_and(|_| !containers_ready)
+        {
+            format!("NotReady ({phase})")
+        } else if phase == "Pending" {
+            "Pending".to_owned()
+        } else {
+            format!("Unknown ({phase})")
+        };
+    let node = pod["spec"]["nodeName"]
+        .as_str()
+        .filter(|node| !node.is_empty())
+        .unwrap_or("—");
+    (readiness, node.to_owned())
 }
 
 fn status_row(status: &Value) -> [String; 6] {
@@ -657,7 +690,7 @@ fn status_row(status: &Value) -> [String; 6] {
 }
 
 fn print_status(status: &Value) {
-    let headers = ["NAME", "ROLE", "PHASE", "POD", "AGENT", "NODE"];
+    let headers = ["NAME", "ROLE", "PHASE", "RUNTIME", "ACTIVITY", "NODE"];
     let row = status_row(status);
     let widths =
         std::array::from_fn::<_, 6, _>(|column| row[column].len().max(headers[column].len()));
@@ -754,26 +787,31 @@ fn print_inspect(status: &Value) -> Result<()> {
             "  Namespace: {}",
             workspace["namespace"].as_str().unwrap_or("unknown")
         );
-        println!(
-            "  Pod: {}",
-            cluster["podName"].as_str().unwrap_or("unknown")
-        );
-        println!(
-            "  Phase: {}",
-            cluster["podPhase"].as_str().unwrap_or("unknown")
-        );
-        println!(
-            "  Ready: {}",
-            cluster["ready"]
-                .as_bool()
-                .map_or("unknown", |ready| if ready { "yes" } else { "no" })
-        );
-        println!(
-            "  Node: {}",
-            cluster["nodeName"].as_str().unwrap_or("unknown")
-        );
-        if let Some(reason) = cluster["containerReason"].as_str() {
-            println!("  Container: {reason}");
+        if let Some(pod) = cluster["pods"].as_array().and_then(|pods| pods.first()) {
+            println!(
+                "  Pod: {}",
+                pod["metadata"]["name"].as_str().unwrap_or("unknown")
+            );
+            println!(
+                "  Phase: {}",
+                pod["status"]["phase"].as_str().unwrap_or("unknown")
+            );
+            let (runtime, node) = pod_summary(status);
+            println!("  Ready: {runtime}");
+            println!("  Node: {node}");
+            if let Some(reason) =
+                pod["status"]["containerStatuses"]
+                    .as_array()
+                    .and_then(|containers| {
+                        containers
+                            .iter()
+                            .find_map(|container| container["state"]["waiting"]["reason"].as_str())
+                    })
+            {
+                println!("  Container: {reason}");
+            }
+        } else {
+            println!("  Pod: missing");
         }
     }
     println!("Agent");
@@ -806,7 +844,7 @@ fn run(cli: &Cli) -> Result<()> {
                 Some(&serde_json::to_value(
                     lifecycle::OperationRequest::Create {
                         operation_id,
-                        spec: lifecycle::CreateIntent::from_workspace(&workspace),
+                        spec: Box::new(lifecycle::CreateIntent::from_workspace(&workspace)),
                     },
                 )?),
             )?;
@@ -827,10 +865,14 @@ fn run(cli: &Cli) -> Result<()> {
         Action::Manifest(options) => print_json(&workspaces::manifest(&options.workspace()?)?),
         Action::List { all, json } => {
             let items = cli.workspaces(*all)?;
+            let reports = items
+                .iter()
+                .map(workspace_list_value)
+                .collect::<Result<Vec<_>>>()?;
             if *json {
                 print_json(&workspace_list_report(&items)?)
             } else {
-                print_workspace_list(&items);
+                print_workspace_list(&reports);
                 Ok(())
             }
         }

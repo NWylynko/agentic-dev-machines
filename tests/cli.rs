@@ -82,6 +82,101 @@ fn configure_lifecycle(command: &mut Command, root: &Path) {
 }
 
 #[test]
+fn list_uses_one_bounded_lifecycle_directory_request_and_projects_pod_activity() {
+    use std::io::{BufRead, BufReader};
+
+    let root = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let token_file = root.path().join("lifecycle-token");
+    fs::write(&token_file, "fixture-token\n").unwrap();
+    let workspace = serde_json::json!({
+        "id":"a1a1a1a1a1a14a1a8a1a1a1a1a1a1a1a",
+        "name":"directory-one",
+        "role":"coding",
+        "namespace":"adm-a1a1a1a1a1a14a1a",
+        "phase":"ready",
+        "image":"adm-dev:test",
+        "storage_class":"adm-replicated",
+        "storage_size":"1Gi",
+        "cpu":"1",
+        "memory":"1Gi",
+        "agent_enabled":true,
+        "repositories":false,
+        "catalog":{},
+        "model":null,
+        "allowed_agents":[],
+        "herdr_space":null,
+        "created_at":1,
+        "last_error":null,
+        "runtime_status":{"activity":{"status":"needs_model"},"selectedModel":null}
+    });
+    let body = serde_json::to_string(&[workspace]).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept lifecycle request: {error}"),
+            }
+        };
+        let mut request = BufReader::new(stream);
+        let mut line = String::new();
+        request.read_line(&mut line).unwrap();
+        assert!(line.starts_with("GET /v1/workspaces HTTP/1.1"), "{line}");
+        loop {
+            line.clear();
+            request.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if line.to_ascii_lowercase().starts_with("authorization:") {
+                assert_eq!(
+                    line.trim().to_ascii_lowercase(),
+                    "authorization: bearer fixture-token"
+                );
+            }
+        }
+        let mut stream = request.into_inner();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        drop(stream);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "CLI made more than one lifecycle directory request"
+        );
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .arg("--lifecycle-url")
+        .arg(&url)
+        .arg("--lifecycle-token-file")
+        .arg(token_file)
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reports: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reports.as_array().unwrap().len(), 1);
+    assert_eq!(reports[0]["activity"]["status"], "needs_model");
+    assert!(reports[0]["effective_model"].is_null());
+    server.join().unwrap();
+}
+
+#[test]
 fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir_all(root.path().join("config/adm")).unwrap();
@@ -226,11 +321,18 @@ elif args[:2] == ['replace','-f']:
         print('Error from server (Conflict): resourceVersion conflict',file=sys.stderr);sys.exit(1)
     lease['metadata']['resourceVersion']=str(int(current['metadata']['resourceVersion'])+1)
     leasepath.write_text(json.dumps(lease));print(json.dumps(lease))
-elif args[:2] == ['get','pods']:
+elif args[:2] == ['get','pod']:
+    namespace=args[args.index('-n')+1]
+    resource=state.get(namespace)
+    if resource is None: print('Error from server (NotFound): pods not found',file=sys.stderr);sys.exit(1)
+    labels=resource['metadata'].get('labels',{})
+    pod={'metadata':{'name':args[2],'namespace':namespace,'uid':'00000000-0000-4000-8000-000000000001','labels':labels},'spec':{'nodeName':'node-a','serviceAccountName':'adm-runtime'},'status':{'phase':'Running','conditions':[{'type':'Ready','status':'True'}]}}
+    print(json.dumps(pod))
+elif args[:2] == ['get','pods'] and '--all-namespaces' in args:
     items=[]
     for namespace, resource in state.items():
-        workspace_id=resource['metadata'].get('labels',{}).get('adm.dev/workspace-id')
-        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':{'phase':'Running','containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
+        labels=resource['metadata'].get('labels',{})
+        items.append({'kind':'Pod','metadata':{'name':'workspace-123','namespace':namespace,'uid':'00000000-0000-4000-8000-000000000001','labels':labels},'spec':{'nodeName':'node-a','serviceAccountName':'adm-runtime'},'status':{'phase':'Running','conditions':[{'type':'Ready','status':'True'}],'containerStatuses':[{'name':'dev','ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:2] == ['get', 'storageclass']:
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
@@ -261,7 +363,10 @@ elif args[:2] == ['get','pods']:
     status = {'phase':'Running','conditions':[condition], 'containerStatuses':[{'name':'dev','ready':ready}]}
     if init_waiting:
         status['initContainerStatuses']=[{'name':'setup','ready':False,'state':{'waiting':{'reason':'ImagePullBackOff','message':'could not pull setup image'}}}]
-    print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':status}]}))
+    namespace=args[args.index('-n')+1] if '-n' in args else 'adm-test'
+    resource=state.get(namespace, {'metadata':{'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':'test-id'}}})
+    pod={'metadata':{'name':'workspace-123','namespace':namespace,'uid':'00000000-0000-4000-8000-000000000001','labels':resource['metadata'].get('labels',{})},'spec':{'nodeName':'node-a','serviceAccountName':'adm-runtime'},'status':status}
+    print(json.dumps({'items':[pod]}))
 elif args and args[0] == 'exec':
     (pathlib.Path(__file__).parent / 'exec-args.json').write_text(json.dumps(args))
     exec_root = os.environ.get('ADM_TEST_EXEC_ROOT')

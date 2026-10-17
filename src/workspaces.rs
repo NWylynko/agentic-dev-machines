@@ -800,12 +800,34 @@ impl WorkspaceStore {
 }
 
 pub fn kubectl(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
-    cli.check_lifecycle_fence()?;
+    kubectl_with_timeout(cli, args, input, false)
+}
+
+pub fn kubectl_bounded(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    kubectl_with_timeout(cli, args, input, true)
+}
+
+fn kubectl_with_timeout(
+    cli: &Cli,
+    args: &[&str],
+    input: Option<&[u8]>,
+    bounded: bool,
+) -> Result<Vec<u8>> {
+    if bounded {
+        cli.check_lifecycle_fence_bounded()?;
+    } else {
+        cli.check_lifecycle_fence()?;
+    }
     let mut command = cli.kubectl_command()?;
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args);
+    if bounded
+        && !args
+            .iter()
+            .any(|argument| argument.starts_with("--request-timeout="))
+    {
+        command.arg("--request-timeout=1s");
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     if input.is_some() {
         command.stdin(Stdio::piped());
     } else {
@@ -835,7 +857,11 @@ pub fn kubectl(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
         display_args,
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    cli.check_lifecycle_fence()?;
+    if bounded {
+        cli.check_lifecycle_fence_bounded()?;
+    } else {
+        cli.check_lifecycle_fence()?;
+    }
     Ok(output.stdout)
 }
 
@@ -966,6 +992,25 @@ pub fn verify_ownership(cli: &Cli, w: &Workspace) -> Result<()> {
         w.namespace
     );
     Ok(())
+}
+
+pub fn cluster_status(cli: &Cli, w: &Workspace) -> Result<Value> {
+    verify_ownership(cli, w)?;
+    let pods: Value = serde_json::from_slice(&kubectl_bounded(
+        cli,
+        &[
+            "get",
+            "pods",
+            "-n",
+            &w.namespace,
+            "-l",
+            &format!("adm.dev/workspace-id={}", w.id),
+            "-o",
+            "json",
+        ],
+        None,
+    )?)?;
+    Ok(json!({"namespace":w.namespace,"pods":pods["items"]}))
 }
 
 pub fn navigation_guidance(workspace: &Workspace, opening_shell: bool) -> String {

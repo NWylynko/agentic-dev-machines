@@ -7,10 +7,15 @@ use serde_json::Value;
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{IpAddr, TcpListener, TcpStream},
     sync::mpsc,
     thread,
+    time::{Duration, Instant},
 };
+
+const RUNTIME_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_STATUS_PARALLELISM: usize = 4;
+const MAX_RUNTIME_STATUS_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -18,7 +23,7 @@ pub enum OperationRequest {
     Create {
         #[serde(rename = "operationId")]
         operation_id: String,
-        spec: CreateIntent,
+        spec: Box<CreateIntent>,
     },
     Delete {
         #[serde(rename = "operationId")]
@@ -142,6 +147,7 @@ impl CreateIntent {
                 "each credential environment name may be specified only once"
             );
         }
+        ensure!(self.agent_enabled, "workspace agents are always enabled");
         let expected_cwd = self
             .repository
             .as_ref()
@@ -157,10 +163,10 @@ impl CreateIntent {
             "repository catalog is only supported for coding workspaces without --repo"
         );
         ensure!(
-            self.image.trim().len() > 0
-                && self.storage_size.trim().len() > 0
-                && self.cpu.trim().len() > 0
-                && self.memory.trim().len() > 0,
+            !self.image.trim().is_empty()
+                && !self.storage_size.trim().is_empty()
+                && !self.cpu.trim().is_empty()
+                && !self.memory.trim().is_empty(),
             "image and resource values must be non-empty"
         );
         ensure!(
@@ -200,7 +206,7 @@ impl CreateIntent {
             storage_size: self.storage_size,
             cpu: self.cpu,
             memory: self.memory,
-            agent_enabled: self.agent_enabled,
+            agent_enabled: true,
             allow_node_local_storage: self.allow_node_local_storage,
             repositories: self.repositories,
             catalog: self.catalog,
@@ -268,6 +274,16 @@ struct RuntimeLeaseRequest {
 #[serde(deny_unknown_fields)]
 struct RuntimeAuthorizeRequest {
     action: String,
+}
+
+#[derive(Clone)]
+struct RuntimeStatusTarget {
+    index: usize,
+    workspace_id: String,
+    namespace: String,
+    pod_name: String,
+    pod_uid: String,
+    ip: IpAddr,
 }
 
 /// Durably admits or replays one lifecycle operation. The request body is
@@ -451,6 +467,7 @@ fn handle_http(
             } else if message.contains("not authorized for workspace")
                 || message.contains("held by another pod")
                 || message.contains("runtime lease fencing token is stale")
+                || message.contains("runtime status is restricted to its own workspace")
                 || message.contains("wrong audience")
                 || message.contains("not bound to a Pod")
             {
@@ -535,13 +552,19 @@ fn route(
     body: &[u8],
     authorization: &str,
 ) -> Result<(u16, Value)> {
-    let mut store = cli.store()?;
     if method == "GET" && path == "/health" {
+        if let Err(error) = cli.check_lifecycle_fence_bounded() {
+            return Ok((
+                503,
+                serde_json::json!({"status":"unavailable","service":"adm-lifecycle","error":format!("lifecycle Lease ownership lost: {error:#}")}),
+            ));
+        }
         return Ok((
             200,
             serde_json::json!({"status":"ok","service":"adm-lifecycle"}),
         ));
     }
+    let mut store = cli.store()?;
     if method == "POST" && path == "/v1/operations" {
         cli.check_lifecycle_fence()?;
         let value: Value = serde_json::from_slice(body)?;
@@ -566,7 +589,7 @@ fn route(
     }
     if method == "GET" && path == "/v1/workspaces" {
         let mut workspaces = store.list(true)?;
-        enrich_runtime_status(cli, &mut workspaces);
+        enrich_runtime_status(cli, &mut workspaces)?;
         return Ok((200, serde_json::to_value(workspaces)?));
     }
     if let Some(id) = path.strip_prefix("/v1/workspaces/")
@@ -574,7 +597,7 @@ fn route(
     {
         return match store.find(id) {
             Ok(mut workspace) if workspace.id == id => {
-                enrich_runtime_status(cli, std::slice::from_mut(&mut workspace));
+                enrich_runtime_status(cli, std::slice::from_mut(&mut workspace))?;
                 Ok((200, serde_json::to_value(workspace)?))
             }
             _ => Ok((
@@ -651,14 +674,15 @@ fn route(
     Ok((404, serde_json::json!({"error":{"code":"NOT_FOUND"}})))
 }
 
-fn enrich_runtime_status(cli: &crate::Cli, workspaces: &mut [Workspace]) {
+fn enrich_runtime_status(cli: &crate::Cli, workspaces: &mut [Workspace]) -> Result<()> {
     if !workspaces
         .iter()
         .any(|workspace| workspace.phase != "deleted")
     {
-        return;
+        return Ok(());
     }
-    let pods = crate::workspaces::kubectl(
+    let deadline = Instant::now() + RUNTIME_STATUS_TIMEOUT;
+    let pods = crate::workspaces::kubectl_bounded(
         cli,
         &[
             "get",
@@ -674,9 +698,11 @@ fn enrich_runtime_status(cli: &crate::Cli, workspaces: &mut [Workspace]) {
     .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).context("decode workspace Pod list"));
     match pods {
         Ok(pods) => {
-            for workspace in workspaces
+            let mut requests = Vec::new();
+            for (index, workspace) in workspaces
                 .iter_mut()
-                .filter(|workspace| workspace.phase != "deleted")
+                .enumerate()
+                .filter(|(_, workspace)| workspace.phase != "deleted")
             {
                 let matches = pods["items"]
                     .as_array()
@@ -688,14 +714,46 @@ fn enrich_runtime_status(cli: &crate::Cli, workspaces: &mut [Workspace]) {
                             && pod["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "adm"
                     })
                     .collect::<Vec<_>>();
-                workspace.runtime_status = Some(if matches.len() == 1 {
-                    pod_runtime_status(matches[0])
+                if matches.len() == 1 {
+                    let mut status = pod_runtime_status(matches[0]);
+                    status["activity"] = serde_json::json!({"status":"unavailable","error":"runtime status has not been queried"});
+                    status["selectedModel"] = Value::Null;
+                    match matches[0]["status"]["podIP"]
+                        .as_str()
+                        .and_then(|ip| ip.parse::<IpAddr>().ok())
+                    {
+                        Some(ip) => {
+                            let pod_name = matches[0]["metadata"]["name"].as_str();
+                            let pod_uid = matches[0]["metadata"]["uid"].as_str();
+                            if let (Some(pod_name), Some(pod_uid)) = (pod_name, pod_uid) {
+                                requests.push(RuntimeStatusTarget {
+                                    index,
+                                    workspace_id: workspace.id.clone(),
+                                    namespace: workspace.namespace.clone(),
+                                    pod_name: pod_name.to_owned(),
+                                    pod_uid: pod_uid.to_owned(),
+                                    ip,
+                                });
+                            } else {
+                                status["activity"] = serde_json::json!({"status":"unavailable","error":"workspace Pod identity is incomplete"});
+                            }
+                        }
+                        None => {
+                            status["activity"] = serde_json::json!({"status":"unavailable","error":"workspace Pod has no valid IP address"});
+                        }
+                    }
+                    workspace.runtime_status = Some(status);
                 } else if matches.is_empty() {
-                    serde_json::json!({"podName":null,"nodeName":null,"podPhase":"Missing","ready":false})
+                    workspace.runtime_status = Some(
+                        serde_json::json!({"podName":null,"nodeName":null,"podPhase":"Missing","ready":false,"activity":{"status":"unavailable","error":"workspace Pod is missing"},"selectedModel":null}),
+                    );
                 } else {
-                    serde_json::json!({"error":"multiple Pods match the canonical workspace ID"})
-                });
+                    workspace.runtime_status = Some(
+                        serde_json::json!({"error":"multiple Pods match the canonical workspace ID","activity":{"status":"unavailable","error":"multiple Pods match the canonical workspace ID"},"selectedModel":null}),
+                    );
+                }
             }
+            collect_runtime_status(cli, workspaces, requests, deadline);
         }
         Err(error) => {
             for workspace in workspaces
@@ -703,10 +761,218 @@ fn enrich_runtime_status(cli: &crate::Cli, workspaces: &mut [Workspace]) {
                 .filter(|workspace| workspace.phase != "deleted")
             {
                 workspace.runtime_status = Some(
-                    serde_json::json!({"error":format!("runtime status unavailable: {error:#}")}),
+                    serde_json::json!({"error":format!("runtime status unavailable: {error:#}"),"activity":{"status":"unavailable","error":format!("workspace Pod list unavailable: {error:#}").chars().take(2000).collect::<String>()},"selectedModel":null}),
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn collect_runtime_status(
+    cli: &crate::Cli,
+    workspaces: &mut [Workspace],
+    requests: Vec<RuntimeStatusTarget>,
+    deadline: Instant,
+) {
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(1))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            mark_runtime_status_unavailable(
+                workspaces,
+                &requests,
+                "runtime status HTTP client is unavailable",
+            );
+            return;
+        }
+    };
+    for (batch_index, batch) in requests.chunks(RUNTIME_STATUS_PARALLELISM).enumerate() {
+        if Instant::now() >= deadline {
+            mark_runtime_status_unavailable(
+                workspaces,
+                &requests[batch_index * RUNTIME_STATUS_PARALLELISM..],
+                "runtime status collection exceeded its 5-second deadline",
+            );
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::scope(|scope| {
+            for target in batch.iter().cloned() {
+                let sender = sender.clone();
+                let client = client.clone();
+                scope.spawn(move || {
+                    let host = match target.ip {
+                        IpAddr::V4(ip) => ip.to_string(),
+                        IpAddr::V6(ip) => format!("[{ip}]"),
+                    };
+                    let token = match runtime_status_token(cli, &target) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            let _ = sender.send((
+                                target.index,
+                                Err(format!("mint target runtime token failed: {error:#}")),
+                            ));
+                            return;
+                        }
+                    };
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        let _ = sender.send((
+                            target.index,
+                            Err("runtime status collection exceeded its 5-second deadline"
+                                .to_owned()),
+                        ));
+                        return;
+                    }
+                    let endpoint = format!(
+                        "http://{host}:{}/v1/workspaces/{}/runtime-status",
+                        cli.runtime_status_port, target.workspace_id
+                    );
+                    let result = client
+                        .get(endpoint)
+                        .bearer_auth(token)
+                        .timeout(remaining)
+                        .send()
+                        .map_err(|error| format!("runtime status request failed: {error}"))
+                        .and_then(|response| {
+                            let status = response.status();
+                            if !status.is_success() {
+                                return Err(format!("runtime status returned HTTP {status}"));
+                            }
+                            let mut body = Vec::new();
+                            response
+                                .take(MAX_RUNTIME_STATUS_BYTES + 1)
+                                .read_to_end(&mut body)
+                                .map_err(|error| {
+                                    format!("read runtime status response failed: {error}")
+                                })?;
+                            if body.len() as u64 > MAX_RUNTIME_STATUS_BYTES {
+                                return Err("runtime status response exceeded 64 KiB".to_owned());
+                            }
+                            serde_json::from_slice::<Value>(&body)
+                                .map_err(|_| "runtime status response is invalid JSON".to_owned())
+                        });
+                    let _ = sender.send((target.index, result));
+                });
+            }
+            drop(sender);
+            for (index, result) in receiver {
+                match result {
+                    Ok(report) if valid_runtime_status_report(&report) => {
+                        if let Some(status) = workspaces[index].runtime_status.as_mut() {
+                            let mut activity =
+                                serde_json::json!({"status":report["activity"]["status"]});
+                            if let Some(error) = report["activity"]["error"].as_str() {
+                                activity["error"] =
+                                    Value::String(error.chars().take(2000).collect());
+                            }
+                            status["activity"] = activity;
+                            status["selectedModel"] = report.get("selectedModel")
+                                .filter(|model| !model.is_null())
+                                .map(|model| serde_json::json!({"provider":model["provider"],"id":model["id"]}))
+                                .unwrap_or(Value::Null);
+                        }
+                    }
+                    Ok(_) => set_runtime_activity_unavailable(
+                        &mut workspaces[index],
+                        "runtime returned an invalid status report",
+                    ),
+                    Err(error) => set_runtime_activity_unavailable(&mut workspaces[index], &error),
+                }
+            }
+        });
+    }
+}
+
+fn valid_runtime_status_report(report: &Value) -> bool {
+    let activity = &report["activity"];
+    let status = activity["status"].as_str();
+    if !activity.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| ["status", "error"].contains(&key.as_str()))
+    }) || !status.is_some_and(|status| {
+        ["needs_model", "running", "error", "idle", "unavailable"].contains(&status)
+    }) {
+        return false;
+    }
+    if activity["error"]
+        .as_str()
+        .is_some_and(|error| error.len() > 2000)
+    {
+        return false;
+    }
+    if let Some(model) = report.get("selectedModel").filter(|model| !model.is_null())
+        && (!model.is_object()
+            || model["provider"].as_str().is_none_or(str::is_empty)
+            || model["id"].as_str().is_none_or(str::is_empty)
+            || !model.as_object().is_some_and(|object| {
+                object
+                    .keys()
+                    .all(|key| ["provider", "id"].contains(&key.as_str()))
+            }))
+    {
+        return false;
+    }
+    true
+}
+
+fn runtime_status_token(cli: &crate::Cli, target: &RuntimeStatusTarget) -> Result<String> {
+    ensure!(
+        uuid::Uuid::parse_str(&target.pod_uid).is_ok(),
+        "workspace Pod UID is invalid"
+    );
+    let path = format!(
+        "/api/v1/namespaces/{}/serviceaccounts/adm-runtime/token",
+        target.namespace
+    );
+    let request = serde_json::json!({
+        "apiVersion":"authentication.k8s.io/v1",
+        "kind":"TokenRequest",
+        "spec":{
+            "audiences":["adm-lifecycle"],
+            "expirationSeconds":600,
+            "boundObjectRef":{
+                "apiVersion":"v1",
+                "kind":"Pod",
+                "name":target.pod_name,
+                "uid":target.pod_uid
+            }
+        }
+    });
+    let response = crate::workspaces::kubectl_bounded(
+        cli,
+        &["create", "--raw", &path, "-f", "-"],
+        Some(&serde_json::to_vec(&request)?),
+    )?;
+    let token = serde_json::from_slice::<Value>(&response)?["status"]["token"]
+        .as_str()
+        .context("Kubernetes TokenRequest omitted its token")?
+        .to_owned();
+    ensure!(
+        !token.is_empty() && !token.contains('\n'),
+        "Kubernetes TokenRequest returned an invalid token"
+    );
+    Ok(token)
+}
+
+fn mark_runtime_status_unavailable(
+    workspaces: &mut [Workspace],
+    requests: &[RuntimeStatusTarget],
+    cause: &str,
+) {
+    for target in requests {
+        set_runtime_activity_unavailable(&mut workspaces[target.index], cause);
+    }
+}
+
+fn set_runtime_activity_unavailable(workspace: &mut Workspace, cause: &str) {
+    if let Some(status) = workspace.runtime_status.as_mut() {
+        status["activity"] = serde_json::json!({"status":"unavailable","error":cause});
+        status["selectedModel"] = Value::Null;
     }
 }
 
@@ -810,24 +1076,20 @@ fn authorize_workspace_action(
     ensure!(
         matches!(
             action,
-            "read" | "prompt" | "abort" | "resume" | "goal" | "loop" | "model" | "delete"
+            "read"
+                | "prompt"
+                | "abort"
+                | "resume"
+                | "goal"
+                | "loop"
+                | "model"
+                | "delete"
+                | "status"
         ),
         "unknown runtime action"
     );
     let target = store.find(target_id)?;
     let (username, _) = review_runtime_token(cli, authorization)?;
-    if username
-        == format!(
-            "system:serviceaccount:{}:adm-lifecycle",
-            cli.lifecycle_namespace
-        )
-    {
-        ensure!(
-            matches!(action, "delete" | "abort"),
-            "lifecycle identity cannot perform this runtime action"
-        );
-        return Ok(());
-    }
     let (service_account, name) = username
         .rsplit_once(':')
         .context("runtime identity is invalid")?;
@@ -847,13 +1109,17 @@ fn authorize_workspace_action(
         .into_iter()
         .find(|workspace| workspace.namespace == namespace)
         .context("runtime caller is not authorized for workspace")?;
+    if target.phase == "deleting" || target.phase == "deleted" {
+        anyhow::bail!("workspace lifecycle is deleting");
+    }
     ensure!(
         source.phase != "deleting" && source.phase != "deleted",
         "runtime caller is not authorized for workspace"
     );
-    if target.phase == "deleting" || target.phase == "deleted" {
-        anyhow::bail!("workspace lifecycle is deleting");
-    }
+    ensure!(
+        action != "status" || source.id == target.id,
+        "runtime status is restricted to its own workspace"
+    );
     ensure!(
         source.id == target.id || (source.role == "bot" && target.role == "coding"),
         "runtime caller is not authorized for workspace"

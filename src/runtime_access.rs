@@ -117,35 +117,48 @@ fn forward(cli: &Cli, workspace: &Workspace, pod: &str) -> Result<(Forward, Stri
         .stdout
         .take()
         .context("read runtime forward readiness")?;
-    let stderr = child.stderr.take().context("read runtime forward errors")?;
+    let mut stderr = child.stderr.take().context("read runtime forward errors")?;
     let (ready_tx, ready_rx) = mpsc::channel();
     thread::spawn(move || {
+        let mut reported_ready = false;
         for line in BufReader::new(stdout).lines() {
             match line {
-                Ok(line) if line.starts_with("Forwarding from 127.0.0.1:") => {
+                Ok(line) if !reported_ready && line.starts_with("Forwarding from 127.0.0.1:") => {
                     let address = line
                         .strip_prefix("Forwarding from 127.0.0.1:")
                         .unwrap_or_default();
                     if let Some(port) = address.split_whitespace().next() {
                         let _ = ready_tx.send(Ok(port.to_owned()));
-                        return;
+                        reported_ready = true;
                     }
                 }
                 Ok(_) => {}
-                Err(error) => {
+                Err(error) if !reported_ready => {
                     let _ = ready_tx.send(Err(error.to_string()));
                     return;
                 }
+                Err(_) => return,
             }
         }
-        let _ = ready_tx.send(Err(
-            "kubectl closed stdout before reporting its forward".into()
-        ));
+        if !reported_ready {
+            let _ = ready_tx.send(Err(
+                "kubectl closed stdout before reporting its forward".into()
+            ));
+        }
     });
     let (stderr_tx, stderr_rx) = mpsc::channel();
     thread::spawn(move || {
         let mut bounded = Vec::new();
-        let _ = stderr.take(8192).read_to_end(&mut bounded);
+        let mut chunk = [0; 1024];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(length) => {
+                    let remaining = 8192usize.saturating_sub(bounded.len());
+                    bounded.extend_from_slice(&chunk[..length.min(remaining)]);
+                }
+            }
+        }
         let _ = stderr_tx.send(String::from_utf8_lossy(&bounded).trim().to_owned());
     });
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
@@ -335,4 +348,63 @@ pub fn login(cli: &Cli, workspace: &Workspace) -> Result<()> {
         .context("open provider login inside workspace Pod")?;
     ensure!(status.success(), "provider login exited with {status}");
     Ok(())
+}
+
+#[cfg(test)]
+mod forward_pipe_tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Instant};
+
+    #[test]
+    fn forward_drains_startup_pipes_after_reporting_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let kubeconfig = directory.path().join("kubeconfig");
+        fs::write(&kubeconfig, "fixture").unwrap();
+        let marker = directory.path().join("drained");
+        let kubectl = directory.path().join("kubectl");
+        fs::write(
+            &kubectl,
+            format!(
+                "#!/bin/sh\nprintf 'Forwarding from 127.0.0.1:39423 -> 7432\\n'\ni=0\nwhile [ \"$i\" -lt 10000 ]; do printf 'Handling connection for 7432\\n'; printf 'long-lived diagnostic\\n' >&2; i=$((i + 1)); done\ntouch '{}'\nsleep 5\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = Cli {
+            state_dir: Some(directory.path().join("state")),
+            kubectl: kubectl.to_string_lossy().into_owned(),
+            kubeconfig: Some(kubeconfig.to_string_lossy().into_owned()),
+            runner_url: String::new(),
+            lifecycle_url: String::new(),
+            lifecycle_namespace: String::new(),
+            lifecycle_token_file: None,
+            runtime_status_port: 7432,
+            lifecycle_fence: None,
+            project_dir: PathBuf::new(),
+            command: crate::Action::LifecycleServe {
+                host: "127.0.0.1".into(),
+                port: 7433,
+            },
+        };
+        let workspace: Workspace = serde_json::from_value(serde_json::json!({
+            "id":"a1a1a1a1a1a14a1a8a1a1a1a1a1a1a1a",
+            "name":"pipe-test", "role":"coding", "namespace":"adm-pipe-test",
+            "phase":"ready", "image":"adm-dev:test", "storage_class":"test",
+            "storage_size":"1Gi", "cpu":"1", "memory":"1Gi", "agent_enabled":true,
+            "repositories":false, "catalog":{}, "model":null, "allowed_agents":[],
+            "created_at":1
+        }))
+        .unwrap();
+        let (mut forward, url) = forward(&cli, &workspace, "workspace-pod").unwrap();
+        assert_eq!(url, "http://127.0.0.1:39423");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "kubectl stopped writing after readiness");
+        assert!(forward.0.try_wait().unwrap().is_none());
+        forward.0.kill().unwrap();
+        forward.0.wait().unwrap();
+    }
 }
