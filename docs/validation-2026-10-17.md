@@ -19,13 +19,21 @@ completed commits are integrated on local `main`; publication is separate.
   events, durable asynchronous admission, and journal replay.
 - Installer fixtures pass 10/10; the release-publication fixture passes. These
   tests publish no real release.
+- The complete Rust suite, formatting, Clippy, and TypeScript checks pass on the
+  integrated Pod runtime. The combined npm suite passes 43 runner/browser/RBAC
+  tests and 17 terminal tests. The subsequent clipboard/session-statistics
+  change passes 18 terminal tests, including bot visibility checks.
+- The actual release archive installs and runs without a checkout. Its packaged
+  Pod-mode runtime uses a mounted workspace identity and an HTTP lifecycle
+  fixture, then executes Code Mode through the installed worker/WASM assets.
+  The test also exercises the compiled CLI, managed shell, and terminal assets.
 
 ## Combined workspace image
 
-The immutable source snapshot `bfee530` built as `adm-dev:verify-bfee530`
-(image configuration `sha256:92270464fe589b15793838241a2723391ccce1405bf021c57b560d933bc3266a`).
-Its full image smoke passes after repairing the test fixtures for the new
-mandatory lifecycle identity and active-runtime entrypoint.
+The immutable source snapshot `a5adf68` built as `adm-dev:verify-a5adf68`
+(image configuration `sha256:7d902902e298ca1f5a7fa4f5f7b2201d48da3a0439b8d386c0cde90d6802c442`).
+Its full image smoke passes. This supersedes the earlier `bfee530` container
+snapshot and includes the runtime ownership and release-fixture corrections.
 
 The smoke exercises the packaged Durable runtime performing a real coding-tool
 write and retaining history after process restart, ordinary UID 1000 and sudo,
