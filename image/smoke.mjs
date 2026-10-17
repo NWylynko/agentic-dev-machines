@@ -51,6 +51,8 @@ async function verifySignalForwarding() {
       "--pids-limit",
       "8",
       image,
+      "sleep",
+      "infinity",
     );
     exists = true;
     await docker("start", signalContainer);
@@ -99,6 +101,134 @@ async function verifySignalForwarding() {
       await docker("stop", "--timeout", "2", signalContainer).catch(() => {});
     }
     if (exists) await docker("rm", signalContainer);
+  }
+}
+
+async function verifyPodOwnedRuntime() {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "adm-pod-runtime-smoke-"));
+  const workspaceRoot = join(runtimeRoot, "workspace");
+  const repoRoot = join(workspaceRoot, "repo");
+  const configPath = join(runtimeRoot, "workspace.json");
+  const tokenPath = join(runtimeRoot, "token");
+  const runtimeContainer = `${container}-runtime`;
+  let exists = false;
+  let running = false;
+  try {
+    await mkdir(repoRoot, { recursive: true });
+    await writeFile(tokenPath, "pod-runtime-smoke-token\n", { mode: 0o600 });
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        id: "image-pod-runtime",
+        name: "image-pod-runtime",
+        role: "coding",
+        environment: "pod",
+        localRoot: repoRoot,
+        cwd: repoRoot,
+        model: { provider: "faux", id: "faux-1" },
+      }),
+    );
+    await docker(
+      "create",
+      "--name",
+      runtimeContainer,
+      "--user",
+      "1000:1000",
+      "--cap-drop",
+      "ALL",
+      "--cap-add",
+      "CHOWN",
+      "--cap-add",
+      "DAC_OVERRIDE",
+      "--cap-add",
+      "FOWNER",
+      "--cap-add",
+      "SETGID",
+      "--cap-add",
+      "SETUID",
+      "--security-opt",
+      "no-new-privileges:false",
+      "--network",
+      "none",
+      "--mount",
+      `type=bind,src=${workspaceRoot},dst=/workspace`,
+      "--mount",
+      `type=bind,src=${configPath},dst=/run/adm/workspace.json,readonly`,
+      "--mount",
+      `type=bind,src=${tokenPath},dst=/var/run/secrets/kubernetes.io/serviceaccount/token,readonly`,
+      image,
+    );
+    exists = true;
+    await docker("start", runtimeContainer);
+    running = true;
+
+    const probe = String.raw`
+const headers = { authorization: "Bearer pod-runtime-smoke-token", "content-type": "application/json" };
+const get = async (path) => fetch("http://127.0.0.1:7432" + path, { headers });
+let health;
+for (let attempt = 0; attempt < 100; attempt++) {
+  try { health = await get("/health"); break; }
+  catch (error) {
+    if (attempt === 99) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+if (!health.ok) throw new Error("workspace runtime did not become ready");
+const unauthorized = await fetch("http://127.0.0.1:7432/v1/workspaces");
+if (unauthorized.status !== 401) throw new Error("workspace API accepted unauthenticated access");
+const status = await get("/v1/workspaces/image-pod-runtime");
+if (!(await status.json()).id) throw new Error("workspace was not registered by its Pod runtime");
+const input = await fetch("http://127.0.0.1:7432/v1/workspaces/image-pod-runtime/input", {
+  method: "POST", headers, body: JSON.stringify({ message: "/faux " + JSON.stringify({
+    calls: [{ tool: "write", args: { path: "/workspace/repo/pod-owned.txt", content: "executed inside workspace Pod" } }],
+    answer: "file written",
+  }), requestId: "pod-runtime-tool-write" }),
+});
+if (input.status !== 202) throw new Error("workspace runtime rejected tool work: " + await input.text());
+for (let attempt = 0; attempt < 100; attempt++) {
+  const history = await (await get("/v1/workspaces/image-pod-runtime/history?diagnostics=true")).json();
+  if (history.events.some((event) => event.kind === "assistant")) break;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  if (attempt === 99) throw new Error("workspace agent did not finish its tool turn");
+}
+`;
+    try {
+      await docker("exec", runtimeContainer, "node", "--input-type=module", "-e", probe);
+    } catch (error) {
+      const logs = await docker("logs", runtimeContainer).catch(() => ({ stdout: "" }));
+      throw new Error(`${error.message}\nworkspace runtime logs:\n${logs.stdout}`, { cause: error });
+    }
+    assert.equal(
+      await readFile(join(repoRoot, "pod-owned.txt"), "utf8"),
+      "executed inside workspace Pod",
+    );
+
+    await docker("stop", "--time", "5", runtimeContainer);
+    running = false;
+    await docker("start", runtimeContainer);
+    running = true;
+const recovery = String.raw`
+let response;
+for (let attempt = 0; attempt < 100; attempt++) {
+  try {
+    response = await fetch("http://127.0.0.1:7432/v1/workspaces/image-pod-runtime/history?diagnostics=true", {
+      headers: { authorization: "Bearer pod-runtime-smoke-token" },
+    });
+    break;
+  } catch (error) {
+    if (attempt === 99) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+if (!response.ok) throw new Error("workspace history unavailable after Pod process restart");
+const history = await response.json();
+if (!history.events.some((event) => event.kind === "assistant")) throw new Error("workspace history did not survive process restart");
+`;
+    await docker("exec", runtimeContainer, "node", "--input-type=module", "-e", recovery);
+  } finally {
+    if (running) await docker("stop", "--time", "5", runtimeContainer);
+    if (exists) await docker("rm", runtimeContainer);
+    await rm(runtimeRoot, { recursive: true });
   }
 }
 
@@ -178,6 +308,8 @@ async function verifyPackageInstallation() {
       "--mount",
       `type=bind,src=${packageRoot},dst=/fixture,readonly`,
       image,
+      "sleep",
+      "infinity",
     );
     exists = true;
     await docker("start", packageContainer);
@@ -310,6 +442,8 @@ try {
     "--network",
     "none",
     image,
+    "sleep",
+    "infinity",
   );
   created = true;
   await docker("start", container);
@@ -376,6 +510,7 @@ try {
   );
   assert.equal(git.stderr, "");
   await verifySignalForwarding();
+  await verifyPodOwnedRuntime();
   await verifyPackageInstallation();
   await docker(
     "exec",

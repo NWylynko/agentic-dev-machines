@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import {
   Container,
   Editor,
@@ -26,6 +29,8 @@ export type WorkspaceEvent = {
 type TerminalOptions = {
   url: string;
   workspaceId: string;
+  tokenFile?: string;
+  identityFile?: string;
   diagnostics?: boolean;
   tui?: TUI;
   onRender?: () => void;
@@ -36,6 +41,7 @@ const clean = (text: unknown) =>
     /[\x00-\x08\x0b-\x1f\x7f]/g,
     "",
   );
+const execFileAsync = promisify(execFile);
 const markdownTheme = {
   heading: (text: string) => `\x1b[1m${text}\x1b[0m`,
   link: (text: string) => `\x1b[4m${text}\x1b[0m`,
@@ -158,6 +164,18 @@ export class WorkspaceTerminal extends Container {
       base,
     );
   }
+  private async authorizationHeaders() {
+    if (!this.options.tokenFile && !this.options.identityFile)
+      return {} as Record<string, string>;
+    const token = this.options.identityFile
+      ? await projectedPodToken(
+          this.options.identityFile,
+          this.options.workspaceId,
+        )
+      : (await readFile(this.options.tokenFile!, "utf8")).trim();
+    if (!token) throw new Error("Workspace runtime token file is empty");
+    return { authorization: `Bearer ${token}` } as Record<string, string>;
+  }
   async request(
     path: string,
     body?: unknown,
@@ -166,12 +184,11 @@ export class WorkspaceTerminal extends Container {
   ) {
     const response = await fetch(this.endpoint(path), {
       method: method ?? (body === undefined ? "GET" : "POST"),
-      ...(body === undefined
-        ? {}
-        : {
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(body),
-          }),
+      headers: {
+        ...(await this.authorizationHeaders()),
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal,
     });
     if (!response.ok) {
@@ -236,7 +253,13 @@ export class WorkspaceTerminal extends Container {
         this.endpoint(
           `/events?after=${this.cursor}&diagnostics=${!!this.options.diagnostics}`,
         ),
-        { signal: controller.signal, headers: { accept: "text/event-stream" } },
+        {
+          signal: controller.signal,
+          headers: {
+            accept: "text/event-stream",
+            ...(await this.authorizationHeaders()),
+          },
+        },
       );
       if (!response.ok)
         throw new Error(`Event stream returned HTTP ${response.status}`);
@@ -610,4 +633,83 @@ class RemoteModelRuntime {
       ),
     };
   }
+}
+
+type PodIdentity = {
+  workspaceId: string;
+  namespace: string;
+  podName: string;
+  podUid: string;
+  container: "dev" | "bot";
+  kubectl: string;
+  kubeconfig: string;
+};
+
+async function projectedPodToken(identityPath: string, workspaceId: string) {
+  const identity = JSON.parse(
+    await readFile(identityPath, "utf8"),
+  ) as PodIdentity;
+  if (
+    identity.workspaceId !== workspaceId ||
+    !/^[a-z0-9][a-z0-9-]{0,62}$/.test(identity.namespace) ||
+    !/^[a-z0-9][a-z0-9-]{0,62}$/.test(identity.podName) ||
+    !/^[0-9a-f-]{36}$/i.test(identity.podUid) ||
+    !["dev", "bot"].includes(identity.container) ||
+    !identity.kubectl ||
+    !identity.kubeconfig
+  )
+    throw new Error("Workspace Pod identity descriptor is invalid");
+  const options = {
+    encoding: "utf8" as const,
+    timeout: 10_000,
+    maxBuffer: 1024 * 1024,
+    env: { ...process.env, KUBECONFIG: identity.kubeconfig },
+  };
+  const podResult = await execFileAsync(
+    identity.kubectl,
+    ["get", "pod", identity.podName, "-n", identity.namespace, "-o", "json"],
+    options,
+  );
+  const pod = JSON.parse(podResult.stdout) as {
+    metadata?: {
+      uid?: string;
+      namespace?: string;
+      labels?: Record<string, string>;
+    };
+    spec?: { serviceAccountName?: string };
+    status?: {
+      phase?: string;
+      conditions?: Array<{ type?: string; status?: string }>;
+    };
+  };
+  const ready = pod.status?.conditions?.some(
+    (condition) => condition.type === "Ready" && condition.status === "True",
+  );
+  if (
+    pod.metadata?.uid !== identity.podUid ||
+    pod.metadata.namespace !== identity.namespace ||
+    pod.metadata.labels?.["adm.dev/workspace-id"] !== identity.workspaceId ||
+    pod.spec?.serviceAccountName !== "adm-runtime" ||
+    pod.status?.phase !== "Running" ||
+    !ready
+  )
+    throw new Error(
+      "Workspace Pod identity changed or is not ready; reattach to refresh runtime access",
+    );
+  const tokenResult = await execFileAsync(
+    identity.kubectl,
+    [
+      "exec",
+      "-n",
+      identity.namespace,
+      identity.podName,
+      "-c",
+      identity.container,
+      "--",
+      "cat",
+      "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    ],
+    options,
+  );
+  return tokenResult.stdout.trim();
 }

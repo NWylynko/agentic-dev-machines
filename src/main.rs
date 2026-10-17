@@ -3,6 +3,7 @@ mod herdr;
 mod lease;
 mod lifecycle;
 mod runner;
+mod runtime_access;
 mod setup;
 mod workspaces;
 
@@ -169,8 +170,8 @@ pub enum Action {
     },
     /// Configure workspace defaults, provider login, and the background service.
     Setup,
-    /// Open the installed Pi provider login interface; use /login there.
-    Login,
+    /// Log a provider into this workspace's private durable auth store.
+    Login { name: String },
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
     Herdr {
         #[command(subcommand)]
@@ -471,7 +472,12 @@ impl Cli {
         Ok(())
     }
     pub fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
-        runner::request(&self.runner_url, method, path, body)
+        let id = path
+            .strip_prefix("/v1/workspaces/")
+            .and_then(|path| path.split('/').next())
+            .context("workspace runtime request must target an immutable workspace ID")?;
+        let workspace = self.workspace(id, false)?;
+        runtime_access::request(self, &workspace, method, path, body)
     }
 }
 
@@ -493,17 +499,22 @@ fn print_workspace_list(items: &[workspaces::Workspace]) {
                 workspace.name.as_str(),
                 workspace.role.as_str(),
                 workspace.phase.as_str(),
-                if workspace.agent_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
+                workspace
+                    .runtime_status
+                    .as_ref()
+                    .and_then(|status| status["activity"]["status"].as_str())
+                    .unwrap_or("unavailable"),
+                workspace
+                    .runtime_status
+                    .as_ref()
+                    .and_then(|status| status["ready"].as_bool())
+                    .map_or("unknown", |ready| if ready { "Ready" } else { "NotReady" }),
                 workspace.id.as_str(),
             ]
         })
         .collect::<Vec<_>>();
-    let headers = ["NAME", "ROLE", "PHASE", "AGENT", "ID"];
-    let widths = std::array::from_fn::<_, 5, _>(|column| {
+    let headers = ["NAME", "ROLE", "PHASE", "AGENT", "POD", "ID"];
+    let widths = std::array::from_fn::<_, 6, _>(|column| {
         rows.iter()
             .map(|row| row[column].len())
             .max()
@@ -513,80 +524,112 @@ fn print_workspace_list(items: &[workspaces::Workspace]) {
 
     for row in std::iter::once(headers.as_slice()).chain(rows.iter().map(|row| row.as_slice())) {
         println!(
-            "{:<name$}  {:<role$}  {:<phase$}  {:<agent$}  {}",
+            "{:<name$}  {:<role$}  {:<phase$}  {:<agent$}  {:<pod$}  {}",
             row[0],
             row[1],
             row[2],
             row[3],
             row[4],
+            row[5],
             name = widths[0],
             role = widths[1],
             phase = widths[2],
             agent = widths[3],
+            pod = widths[4],
         );
     }
 }
 
+fn workspace_list_report(items: &[workspaces::Workspace]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .map(|workspace| {
+            let mut report = serde_json::to_value(workspace)?;
+            report["requested_model"] = report["model"].clone();
+            let activity = workspace
+                .runtime_status
+                .as_ref()
+                .and_then(|status| status.get("activity"))
+                .cloned()
+                .unwrap_or_else(|| json!({"status":"unavailable"}));
+            report["activity"] = activity;
+            let selected_model = workspace
+                .runtime_status
+                .as_ref()
+                .and_then(|status| status.get("selectedModel"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            report["effective_model"] = selected_model.clone();
+            report["model"] = selected_model;
+            Ok(report)
+        })
+        .collect()
+}
+
 fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
     let workspace = cli.workspace(name, true)?;
-    let cluster = if workspace.role == "coding" && workspace.phase != "deleted" {
-        match workspaces::cluster_status(cli, &workspace) {
-            Ok(value) => value,
-            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
+    let cluster = match (&workspace.runtime_status, workspace.phase.as_str()) {
+        (_, "deleted") => json!({"status":"deleted"}),
+        (Some(status), _) => status.clone(),
+        (None, _) => {
+            json!({"status":"unavailable","ready":null,"error":"runtime status has not been observed"})
         }
-    } else {
-        Value::Null
     };
-    let agent = if workspace.agent_enabled && workspace.phase != "deleted" {
+    let mut agent = if workspace.phase == "deleted" {
+        json!({"status":"stopped"})
+    } else {
         match cli.request("GET", &format!("/v1/workspaces/{}", workspace.id), None) {
             Ok(value) => value,
-            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
+            Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
         }
-    } else {
-        json!({"status":"disabled"})
     };
-    Ok(json!({"workspace":workspace,"cluster":cluster,"agent":agent}))
+    let mut selected_model = Value::Null;
+    let mut model_state = "unavailable";
+    if agent["status"] != "unavailable" && workspace.phase != "deleted" {
+        match cli.request(
+            "GET",
+            &format!("/v1/workspaces/{}/models", workspace.id),
+            None,
+        ) {
+            Ok(catalog) => {
+                selected_model = catalog["selected"].clone();
+                model_state = if selected_model.is_null() {
+                    "needs_model"
+                } else {
+                    "selected"
+                };
+                agent["model"] = selected_model.clone();
+            }
+            Err(error) => agent["model_error"] = json!(format!("{error:#}")),
+        }
+    }
+    let mut workspace_value = serde_json::to_value(&workspace)?;
+    workspace_value["requested_model"] = workspace_value["model"].clone();
+    workspace_value["model"] = selected_model;
+    workspace_value["model_state"] = json!(model_state);
+    Ok(json!({"workspace":workspace_value,"cluster":cluster,"agent":agent}))
 }
 
 fn pod_summary(status: &Value) -> (String, String) {
-    let Some(pod) = status["cluster"]["pods"]
-        .as_array()
-        .and_then(|pods| pods.first())
-    else {
-        return ("missing".into(), "—".into());
-    };
-    let phase = pod["status"]["phase"].as_str().unwrap_or("Unknown");
-    let ready_condition = pod["status"]["conditions"]
-        .as_array()
-        .and_then(|conditions| {
-            conditions
-                .iter()
-                .find(|condition| condition["type"] == "Ready")
-        });
-    let containers = pod["status"]["containerStatuses"].as_array();
-    let containers_ready = containers.is_none_or(|containers| {
-        containers
-            .iter()
-            .all(|container| container["ready"] == true)
-    });
-    let readiness = if ready_condition.is_some_and(|condition| condition["status"] == "True")
-        && containers_ready
-    {
+    let runtime = &status["cluster"];
+    let readiness = if runtime["status"] == "deleted" {
+        "deleted".to_owned()
+    } else if runtime["ready"] == true {
         "Ready".to_owned()
-    } else if ready_condition.is_some_and(|condition| condition["status"] == "False")
-        || containers.is_some_and(|_| !containers_ready)
-    {
-        format!("NotReady ({phase})")
-    } else if phase == "Pending" {
-        "Pending".to_owned()
+    } else if runtime["ready"] == false {
+        format!(
+            "NotReady ({})",
+            runtime["podPhase"].as_str().unwrap_or("Unknown")
+        )
+    } else if runtime["status"] == "unavailable" {
+        "unavailable".to_owned()
     } else {
-        format!("Unknown ({phase})")
+        "unknown".to_owned()
     };
-    let node = pod["spec"]["nodeName"]
-        .as_str()
-        .filter(|node| !node.is_empty())
-        .unwrap_or("—");
-    (readiness, node.to_owned())
+    (
+        readiness,
+        runtime["nodeName"].as_str().unwrap_or("—").to_owned(),
+    )
 }
 
 fn status_row(status: &Value) -> [String; 6] {
@@ -595,8 +638,6 @@ fn status_row(status: &Value) -> [String; 6] {
     let phase = workspace["phase"].as_str().unwrap_or("unknown");
     let (pod, node) = if phase == "deleted" {
         ("deleted".into(), "—".into())
-    } else if role == "bot" {
-        ("n/a".into(), "management host".into())
     } else if status["cluster"]["status"] == "unavailable" {
         ("unavailable".into(), "—".into())
     } else if status["cluster"].is_null() {
@@ -649,7 +690,7 @@ fn print_status(status: &Value) {
         agent = widths[4]
     );
     if let Some(error) = status["cluster"]["error"].as_str() {
-        println!("Cluster unavailable: {error}");
+        println!("Runtime unavailable: {error}");
     }
     if let Some(error) = status["agent"]["error"].as_str() {
         match status["agent"]["status"].as_str() {
@@ -661,57 +702,8 @@ fn print_status(status: &Value) {
     if let Some(error) = status["workspace"]["last_error"].as_str() {
         println!("Workspace failure: {error}");
     }
-    if let Some(pod) = status["cluster"]["pods"]
-        .as_array()
-        .and_then(|pods| pods.first())
-    {
-        let readiness_reason = pod["status"]["conditions"]
-            .as_array()
-            .and_then(|conditions| {
-                conditions
-                    .iter()
-                    .find(|condition| condition["type"] == "Ready")
-            })
-            .filter(|condition| condition["status"] != "True")
-            .and_then(|condition| {
-                condition["message"]
-                    .as_str()
-                    .or_else(|| condition["reason"].as_str())
-            });
-        if let Some(reason) = readiness_reason {
-            println!("Pod readiness: {reason}");
-        }
-        for (kind, key) in [
-            ("Container", "containerStatuses"),
-            ("Init container", "initContainerStatuses"),
-        ] {
-            let Some(containers) = pod["status"][key].as_array() else {
-                continue;
-            };
-            for container in containers
-                .iter()
-                .filter(|container| container["ready"] == false)
-            {
-                let Some((state, detail)) = container["state"]
-                    .as_object()
-                    .and_then(|states| states.iter().next())
-                else {
-                    continue;
-                };
-                let reason = detail["reason"].as_str();
-                let message = detail["message"].as_str();
-                let description = match (reason, message) {
-                    (Some(reason), Some(message)) => format!("{reason}: {message}"),
-                    (Some(reason), None) => reason.to_owned(),
-                    (None, Some(message)) => message.to_owned(),
-                    (None, None) => continue,
-                };
-                println!(
-                    "{kind} {} {state}: {description}",
-                    container["name"].as_str().unwrap_or("unknown")
-                );
-            }
-        }
+    if let Some(reason) = status["cluster"]["containerReason"].as_str() {
+        println!("Pod runtime: {reason}");
     }
 }
 
@@ -750,9 +742,7 @@ fn print_inspect(status: &Value) -> Result<()> {
     let cluster = &status["cluster"];
     println!("Cluster");
     if cluster.is_null() {
-        if workspace["role"] == "bot" {
-            println!("  Location: management host (no workspace Pod)");
-        } else if workspace["phase"] == "deleted" {
+        if workspace["phase"] == "deleted" {
             println!("  Runtime: destroyed (workspace deleted)");
         } else {
             println!("  Pod: not queried");
@@ -762,19 +752,28 @@ fn print_inspect(status: &Value) -> Result<()> {
     } else {
         println!(
             "  Namespace: {}",
-            cluster["namespace"].as_str().unwrap_or("unknown")
+            workspace["namespace"].as_str().unwrap_or("unknown")
         );
-        if let Some(pods) = cluster["pods"].as_array() {
-            if pods.is_empty() {
-                println!("  Pods: none");
-            }
-            for pod in pods {
-                let name = pod["metadata"]["name"].as_str().unwrap_or("unnamed");
-                let phase = pod["status"]["phase"].as_str().unwrap_or("Unknown");
-                let (readiness, node) = pod_summary(&json!({"cluster":{"pods":[pod]}}));
-                println!("  Pod {name}: {readiness}; phase {phase}; node {node}");
-                println!("    Details: {}", serde_json::to_string(&pod["status"])?);
-            }
+        println!(
+            "  Pod: {}",
+            cluster["podName"].as_str().unwrap_or("unknown")
+        );
+        println!(
+            "  Phase: {}",
+            cluster["podPhase"].as_str().unwrap_or("unknown")
+        );
+        println!(
+            "  Ready: {}",
+            cluster["ready"]
+                .as_bool()
+                .map_or("unknown", |ready| if ready { "yes" } else { "no" })
+        );
+        println!(
+            "  Node: {}",
+            cluster["nodeName"].as_str().unwrap_or("unknown")
+        );
+        if let Some(reason) = cluster["containerReason"].as_str() {
+            println!("  Container: {reason}");
         }
     }
     println!("Agent");
@@ -829,7 +828,7 @@ fn run(cli: &Cli) -> Result<()> {
         Action::List { all, json } => {
             let items = cli.workspaces(*all)?;
             if *json {
-                print_json(&items)
+                print_json(&workspace_list_report(&items)?)
             } else {
                 print_workspace_list(&items);
                 Ok(())
@@ -892,7 +891,6 @@ fn run(cli: &Cli) -> Result<()> {
             );
             workspaces::verify_ownership(cli, &workspace)
                 .context("verify workspace namespace ownership using the selected kubeconfig")?;
-            runner::ensure_started(cli)?;
             print_json(&cli.request(
                 "PUT",
                 &format!("/v1/workspaces/{}/kubernetes-connection", workspace.id),
@@ -908,15 +906,7 @@ fn run(cli: &Cli) -> Result<()> {
                 workspace.agent_enabled,
                 "workspace has no agent; use adm shell"
             );
-            runner::ensure_started(cli)?;
-            let mut command = cli.runtime_command("terminal")?;
-            command.args(["--url", &cli.runner_url, "--workspace", &workspace.id]);
-            if *diagnostics {
-                command.arg("--diagnostics");
-            }
-            let status = command.status().context("start terminal client")?;
-            anyhow::ensure!(status.success(), "terminal exited with {status}");
-            Ok(())
+            runtime_access::attach(cli, &workspace, *diagnostics)
         }
         Action::Shell {
             name,
@@ -933,28 +923,7 @@ fn run(cli: &Cli) -> Result<()> {
                 eprintln!("{}", workspaces::navigation_guidance(&workspace, true));
             }
             if *manage {
-                let mut management = cli.runtime_command("shell-management")?;
-                management.env("KUBECONFIG", cli.kubeconfig_reference()?);
-                management.args([
-                    "--kubectl",
-                    &cli.kubectl,
-                    "--namespace",
-                    &workspace.namespace,
-                    "--workspace-id",
-                    &workspace.id,
-                    "--cwd",
-                    &workspace.cwd,
-                    "--runner-url",
-                    &cli.runner_url,
-                ]);
-                if !command.is_empty() {
-                    management.arg("--").args(command);
-                }
-                let status = management
-                    .status()
-                    .context("start current-workspace management shell")?;
-                anyhow::ensure!(status.success(), "managed shell exited with {status}");
-                return Ok(());
+                return runtime_access::managed_shell(cli, &workspace, &workspace.cwd, command);
             }
             let mut child = cli.kubectl_command()?;
             child.args([
@@ -1050,7 +1019,6 @@ fn run(cli: &Cli) -> Result<()> {
         } => {
             let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(workspace.agent_enabled, "workspace has no agent");
-            runner::ensure_started(cli)?;
             let body = match request_id {
                 Some(request_id) => json!({"message":message,"requestId":request_id}),
                 None => json!({"message":message}),
@@ -1078,20 +1046,28 @@ fn run(cli: &Cli) -> Result<()> {
             )?)
         }
         Action::Start => {
-            runner::ensure_started(cli)?;
-            print_json(&json!({"status":"ready","url":cli.runner_url}))
+            anyhow::bail!(
+                "agent runtimes start inside workspace Pods; use `adm attach NAME` to connect"
+            )
         }
-        Action::Serve => runner::serve(cli),
+        Action::Serve => anyhow::bail!(
+            "the host does not run agent harnesses; workspace Pods own runtime execution"
+        ),
         Action::LifecycleServe { host, port } => {
             lifecycle::serve(cli.clone_for_lifecycle(), host, *port)
         }
-        Action::Stop => runner::stop(cli),
+        Action::Stop => anyhow::bail!(
+            "there is no host agent runner to stop; workspace Pods own agent execution"
+        ),
         Action::Doctor {
             storage_class,
             json,
         } => diagnostics::doctor(cli, storage_class, *json),
         Action::Setup => setup::run(cli),
-        Action::Login => setup::login(cli),
+        Action::Login { name } => {
+            let workspace = cli.active_workspace(name)?;
+            runtime_access::login(cli, &workspace)
+        }
         Action::Herdr { command } => herdr::run(cli, command),
         Action::Browser {
             name,
@@ -1169,7 +1145,7 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
             {
                 options.storage_class = storage_class;
             }
-            if options.model.is_none() && !options.no_agent {
+            if options.model.is_none() {
                 options.model = config.model;
             }
             if let Some(model) = &options.model {

@@ -1,5 +1,5 @@
 # Development workspace image referenced by adm manifests as adm-dev:0.1.0.
-# Model credentials stay on the management host; this image has no provider keys.
+# Provider credentials are injected into each runtime Pod; the image contains no provider keys.
 
 FROM golang:1.26.5-bookworm AS go-build
 WORKDIR /src/repositories
@@ -17,7 +17,9 @@ COPY packages/runner/package.json packages/runner/package.json
 COPY packages/terminal/package.json packages/terminal/package.json
 RUN npm ci --ignore-scripts
 COPY packages/runner packages/runner
-RUN npx esbuild packages/runner/src/remote-env-server.ts --bundle --platform=node --format=esm --outfile=/out/workspace-env.mjs
+RUN npx esbuild packages/runner/src/main.ts --bundle --platform=node --format=esm --packages=external --outfile=/out/runner.mjs \
+ && npx esbuild packages/runner/src/remote-env-server.ts --bundle --platform=node --format=esm --outfile=/out/workspace-env.mjs \
+ && npm prune --omit=dev --ignore-scripts
 
 FROM rust:1.89-bookworm AS adm-build
 WORKDIR /src
@@ -47,6 +49,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=go-build /out/adm-repositories /usr/local/bin/adm-repositories
 COPY --from=go-build /go/bin/artifact-fs /usr/local/bin/artifact-fs
+COPY --from=js-build /out/runner.mjs /opt/adm/runner.mjs
+COPY --from=js-build /src/node_modules /opt/adm/node_modules
 COPY packages/repositories/git /usr/local/lib/adm-repositories/git
 COPY image/adm-dev-entrypoint /usr/local/bin/adm-dev-entrypoint
 COPY image/adm-init-workspace /usr/local/bin/adm-init-workspace
@@ -69,5 +73,6 @@ RUN chown root:root \
       /usr/local/bin/adm-init-workspace \
       /usr/local/lib/adm-repositories/git \
  && ln -sfn /workspace/.adm/catalog /repos
+ENV NODE_PATH=/opt/adm/node_modules
 WORKDIR /
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/adm-dev-entrypoint"]

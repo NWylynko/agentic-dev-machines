@@ -142,10 +142,6 @@ impl CreateIntent {
                 "each credential environment name may be specified only once"
             );
         }
-        ensure!(
-            !self.agent_enabled || self.model.is_some(),
-            "agent workspaces require a selected model"
-        );
         let expected_cwd = self
             .repository
             .as_ref()

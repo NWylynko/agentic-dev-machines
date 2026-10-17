@@ -1,4 +1,4 @@
-use crate::{Cli, runner};
+use crate::Cli;
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -100,7 +100,7 @@ pub struct CreateOptions {
     /// Stable lifecycle operation UUID used to replay this create request.
     #[arg(long)]
     pub operation_id: Option<String>,
-    /// Bot agents run in the management-host runner and have no workspace Pod.
+    /// Runtime role; both coding and bot agents run in private workspace Pods.
     #[arg(long,default_value="coding",value_parser=["coding","bot"])]
     pub role: String,
     /// Workspace image; otherwise use the configured or matching release image.
@@ -119,8 +119,6 @@ pub struct CreateOptions {
     pub cpu: String,
     #[arg(long, default_value = "2Gi")]
     pub memory: String,
-    #[arg(long)]
-    pub no_agent: bool,
     #[arg(long)]
     pub no_repositories: bool,
     #[arg(long)]
@@ -316,7 +314,7 @@ impl CreateOptions {
             storage_size: self.storage_size.clone(),
             cpu: self.cpu.clone(),
             memory: self.memory.clone(),
-            agent_enabled: !self.no_agent,
+            agent_enabled: true,
             allow_node_local_storage: self.allow_node_local_storage,
             repositories: self.catalog.is_some() && !self.no_repositories && self.role == "coding",
             catalog,
@@ -842,31 +840,78 @@ pub fn kubectl(cli: &Cli, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
 }
 
 fn labels(w: &Workspace) -> Value {
-    json!({"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/workspace-id":w.id})
+    json!({"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/workspace-id":w.id,"adm.dev/role":w.role})
 }
 fn metadata(w: &Workspace, name: &str) -> Value {
     json!({"name":name,"namespace":w.namespace,"labels":labels(w)})
 }
 
 pub fn manifest(w: &Workspace) -> Result<Value> {
+    let lifecycle_namespace =
+        std::env::var("ADM_LIFECYCLE_NAMESPACE").unwrap_or_else(|_| "adm-system".to_owned());
+    ensure!(
+        !lifecycle_namespace.is_empty()
+            && lifecycle_namespace.len() <= 63
+            && lifecycle_namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && lifecycle_namespace
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && lifecycle_namespace
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric),
+        "ADM_LIFECYCLE_NAMESPACE must be a lowercase Kubernetes namespace name"
+    );
     let labels = labels(w);
     let namespace = json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":w.namespace,"labels":labels}});
-    let mut items = vec![namespace];
-    if w.role == "bot" {
-        return Ok(json!({"apiVersion":"v1","kind":"List","items":items}));
-    }
+    let mut items = vec![
+        namespace,
+        json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":metadata(w,"adm-runtime"),"automountServiceAccountToken":false}),
+    ];
     let claim = json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":metadata(w,"work"),"spec":{"accessModes":["ReadWriteOnce"],"storageClassName":w.storage_class,"resources":{"requests":{"storage":w.storage_size}}}});
+    let mut workspace_config = json!({
+        "id":w.id,
+        "name":w.name,
+        "role":w.role,
+        "environment":"pod",
+        "model":w.model,
+        "allowedAgents":w.allowed_agents,
+        "mcpServers":w.mcp_servers,
+    });
+    if workspace_config["mcpServers"].is_null() {
+        workspace_config
+            .as_object_mut()
+            .unwrap()
+            .remove("mcpServers");
+    }
+    if w.role == "coding" {
+        workspace_config["localRoot"] = json!("/workspace");
+        workspace_config["cwd"] = json!(w.cwd);
+    }
+    let runtime_config = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"workspace-runtime"),"data":{"workspace.json":serde_json::to_string(&workspace_config)?}});
+    let service = json!({"apiVersion":"v1","kind":"Service","metadata":metadata(w,"workspace"),"spec":{"selector":labels,"ports":[{"name":"http","port":7432,"targetPort":7432}]}});
     let mounts = vec![
         json!({"name":"work","mountPath":"/workspace","mountPropagation":"HostToContainer"}),
         json!({"name":"shm","mountPath":"/dev/shm"}),
+        json!({"name":"runtime-config","mountPath":"/run/adm","readOnly":true}),
+        json!({"name":"runtime-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true}),
     ];
     let mut volumes = vec![
         json!({"name":"work","persistentVolumeClaim":{"claimName":"work"}}),
         json!({"name":"shm","emptyDir":{"medium":"Memory","sizeLimit":"256Mi"}}),
+        json!({"name":"runtime-config","configMap":{"name":"workspace-runtime","items":[{"key":"workspace.json","path":"workspace.json"}]}}),
+        json!({"name":"runtime-token","projected":{"sources":[{"serviceAccountToken":{"audience":"adm-lifecycle","expirationSeconds":3600,"path":"token"}}]}}),
     ];
-    let mut dev = json!({"name":"dev","image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/repos","securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"exec":{"command":["test","-d","/repos"]},"initialDelaySeconds":1,"periodSeconds":2}});
-    if !w.credential_env.is_empty() {
-        dev["env"] = Value::Array(w.credential_env.iter().map(|reference| json!({"name":reference.name,"valueFrom":{"secretKeyRef":{"name":reference.secret_name,"key":reference.key}}})).collect());
+    let mut dev = json!({"name":if w.role == "coding" { "dev" } else { "bot" },"image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":if w.role == "coding" { "/repos" } else { "/workspace" },"ports":[{"name":"http","containerPort":7432}],"securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":1,"periodSeconds":2},"livenessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":10,"periodSeconds":10,"failureThreshold":3}});
+    dev["env"] = json!([
+        {"name":"ADM_LIFECYCLE_URL","value":format!("http://adm-lifecycle.{lifecycle_namespace}.svc.cluster.local:7433")},
+        {"name":"ADM_POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}
+    ]);
+    for reference in &w.credential_env {
+        dev["env"].as_array_mut().unwrap().push(json!({"name":reference.name,"valueFrom":{"secretKeyRef":{"name":reference.secret_name,"key":reference.key}}}));
     }
     let mut containers = vec![dev];
     if w.repositories {
@@ -875,9 +920,22 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         items.push(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"repositories"),"data":{"catalog.json":serde_json::to_string(&w.catalog)?}}));
     }
     let init = json!({"name":"initialize","image":w.image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
-    let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
-    let network = json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":metadata(w,"workspace-isolation"),"spec":{"podSelector":{},"policyTypes":["Ingress","Egress"],"ingress":[{"from":[{"podSelector":{}}]}],"egress":[{"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}}}],"ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]},{"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.42.0.0/16","10.43.0.0/16","169.254.0.0/16"]}}]}]}});
-    items.extend([claim, deployment, network]);
+    let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"serviceAccountName":"adm-runtime","automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
+    let mut ingress = vec![
+        json!({"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":lifecycle_namespace}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"adm-lifecycle"}}}],"ports":[{"protocol":"TCP","port":7432}]}),
+    ];
+    let mut egress = vec![
+        json!({"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}}}],"ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]}),
+        json!({"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":lifecycle_namespace}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"adm-lifecycle"}}}],"ports":[{"protocol":"TCP","port":7433}]}),
+        json!({"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.42.0.0/16","10.43.0.0/16","169.254.0.0/16"]}}]}),
+    ];
+    if w.role == "coding" {
+        ingress.push(json!({"from":[{"namespaceSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"bot"}},"podSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"bot"}}}],"ports":[{"protocol":"TCP","port":7432}]}));
+    } else {
+        egress.push(json!({"to":[{"namespaceSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"coding"}},"podSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"coding"}}}],"ports":[{"protocol":"TCP","port":7432}]}));
+    }
+    let network = json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":metadata(w,"workspace-isolation"),"spec":{"podSelector":{},"policyTypes":["Ingress","Egress"],"ingress":ingress,"egress":egress}});
+    items.extend([runtime_config, claim, service, deployment, network]);
     Ok(json!({"apiVersion":"v1","kind":"List","items":items}))
 }
 
@@ -961,10 +1019,6 @@ pub fn navigation_guidance(workspace: &Workspace, opening_shell: bool) -> String
 pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
     let allow_node_local_storage = requested.allow_node_local_storage;
     let started = Instant::now();
-    ensure!(
-        !requested.agent_enabled || requested.model.is_some(),
-        "agent workspaces require a selected model"
-    );
     let mut store = cli.store()?;
     let existing = store
         .list(false)?
@@ -1042,64 +1096,51 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
             )?;
             Ok(())
         })?;
-        if w.role == "coding" {
-            lifecycle_stage(
-                "create",
-                &w.name,
-                "waiting for deployment readiness",
-                || {
-                    kubectl(
-                        cli,
-                        &[
-                            "wait",
-                            "--for=condition=available",
-                            "deployment/workspace",
-                            "-n",
-                            &w.namespace,
-                            "--timeout=180s",
-                        ],
-                        None,
-                    )?;
-                    Ok(())
-                },
-            )?;
-        }
         if let Some(repository) = &w.repository {
-            prepare_repository(cli, &w, repository)?;
-        }
-        w.phase = "ready".into();
-        if w.agent_enabled {
-            lifecycle_stage("create", &w.name, "starting agent runner", || {
-                runner::ensure_started(cli)
-            })?;
-            let mut registration = json!({"id":w.id,"name":w.name,"role":w.role,"environment":"kubernetes","allowedAgents":w.allowed_agents});
-            if w.role == "coding" {
-                registration["namespace"] = w.namespace.clone().into();
-                registration["container"] = "dev".into();
-                registration["cwd"] = w.cwd.clone().into();
-                registration["kubectl"] = cli.kubectl.clone().into();
-                registration["kubeconfig"] = cli.kubeconfig_reference()?.into();
-            }
-            if let Some(model) = &w.model {
-                registration["model"] = model.clone();
-            }
-            if let Some(mcp_servers) = &w.mcp_servers {
-                registration["mcpServers"] = mcp_servers.clone();
-            }
-            lifecycle_stage("create", &w.name, "registering agent workspace", || {
-                store.admit_if_provisioning(&w, || {
-                    cli.request(
-                        "PUT",
-                        &format!("/v1/workspaces/{}", w.id),
-                        Some(&registration),
-                    )?;
-                    Ok(())
-                })?;
+            // A missing checkout can prevent the runtime from becoming
+            // Deployment-ready. Wait for its container to run, prepare the
+            // private checkout, then require the normal readiness condition.
+            lifecycle_stage("create", &w.name, "waiting for workspace Pod", || {
+                kubectl(
+                    cli,
+                    &[
+                        "wait",
+                        "--for=jsonpath='{.status.phase}'=Running",
+                        "pod",
+                        "-l",
+                        &format!("adm.dev/workspace-id={}", w.id),
+                        "-n",
+                        &w.namespace,
+                        "--timeout=180s",
+                    ],
+                    None,
+                )?;
                 Ok(())
             })?;
-        } else {
-            store.admit_if_provisioning(&w, || Ok(()))?;
+            prepare_repository(cli, &w, repository)?;
         }
+        lifecycle_stage(
+            "create",
+            &w.name,
+            "waiting for deployment readiness",
+            || {
+                kubectl(
+                    cli,
+                    &[
+                        "wait",
+                        "--for=condition=available",
+                        "deployment/workspace",
+                        "-n",
+                        &w.namespace,
+                        "--timeout=180s",
+                    ],
+                    None,
+                )?;
+                Ok(())
+            },
+        )?;
+        w.phase = "ready".into();
+        store.admit_if_provisioning(&w, || Ok(()))?;
         Ok(())
     })();
     if let Err(error) = provision {
@@ -1221,39 +1262,6 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
     })?;
     w.phase = "deleting".into();
     store.save(&w)?;
-    let directory = cli.state_path().join("runner/tombstones");
-    fs::create_dir_all(&directory)?;
-    let tombstone = directory.join(format!("{}.json", w.id));
-    if !tombstone.exists() {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tombstone)?;
-        file.write_all(&serde_json::to_vec(&json!({"id":w.id,"deletedAt":now()}))?)?;
-        file.sync_all()?;
-        fs::File::open(&directory)?.sync_all()?;
-    }
-    if w.agent_enabled {
-        lifecycle_stage("destroy", &w.name, "cancelling agent activity", || {
-            runner::ensure_started(cli)?;
-            if let Err(error) = cli.request("DELETE", &format!("/v1/workspaces/{}", w.id), None) {
-                let missing = error
-                    .downcast_ref::<runner::HttpError>()
-                    .is_some_and(|error| {
-                        error.status == reqwest::StatusCode::NOT_FOUND
-                            && error.code.as_deref() == Some("WORKSPACE_NOT_FOUND")
-                    });
-                let deleted = error
-                    .downcast_ref::<runner::HttpError>()
-                    .is_some_and(|error| {
-                        error.status == reqwest::StatusCode::GONE
-                            && error.code.as_deref() == Some("WORKSPACE_DELETED")
-                    });
-                ensure!(missing || deleted, "{error:#}");
-            }
-            Ok(())
-        })?;
-    }
     lifecycle_stage("destroy", &w.name, "waiting for namespace removal", || {
         kubectl(
             cli,
@@ -1274,25 +1282,6 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
     store.save(&w)?;
     lifecycle_complete("destroy", &w.name, "deleted", started);
     Ok(w)
-}
-
-pub fn cluster_status(cli: &Cli, w: &Workspace) -> Result<Value> {
-    verify_ownership(cli, w)?;
-    let pods: Value = serde_json::from_slice(&kubectl(
-        cli,
-        &[
-            "get",
-            "pods",
-            "-n",
-            &w.namespace,
-            "-l",
-            &format!("adm.dev/workspace-id={}", w.id),
-            "-o",
-            "json",
-        ],
-        None,
-    )?)?;
-    Ok(json!({"namespace":w.namespace,"pods":pods["items"]}))
 }
 
 #[cfg(test)]
