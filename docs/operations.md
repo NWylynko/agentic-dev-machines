@@ -77,7 +77,19 @@ Every workspace starts with a durable agent. Without a configured default, selec
 
 Use `adm shell NAME --manage` when you also need the current agent controls from inside that shell. The private `adm` client supports `adm status [--json]`, `adm history [--after N] [--limit N]`, `adm prompt MESSAGE`, `adm abort [--background]`, and `adm help`. History defaults to 200 entries; its response limit is 1 MiB, so use a smaller `--limit` if it reports an oversized response. It can address only the workspace selected on the management host; workspace IDs, host state, credentials, and the runner URL are not passed into the development container. Same-workspace processes can use the allowed actions while the managed session is open. Closing the shell closes the temporary management relay and leaves the agent running. The ordinary `adm shell NAME` path does not start a relay. Use the management host for `adm list`, creation/deletion, port forwarding, `exec`, and other workspace operations.
 
-The workspace image includes `nano`, GitHub CLI (`gh`), and passwordless `sudo`. `gh` comes from GitHub's signed Debian repository and takes the current stable package when the image is built; an existing image stays at that package version until rebuilt. This supplies the executable only: authenticating GitHub CLI for private repository access or Git pushes is a separate per-workspace setup. New coding workspaces permit unattended administration inside their own container by default:
+The workspace image includes `nano`, GitHub CLI (`gh`), and passwordless `sudo`. `gh` comes from GitHub's signed Debian repository and takes the current stable package when the image is built; an existing image stays at that package version until rebuilt. Git's credential helper uses only an explicit `GH_TOKEN` supplied to that workspace. It applies to HTTPS remotes on `github.com`; Git author identity remains the repository's separate `user.name` and `user.email` settings. The helper does not save credentials in Git or `gh` config, and it does not send the token to other hosts.
+
+Provision a fine-grained token through the selected secret manager, limited to the repository or repositories the workspace needs and with repository `Contents: read and write` permission for pushes. Have the cluster's secret controller create a key such as `token` in the workspace's own namespace, then select that key when creating the workspace:
+
+```sh
+adm create package-workspace \
+  --credential-env GH_TOKEN=github-auth:token \
+  --repo OWNER/REPO
+```
+
+The namespace Secret must exist before the Pod starts. ADM stores only its name and key reference; the Kubernetes Pod receives the value as `GH_TOKEN`. Never place the token in a remote URL, shell command, workspace file, ADM configuration, or image. The image fails Git authentication with actionable guidance when `GH_TOKEN` is missing, and reports when GitHub rejects the workspace token. After updating the Secret, replace the Pod so the process receives the new environment value; for example, get the namespace from `adm status NAME --json` and run `kubectl -n WORKSPACE_NAMESPACE rollout restart deployment/workspace`. Updating a Secret alone does not change an existing process. Limit each token to the repositories that workspace is allowed to write. GitHub documents [`GH_TOKEN`](https://cli.github.com/manual/gh_help_environment) for headless CLI authentication and [`gh auth setup-git`](https://cli.github.com/manual/gh_auth_setup-git) for configuring Git's credential helper.
+
+New coding workspaces permit unattended administration inside their own container by default:
 
 ```sh
 adm create package-workspace
@@ -96,7 +108,7 @@ adm-repositories discover --owner example-owner > /tmp/adm-catalog.json
 adm create my-project --catalog /tmp/adm-catalog.json --model PROVIDER/MODEL_ID
 ```
 
-Discovery authenticates `gh` on the management host. Fetching private repository contents also requires a scoped Git credential mechanism in the repository container; this is an operator prerequisite, not something the discovery JSON supplies. Credentials must not appear in remote URLs. No eager-clone fallback is used when an upstream lacks filtering support. A failed acquisition stays retryable after its cause is fixed.
+Discovery authenticates `gh` on the management host. GitHub HTTPS authentication in a coding workspace uses its explicit `GH_TOKEN` Secret reference described above. The lazy catalog sidecar does not receive that token, so private lazy fetches need a separate credential design. Credentials must not appear in remote URLs. No eager-clone fallback is used when an upstream lacks filtering support. A failed acquisition stays retryable after its cause is fixed.
 
 The repository service requires FUSE, mount propagation, and a Linux kernel supporting unique mount identities (`STATX_MNT_ID_UNIQUE`, available since Linux 6.8 according to [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html)). It fails clearly when that support is unavailable. The repository sidecar currently has elevated mount authority; the `dev` container has the standard own-container administration profile while retaining UID 1000 for ordinary work. It receives neither a service-account token nor management-host credentials. Treat the sidecar as a separate trusted component. The immutable-upstream cache is optional and must be mounted read-only; each workspace's Git state and writable files remain private.
 

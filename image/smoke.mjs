@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { verifyGitHubPushAuthentication } from "./github-auth-smoke.mjs";
 
 const exec = promisify(execFile);
 const image = process.argv[2] ?? "ghcr.io/nwylynko/agentic-dev-machines:latest";
@@ -389,6 +390,7 @@ try {
     "-e",
     browserFixture,
   );
+  await verifyGitHubPushAuthentication(image);
   process.stdout.write(`Image smoke passed for ${image} in ${container}\n`);
 } catch (error) {
   failure = error;
