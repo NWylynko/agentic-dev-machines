@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { WorkspaceTerminal } from "./terminal.ts";
+import { configureTerminalKeybindings } from "./keybindings.ts";
 async function runTerminal() {
+  await configureTerminalKeybindings();
   const args = process.argv.slice(2);
   let url = "http://127.0.0.1:7432",
     workspaceId = "",
