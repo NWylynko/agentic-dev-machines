@@ -2336,13 +2336,18 @@ fn zsh_completions_load_and_complete_cli_commands_and_flags_offline() {
         eprintln!("skipping interactive completion assertions because zsh is unavailable");
         return;
     }
+    // Insecure ambient completion paths must not consume the PTY's test input.
+    let insecure_completions = root.path().join("insecure-completions");
+    fs::create_dir(&insecure_completions).unwrap();
+    fs::set_permissions(&insecure_completions, fs::Permissions::from_mode(0o777)).unwrap();
     let driver = root.path().join("completion-test.zsh");
     fs::write(
         &driver,
         r#"zmodload zsh/zpty
 zpty adm-completion zsh -f -i
-zpty -w adm-completion $'stty -echo\nautoload -Uz compinit\ncompinit -D\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() { print -r -- "__ADM_RESULT__:$*"; }\nprint __ADM_READY__\n'
+zpty -w adm-completion $'stty -echo\nfpath=("$ADM_TEST_INSECURE_COMPLETIONS" $fpath)\nautoload -Uz compinit\ncompinit -D -i\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() { print -r -- "__ADM_RESULT__:$*"; }\nprint __ADM_READY__\n'
 zpty -r -m adm-completion output '*__ADM_READY__*'
+print -r -- "$output"
 for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t'; do
   zpty -w adm-completion "$input"
   zpty -r -m adm-completion output '*__ADM_RESULT__*'
@@ -2355,6 +2360,7 @@ zpty -d adm-completion
     let zsh = Command::new("zsh")
         .env("ZDOTDIR", root.path())
         .env("ADM_TEST_COMPLETION_SCRIPT", &script_path)
+        .env("ADM_TEST_INSECURE_COMPLETIONS", &insecure_completions)
         .arg("-f")
         .arg(&driver)
         .output()
