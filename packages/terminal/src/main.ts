@@ -5,11 +5,13 @@ async function runTerminal() {
   const args = process.argv.slice(2);
   let url = "http://127.0.0.1:7432",
     workspaceId = "",
+    tokenFile: string | undefined,
+    identityFile: string | undefined,
     diagnostics = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--help" || args[i] === "-h") {
       console.log(
-        "adm terminal --url URL --workspace ID [--diagnostics]\nCtrl+C detaches. Agents keep running. Ctrl+R reconnects. /help lists commands.",
+        "adm terminal --url URL --workspace ID [--identity-file PATH] [--diagnostics]\nCtrl+C detaches. Agents keep running. Ctrl+R reconnects. /help lists commands.",
       );
       return;
     }
@@ -17,12 +19,19 @@ async function runTerminal() {
       diagnostics = true;
       continue;
     }
-    if (args[i] === "--url" || args[i] === "--workspace") {
+    if (
+      args[i] === "--url" ||
+      args[i] === "--workspace" ||
+      args[i] === "--token-file" ||
+      args[i] === "--identity-file"
+    ) {
       const value = args[++i];
       if (!value || value.startsWith("--"))
         throw new Error(`Missing value for ${args[i - 1]}`);
       if (args[i - 1] === "--url") url = value;
-      else workspaceId = value;
+      else if (args[i - 1] === "--workspace") workspaceId = value;
+      else if (args[i - 1] === "--token-file") tokenFile = value;
+      else identityFile = value;
       continue;
     }
     throw new Error(`Unknown argument: ${args[i]}`);
@@ -36,6 +45,8 @@ async function runTerminal() {
   const terminal = new WorkspaceTerminal({
     url,
     workspaceId,
+    tokenFile,
+    identityFile,
     diagnostics,
     tui: ui,
     onRender: () => ui.requestRender(),

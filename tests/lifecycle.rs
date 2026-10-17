@@ -1346,6 +1346,26 @@ else:
     .json()
     .unwrap();
     assert_eq!(bot_create_receipt["operationId"], bot_create_id);
+    let bot_operation_path = format!("/v1/runtime/operations/{bot_create_id}");
+    let observed =
+        request_with_token(&url, "GET", &bot_operation_path, None, Some("bot-token")).unwrap();
+    assert_eq!(observed.status(), 200);
+    let observed: Value = observed.json().unwrap();
+    assert_eq!(observed["workspaceId"], bot_create_receipt["workspaceId"]);
+    assert_eq!(observed["operationId"], bot_create_id);
+    assert_eq!(
+        request_with_token(
+            &url,
+            "GET",
+            &bot_operation_path,
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap()
+        .status(),
+        403,
+        "a coding Pod cannot read global lifecycle receipts"
+    );
     let replay_create: Value = request_with_token(
         &url,
         "POST",
@@ -1604,6 +1624,8 @@ else:
     });
     let busy_delete_id = "2c7edb0b-cf82-4563-8faa-7756ff8b4f61";
     let busy_delete = json!({"operationId":busy_delete_id,"kind":"delete","workspaceId":busy_receipt["workspaceId"]});
+    fs::remove_file(root.path().join("delete-release")).unwrap();
+    fs::remove_file(root.path().join("deleting-entered")).unwrap();
     fs::write(root.path().join("hold-delete"), "yes").unwrap();
     request_with_token(
         &url,
@@ -1625,6 +1647,17 @@ else:
         Some("synthetic-lifecycle-token"),
     )
     .unwrap();
+    let in_flight_bot_replay: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&queued_delete),
+        Some(&fresh_bot_token),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(in_flight_bot_replay["operationId"], queued_delete_id);
     let unavailable: Value = request_with_token(
         &url,
         "GET",
@@ -1666,6 +1699,30 @@ else:
             .filter(|receipt| receipt["status"] == "completed")
         });
     }
+    let completed_bot_replay: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&queued_delete),
+        Some(&fresh_bot_token),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(completed_bot_replay["operationId"], queued_delete_id);
+    assert_eq!(completed_bot_replay["status"], "completed");
+    let completed_status = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/runtime/operations/{queued_delete_id}"),
+        None,
+        Some(&fresh_bot_token),
+    )
+    .unwrap();
+    assert_eq!(completed_status.status(), 200);
+    let completed_status: Value = completed_status.json().unwrap();
+    assert_eq!(completed_status["status"], "completed");
+    assert_eq!(completed_status["workspaceId"], runtime_id);
     fs::remove_file(root.path().join("hold-delete")).unwrap();
     fs::remove_file(root.path().join("delete-release")).unwrap();
     fs::write(root.path().join("hold-apply"), "yes").unwrap();

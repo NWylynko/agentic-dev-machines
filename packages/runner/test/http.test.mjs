@@ -22,7 +22,16 @@ const main = new URL("../src/main.ts", import.meta.url);
 async function startRunner(
   directory,
   env = {},
-  { useFaux = true, defaultModel = true, port = 0, tokenFile } = {},
+  {
+    useFaux = true,
+    defaultModel = true,
+    port = 0,
+    host = "127.0.0.1",
+    tokenFile,
+    workspaceConfigFile,
+    lifecycleUrl,
+    podUid,
+  } = {},
 ) {
   const child = spawn(
     process.execPath,
@@ -30,9 +39,16 @@ async function startRunner(
       main.pathname,
       "--port",
       String(port),
+      "--host",
+      host,
       "--state-dir",
       directory,
       ...(tokenFile ? ["--token-file", tokenFile] : []),
+      ...(workspaceConfigFile
+        ? ["--workspace-config", workspaceConfigFile]
+        : []),
+      ...(lifecycleUrl ? ["--lifecycle-url", lifecycleUrl] : []),
+      ...(podUid ? ["--pod-uid", podUid] : []),
       ...(useFaux
         ? ["--provider", "faux", ...(defaultModel ? ["--model", "faux-1"] : [])]
         : ["--auth-path", join(directory, "empty-auth.json")]),
@@ -75,10 +91,13 @@ async function startRunner(
       }
       lines.close();
     },
-    async request(path, method = "GET", body, signal) {
+    async request(path, method = "GET", body, signal, token) {
       const response = await fetch(url + path, {
         method,
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
         ...(signal ? { signal } : {}),
       });
@@ -100,6 +119,45 @@ async function freePort() {
   return port;
 }
 
+async function startPodRunner(root, lifecycle, { id, name, role, host, podUid, port = 7432 }) {
+  const workspace = {
+    id,
+    name,
+    role,
+    phase: "ready",
+    namespace: `fixture-${id}`,
+    runtime_status: {
+      podIP: host,
+      ready: true,
+      activity: { status: "idle" },
+    },
+  };
+  const token = `token-${id}`;
+  const tokenFile = await lifecycle.addWorkspace(workspace, token);
+  const workspaceConfigFile = join(root, `${id}.json`);
+  await writeFile(
+    workspaceConfigFile,
+    JSON.stringify({
+      id,
+      name,
+      role,
+      environment: "pod",
+      ...(role === "coding" ? { localRoot: join(root, id, "repos") } : {}),
+      model: { provider: "faux", id: "faux-1" },
+    }),
+    { mode: 0o600 },
+  );
+  const runner = await startRunner(join(root, id), { ADM_RUNTIME_PORT: String(port) }, {
+    host,
+    port,
+    tokenFile,
+    workspaceConfigFile,
+    lifecycleUrl: lifecycle.url,
+    podUid,
+  });
+  return { runner, token, workspace };
+}
+
 async function startBotLifecycle(
   directory,
   workspaces,
@@ -110,6 +168,7 @@ async function startBotLifecycle(
   await writeFile(tokenFile, "fixture-runtime-token\n", { mode: 0o600 });
   const authorizations = [];
   const operations = new Map();
+  const tokens = new Map([['fixture-runtime-token', 'fixture-source']]);
   let signalDirectoryRequest;
   let signalDirectoryAbort;
   const directoryRequest = new Promise((resolve) => {
@@ -120,7 +179,10 @@ async function startBotLifecycle(
   });
   const server = createServer(async (request, response) => {
     const headers = { "content-type": "application/json" };
-    if (request.headers.authorization !== "Bearer fixture-runtime-token") {
+    const sourceId = tokens.get(
+      request.headers.authorization?.replace(/^Bearer /, ""),
+    );
+    if (!sourceId) {
       response
         .writeHead(403, headers)
         .end(JSON.stringify({ error: { message: "forbidden" } }));
@@ -135,7 +197,26 @@ async function startBotLifecycle(
         response.once("close", signalDirectoryAbort);
         return;
       }
-      response.writeHead(200, headers).end(JSON.stringify(workspaces));
+      response.writeHead(200, headers).end(JSON.stringify(workspaces.filter((workspace) => workspace.role === "coding" && workspace.phase !== "deleted" && workspace.phase !== "deleting")));
+      return;
+    }
+    const runtime = /^\/v1\/workspaces\/([^/]+)\/runtime\/(authorize|lease|lease\/renew|check)$/.exec(request.url ?? "");
+    if (request.method === "POST" && runtime) {
+      const id = decodeURIComponent(runtime[1]);
+      const action = runtime[2];
+      if (action === "authorize") {
+        const target = workspaces.find((workspace) => workspace.id === id);
+        const allowed = target && target.phase !== "deleted" && target.phase !== "deleting" && (sourceId === id || (target.role === "coding" && workspaces.some((workspace) => workspace.id === sourceId && workspace.role === "bot")));
+        authorizations.push({ id, action: value.action, sourceId });
+        response.writeHead(allowed ? 200 : 403, headers).end(JSON.stringify(allowed ? { allowed: true } : { error: { message: "not authorized" } }));
+        return;
+      }
+      const own = workspaces.find((workspace) => workspace.id === sourceId);
+      if (id !== sourceId || !own) {
+        response.writeHead(403, headers).end(JSON.stringify({ error: { message: "not authorized" } }));
+        return;
+      }
+      response.writeHead(200, headers).end(JSON.stringify({ workspaceId: id, holder: value.holder, fencingToken: 1, expiresAt: Date.now() + 60000 }));
       return;
     }
     const authorize = /^\/v1\/workspaces\/([^/]+)\/runtime\/authorize$/.exec(
@@ -181,6 +262,12 @@ async function startBotLifecycle(
       response.writeHead(202, headers).end(JSON.stringify(receipt));
       return;
     }
+    const operationStatus = /^\/v1\/runtime\/operations\/([^/]+)$/.exec(request.url ?? "");
+    if (request.method === "GET" && operationStatus) {
+      const receipt = operations.get(decodeURIComponent(operationStatus[1]))?.receipt;
+      response.writeHead(receipt ? 200 : 404, headers).end(JSON.stringify(receipt ?? { error: { message: "not found" } }));
+      return;
+    }
     response
       .writeHead(404, headers)
       .end(JSON.stringify({ error: { message: "not found" } }));
@@ -192,6 +279,16 @@ async function startBotLifecycle(
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     tokenFile,
+    addWorkspace(workspace, token) {
+      const tokenPath = join(directory, `${workspace.id}-token`);
+      return writeFile(tokenPath, `${token}\n`, { mode: 0o600 }).then(() => {
+        tokens.set(token, workspace.id);
+        const existing = workspaces.findIndex((item) => item.id === workspace.id);
+        if (existing < 0) workspaces.push(workspace);
+        else workspaces[existing] = workspace;
+        return tokenPath;
+      });
+    },
     authorizations,
     operations,
     directoryRequest,
@@ -203,6 +300,232 @@ async function startBotLifecycle(
   };
 }
 
+test("a workspace runtime authenticates every management route while keeping health public", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-auth-"));
+  const tokenFile = join(directory, "runtime-token");
+  await writeFile(tokenFile, "workspace-runtime-secret\n", { mode: 0o600 });
+  const runner = await startRunner(directory, {}, { tokenFile });
+  t.after(() => runner.stop());
+
+  assert.deepEqual((await runner.request("/health")).body, {
+    status: "ok",
+    version: "0.1.0",
+  });
+  assert.equal((await runner.request("/v1/workspaces")).status, 401);
+  const authorized = await fetch(`${runner.url}/v1/workspaces`, {
+    headers: { authorization: "Bearer workspace-runtime-secret" },
+  });
+  assert.equal(authorized.status, 200);
+  assert.deepEqual(await authorized.json(), { workspaces: [] });
+});
+
+test("a pod runtime opens its immutable workspace directly from mounted runtime configuration", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-pod-"));
+  const configPath = join(directory, "workspace.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      id: "workspace-pod-runtime",
+      name: "pod-runtime",
+      role: "bot",
+      environment: "pod",
+    }),
+  );
+  const runner = await startRunner(
+    directory,
+    {},
+    { workspaceConfigFile: configPath, defaultModel: false },
+  );
+  t.after(() => runner.stop());
+
+  const response = await runner.request("/v1/workspaces/workspace-pod-runtime");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.id, "workspace-pod-runtime");
+  assert.equal(response.body.role, "bot");
+  assert.equal(response.body.status, "needs_model");
+});
+
+test("a mounted bot runtime keeps its identity when the Pod restarts", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-mounted-bot-restart-"));
+  const configPath = join(directory, "workspace.json");
+  await writeFile(configPath, JSON.stringify({
+    id: "mounted-bot-restart",
+    name: "watcher",
+    role: "bot",
+    environment: "pod",
+  }));
+  let runner = await startRunner(directory, {}, { workspaceConfigFile: configPath, defaultModel: false });
+  assert.equal((await runner.request("/v1/workspaces/mounted-bot-restart")).status, 200);
+  await runner.stop();
+  runner = await startRunner(directory, {}, { workspaceConfigFile: configPath, defaultModel: false });
+  t.after(() => runner.stop());
+  assert.equal((await runner.request("/v1/workspaces/mounted-bot-restart")).status, 200);
+});
+
+test("workspace requests are authorized by lifecycle against the caller's projected identity", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-lifecycle-auth-"));
+  const tokenFile = join(directory, "service-account-token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  await writeFile(tokenFile, "rotating-pod-identity-token\n", { mode: 0o600 });
+  await writeFile(
+    workspaceConfigFile,
+    JSON.stringify({
+      id: "workspace-lifecycle-auth",
+      name: "lifecycle-auth",
+      role: "bot",
+      environment: "pod",
+      model: { provider: "faux", id: "faux-1" },
+    }),
+  );
+  const authorizations = [];
+  let deleting = false;
+  const control = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    authorizations.push({
+      path: request.url,
+      authorization: request.headers.authorization,
+      body,
+    });
+    const authorized =
+      request.headers.authorization === "Bearer rotating-pod-identity-token";
+    const leasePath = request.url?.endsWith("/runtime/lease");
+    const checkPath = request.url?.endsWith("/runtime/check");
+    const status = !authorized ? 401 : checkPath && deleting ? 410 : 200;
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify(
+        !authorized
+          ? { error: { code: "UNAUTHORIZED" } }
+          : leasePath
+            ? {
+                workspaceId: "workspace-lifecycle-auth",
+                holder: body.holder,
+                fencingToken: 7,
+                expiresAt: Date.now() + 30_000,
+              }
+            : checkPath && deleting
+              ? {
+                  error: {
+                    code: "WORKSPACE_DELETED",
+                    message: "Workspace is deleting",
+                  },
+                }
+              : checkPath
+                ? { valid: true }
+                : { allowed: true },
+      ),
+    );
+  });
+  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+  const controlUrl = `http://127.0.0.1:${control.address().port}`;
+  const runner = await startRunner(
+    directory,
+    {},
+    {
+      tokenFile,
+      workspaceConfigFile,
+      lifecycleUrl: controlUrl,
+      podUid: "a1b2c3d4-e5f6-47a8-9012-123456789abc",
+    },
+  );
+  t.after(async () => {
+    await runner.stop();
+    await new Promise((resolve) => control.close(resolve));
+  });
+
+  const denied = await fetch(`${runner.url}/v1/workspaces`);
+  assert.equal(denied.status, 401);
+  const response = await fetch(`${runner.url}/v1/workspaces`, {
+    headers: { authorization: "Bearer rotating-pod-identity-token" },
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    authorizations.filter((entry) => entry.path.endsWith("/authorize")),
+    [
+      {
+        path: "/v1/workspaces/workspace-lifecycle-auth/runtime/authorize",
+        authorization: "",
+        body: { action: "read" },
+      },
+      {
+        path: "/v1/workspaces/workspace-lifecycle-auth/runtime/authorize",
+        authorization: "Bearer rotating-pod-identity-token",
+        body: { action: "read" },
+      },
+    ],
+  );
+  assert.ok(
+    authorizations.some((entry) => entry.path.endsWith("/runtime/check")),
+    "Durable commits and requests must check the lifecycle fence",
+  );
+  const projectedStatus = await fetch(
+    `${runner.url}/v1/workspaces/workspace-lifecycle-auth/runtime-status`,
+    { headers: { authorization: "Bearer rotating-pod-identity-token" } },
+  );
+  assert.equal(projectedStatus.status, 200);
+  const projectedBody = await projectedStatus.json();
+  assert.ok(["idle", "running"].includes(projectedBody.activity.status));
+  assert.deepEqual(projectedBody.selectedModel, { provider: "faux", id: "faux-1" });
+  assert.ok(
+    authorizations.some((entry) => entry.path.endsWith("/authorize") && entry.authorization === "Bearer rotating-pod-identity-token" && entry.body.action === "read"),
+    "runtime status is available only to an identity scoped to this workspace Pod",
+  );
+  assert.ok(
+    !authorizations.some((entry) => entry.authorization === "Bearer lifecycle-controller-token"),
+    "the controller credential never crosses into the workspace Pod",
+  );
+  const admitted = await fetch(
+    `${runner.url}/v1/workspaces/workspace-lifecycle-auth/input`,
+    {
+      method: "POST",
+      headers: {
+        authorization: "Bearer rotating-pod-identity-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        message: "Persist this request",
+        requestId: "fenced-commit",
+      }),
+    },
+  );
+  assert.equal(admitted.status, 202);
+  const commitChecks = authorizations.filter((entry) =>
+    entry.path.endsWith("/runtime/check"),
+  ).length;
+  assert.ok(
+    commitChecks >= 2,
+    "workspace admission and the Durable SQLite commit both check the lifecycle fence",
+  );
+  deleting = true;
+  const fenced = await fetch(
+    `${runner.url}/v1/workspaces/workspace-lifecycle-auth/input`,
+    {
+      method: "POST",
+      headers: {
+        authorization: "Bearer rotating-pod-identity-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        message: "Must not be admitted",
+        requestId: "after-delete",
+      }),
+    },
+  );
+  assert.equal(fenced.status, 503);
+  assert.equal((await fenced.json()).error.code, "RUNTIME_OWNERSHIP_LOST");
+  const readiness = await fetch(`${runner.url}/health`);
+  assert.equal(readiness.status, 503);
+  assert.equal((await readiness.json()).status, "error");
+  const closed = await fetch(
+    `${runner.url}/v1/workspaces/workspace-lifecycle-auth`,
+    { headers: { authorization: "Bearer rotating-pod-identity-token" } },
+  );
+  assert.equal(closed.status, 503);
+  assert.equal((await closed.json()).error.code, "RUNTIME_OWNERSHIP_LOST");
+});
+
 async function nextEvent(
   runner,
   id,
@@ -210,6 +533,7 @@ async function nextEvent(
   after = 0,
   diagnostics = false,
   timeoutMs = 0,
+  token,
 ) {
   const controller = new AbortController();
   const timeout = timeoutMs
@@ -217,7 +541,7 @@ async function nextEvent(
     : undefined;
   const response = await fetch(
     `${runner.url}/v1/workspaces/${id}/events?after=${after}&diagnostics=${diagnostics}`,
-    { signal: controller.signal },
+    { signal: controller.signal, headers: token ? { authorization: `Bearer ${token}` } : {} },
   );
   assert.equal(response.status, 200);
   let buffer = "";
@@ -1463,369 +1787,116 @@ test(
 );
 
 test(
-  "a bot discovers all live coding agents across Code Mode, deletion, and restart",
-  { timeout: 30000 },
+  "a pod bot controls isolated coding runtimes, observes durable operations, and keeps broad discovery after restart",
+  { timeout: 45000 },
   async (t) => {
-    const directory = await mkdtemp(
-      join(tmpdir(), "adm-runner-agent-directory-"),
-    );
-    const port = await freePort();
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-agent-directory-"));
     const workspaces = [];
-    const lifecycle = await startBotLifecycle(
-      join(directory, "management"),
-      workspaces,
-    );
-    const botEnv = {
-      ADM_LIFECYCLE_URL: lifecycle.url,
-      ADM_RUNTIME_PORT: String(port),
-    };
-    let runner = await startRunner(directory, botEnv, {
-      port,
-      tokenFile: lifecycle.tokenFile,
+    const port = await freePort();
+    const lifecycle = await startBotLifecycle(join(directory, "management"), workspaces);
+    const botId = "directory-bot";
+    const botWorkspace = { id: botId, name: "bot", role: "bot", phase: "ready", namespace: "fixture-directory-bot" };
+    const botPod = await startPodRunner(directory, lifecycle, {
+      ...botWorkspace,
+      host: "127.0.0.1", port,
+      podUid: "11111111-1111-4111-8111-111111111111",
     });
+    const targets = new Map();
+    async function addTarget(id, name, host) {
+      const target = await startPodRunner(directory, lifecycle, {
+        id, name, role: "coding", host, port,
+        podUid: id === "alpha" ? "22222222-2222-4222-8222-222222222222" : "33333333-3333-4333-8333-333333333333",
+      });
+      targets.set(id, target);
+      return target;
+    }
+    await addTarget("alpha", "project-albatross", "127.0.0.2");
+    await addTarget("beta", "project-bee", "127.0.0.3");
+    const bot = botPod.runner;
+    const targetRunner = (id) => targets.get(id)?.runner;
     t.after(async () => {
-      await runner.stop();
+      await Promise.all([bot.stop(), ...[...targets.values()].map(({ runner }) => runner.stop())]);
       await lifecycle.close();
     });
-    const coder = (id, name) => ({
-      id,
-      name,
-      role: "coding",
-      environment: "local",
-      localRoot: join(directory, id),
-      model: { provider: "faux", id: "faux-1" },
-    });
-    const bot = {
-      id: "directory-bot",
-      name: "bot",
-      role: "bot",
-      environment: "local",
-      model: { provider: "faux", id: "faux-1" },
-    };
-    for (const config of [
-      coder("granted-coder", "project-albatross"),
-      coder("ungranted-coder", "project-bee"),
-    ])
-      assert.equal(
-        (await runner.request(`/v1/workspaces/${config.id}`, "PUT", config))
-          .status,
-        200,
-      );
-    workspaces.push(
-      { id: "granted-coder", name: "project-albatross" },
-      { id: "ungranted-coder", name: "project-bee" },
-    );
-    for (const workspace of workspaces)
-      Object.assign(workspace, {
-        role: "coding",
-        phase: "ready",
-        namespace: `fixture-${workspace.id}`,
-        runtime_status: {
-          podIP: "127.0.0.1",
-          ready: true,
-          activity: { status: "idle" },
-        },
+    const authRequest = async (runner, token, path, method = "GET", body) => {
+      const response = await fetch(runner.url + path, {
+        method,
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
       });
-    const registration = await runner.request(
-      `/v1/workspaces/${bot.id}`,
-      "PUT",
-      bot,
-    );
-    assert.equal(registration.status, 200);
-    assert.ok(registration.body.tools.includes("listAgents"));
-    assert.ok(registration.body.tools.includes("monitorAgent"));
-    assert.ok(registration.body.tools.includes("promptAgent"));
-
+      return { status: response.status, body: await response.json() };
+    };
     let cursor = 0;
     async function call(tool, args, requestId, code = false) {
       const calls = code
-        ? [
-            {
-              tool: "codemode",
-              args: {
-                code: `return await tools.${tool}(${JSON.stringify(args)})`,
-              },
-            },
-          ]
+        ? [{ tool: "codemode", args: { code: `return await tools.${tool}(${JSON.stringify(args)})` } }]
         : [{ tool, args }];
-      await runner.request(`/v1/workspaces/${bot.id}/input`, "POST", {
-        message:
-          "/faux " +
-          JSON.stringify({ calls, answer: "Private directory result." }),
-        requestId,
+      const input = await authRequest(bot, botPod.token, `/v1/workspaces/${botId}/input`, "POST", {
+        message: "/faux " + JSON.stringify({ calls, answer: "Private lifecycle result." }), requestId,
       });
-      const event = await nextEvent(
-        runner,
-        bot.id,
-        (value) =>
-          value.kind === "tool" &&
-          value.data.name === (code ? "codemode" : tool),
-        cursor,
-        true,
-      );
+      assert.equal(input.status, 202);
+      const event = await nextEvent(bot, botId,
+        (value) => value.kind === "tool" && value.data.name === (code ? "codemode" : tool),
+        cursor, true, 0, botPod.token);
       cursor = event.seq;
       return event.data;
     }
-    function toolText(result) {
-      return result.text;
+    const listed = JSON.parse((await call("listAgents", {}, "list")).text);
+    assert.deepEqual(listed.agents.map(({ id, name }) => ({ id, name })), [
+      { id: "alpha", name: "project-albatross" }, { id: "beta", name: "project-bee" },
+    ]);
+    const codeMode = await call("listAgents", {}, "list-code", true);
+    assert.equal(codeMode.isError, false);
+    assert.match(codeMode.text, /project-bee/);
+
+    const target = targetRunner("alpha");
+    const remoteInput = await authRequest(target, targets.get("alpha").token, "/v1/workspaces/alpha/input", "POST", {
+      message: "/faux " + JSON.stringify({ calls: [{ tool: "write", args: { path: join(directory, "tool.txt"), content: "done" } }], answer: "written" }),
+      requestId: "history-with-tool",
+    });
+    assert.equal(remoteInput.status, 202);
+    await nextEvent(target, "alpha", (event) => event.kind === "tool" && event.data.name === "write", 0, true, 0, targets.get("alpha").token);
+    const monitored = JSON.parse((await call("monitorAgent", { agentId: "alpha", after: 0, limit: 2 }, "monitor")).text);
+    assert.equal(monitored.id, "alpha");
+    let historyEvents = monitored.history.events;
+    let nextAfter = monitored.history.nextAfter;
+    while (monitored.history.hasMore) {
+      const page = JSON.parse((await call("monitorAgent", { agentId: "alpha", after: nextAfter, limit: 100 }, `monitor-${nextAfter}`)).text).history;
+      historyEvents = [...historyEvents, ...page.events];
+      nextAfter = page.nextAfter;
+      if (!page.hasMore) break;
     }
+    assert.ok(historyEvents.some((event) => event.kind === "tool" && event.data.name === "write"));
 
-    const listed = JSON.parse(toolText(await call("listAgents", {}, "list")));
-    assert.deepEqual(
-      listed.agents.map(({ id, name }) => ({ id, name })),
-      [
-        { id: "granted-coder", name: "project-albatross" },
-        { id: "ungranted-coder", name: "project-bee" },
-      ],
-    );
-    const codeModeText = toolText(
-      await call("listAgents", {}, "list-codemode", true),
-    );
-    assert.match(codeModeText, /\"id\":\"granted-coder\"/);
-    assert.match(codeModeText, /\"name\":\"project-albatross\"/);
-    assert.match(codeModeText, /ungranted-coder|project-bee/);
+    const prompt = JSON.parse((await call("promptAgent", { agentId: "alpha", message: "Report your status." }, "prompt")).text);
+    assert.equal(prompt.status, "admitted");
+    await nextEvent(target, "alpha", (event) => event.kind === "assistant" && event.data.text.includes("Report your status."), 0, true, 0, targets.get("alpha").token);
+    assert.equal(JSON.parse((await call("saveAgentGoal", { agentId: "alpha", goal: { description: "Ship it" } }, "goal")).text).description, "Ship it");
+    assert.equal(JSON.parse((await call("saveAgentLoop", { agentId: "beta", loop: { prompt: "Check progress", intervalMs: 60000, nextAt: 2000000000000 } }, "loop")).text).prompt, "Check progress");
+    assert.equal((await call("configureAgentModel", { agentId: "beta", provider: "faux", modelId: "faux-1" }, "model")).isError, false);
 
-    const monitored = JSON.parse(
-      toolText(
-        await call("monitorAgent", { agentId: listed.agents[0].id }, "monitor"),
-      ),
-    );
-    assert.equal(monitored.id, "granted-coder");
-    const toolRun = {
-      calls: [
-        {
-          tool: "write",
-          args: { path: join(directory, "tool.txt"), content: "done" },
-        },
-      ],
-      answer: "The file is written.",
-    };
-    await runner.request("/v1/workspaces/granted-coder/input", "POST", {
-      message: "/faux " + JSON.stringify(toolRun),
-      requestId: "remote-history-tool",
-    });
-    await nextEvent(
-      runner,
-      "granted-coder",
-      (event) => event.kind === "tool" && event.data.name === "write",
-    );
-    const historyPage = JSON.parse(
-      toolText(
-        await call(
-          "monitorAgent",
-          { agentId: "granted-coder", after: 0, limit: 2 },
-          "monitor-history-page-1",
-        ),
-      ),
-    ).history;
-    assert.ok(historyPage.events.length > 0 && historyPage.events.length <= 2);
-    assert.equal(historyPage.hasMore, true);
-    const nextHistoryPage = JSON.parse(
-      toolText(
-        await call(
-          "monitorAgent",
-          {
-            agentId: "granted-coder",
-            after: historyPage.nextAfter,
-            limit: 1000,
-          },
-          "monitor-history-page-2",
-        ),
-      ),
-    ).history;
-    assert.ok(
-      [...historyPage.events, ...nextHistoryPage.events].some(
-        (event) => event.kind === "tool" && event.data.name === "write",
-      ),
-    );
-    await call(
-      "promptAgent",
-      { agentId: listed.agents[0].id, message: "Report your status." },
-      "prompt",
-    );
-    await nextEvent(
-      runner,
-      "granted-coder",
-      (event) =>
-        event.kind === "assistant" &&
-        event.data.text.includes("Report your status."),
-    );
-    const savedGoal = JSON.parse(
-      toolText(
-        await call(
-          "saveAgentGoal",
-          { agentId: "granted-coder", goal: { description: "Ship it" } },
-          "goal",
-        ),
-      ),
-    );
-    assert.equal(savedGoal.description, "Ship it");
-    const savedLoop = JSON.parse(
-      toolText(
-        await call(
-          "saveAgentLoop",
-          {
-            agentId: "ungranted-coder",
-            loop: {
-              prompt: "Check progress",
-              intervalMs: 60000,
-              nextAt: 2000000000000,
-            },
-          },
-          "loop",
-        ),
-      ),
-    );
-    assert.equal(savedLoop.prompt, "Check progress");
-    const changedModel = await call(
-      "configureAgentModel",
-      {
-        agentId: "ungranted-coder",
-        provider: "faux",
-        modelId: "faux-1",
-      },
-      "model",
-    );
-    assert.equal(changedModel.isError, false);
-    const created = JSON.parse(
-      toolText(
-        await call(
-          "createAgent",
-          {
-            name: "new-agent",
-            image: "adm-dev:0.1.0",
-            storageClass: "fast",
-            storageSize: "10Gi",
-            cpu: "2",
-            memory: "4Gi",
-            model: { provider: "faux", id: "faux-1" },
-          },
-          "create",
-        ),
-      ),
-    );
-    assert.equal(created.kind, "create");
+    const created = JSON.parse((await call("createAgent", {
+      name: "new-agent", image: "adm-dev:0.1.0", storageClass: "fast", storageSize: "10Gi", cpu: "2", memory: "4Gi", model: { provider: "faux", id: "faux-1" },
+    }, "create")).text);
     assert.equal(created.status, "accepted");
-    const destroyed = JSON.parse(
-      toolText(
-        await call("destroyAgent", { agentId: "ungranted-coder" }, "destroy"),
-      ),
-    );
+    const operation = JSON.parse((await call("monitorAgentOperation", { operationId: created.operationId }, "create-status")).text);
+    assert.equal(operation.operationId, created.operationId);
+    const destroyed = JSON.parse((await call("destroyAgent", { agentId: "beta" }, "destroy")).text);
     assert.equal(destroyed.kind, "delete");
-    assert.equal(destroyed.workspaceId, "ungranted-coder");
+    assert.equal(destroyed.workspaceId, "beta");
+    assert.equal(JSON.parse((await call("monitorAgentOperation", { operationId: destroyed.operationId }, "delete-status")).text).operationId, destroyed.operationId);
 
-    const ungranted = await call(
-      "monitorAgent",
-      { agentId: "ungranted-coder" },
-      "monitor-ungranted",
-    );
-    assert.equal(ungranted.isError, false);
-    const codeModeMonitor = await call(
-      "monitorAgent",
-      { agentId: "ungranted-coder" },
-      "monitor-ungranted-codemode",
-      true,
-    );
-    assert.equal(codeModeMonitor.isError, false);
-
-    assert.equal(
-      (await runner.request("/v1/workspaces/granted-coder", "DELETE")).status,
-      200,
-    );
-    workspaces.splice(
-      workspaces.findIndex((workspace) => workspace.id === "granted-coder"),
-      1,
-    );
-    const afterDelete = JSON.parse(
-      toolText(await call("listAgents", {}, "list-deleted")),
-    );
-    assert.deepEqual(
-      afterDelete.agents.map((agent) => agent.id),
-      ["ungranted-coder"],
-    );
-    assert.deepEqual(afterDelete.unavailable, []);
-
-    assert.equal(
-      (
-        await runner.request(
-          "/v1/workspaces/replacement-coder",
-          "PUT",
-          coder("replacement-coder", "project-albatross"),
-        )
-      ).status,
-      200,
-    );
-    workspaces.push({
-      id: "replacement-coder",
-      name: "project-albatross",
-      role: "coding",
-      phase: "ready",
-      namespace: "fixture-replacement-coder",
-      runtime_status: {
-        podIP: "127.0.0.1",
-        ready: true,
-        activity: { status: "idle" },
-      },
+    await bot.stop();
+    const restarted = await startPodRunner(directory, lifecycle, { ...botWorkspace, host: "127.0.0.1", port, podUid: "11111111-1111-4111-8111-111111111111" });
+    t.after(() => restarted.runner.stop());
+    const persisted = await authRequest(restarted.runner, restarted.token, `/v1/workspaces/${botId}`);
+    assert.equal(persisted.status, 200);
+    const afterRestart = await authRequest(restarted.runner, restarted.token, `/v1/workspaces/${botId}/input`, "POST", {
+      message: "/faux " + JSON.stringify({ calls: [{ tool: "listAgents", args: {} }], answer: "Private." }), requestId: "restart-list",
     });
-    const afterReuse = JSON.parse(
-      toolText(await call("listAgents", {}, "list-reused-name")),
-    );
-    assert.deepEqual(
-      afterReuse.agents.map(({ id, name }) => ({ id, name })),
-      [
-        { id: "ungranted-coder", name: "project-bee" },
-        { id: "replacement-coder", name: "project-albatross" },
-      ],
-    );
-
-    await runner.stop();
-    runner = await startRunner(directory, botEnv, {
-      port,
-      tokenFile: lifecycle.tokenFile,
-    });
-    const afterRestart = await runner.request(`/v1/workspaces/${bot.id}`);
-    assert.equal(afterRestart.status, 200);
-    const persisted = JSON.parse(
-      toolText(await call("listAgents", {}, "list-after-restart")),
-    );
-    assert.deepEqual(
-      persisted.agents.map((agent) => agent.id),
-      ["ungranted-coder", "replacement-coder"],
-    );
-
-    const emptyBot = {
-      ...bot,
-      id: "empty-directory-bot",
-    };
-    assert.equal(
-      (await runner.request(`/v1/workspaces/${emptyBot.id}`, "PUT", emptyBot))
-        .status,
-      200,
-    );
-    const emptyRequest = await runner.request(
-      `/v1/workspaces/${emptyBot.id}/input`,
-      "POST",
-      {
-        message:
-          "/faux " +
-          JSON.stringify({
-            calls: [{ tool: "listAgents", args: {} }],
-            answer: "Private empty directory result.",
-          }),
-        requestId: "list-empty-grants",
-      },
-    );
-    assert.equal(emptyRequest.status, 202);
-    const emptyResult = await nextEvent(
-      runner,
-      emptyBot.id,
-      (event) => event.kind === "tool" && event.data.name === "listAgents",
-      0,
-      true,
-    );
-    const emptyListing = JSON.parse(toolText(emptyResult.data));
-    assert.equal(emptyListing.agents.length, 2);
-    assert.deepEqual(emptyListing.unavailable, []);
+    assert.equal(afterRestart.status, 202);
+    const afterEvent = await nextEvent(restarted.runner, botId, (event) => event.kind === "tool" && event.data.name === "listAgents", 0, true, 0, restarted.token);
+    assert.match(afterEvent.data.text, /project-albatross/);
   },
 );
 
@@ -1835,183 +1906,55 @@ test(
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-cancel-"));
     const port = await freePort();
-    const workspaces = [
-      {
-        id: "cancel-target",
-        name: "cancel target",
-        role: "coding",
-        phase: "ready",
-        namespace: "fixture-cancel-target",
-        runtime_status: { podIP: "127.0.0.1", ready: true },
-      },
-    ];
-    const lifecycle = await startBotLifecycle(
-      join(directory, "management"),
-      workspaces,
-      { holdDirectory: true },
-    );
-    const runner = await startRunner(
-      directory,
-      {
-        ADM_LIFECYCLE_URL: lifecycle.url,
-        ADM_RUNTIME_PORT: String(port),
-      },
-      { port, tokenFile: lifecycle.tokenFile },
-    );
-    t.after(async () => {
-      await runner.stop();
-      await lifecycle.close();
+    const lifecycle = await startBotLifecycle(join(directory, "management"), [], { holdDirectory: true });
+    const pod = await startPodRunner(directory, lifecycle, {
+      id: "cancel-bot", name: "bot", role: "bot", host: "127.0.0.1", port,
+      podUid: "11111111-1111-4111-8111-111111111111",
     });
-    const bot = {
-      id: "cancel-bot",
-      name: "bot",
-      role: "bot",
-      environment: "local",
-      model: { provider: "faux", id: "faux-1" },
-    };
-    assert.equal(
-      (
-        await runner.request("/v1/workspaces/cancel-target", "PUT", {
-          id: "cancel-target",
-          name: "cancel target",
-          role: "coding",
-          environment: "local",
-          localRoot: join(directory, "repo"),
-          model: { provider: "faux", id: "faux-1" },
-        })
-      ).status,
-      200,
-    );
-    assert.equal(
-      (await runner.request(`/v1/workspaces/${bot.id}`, "PUT", bot)).status,
-      200,
-    );
-    await runner.request(`/v1/workspaces/${bot.id}/input`, "POST", {
-      message: `/faux ${JSON.stringify({
-        calls: [{ tool: "listAgents", args: {} }],
-      })}`,
+    t.after(async () => { await pod.runner.stop(); await lifecycle.close(); });
+    const call = await pod.runner.request("/v1/workspaces/cancel-bot/input", "POST", {
+      message: `/faux ${JSON.stringify({ calls: [{ tool: "listAgents", args: {} }] })}`,
       requestId: "cancel-management-request",
-    });
+    }, undefined, pod.token);
+    assert.equal(call.status, 202);
     await lifecycle.directoryRequest;
-    assert.equal(
-      (await runner.request(`/v1/workspaces/${bot.id}/abort`, "POST", {}))
-        .status,
-      200,
-    );
+    assert.equal((await pod.runner.request("/v1/workspaces/cancel-bot/abort", "POST", {}, undefined, pod.token)).status, 200);
     await lifecycle.directoryAbort;
   },
 );
 
 test(
-  "a bot discovers coding agents created after it through direct tools and Code Mode",
+  "a pod bot discovers coding agents created later through direct tools and Code Mode",
   { timeout: 30000 },
   async (t) => {
-    const directory = await mkdtemp(
-      join(tmpdir(), "adm-runner-bot-late-agent-"),
-    );
-    const workspaces = [];
-    const lifecycle = await startBotLifecycle(
-      join(directory, "management"),
-      workspaces,
-    );
-    const target = await startRunner(join(directory, "target"));
-    const botRunner = await startRunner(join(directory, "bot"), {
-      ADM_LIFECYCLE_URL: lifecycle.url,
-      ADM_LIFECYCLE_IDENTITY_TOKEN_FILE: lifecycle.tokenFile,
-      ADM_RUNTIME_PORT: new URL(target.url).port,
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-late-agent-"));
+    const port = await freePort();
+    const lifecycle = await startBotLifecycle(join(directory, "management"), []);
+    const bot = await startPodRunner(directory, lifecycle, {
+      id: "late-agent-bot", name: "bot", role: "bot", host: "127.0.0.1", port,
+      podUid: "11111111-1111-4111-8111-111111111111",
     });
-    t.after(async () => {
-      await botRunner.stop();
-      await target.stop();
-      await lifecycle.close();
+    const target = await startPodRunner(directory, lifecycle, {
+      id: "created-after-bot", name: "new-project", role: "coding", host: "127.0.0.2", port,
+      podUid: "22222222-2222-4222-8222-222222222222",
     });
-    const bot = {
-      id: "late-agent-bot",
-      name: "bot",
-      role: "bot",
-      environment: "local",
-      model: { provider: "faux", id: "faux-1" },
-    };
-    const coder = {
-      id: "created-after-bot",
-      name: "new-project",
-      role: "coding",
-      environment: "local",
-      localRoot: join(directory, "new-project"),
-      model: { provider: "faux", id: "faux-1" },
-    };
-    assert.equal(
-      (await botRunner.request(`/v1/workspaces/${bot.id}`, "PUT", bot)).status,
-      200,
-    );
-    assert.equal(
-      (await target.request(`/v1/workspaces/${coder.id}`, "PUT", coder)).status,
-      200,
-    );
-    workspaces.push({
-      id: coder.id,
-      name: coder.name,
-      role: "coding",
-      phase: "ready",
-      namespace: "fixture-coding",
-      runtime_status: {
-        podIP: "127.0.0.1",
-        ready: true,
-        activity: { status: "idle" },
-      },
-    });
-
+    t.after(async () => { await bot.runner.stop(); await target.runner.stop(); await lifecycle.close(); });
     let cursor = 0;
     async function call(tool, args, requestId, code = false) {
-      const calls = code
-        ? [
-            {
-              tool: "codemode",
-              args: {
-                code: `return await tools.${tool}(${JSON.stringify(args)})`,
-              },
-            },
-          ]
-        : [{ tool, args }];
-      await botRunner.request(`/v1/workspaces/${bot.id}/input`, "POST", {
-        message:
-          "/faux " +
-          JSON.stringify({ calls, answer: "Private lifecycle result." }),
-        requestId,
-      });
-      const event = await nextEvent(
-        botRunner,
-        bot.id,
-        (value) =>
-          value.kind === "tool" &&
-          value.data.name === (code ? "codemode" : tool),
-        cursor,
-        true,
-      );
+      const calls = code ? [{ tool: "codemode", args: { code: `return await tools.${tool}(${JSON.stringify(args)})` } }] : [{ tool, args }];
+      assert.equal((await bot.runner.request("/v1/workspaces/late-agent-bot/input", "POST", {
+        message: "/faux " + JSON.stringify({ calls, answer: "Private lifecycle result." }), requestId,
+      }, undefined, bot.token)).status, 202);
+      const event = await nextEvent(bot.runner, "late-agent-bot", (value) => value.kind === "tool" && value.data.name === (code ? "codemode" : tool), cursor, true, 0, bot.token);
       cursor = event.seq;
       return event.data;
     }
-
     const direct = JSON.parse((await call("listAgents", {}, "late-list")).text);
-    assert.deepEqual(direct.agents, [
-      {
-        id: coder.id,
-        name: coder.name,
-        status: "idle",
-        phase: "ready",
-        ready: true,
-      },
-    ]);
-    assert.deepEqual(direct.unavailable, []);
-
-    const throughCodeMode = await call(
-      "listAgents",
-      {},
-      "late-list-codemode",
-      true,
-    );
+    assert.deepEqual(direct.agents, [{ id: "created-after-bot", name: "new-project", status: "idle", phase: "ready", ready: true }]);
+    const throughCodeMode = await call("listAgents", {}, "late-list-codemode", true);
     assert.equal(throughCodeMode.isError, false);
-    assert.match(throughCodeMode.text, new RegExp(coder.id));
+    assert.match(throughCodeMode.text, /created-after-bot/);
+    assert.equal((await target.runner.request("/v1/workspaces/created-after-bot", "GET", undefined, undefined, bot.token)).status, 200);
   },
 );
 

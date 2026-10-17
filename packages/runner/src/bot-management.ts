@@ -63,6 +63,7 @@ export type BotAgentManagement = {
     workspaceId: string,
     signal?: AbortSignal,
   ): Promise<unknown>;
+  operationStatus(operationId: string, signal?: AbortSignal): Promise<unknown>;
 };
 
 export function botAgentManagementFromEnvironment(config: {
@@ -232,6 +233,14 @@ export function botAgentManagementFromEnvironment(config: {
         "/v1/runtime/operations",
         "POST",
         { operationId, kind: "delete", workspaceId },
+        signal,
+      ),
+    operationStatus: (operationId, signal) =>
+      request(
+        lifecycleUrl,
+        `/v1/runtime/operations/${encodeURIComponent(operationId)}`,
+        "GET",
+        undefined,
         signal,
       ),
   };

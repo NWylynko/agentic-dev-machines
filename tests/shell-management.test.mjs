@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer as createTcpServer, createConnection } from "node:net";
 import {
   mkdir,
   mkdtemp,
@@ -116,6 +117,7 @@ try {
     kube,
     `#!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { createServer as createTcpServer, createConnection } from "node:net";
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 const args = process.argv.slice(2);
@@ -124,8 +126,31 @@ await appendFile(${JSON.stringify(hostEnvLog)}, JSON.stringify(process.env.KUBEC
 const statePath = ${JSON.stringify(stateFile)};
 const leasePath = ${JSON.stringify(leaseFile)};
 const shellPidPath = ${JSON.stringify(join(root, "shell.pid"))};
+const runtimePodUid = "00000000-0000-4000-8000-000000000002";
+const runtimeToken = "fixture-pod-runtime-token";
 let state = {};
 try { state = JSON.parse(await readFile(statePath, "utf8")); } catch {}
+const namespaceFromArgs = args.includes("-n") ? args[args.indexOf("-n") + 1] : undefined;
+const workspaceResource = namespaceFromArgs ? state[namespaceFromArgs] : undefined;
+const workspaceId = workspaceResource?.metadata?.labels?.["adm.dev/workspace-id"];
+const tokenNamespace = namespaceFromArgs ?? Object.keys(state)[0];
+const pod = workspaceResource ? {
+  metadata: { name: "workspace-pod", namespace: namespaceFromArgs, uid: runtimePodUid,
+    labels: { "app.kubernetes.io/managed-by": "adm", "adm.dev/workspace-id": workspaceId } },
+  spec: { serviceAccountName: "adm-runtime", nodeName: "node-a" },
+  status: { phase: "Running", podIP: null,
+    conditions: [{ type: "Ready", status: "True" }],
+    containerStatuses: [{ name: "dev", ready: true }] },
+} : undefined;
+const pods = Object.entries(state).map(([namespace, resource]) => ({
+  metadata: { name: "workspace-pod", namespace, uid: runtimePodUid,
+    labels: { "app.kubernetes.io/managed-by": "adm",
+      "adm.dev/workspace-id": resource.metadata.labels["adm.dev/workspace-id"] } },
+  spec: { serviceAccountName: "adm-runtime", nodeName: "node-a" },
+  status: { phase: "Running", podIP: null,
+    conditions: [{ type: "Ready", status: "True" }],
+    containerStatuses: [{ name: "dev", ready: true }] },
+}));
 if (args[0] === "get" && args[1] === "lease") {
   try { process.stdout.write(await readFile(leasePath, "utf8")); }
   catch { process.stderr.write("Error from server (NotFound): leases.coordination.k8s.io \\\"adm-lifecycle-owner\\\" not found\\n"); process.exitCode = 1; }
@@ -134,6 +159,24 @@ if (args[0] === "get" && args[1] === "lease") {
   await writeFile(leasePath, input);
   process.stdout.write("lease saved\\n");
 } else if (args[0] === "get" && args[1] === "storageclass") process.stdout.write(JSON.stringify({provisioner:"driver.longhorn.io"}));
+else if (args[0] === "get" && args[1] === "pods") process.stdout.write(JSON.stringify({items: pods}));
+else if (args[0] === "get" && args[1] === "pod") process.stdout.write(JSON.stringify(pod));
+else if (args[0] === "create" && args[1] === "--raw") {
+  let input = ""; for await (const chunk of process.stdin) input += chunk;
+  process.stdout.write(JSON.stringify({ status: { authenticated: true,
+    audiences: ["adm-lifecycle"],
+    user: { username: "system:serviceaccount:" + tokenNamespace + ":adm-runtime",
+      extra: { "authentication.kubernetes.io/pod-uid": [runtimePodUid] } } } }));
+}
+else if (args[0] === "port-forward") {
+  const forward = createTcpServer((client) => {
+    const upstream = createConnection({ host: "127.0.0.1", port: ${server.address().port} });
+    client.pipe(upstream); upstream.pipe(client);
+  });
+  forward.listen(0, "127.0.0.1", () => {
+    process.stdout.write("Forwarding from 127.0.0.1:" + forward.address().port + " -> 7432\\n");
+  });
+}
 else if (args[0] === "apply") {
   let input = ""; for await (const chunk of process.stdin) input += chunk;
   const manifest = JSON.parse(input); const ns = manifest.items.find(x => x.kind === "Namespace");
@@ -144,7 +187,9 @@ else if (args[0] === "apply") {
 } else if (args[0] === "wait") process.stdout.write("condition met\\n");
 else if (args[0] === "exec") {
   const split = args.indexOf("--"); const command = args.slice(split + 1);
-  if (command[0] === "sh" && command[1] === "-eu" && command[4] === "adm-repository") {
+  if (command[0] === "cat" && command.at(-1) === "/var/run/secrets/kubernetes.io/serviceaccount/token") {
+    process.stdout.write(runtimeToken + "\\n");
+  } else if (command[0] === "sh" && command[1] === "-eu" && command[4] === "adm-repository") {
     process.stdout.write("repository prepared\\n");
   } else if (
     command[0] === "bash" &&
@@ -455,8 +500,6 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
   assert.deepEqual(
     requests.map(({ method, path }) => [method, path]),
     [
-      ["GET", "/health"],
-      ["PUT", `/v1/workspaces/${workspace.id}`],
       ["GET", `/v1/workspaces/${workspace.id}`],
       ["GET", `/v1/workspaces/${workspace.id}/history?after=0&limit=1`],
       ["GET", `/v1/workspaces/${workspace.id}/history?after=0&limit=200`],
@@ -464,13 +507,6 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
       ["POST", `/v1/workspaces/${workspace.id}/abort`],
       ["POST", `/v1/workspaces/${workspace.id}/input`],
     ],
-  );
-  assert.equal(
-    requests.find(
-      ({ method, path }) =>
-        method === "PUT" && path === `/v1/workspaces/${workspace.id}`,
-    ).body.cwd,
-    "/repos/owner/project",
   );
   assert.equal(
     requests.find(({ path }) => path.endsWith("/input")).body.message,

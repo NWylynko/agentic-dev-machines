@@ -394,6 +394,21 @@ export function botExtension(
           return { output: [{ type: "text", text: JSON.stringify(result) }] };
         },
       }),
+      defineTool({
+        name: "monitorAgentOperation",
+        description:
+          "Read the durable status, completion, or failure of a coding-agent create or destroy operation by its operation ID.",
+        parameters: Type.Object({ operationId: Type.String() }),
+        replay: "safe",
+        execute: async ({ operationId }, _api, context) => {
+          await assertActive();
+          const result = await agents.operationStatus(
+            operationId,
+            context.abortSignal,
+          );
+          return { output: [{ type: "text", text: JSON.stringify(result) }] };
+        },
+      }),
     ],
   });
 }

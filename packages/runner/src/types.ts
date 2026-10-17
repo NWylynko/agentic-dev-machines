@@ -2,7 +2,7 @@ export type WorkspaceConfig = {
   id: string;
   name: string;
   role: "coding" | "bot";
-  environment: "kubernetes" | "local";
+  environment: "kubernetes" | "local" | "pod";
   namespace?: string;
   container?: string;
   cwd?: string;

@@ -2,6 +2,8 @@
 
 These notes distinguish confirmed requirements, implemented local behavior, and proposals that still need validation. For installation and everyday use, start with the [README](../README.md) and [operations guide](operations.md).
 
+The implementation target changed on 2026-10-16: all agent execution and durable state belong in workspace Pods; the management host is an access plane. Placement proposals in the earlier investigation below are historical.
+
 ## Confirmed behavior
 
 - Preserve repository work and agent history across runtime replacement. Installed tools are temporary or supplied by the base image.
@@ -125,7 +127,7 @@ This diagram shows the proposed container implementation. Persisting the whole o
 | Repository filesystem        | Discover repositories, fetch contents on demand, and enforce private writable views and Git state                               |
 | Persistent storage           | Make selected workspace state recoverable on another node                                                                       |
 | Agent runner / backend       | Execute unattended with role-specific tools, persist history and goals, schedule work, and recover independently of attachments |
-| Bot control interface        | Expose permitted monitoring and prompting operations without development filesystem or shell access                             |
+| Bot control interface        | Expose authenticated discovery and lifecycle/runtime controls without development filesystem or shell access                    |
 | Terminal message adapter     | Deliver explicit bot messages to its Pi-style conversation in Herdr                                                             |
 | Preview access               | Route client connections to development sites and selected ports in the current runtime                                         |
 
@@ -235,7 +237,7 @@ Important integration findings:
 - Reopening a store must be followed by scheduling/resume. Closing the harness preserves recoverable work; ordinary abort excludes background tasks. Space destruction needs explicit admission revocation and cancellation including background work.
 - SQLite is a starting backend, not cluster replication or ownership fencing. Its WAL requirements rule out treating an arbitrary NFS mount as a ready solution. See the report for storage constraints and locally verified recovery behavior.
 
-The runner and terminal now implement this local proof. Bot and coding runners live in their workspace Pods; the management host provides access and lifecycle routing. These tests do not establish cross-node filesystem durability or compatibility with every real provider account.
+The workspace runtime and terminal now run against a Pod-owned Durable harness. The management host routes authenticated access to that Pod and never owns agent execution. Tests do not establish cross-node filesystem durability, the node-failure loss window, or compatibility with every real provider account.
 
 [celld](https://github.com/denoland/celld) provides self-hosted, distributed Durable Objects and is a candidate for durable application state. Its role here would need to be demonstrated with the chosen agent harness. It does not establish recovery guarantees for this project's Linux filesystem or shell processes.
 
@@ -260,7 +262,7 @@ The runner records message delivery state alongside the session so recovery can 
 
 The bot can use Code Mode to combine its permitted tools and process their results. Pi's [Code Mode](https://pi.dev/docs/latest/codemode) runs JavaScript in a sandbox without direct filesystem or network access, but can call the session's tools. Therefore the bot's tool registry must exclude repository, shell, Git, editing, and other coding tools, including tools hidden from the model but discoverable through Code Mode. Disabling their UI display is insufficient.
 
-Monitoring and prompting must use an explicit interface to permitted coding agents, not a mount or shell connection into their workspace. Observation and prompting should target stable agent identities. The exact bot-to-agent assignments and visibility of agent events remain to be designed.
+Monitoring and control use lifecycle-authorized runtime APIs, not a mount or shell connection into coding workspaces. Bots discover all live coding agents and target immutable workspace IDs; lifecycle checks the bot Pod identity and current runtime lease for each call. The interface includes status, full cursor-paginated history, steering/follow-up, resume/abort, goals/loops, model selection, and durable create/delete receipts. It grants no repository, shell, or general workspace access.
 
 ### Goals and recurring work
 
@@ -302,7 +304,7 @@ Build in small stages, proving each through real CLI, shell, and cluster behavio
 3. **Filesystem recovery:** edit files and create local commits, then drain the hosting node. Recover repository and Git state on another node. Separately simulate an unexpected failure and measure the interruption and loss window.
 4. **Lazy repositories and isolation:** expose a catalog and verify that unused repositories do not hydrate. Open the same repository on `main` in two spaces; edits, branch changes, and local commits must stay private, and attempts to access the other space's files must fail. Measure actual disk use.
 5. **Unattended agent recovery:** disconnect every client while a real agent works, replace its runtime, and demonstrate automatic recovery of its conversation and pending work without blindly repeating a partially completed action.
-6. **Bot role:** verify that normal model output produces no terminal chat delivery, `sendMessage` delivers an explicit message, and a self-created goal and loop survive replacement. Verify permitted monitoring/prompting works while direct and Code Mode access to coding tools and repositories is unavailable. Remove the owning space and verify that queued or future work cannot recreate it or a deliberately removed target.
+6. **Bot role:** verify that normal model output produces no terminal chat delivery, `sendMessage` delivers an explicit message, and goals/loops survive replacement. Verify broad lifecycle/runtime controls and durable operation receipts work through direct tools and Code Mode, while coding tools and repository/shell access remain unavailable. Remove the owning space and verify queued work cannot recreate it or a deliberately removed target.
 7. **Browser and preview access:** automate a real browser against a workspace's development site and open its exposed site/port from a client laptop. Verify routing after replacement and cleanup on removal.
 8. **Custom image:** bake in the tools that the proven workflows need. Allow image and resource configuration for the management box and development workspaces independently.
 
@@ -310,18 +312,18 @@ Use end-to-end tests first for implementation changes. Provisioning, scheduling,
 
 ## Decisions still open
 
-| Decision                                                    | Effect on the user                                                                                                                     |
-| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Exact recovery time and recent-work loss window             | Determines how long a failure interrupts work and how much recent progress may be lost                                                 |
-| Storage and lazy-filesystem implementation                  | Determines startup time, disk use, Git compatibility, and recovery behavior                                                            |
-| Agent backend and location of the supervised runner         | The runner is Pi Durable 1.2.0 in each workspace Pod; the management host is an access plane. Cross-node recovery remains unproven      |
-| Attach transport and exact Herdr integration                | `adm herdr` consumes explicit removal events. A live Herdr plugin install is not part of the tests                                     |
-| Pi-style terminal adapter and inbound message transport     | The terminal client speaks the runner HTTP API. Herdr pane wiring beyond `adm attach` is still local to the management box             |
-| Bot ownership and Herdr space assignment                | Bot lifecycle control is broad across coding agents; whether each bot has its own Herdr space remains open                                 |
-| Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop        |
-| Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                |
-| Browser automation and development-port transport           | Determines how browsers run and how client laptops reach development sites and ports                                                   |
-| Provider authentication and allowance handling              | Determines supported account connections and how unattended work waits when capacity or authentication is unavailable                  |
-| Image, resource, and cache configuration                    | Determines available tools, concurrent workloads, and capacity use                                                                     |
+| Decision                                                    | Effect on the user                                                                                                                                                              |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact recovery time and recent-work loss window             | Determines how long a failure interrupts work and how much recent progress may be lost                                                                                          |
+| Storage and lazy-filesystem implementation                  | Determines startup time, disk use, Git compatibility, and recovery behavior                                                                                                     |
+| Agent backend and location of the supervised runner         | Pi Durable 1.2.0 owns each coding or bot workspace inside its private Pod; the host is an access plane. Cross-node durable storage and the node-failure loss window remain open |
+| Attach transport and exact Herdr integration                | `adm herdr` consumes explicit removal events. A live Herdr plugin install is not part of the tests                                                                              |
+| Pi-style terminal adapter and inbound message transport     | The terminal client speaks the runner HTTP API. Herdr pane wiring beyond `adm attach` is still local to the management box                                                      |
+| Bot ownership, permitted agents, and control-tool interface | A bot supervises only the agent ids it was given. Whether it has its own Herdr space is still open                                                                              |
+| Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop                                                 |
+| Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                                                         |
+| Browser automation and development-port transport           | Determines how browsers run and how client laptops reach development sites and ports                                                                                            |
+| Provider authentication and allowance handling              | Determines supported account connections and how unattended work waits when capacity or authentication is unavailable                                                           |
+| Image, resource, and cache configuration                    | Determines available tools, concurrent workloads, and capacity use                                                                                                              |
 
 The first useful milestone is an isolated workspace whose agents keep working unattended, recover after replacement, and stop permanently when its Herdr space is removed.

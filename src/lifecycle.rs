@@ -5,10 +5,11 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -319,8 +320,14 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
     ensure!(!token.is_empty(), "lifecycle bearer token file is empty");
     let listener = TcpListener::bind((bind, port)).context("bind lifecycle service")?;
     let (wake, work) = mpsc::channel::<String>();
-    let worker_cli = cli.clone_for_lifecycle();
-    thread::spawn(move || lifecycle_worker(worker_cli, work));
+    let work = Arc::new(Mutex::new(work));
+    let active_operations = Arc::new(Mutex::new(HashSet::new()));
+    for _ in 0..4 {
+        let worker_cli = cli.clone_for_lifecycle();
+        let worker_work = work.clone();
+        let worker_active_operations = active_operations.clone();
+        thread::spawn(move || lifecycle_worker(worker_cli, worker_work, worker_active_operations));
+    }
     // Replay interrupted accepted/running work before accepting new requests.
     for (operation_id, _) in cli.store()?.pending_lifecycle_operations()? {
         let _ = wake.send(operation_id);
@@ -342,8 +349,26 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn lifecycle_worker(cli: crate::Cli, work: mpsc::Receiver<String>) {
-    for operation_id in work {
+fn lifecycle_worker(
+    cli: crate::Cli,
+    work: Arc<Mutex<mpsc::Receiver<String>>>,
+    active_operations: Arc<Mutex<HashSet<String>>>,
+) {
+    loop {
+        let operation_id = match work.lock() {
+            Ok(receiver) => match receiver.recv() {
+                Ok(operation_id) => operation_id,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        let Ok(mut active) = active_operations.lock() else {
+            return;
+        };
+        if !active.insert(operation_id.clone()) {
+            continue;
+        }
+        drop(active);
         let mut cli = cli.clone_for_lifecycle();
         cli.lifecycle_operation_id = Some(operation_id.clone());
         let outcome = (|| -> Result<()> {
@@ -409,6 +434,9 @@ fn lifecycle_worker(cli: crate::Cli, work: mpsc::Receiver<String>) {
                 );
             }
             eprintln!("adm lifecycle operation {operation_id} failed: {error:#}");
+        }
+        if let Ok(mut active) = active_operations.lock() {
+            active.remove(&operation_id);
         }
     }
 }
@@ -569,7 +597,7 @@ fn route(
     let mut store = cli.store()?;
     if method == "GET" && path == "/v1/runtime/workspaces" {
         cli.check_lifecycle_fence()?;
-        let caller = authorize_runtime_caller(&cli, &store, authorization)?;
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
         ensure!(
             caller.role == "bot",
             "runtime caller is not authorized for workspace directory"
@@ -583,7 +611,7 @@ fn route(
                     && workspace.phase != "deleted"
             })
             .collect::<Vec<_>>();
-        enrich_runtime_status(&cli, &mut workspaces)?;
+        enrich_runtime_status(cli, &mut workspaces)?;
         let directory = workspaces
             .into_iter()
             .map(|workspace| {
@@ -601,7 +629,7 @@ fn route(
     }
     if method == "POST" && path == "/v1/runtime/operations" {
         cli.check_lifecycle_fence()?;
-        let caller = authorize_runtime_caller(&cli, &store, authorization)?;
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
         ensure!(
             caller.role == "bot",
             "runtime caller is not authorized for lifecycle operations"
@@ -619,7 +647,6 @@ fn route(
                     target.role == "coding",
                     "runtime caller is not authorized to delete this workspace role"
                 );
-                authorize_workspace_action(&cli, &store, workspace_id, "delete", authorization)?;
             }
         }
         let operation_id = request.operation_id().to_owned();
@@ -628,6 +655,25 @@ fn route(
             let _ = wake.send(operation_id);
         }
         return Ok((202, serde_json::to_value(receipt)?));
+    }
+    if let Some(operation_id) = path.strip_prefix("/v1/runtime/operations/")
+        && method == "GET"
+    {
+        cli.check_lifecycle_fence()?;
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
+        ensure!(
+            caller.role == "bot",
+            "runtime caller is not authorized for lifecycle operations"
+        );
+        return match store.lifecycle_operation(operation_id) {
+            Ok(receipt) if store.find(&receipt.workspace_id)?.role == "coding" => {
+                Ok((200, serde_json::to_value(receipt)?))
+            }
+            _ => Ok((
+                404,
+                serde_json::json!({"error":{"code":"OPERATION_NOT_FOUND"}}),
+            )),
+        };
     }
     if method == "POST" && path == "/v1/operations" {
         cli.check_lifecycle_fence()?;

@@ -16,6 +16,7 @@ import {
 import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { parseArgs } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Workspace } from "./workspace.ts";
@@ -36,15 +37,22 @@ const { values } = parseArgs({
     model: { type: "string" },
     "auth-path": { type: "string" },
     "token-file": { type: "string" },
+    "workspace-config": { type: "string" },
+    "lifecycle-url": { type: "string" },
+    "pod-uid": { type: "string" },
   },
 });
 const host = values.host!,
   port = Number(values.port),
   stateDirectory = values["state-dir"]!;
-if (!["127.0.0.1", "::1", "localhost"].includes(host))
+const tokenFile = values["token-file"];
+const lifecycleUrl = values["lifecycle-url"] ?? process.env.ADM_LIFECYCLE_URL;
+if (!["127.0.0.1", "::1", "localhost"].includes(host) && !lifecycleUrl)
   throw new Error(
-    "Runner binds must be loopback; remote authenticated configuration is not implemented",
+    "Non-loopback runner binds require --lifecycle-url for authenticated authorization",
   );
+if (lifecycleUrl && !tokenFile)
+  throw new Error("Lifecycle-authenticated runner requires --token-file for its projected Pod identity");
 if (!Number.isInteger(port) || port < 0 || port > 65535)
   throw new Error("Invalid port");
 await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
@@ -81,6 +89,9 @@ async function atomicJson(path: string, value: unknown) {
 const ownerPath = join(stateDirectory, "owner.json");
 const ownerDatabasePath = join(stateDirectory, "owner.sqlite");
 let ownerDatabase: DatabaseSync | undefined;
+let runtimeLease: { workspaceId: string; holder: string; fencingToken: number } | undefined;
+let runtimeLeaseError: Error | undefined;
+let fenceShutdown: Promise<void> | undefined;
 async function processStart(pid: number): Promise<string | undefined> {
   try {
     const record = await readFile(`/proc/${pid}/stat`, "utf8");
@@ -185,7 +196,7 @@ await acquireOwner();
 const registryPath = join(stateDirectory, "workspaces.json");
 const configs = new Map<string, WorkspaceConfig>();
 const botAgents = botAgentManagementFromEnvironment({
-  lifecycleUrl: process.env.ADM_LIFECYCLE_URL,
+  lifecycleUrl,
   tokenFile: values["token-file"],
   runtimePort: process.env.ADM_RUNTIME_PORT,
 });
@@ -208,12 +219,147 @@ async function isDeleted(id: string) {
   }
 }
 async function assertActive(id: string) {
+  if (runtimeLeaseError)
+    throw new ApiError(503, "RUNTIME_OWNERSHIP_LOST", runtimeLeaseError.message);
   if (await isDeleted(id))
     throw new ApiError(
       410,
       "WORKSPACE_DELETED",
       "This workspace was deliberately deleted",
     );
+  if (lifecycleUrl) {
+    if (!runtimeLease || runtimeLease.workspaceId !== id)
+      throw new ApiError(503, "RUNTIME_LEASE_MISSING", "Workspace runtime does not hold its lifecycle fence");
+    try {
+      await lifecycleRuntimeCall(id, "check", {
+        holder: runtimeLease.holder,
+        fencingToken: runtimeLease.fencingToken,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await fenceLost(error);
+      throw new ApiError(503, "RUNTIME_OWNERSHIP_LOST", message);
+    }
+  }
+}
+function fenceLost(error: unknown) {
+  if (fenceShutdown) return fenceShutdown;
+  runtimeLeaseError = error instanceof Error ? error : new Error(String(error));
+  process.stderr.write(`FATAL workspace runtime lost its lifecycle fence: ${runtimeLeaseError.message}\n`);
+  fenceShutdown = (async () => {
+    for (const workspace of workspaces.values()) {
+      try {
+        await workspace.close(true);
+      } catch (closeError) {
+        process.stderr.write(`FATAL failed to stop fenced workspace ${workspace.config.id}: ${String(closeError)}\n`);
+      }
+    }
+  })();
+  return fenceShutdown;
+}
+async function lifecycleRuntimeCall(
+  id: string,
+  action: string,
+  body: Record<string, unknown>,
+) {
+  if (!lifecycleUrl || !tokenFile)
+    throw new Error("Lifecycle runtime transport is not configured");
+  const token = (await readFile(tokenFile, "utf8")).trim();
+  if (!token) throw new Error("Projected workspace identity token is empty");
+  let response: Response;
+  try {
+    response = await fetch(
+      `${lifecycleUrl.replace(/\/$/, "")}/v1/workspaces/${encodeURIComponent(id)}/runtime/${action}`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(5_000),
+      },
+    );
+  } catch (error) {
+    throw new Error(`Workspace lifecycle ${action} request failed: ${(error as Error).message}`);
+  }
+  const value = await response.json().catch(() => ({})) as {
+    error?: { code?: string; message?: string };
+    fencingToken?: number;
+    holder?: string;
+  };
+  if (!response.ok)
+    throw new ApiError(
+      response.status,
+      value.error?.code ?? "RUNTIME_FENCE_REJECTED",
+      value.error?.message ?? `Workspace lifecycle rejected runtime ${action}`,
+    );
+  return value;
+}
+function runtimeAction(method: string, pathname: string): string {
+  const endpoint = pathname.match(/^\/v1\/workspaces\/[^/]+(?:\/(.*))?$/)?.[1];
+  if (method === "GET") return "read";
+  if (method === "DELETE") return "delete";
+  if (method === "PUT" && endpoint === "model") return "model";
+  if (method !== "POST") return "read";
+  if (endpoint === "input") return "prompt";
+  if (endpoint === "abort") return "abort";
+  if (endpoint === "resume" || endpoint === "retry") return "resume";
+  if (endpoint === "goals") return "goal";
+  if (endpoint === "loops") return "loop";
+  return "read";
+}
+async function authorizeRuntimeRequest(
+  request: IncomingMessage,
+  pathname: string,
+) {
+  const authorization = request.headers.authorization ?? "";
+  if (lifecycleUrl) {
+    const match = pathname.match(/^\/v1\/workspaces(?:\/([^/]+))?/);
+    const id = match?.[1]
+      ? decodeURIComponent(match[1])
+      : [...configs.keys()][0];
+    if (!id)
+      throw new ApiError(401, "UNAUTHORIZED", "Workspace runtime identity is unavailable");
+    let response: Response;
+    try {
+      response = await fetch(
+        `${lifecycleUrl.replace(/\/$/, "")}/v1/workspaces/${encodeURIComponent(id)}/runtime/authorize`,
+        {
+          method: "POST",
+          headers: {
+            authorization,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ action: runtimeAction(request.method ?? "GET", pathname) }),
+          signal: AbortSignal.timeout(5_000),
+        },
+      );
+    } catch (error) {
+      throw new ApiError(503, "AUTHORIZATION_UNAVAILABLE", `Lifecycle authorization is unavailable: ${(error as Error).message}`);
+    }
+    if (!response.ok) {
+      const value = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
+      throw new ApiError(response.status, value.error?.code ?? "UNAUTHORIZED", value.error?.message ?? "Lifecycle rejected the workspace request");
+    }
+    return;
+  }
+  if (!tokenFile) return;
+  let expected: Buffer;
+  try {
+    expected = Buffer.from((await readFile(tokenFile, "utf8")).trim());
+  } catch (error) {
+    throw new ApiError(503, "AUTH_UNAVAILABLE", `Runtime token unavailable: ${(error as Error).message}`);
+  }
+  const supplied = authorization.startsWith("Bearer ")
+    ? Buffer.from(authorization.slice(7))
+    : Buffer.alloc(0);
+  if (
+    expected.length === 0 ||
+    expected.length !== supplied.length ||
+    !timingSafeEqual(expected, supplied)
+  )
+    throw new ApiError(401, "UNAUTHORIZED", "A valid workspace runtime bearer token is required");
 }
 async function openWorkspace(
   config: WorkspaceConfig,
@@ -233,8 +379,72 @@ async function openWorkspace(
   workspaces.set(config.id, workspace);
   return workspace;
 }
+if (values["workspace-config"]) {
+  const workspaceConfig = JSON.parse(
+    await readFile(values["workspace-config"], "utf8"),
+  ) as WorkspaceConfig;
+  const config = validateConfig(workspaceConfig.id, workspaceConfig);
+  const previous = configs.get(config.id);
+  const persistedIdentity = previous && { ...previous };
+  if (persistedIdentity) delete persistedIdentity.onboardingRequired;
+  if (
+    persistedIdentity &&
+    JSON.stringify(persistedIdentity) !== JSON.stringify(config)
+  )
+    throw new Error("Mounted workspace configuration conflicts with persisted runtime identity");
+  if (!previous) {
+    const registration = {
+      ...config,
+      ...(config.role === "bot" ? { onboardingRequired: true } : {}),
+    };
+    configs.set(config.id, registration);
+    await atomicJson(registryPath, [...configs.values()]);
+  }
+}
+if (lifecycleUrl) {
+  const config = [...configs.values()][0];
+  if (!config || configs.size !== 1)
+    throw new Error("A lifecycle-owned Pod runtime must open exactly one workspace");
+  const holder = values["pod-uid"] ?? process.env.ADM_POD_UID;
+  if (!holder || !/^[0-9a-f-]{36}$/i.test(holder))
+    throw new Error("Lifecycle-owned Pod runtime requires its Kubernetes Pod UID");
+  const acquired = await lifecycleRuntimeCall(config.id, "lease", { holder });
+  if (
+    acquired.holder !== holder ||
+    !Number.isSafeInteger(acquired.fencingToken) ||
+    acquired.fencingToken! < 1
+  )
+    throw new Error("Lifecycle returned an invalid workspace runtime fence");
+  runtimeLease = {
+    workspaceId: config.id,
+    holder,
+    fencingToken: acquired.fencingToken!,
+  };
+}
 for (const config of configs.values())
   await openWorkspace(config, await isDeleted(config.id));
+
+if (lifecycleUrl) {
+  const { workspaceId, holder } = runtimeLease!;
+  let renewing = false;
+  const renewal = setInterval(async () => {
+    if (renewing || !runtimeLease || runtimeLeaseError) return;
+    renewing = true;
+    try {
+      const renewed = await lifecycleRuntimeCall(workspaceId, "lease/renew", {
+        holder,
+        fencingToken: runtimeLease.fencingToken,
+      });
+      if (renewed.fencingToken !== runtimeLease.fencingToken)
+        throw new Error("Lifecycle changed the active workspace fence");
+    } catch (error) {
+      await fenceLost(error);
+    } finally {
+      renewing = false;
+    }
+  }, 10_000);
+  renewal.unref();
+}
 
 function validateConfig(id: string, input: unknown): WorkspaceConfig {
   const config = input as WorkspaceConfig;
@@ -252,7 +462,7 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
     !config ||
     config.id !== id ||
     !["coding", "bot"].includes(config.role) ||
-    !["local", "kubernetes"].includes(config.environment)
+    !["local", "kubernetes", "pod"].includes(config.environment)
   )
     throw new ApiError(
       400,
@@ -384,13 +594,13 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
   }
   if (
     config.role === "coding" &&
-    config.environment === "local" &&
+    ["local", "pod"].includes(config.environment) &&
     (!config.localRoot || !isAbsolute(config.localRoot))
   )
     throw new ApiError(
       400,
       "INVALID_LOCAL_ROOT",
-      "Local coding workspaces require an explicit absolute localRoot",
+      "Local and pod coding workspaces require an explicit absolute localRoot",
     );
   if (config.role === "coding" && config.environment === "kubernetes") {
     if (
@@ -517,8 +727,12 @@ const server = createServer(async (request, response) => {
         "Browser origins may not control the runner",
       );
     const url = new URL(request.url!, "http://127.0.0.1");
-    if (url.pathname === "/health" && request.method === "GET")
+    if (url.pathname === "/health" && request.method === "GET") {
+      if (runtimeLeaseError)
+        return json(response, 503, { status: "error", error: runtimeLeaseError.message });
       return json(response, 200, { status: "ok", version: "0.1.0" });
+    }
+    await authorizeRuntimeRequest(request, url.pathname);
     if (url.pathname === "/v1/workspaces" && request.method === "GET")
       return json(response, 200, {
         workspaces: await Promise.all(
@@ -530,7 +744,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|branches|branch|tree|compact|reset|settings))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|compact|reset|settings))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -664,6 +878,18 @@ const server = createServer(async (request, response) => {
             },
           ),
         );
+      });
+    }
+    if (request.method === "GET" && action === "runtime-status") {
+      const status = await workspace.status();
+      const catalog = await workspace.modelCatalog(new AbortController().signal, false);
+      const activity = ["needs_model", "running", "error", "idle"].includes(status.status)
+        ? status.status
+        : "unavailable";
+      const error = typeof status.error === "string" ? status.error.slice(0, 2000) : undefined;
+      return json(response, 200, {
+        activity: { status: activity, ...(error ? { error } : {}) },
+        ...(catalog.selected ? { selectedModel: catalog.selected } : {}),
       });
     }
     if (request.method === "GET" && action === "history") {
@@ -1148,4 +1374,21 @@ process.on("SIGINT", () => {
   void shutdown().catch(() => {
     process.exitCode = 1;
   });
+});
+process.on("unhandledRejection", (reason) => {
+  if (
+    reason instanceof ApiError &&
+    (reason.code === "WORKSPACE_DELETED" ||
+      reason.code === "RUNTIME_FENCE_REJECTED")
+  ) {
+    console.error(
+      JSON.stringify({
+        event: "runtime-work-cancelled",
+        code: reason.code,
+        message: reason.message,
+      }),
+    );
+    return;
+  }
+  throw reason;
 });
