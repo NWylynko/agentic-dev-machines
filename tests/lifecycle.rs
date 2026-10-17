@@ -229,13 +229,19 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     fs::write(
         root.path().join("kubectl"),
         r##"#!/usr/bin/env python3
-import fcntl, json, pathlib, sys, time
+import datetime, fcntl, json, pathlib, re, sys, time
 root=pathlib.Path(__file__).parent
 args=sys.argv[1:]
 args=[arg for arg in args if not arg.startswith('--request-timeout=')]
 state_path=root/'cluster.json'
 state=json.loads(state_path.read_text()) if state_path.exists() else {}
 lease_path=root/'lease.json'
+def validate_lease_microtime(doc):
+    for field in ['acquireTime','renewTime']:
+        value=doc['spec'].get(field,'')
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z',value):
+            print('Error from server (BadRequest): Lease '+field+' requires Kubernetes MicroTime with six fractional digits',file=sys.stderr); sys.exit(1)
+        datetime.datetime.strptime(value,'%Y-%m-%dT%H:%M:%S.%fZ')
 if args[:2] == ['get','lease']:
     count_path=root/'lease-gets'
     with count_path.open('a+') as counter:
@@ -318,16 +324,21 @@ elif args[0] == 'apply':
     state_path.write_text(json.dumps(state))
 elif args[:2] == ['create','-f']:
     doc=json.load(sys.stdin)
+    validate_lease_microtime(doc)
     doc['metadata']['resourceVersion']='1'
     lease_path.write_text(json.dumps(doc))
+    (root/'lease-initial.json').write_text(json.dumps(doc))
     print(json.dumps(doc))
 elif args[:2] == ['replace','-f']:
     doc=json.load(sys.stdin)
+    validate_lease_microtime(doc)
     current=json.loads(lease_path.read_text())
     if doc['metadata'].get('resourceVersion') != current['metadata']['resourceVersion']:
         print('Error from server (Conflict): resourceVersion conflict',file=sys.stderr); sys.exit(1)
     doc['metadata']['resourceVersion']=str(int(current['metadata']['resourceVersion'])+1)
     lease_path.write_text(json.dumps(doc))
+    if doc['spec']['holderIdentity']==current['spec']['holderIdentity']:
+        (root/'lease-renewed').write_text('yes')
     print(json.dumps(doc))
 elif args[0] == 'wait': pass
 elif args[:2] == ['delete','namespace']:
@@ -387,6 +398,19 @@ else:
         .unwrap()
         .status(),
         200
+    );
+    let initial_lease: Value =
+        serde_json::from_slice(&fs::read(root.path().join("lease-initial.json")).unwrap()).unwrap();
+    wait_for(|| root.path().join("lease-renewed").exists().then_some(()));
+    let renewed_lease: Value =
+        serde_json::from_slice(&fs::read(root.path().join("lease.json")).unwrap()).unwrap();
+    assert_eq!(
+        renewed_lease["spec"]["acquireTime"], initial_lease["spec"]["acquireTime"],
+        "renewing the owner must preserve the acquisition time"
+    );
+    assert_ne!(
+        renewed_lease["spec"]["renewTime"], initial_lease["spec"]["renewTime"],
+        "the running lifecycle owner must renew its Kubernetes Lease"
     );
     let forged = json!({"operationId":"f199aa5e-a626-4d96-bcea-89092d725d83","kind":"create","spec":{
         "name":"forged","role":"coding","image":"test-image","storage_class":"test-storage",

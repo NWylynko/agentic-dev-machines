@@ -100,7 +100,7 @@ fn timestamp() -> String {
     let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
     unsafe { libc::gmtime_r(&seconds, &mut tm) };
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000000Z",
         tm.tm_year + 1900,
         tm.tm_mon + 1,
         tm.tm_mday,
