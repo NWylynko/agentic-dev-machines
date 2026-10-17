@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,21 @@ const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const binary = join(root, "target/debug/adm");
 const kubectl = process.env.ADM_KUBECTL ?? "kubectl";
 const enabled = process.env.ADM_LIVE_CLUSTER === "1";
+
+async function lifecycleArgs() {
+  const url = process.env.ADM_LIFECYCLE_URL;
+  const tokenFile = process.env.ADM_LIFECYCLE_TOKEN_FILE;
+  assert.ok(
+    url,
+    "ADM_LIVE_CLUSTER=1 requires ADM_LIFECYCLE_URL for the installed lifecycle API.",
+  );
+  assert.ok(
+    tokenFile,
+    "ADM_LIVE_CLUSTER=1 requires ADM_LIFECYCLE_TOKEN_FILE for the client credential.",
+  );
+  await access(tokenFile);
+  return ["--lifecycle-url", url, "--lifecycle-token-file", tokenFile];
+}
 
 function run(file, args, { input, env = process.env, timeout = 180_000 } = {}) {
   return new Promise((resolveRun, reject) => {
@@ -44,9 +59,18 @@ function run(file, args, { input, env = process.env, timeout = 180_000 } = {}) {
 }
 
 async function adm(state, args, input) {
-  return run(binary, ["--state-dir", state, "--kubectl", kubectl, ...args], {
-    input,
-  });
+  return run(
+    binary,
+    [
+      "--state-dir",
+      state,
+      "--kubectl",
+      kubectl,
+      ...(await lifecycleArgs()),
+      ...args,
+    ],
+    { input },
+  );
 }
 
 async function kubectlRun(args, input) {

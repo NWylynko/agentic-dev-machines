@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -680,6 +680,88 @@ test(
     }
   },
 );
+
+test("terminal re-reads the verified Pod identity so token rotation keeps status, SSE, and prompts authorized", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-terminal-identity-"));
+  const identityPath = join(directory, "identity.json");
+  const tokenPath = join(directory, "projection");
+  const kubectlPath = join(directory, "kubectl");
+  await writeFile(tokenPath, "projected-runtime-token-1\n", { mode: 0o600 });
+  await writeFile(
+    identityPath,
+    JSON.stringify({
+      workspaceId: "work",
+      namespace: "adm-work",
+      podName: "workspace-0",
+      podUid: "a1b2c3d4-e5f6-47a8-9012-123456789abc",
+      container: "dev",
+      kubectl: kubectlPath,
+      kubeconfig: "/tmp/kubeconfig",
+    }),
+    { mode: 0o600 },
+  );
+  const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  await writeFile(
+    kubectlPath,
+    `#!/bin/sh\nif [ "$1" = get ]; then printf '%s' '{"metadata":{"uid":"a1b2c3d4-e5f6-47a8-9012-123456789abc","namespace":"adm-work","labels":{"adm.dev/workspace-id":"work"}},"spec":{"serviceAccountName":"adm-runtime"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}'; else cat ${shellQuote(tokenPath)}; fi\n`,
+    { mode: 0o700 },
+  );
+  const observed: string[] = [];
+  const server = createServer(async (request, response) => {
+    observed.push(request.headers.authorization ?? "");
+    if (
+      !request.headers.authorization?.startsWith(
+        "Bearer projected-runtime-token-",
+      )
+    ) {
+      response.writeHead(401).end();
+      return;
+    }
+    if (request.url?.includes("/events")) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+      return;
+    }
+    response.setHeader("content-type", "application/json");
+    response.end(
+      JSON.stringify(
+        request.method === "POST"
+          ? { submissionId: "sent", status: "admitted" }
+          : request.url?.includes("/history")
+            ? { events: [], nextAfter: 0, hasMore: false }
+            : {
+                id: "work",
+                name: "demo",
+                role: "coding",
+                status: "idle",
+                goals: [],
+                loops: [],
+              },
+      ),
+    );
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as any;
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+    identityFile: identityPath,
+  });
+  try {
+    await terminal.connect();
+    assert.ok(terminalText(terminal).includes("Connected"));
+    await writeFile(tokenPath, "projected-runtime-token-2\n", { mode: 0o600 });
+    await terminal.submit("hello");
+    assert.ok(observed.length >= 4);
+    assert.ok(observed.includes("Bearer projected-runtime-token-1"));
+    assert.ok(observed.includes("Bearer projected-runtime-token-2"));
+  } finally {
+    terminal.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 
 test(
   "a real terminal submits to the runner, detaches mid-run, and reconnects to the completed history",

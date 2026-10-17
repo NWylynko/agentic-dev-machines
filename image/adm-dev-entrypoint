@@ -6,6 +6,8 @@ set -eu
 if [ "${1:-}" = "--check" ]; then
   test "$(readlink /repos)" = "/workspace/.adm/catalog"
   test -f /opt/adm/workspace-env.mjs
+  test -f /opt/adm/runner.mjs
+  test -d /opt/adm/node_modules/@earendil-works/pi-durable
   test -f /opt/adm/browser.mjs
   test -x /usr/local/bin/adm-repositories
   test -x /usr/local/bin/artifact-fs
@@ -17,4 +19,14 @@ if [ "${1:-}" = "--check" ]; then
   test -f /opt/adm/oh-my-zsh/oh-my-zsh.sh
   exit 0
 fi
-exec sleep infinity
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+exec node /opt/adm/runner.mjs \
+  --host 0.0.0.0 \
+  --port 7432 \
+  --state-dir /workspace/.adm/runtime \
+  --workspace-config /run/adm/workspace.json \
+  --token-file /var/run/secrets/kubernetes.io/serviceaccount/token \
+  --lifecycle-url "${ADM_LIFECYCLE_URL:?ADM_LIFECYCLE_URL must be set}" \
+  --pod-uid "${ADM_POD_UID:?ADM_POD_UID must be set}"

@@ -1,29 +1,27 @@
 # Running ADM
 
-ADM has a Rust CLI and a long-running access runner on the management host. Coding agents execute in their workspace Pods, and provider credentials belong to the selected workspace. Terminal attachments are clients; closing one does not stop an agent.
+ADM has a Rust CLI and an in-cluster lifecycle service. The management host is an access plane: coding and bot agents, their model requests, tools, MCP servers, goals, and schedules run in their own workspace Pods. Terminal and shell attachments are clients; closing one does not stop an agent.
 
 ## Management host
 
-Install the standalone release with the command in the [README](../README.md), then run `adm setup`. The management host needs Node.js 24+, `kubectl`, and Git; `gh` is needed for repository discovery. Rust, Go, npm, and the checkout are only needed for source development. See [installation and updates](installation.md) for prerequisites, version selection, and migrating an older manual installation.
+Install the standalone release with the command in the [README](../README.md), then run `adm setup`. The management host needs `kubectl`; Git and `gh` are needed only for repository discovery. Rust, Go, npm, and the checkout are only needed for source development. See [installation and updates](installation.md) for prerequisites and version selection.
 
-Make sure `$HOME/.local/bin` is on your shell's PATH. `adm doctor` reports tool availability, cluster readiness, the default StorageClass, runner health, and the selected local state directory. It preserves storage and runner error causes instead of treating every failure as a stopped service. Use `adm doctor --storage-class NAME` to inspect another class; node-local storage is labeled explicitly. Diagnostics do not allocate a workspace or install missing prerequisites.
+Make sure `$HOME/.local/bin` is on your shell's PATH. `adm doctor` reports local tools, cluster readiness, the default StorageClass, and the selected CLI state directory. Use `adm doctor --storage-class NAME` to inspect another class; node-local storage is labeled explicitly. Diagnostics do not allocate a workspace or install missing prerequisites.
 
-Use Pi's `/login` in the selected coding workspace to create its private, writable authentication store at `/workspace/.adm/pi/auth.json`. The store lives on that workspace's private persistent volume, so Pod replacement retains refresh-token rotations and logout state. Pi commits a rotated refresh token before releasing the store lock; if the caller cancels while rotation is in flight, the runtime waits for the commit so the only valid refresh token is not lost. A separate workspace login has an independent token family. If an operator intentionally shares one OAuth token family, it must have one canonical mutable store owner; do not copy the same refresh token into multiple independently refreshing stores. For API keys, an operator can create a Secret in that workspace namespace and pass only a key reference, for example `--credential-env OPENAI_API_KEY=provider-auth:openai`. Secret values supplied as environment variables are read when the Pod starts, so replacing a Secret requires Pod replacement before that value reaches the process. The value is delivered to the dev container and is not saved in ADM workspace metadata or service units. Full root inside a workspace can read credentials delivered there, so scope each Secret to that workspace and provider. If the provider rejects refresh or credentials are revoked, the selected model request fails visibly; ADM does not select a fallback provider or credential source. Log out or repair the selected workspace credential, then explicitly retry the failed request. Subscription compatibility depends on the provider integration and has not been validated for every account. `adm login` configures the local Pi host store and does not copy it into workspaces.
+Use `adm login NAME` to open Pi’s standalone provider authentication UI inside the selected workspace Pod. It runs without coding tools, extensions, or a conversation session, and writes that workspace’s private authentication store at `/workspace/.adm/pi/auth.json`. The attached agent interface does not currently expose `/login`. The store lives on that workspace’s private persistent volume, so Pod replacement retains refresh-token rotations and logout state. Pi commits a rotated refresh token before releasing the store lock; if the caller cancels while rotation is in flight, the runtime waits for the commit so the only valid refresh token is not lost. Each workspace login has an independent token family. For API keys, create a Secret in that workspace namespace and pass only a key reference, for example `--credential-env OPENAI_API_KEY=provider-auth:openai`. Secret values supplied as environment variables are read when the Pod starts, so replacing a Secret requires Pod replacement before that value reaches the process. The value is delivered to the workspace container and is not saved in ADM workspace metadata or service units. Full root inside a workspace can read credentials delivered there, so scope each Secret to that workspace and provider. If the provider rejects refresh or credentials are revoked, the selected model request fails visibly; ADM does not select a fallback provider or credential source. Log out or repair the selected workspace credential, then explicitly retry the failed request.
 
 Choose a default model in `adm setup`, or select one explicitly with `--model PROVIDER/MODEL_ID` when creating an agent workspace. `faux/faux-1` is a deterministic local test provider and is available only when explicitly selected. It does not call an external model.
 
 ```sh
-adm start
 adm status my-project
+adm attach my-project
 ```
 
-`adm start` detaches the runner from the invoking terminal. For restart after a management-host reboot or runner crash, use `adm setup` to install the user service supervising `adm serve`. A manual [service template](../deploy/adm-runner.service) is also available. Do not start a second runner for the same state directory. Its owner lock rejects competing processes; SQLite is not a multi-owner database.
+`adm start`, `adm serve`, and `adm stop` do not start a host-side agent runtime. Workspace Pods start and supervise their own agents independently of the management host, CLI, SSH, and terminal connections.
 
-Kubernetes access stays on the management host. `adm create` records the host-side `KUBECONFIG` path list for each coding workspace and passes it to the runner's `kubectl` process, including after runner restart. Use `--kubeconfig PATHS` or `KUBECONFIG` to select a file or the normal colon-separated merge list; relative entries are made absolute. If neither is set, ADM records `$HOME/.kube/config`. An empty `KUBECONFIG` uses that same default; empty entries inside a merge list are rejected clearly. The runner stores only these paths, never kubeconfig contents. Existing coding workspaces registered before this setting was added fail tool calls clearly and never fall back to the runner's ambient Kubernetes context. Repair one in place with `adm reconnect NAME --kubeconfig PATHS`; omit the flag to use the current CLI default. ADM verifies the namespace's immutable workspace ID with the selected connection, refuses while work is active, and keeps the same files, workspace ID, and history. Do not copy kubeconfig files into the development container.
+Kubernetes credentials stay on the management host. `adm create` records the host-side `KUBECONFIG` path list for each coding workspace so coding tools keep using the selected cluster after Pod replacement. Use `--kubeconfig PATHS` or `KUBECONFIG` to select a file or the normal colon-separated merge list; relative entries are made absolute. If neither is set, ADM uses `$HOME/.kube/config`. Kubeconfig contents never enter a workspace Pod. `adm reconnect NAME --kubeconfig PATHS` verifies namespace ownership and updates the host-side coding-tool connection while preserving the workspace ID, files, and history.
 
-The default state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm` when XDG_DATA_HOME is unset. `--state-dir` and `--runner-url` are global options. Use the same values in the service and every CLI command. The default runner URL is `http://127.0.0.1:7432`; remote unauthenticated binds are rejected.
-
-`adm stop` stops a runner launched by `adm start` while preserving recoverable work. For the user service, use `systemctl --user stop adm-runner.service` and `systemctl --user start adm-runner.service`. Workspace deletion uses `adm destroy`, which has different semantics.
+The default CLI state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm` when XDG_DATA_HOME is unset. Lifecycle state and deletion work are owned by the in-cluster service on its persistent volume. See [the lifecycle API deployment guide](lifecycle-api.md#fresh-control-plane-install) for installation and the management-host connection.
 
 ## Published builds
 
@@ -48,7 +46,7 @@ docker build -f image/Dockerfile -t adm-dev:0.1.0 .
 
 For local image development, distribute that exact image to the cluster's nodes and pass `--image adm-dev:0.1.0`. Installed releases default to their matching published GHCR reference unless setup configured another image. Building it on the management host does not make it available to Kubernetes. ADM does not install node helpers or change container-runtime configuration.
 
-Configure a replicated StorageClass as described in [storage.md](../deploy/storage.md). The default is `adm-replicated`; this repository does not install a storage backend. The filesystem must support the required mount behavior, and the runner's management-host SQLite store needs a WAL-compatible filesystem. Keep management-host state in the backup plan as well as workspace volumes.
+Configure a replicated StorageClass as described in [storage.md](../deploy/storage.md). The default is `adm-replicated`; this repository does not install a storage backend. The filesystem must support the required mount behavior. Include the lifecycle service's SQLite PVC and workspace volumes in the backup plan; SQLite WAL compatibility is required for the lifecycle state volume.
 
 For a deliberately node-local experiment, use `--storage-class local-path --allow-node-local-storage`. This acknowledges that replacement on a different node cannot recover that volume. It is useful for testing Pod replacement on the same node, not evidence of node-failure recovery.
 
@@ -67,9 +65,9 @@ adm status my-project
 adm inspect my-project
 ```
 
-`adm create` writes lifecycle stage starts and elapsed stage/total durations to stderr and returns its workspace record on stdout. It reports the StorageClass lookup, resource apply, deployment readiness, optional repository preparation, and runner startup/registration separately. `adm destroy` returns its durable operation receipt after deletion is admitted; use `adm destroy NAME --wait` to wait for completion and receive the deleted workspace record. A repeated destroy by name resumes the same deletion operation. The lifecycle service records cleanup stages, timings, and failures in the operation receipt and workspace status. These timings cover ADM's synchronous calls; for example, deployment readiness includes whatever Kubernetes waits on before the Deployment becomes Available, such as storage binding, scheduling, and initialization. Use the slowest stage to guide further measurements; the CLI does not infer a cause or split Kubernetes internals into separate durations.
+`adm create` writes lifecycle stage starts and elapsed stage/total durations to stderr and returns its workspace record on stdout. It reports the StorageClass lookup, resource apply, deployment readiness, optional repository preparation, and runner startup/registration separately. For `--repo`, creation waits until the owned Pod container is running, prepares the private checkout, then waits for Deployment readiness so a missing repository path cannot block startup. `adm destroy` returns its durable lifecycle operation receipt after deletion is admitted; use `adm destroy NAME --wait` to wait for completion and receive the deleted workspace record. A repeated destroy resumes the same operation, including after service restart. The lifecycle service records a tombstone before namespace cleanup, and stores cleanup stages, timings, and failures in the operation receipt and workspace status. These timings cover ADM's synchronous calls; for example, deployment readiness includes whatever Kubernetes waits on before the Deployment becomes Available, such as storage binding, scheduling, and initialization. Use the slowest stage to guide further measurements; the CLI does not infer a cause or split Kubernetes internals into separate durations.
 
-If an older coding workspace's tool calls report that no Kubernetes connection is pinned, verify that the selected host kubeconfig reaches the intended cluster and run `adm reconnect NAME --kubeconfig PATHS`. The command checks the namespace's `adm.dev/workspace-id` ownership label, then updates the runner's persisted host connection while retaining the same namespace, workspace ID, files, Durable history, goals, and loops. If active work blocks the rebind, stop it deliberately with `adm abort NAME`, then retry. Restarting the runner alone does not change a registered connection. The `--kubeconfig` argument accepts the ordinary colon-separated merge list; CLI-relative entries are resolved from the current directory.
+If coding tools cannot use Kubernetes, verify that the selected host kubeconfig reaches the intended cluster and run `adm reconnect NAME --kubeconfig PATHS`. The command checks the namespace's immutable workspace ownership, then updates the Pod runtime's host-side tool connection while retaining the namespace, workspace ID, files, history, goals, and loops. If active work blocks the rebind, stop it deliberately with `adm abort NAME`, then retry. A workspace Pod replacement retains the registered connection. The `--kubeconfig` argument accepts the ordinary colon-separated merge list; CLI-relative entries are resolved from the current directory.
 
 Every workspace starts with a durable agent. Without a configured default, select a model after attaching with `/model`; input remains paused until a model is selected. By default `/repos` is an ordinary writable directory, so normal cloning works. `--repo OWNER/REPO` performs a normal full clone of a public GitHub repository into `/repos/OWNER/REPO`; Git checks out the remote's advertised default branch. The shell and coding agent start there. The clone uses the private workspace volume and does not enable the lazy catalog. Private repository authentication is not configured by this option, and the clone does not use shallow or filtered fetches. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. `--repo` cannot be combined with `--catalog`, `--no-repositories`, or bot workspaces.
 
@@ -116,11 +114,11 @@ The repository service requires FUSE, mount propagation, and a Linux kernel supp
 
 Use `/repos` for your work. Its contents depend on how the workspace was created:
 
-| Creation choice | What you find | Next action |
-| --- | --- | --- |
-| Plain workspace | Empty, writable directory | Clone a repository into `/repos` |
-| `--repo OWNER/REPO` | A private Git checkout at `/repos/OWNER/REPO` | The default shell and coding agent start in that checkout |
-| `--catalog FILE` | Owner and repository listings from that catalog | Enter a listed repository to acquire its files |
+| Creation choice     | What you find                                   | Next action                                               |
+| ------------------- | ----------------------------------------------- | --------------------------------------------------------- |
+| Plain workspace     | Empty, writable directory                       | Clone a repository into `/repos`                          |
+| `--repo OWNER/REPO` | A private Git checkout at `/repos/OWNER/REPO`   | The default shell and coding agent start in that checkout |
+| `--catalog FILE`    | Owner and repository listings from that catalog | Enter a listed repository to acquire its files            |
 
 For a plain workspace, run these inside `adm shell NAME`:
 
@@ -154,13 +152,11 @@ adm create supervisor --role bot --model PROVIDER/MODEL_ID --allow-agent CODING_
 adm attach supervisor
 ```
 
-Bots execute their model and tools in the long-running management-host runner. Their Kubernetes namespace intentionally has no workspace Pod. Creation reports this location on stderr while stdout remains the workspace JSON. `adm status supervisor` identifies the management host and distinguishes a reachable agent from an unavailable runner; `adm inspect supervisor` provides detailed diagnostics.
+Bots use the same isolated Pod and private persistent volume model as coding agents. They have no repository checkout, coding tools, or shell, including through Code Mode. They can manage only explicitly granted coding workspace IDs through the lifecycle service and publish chat text only with `sendMessage`.
 
-On that host, inspect a service runner with `systemctl --user show adm-runner.service -p MainPID -p ActiveState` and `journalctl --user -u adm-runner.service`. A runner launched by `adm start` writes `runner.pid` and `runner.log` in the ADM state directory (default `$XDG_DATA_HOME/adm`, or `~/.local/share/adm`). Registration and conversations are under `runner/workspaces.json` and `runner/sessions/ID/session.sqlite`. Use the same `--state-dir` and `--runner-url` as the owning runner when inspecting it.
+New bot conversations start one durable setup turn. The bot asks for an identity and purpose and publishes the setup question through `sendMessage`; its saved profile appears in future model instructions and survives Pod replacement. Ordinary model output remains private in diagnostics.
 
-New bot conversations start one durable setup turn. The bot asks for an identity and purpose and publishes the setup question through `sendMessage`; its saved profile appears in future model instructions and survives runner restarts. Existing bot conversations without a profile are left unchanged during upgrade. Ordinary model output remains private in diagnostics.
-
-MCP access is configured by the host with a nonsecret JSON file that grants exact stdio server tools. Environment values are looked up by reference in the runner process and passed only to that MCP server; the runner does not pass its other environment through.
+MCP access is configured at workspace creation with a nonsecret JSON file that grants exact stdio server tools. Environment values are looked up by reference inside the workspace runtime and passed only to that MCP server; the runtime does not pass its other environment through.
 
 ```json
 [
@@ -182,11 +178,13 @@ The config stores only the environment reference name, never its value. Only lis
 
 Use immutable IDs from `adm list` for supervision grants. A bot can use `listAgents` to discover the names and status of its live permitted coding agents, then observe and prompt those targets. Deleted or missing grants are reported as unavailable and never transfer to a workspace that reuses the same name. The bot can also manage goals and loops and publish through `sendMessage`. It has no coding filesystem, shell, or development browser, including through Code Mode. `adm attach supervisor --diagnostics` explicitly opts in to seeing diagnostics.
 
-`adm list` shows each workspace's persisted phase and agent configuration alongside current activity and the full immutable ID. It makes one bounded runner directory request for all activity and does not contact Kubernetes; if the runner or an individual record is unavailable, activity is shown as `unavailable` with its cause. `adm list --json` returns the complete stored records plus an `activity` object; add `--all` to include deleted workspaces. `adm status NAME` expands the selected workspace with namespace, model, CPU, memory, storage, runtime readiness/state, agent activity, node, and available failure causes. Its table labels persisted `PHASE`, runtime readiness, and agent `ACTIVITY` separately. Bot workspaces currently have no Pod and identify the management host as their location. Use `adm status NAME --json` for the complete status payload, or `adm inspect NAME` for labeled diagnostics. `adm inspect NAME --json` returns the same payload as status JSON.
+`adm list` shows persisted workspace phase alongside live Pod readiness and agent activity. The lifecycle service makes one bounded Pod-directory request and performs bounded, deadline-limited per-Pod runtime status reads using a short-lived TokenRequest bound to that Pod's UID. A failed status read stays `unavailable` with its cause. `adm list --json` includes an `activity` object; add `--all` to include deleted workspaces. `adm status NAME` reports namespace, requested and selected model, resources, Pod readiness/node, activity, and available failure causes. `adm inspect NAME` provides the same labeled diagnostics, and JSON modes preserve the full payload. Deleted state takes precedence over any stale Pod/runtime report.
 
 ## Errors and recovery
 
 The terminal supports `/status`, `/resume`, `/reconnect`, `/abort`, `/abort all`, `/newgoal DESCRIPTION`, and `/loop SECONDS PROMPT`. See the [terminal controls](../packages/terminal/README.md).
+
+Each workspace runtime holds and renews a lifecycle fence. If it cannot verify that fence, it records the cause, closes its harness and scheduled work, returns unhealthy readiness, and rejects new requests and Durable commits. The Pod's liveness probe restarts the runtime after three failed checks at ten-second intervals; the replacement must acquire a fresh fence before serving. This is fail-stop behavior, not a provider or host-runtime fallback. The directory reports runtime status as unavailable with the observed cause while it cannot reach the Pod.
 
 An authentication or allowance error is retained in history and status. Restore the selected provider's credentials or capacity, then use `/resume`. Resume reuses its request identity and is allowed only when no tool ran during the failed turn. After a tool may have changed files or external systems, inspect that state and send an explicit follow-up instead. ADM does not switch providers, billing methods, or execution environments on failure.
 
@@ -263,11 +261,15 @@ The lighter cluster contract check needs no workspace image or storage provision
 ADM_LIVE_CLUSTER=1 npm run test:cluster-contract
 ```
 
+Live CLI tests require access to the installed lifecycle service and its protected client-token file; they never fall back to a host runner. Set `ADM_LIFECYCLE_URL` and `ADM_LIFECYCLE_TOKEN_FILE` for the commands below (for example, point the URL at the supervised local port-forward described in the [installation guide](installation.md#in-cluster-lifecycle-owner)).
+
 The full opt-in cluster suite creates coding workspaces, checks normal Git and untracked work after Pod replacement, checks browser and forwarded-port behavior, then destroys its namespaces and claims. It uses local-path deliberately and never drains a node:
 
 ```sh
 cargo build
-ADM_LIVE_CLUSTER=1 ADM_LIVE_IMAGE=adm-dev:0.1.0 npm run test:cluster
+ADM_LIVE_CLUSTER=1 ADM_LIFECYCLE_URL=http://127.0.0.1:7433 ADM_LIFECYCLE_TOKEN_FILE=/secure/path/lifecycle-token ADM_LIVE_IMAGE=adm-dev:0.1.0 npm run test:cluster
 ```
 
 The suite checks that this image is present on every schedulable node before creating anything. Ordinary `npm test` does not mutate the cluster. Passing the local-path experiment does not prove cross-node storage durability, a sudden-node-failure loss window, live account refresh, or connectivity from client laptops.
+
+On 2026-10-16, an isolated Kubernetes permission check verified the lifecycle role against a Pod using an older cached image: target Pod-bound `adm-runtime` TokenRequest succeeded, TokenReview confirmed the namespace, ServiceAccount, Pod UID, and audience, an unrelated audience was rejected, another ServiceAccount name and TokenRequest from the workspace ServiceAccount were forbidden, Pod exec ran as UID 1000, and a namespace apply retry succeeded. The temporary namespaces, ClusterRole, and binding were removed. This validates those API permissions only; it does not validate the new workspace image, full runtime startup, provider access, or persistence across a real Pod replacement.

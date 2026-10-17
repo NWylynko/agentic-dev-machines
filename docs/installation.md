@@ -12,13 +12,13 @@ curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/
 
 The script downloads `adm-linux-amd64.tar.gz` and verifies its checksum from the release's `SHA256SUMS`. Successful `main` builds automatically publish a release containing the CLI, repository helper, compiled runner and terminal, and pinned production Node dependencies. No checkout or build toolchain is needed.
 
-The commands are installed in `$HOME/.local/bin`. Add that directory to your PATH if needed. The installation lives under `$XDG_DATA_HOME/adm/install`, or `$HOME/.local/share/adm/install` when XDG_DATA_HOME is unset. Versioned runtime files are separate from workspace and runner state.
+The commands are installed in `$HOME/.local/bin`. Add that directory to your PATH if needed. The installation lives under `$XDG_DATA_HOME/adm/install`, or `$HOME/.local/share/adm/install` when XDG_DATA_HOME is unset. Versioned runtime files are separate from workspace and lifecycle-service state.
 
-First installation offers `adm setup` through the terminal. Setup configures the image, storage class, and optional default model, offers local Pi `/login`, and can create/start a systemd user service. Local `adm login` configures only the host's Pi store. Workspace login is performed in that workspace and is kept on its private volume. With no terminal, installation prints the command to run later.
+First installation offers `adm setup` through the terminal. Setup configures the workspace image, storage class, and optional default model. Provider login is performed inside a selected workspace and is kept on its private volume. With no terminal, installation prints the command to run later.
 
 Settings are nonsecret JSON at `$XDG_CONFIG_HOME/adm/config.json`, normally `$HOME/.config/adm/config.json`. Explicit CLI flags override these defaults. Workspaces always create their durable agent; a model can be selected later in `adm attach` with `/model`. Setup never changes your Kubernetes context or installs a storage backend. It saves an explicit image reference, so updates preserve your image choice too.
 
-The generated runner service does not inherit keys from your login shell. Configure each coding workspace's credentials with Pi login in that workspace or references to keys in a Secret in that workspace's namespace. For API keys, pass references such as `--credential-env OPENAI_API_KEY=provider-auth:openai`; ADM stores only the environment name and Secret/key reference and maps the value into that workspace's dev container. No particular secret manager is required. Do not put values in ADM config, service files, or project `.env` files. Persistent user services after logout require operator-configured systemd lingering; setup reports this requirement.
+Configure each workspace's credentials with `adm login NAME` or references to keys in a Secret in that workspace's namespace. For API keys, pass references such as `--credential-env OPENAI_API_KEY=provider-auth:openai`; ADM stores only the environment name and Secret/key reference and maps the value into that workspace's container. No particular secret manager is required. Do not put values in ADM config, service files, or project `.env` files.
 
 ## In-cluster lifecycle owner
 
@@ -35,11 +35,10 @@ kubectl apply -f deploy/lifecycle/control-plane.yaml
 kubectl -n adm-system port-forward service/adm-lifecycle 7433:7433
 ```
 
-Point `ADM_LIFECYCLE_URL` to `http://127.0.0.1:7433` and `ADM_LIFECYCLE_TOKEN_FILE` to the protected client token file. Supervise the port-forward separately from the CLI. The service token grants full lifecycle API access; keep it on trusted management clients and do not mount it into workspace Pods. The manifest and API behavior have fake-Kubernetes test coverage; this install path has not been applied to the live cluster.
+Point `ADM_LIFECYCLE_URL` to `http://127.0.0.1:7433` and `ADM_LIFECYCLE_TOKEN_FILE` to the protected client token file. Supervise the port-forward separately from the CLI. The service token grants full lifecycle API access; keep it on trusted management clients and do not mount it into workspace Pods. Fake-Kubernetes coverage checks the manifest and API. A separate live API-permission check verifies the lifecycle role's target-bound TokenRequest, TokenReview, Pod exec, and namespace retry permissions using an older cached base image; see [the operations guide](operations.md#verification). The full control-plane install and the new runtime image have not been validated end to end on the cluster.
 
 ```sh
 adm doctor
-adm start  # when not using the background service
 adm create my-project
 adm attach my-project
 ```
@@ -48,15 +47,9 @@ adm attach my-project
 
 Rerun the install command to get the latest successful `main` release. Each build has its own `sha-<commit>` release and matching workspace image; updating does not require a manual version tag. Markdown-only pushes skip the build. Optional `v*` tags publish pinned versions without changing the installer's default release.
 
-Updates validate the download before changing the active installation, retain previous runtime directories, and preserve configuration, workspace metadata, conversations, and provider login. An active `adm-runner.service` restarts after the switch. Its restart failure is reported; inspect `systemctl --user status adm-runner.service` before continuing. Existing workspaces retain their image and storage settings.
+Updates validate the download before changing the active installation, retain previous runtime directories, and preserve configuration. Workspace Pods continue running independently of an installer update. Existing workspaces retain their image and storage settings.
 
-For a runner started with `adm start`, stop it before updating and start it afterward. Closing terminal attachments detaches; it does not delete workspaces. Use the same `--state-dir` and `--runner-url` for custom runners. The installer recognizes the default state directory or `ADM_STATE_DIR`; custom runner locations remain operator-managed.
-
-```sh
-adm stop
-curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/install.sh | sh
-adm start
-```
+Closing terminal attachments detaches; it does not delete workspaces. Use `adm destroy NAME` to delete a workspace and stop its owned work.
 
 To select a release or skip guided setup:
 
@@ -67,7 +60,7 @@ sh /tmp/adm-install.sh --version v0.1.0 --no-setup
 
 `v0.1.0` is an example: choose an existing version or `sha-<commit>` tag from [Releases](https://github.com/NWylynko/agentic-dev-machines/releases). `--base-url URL` selects an explicit alternative release asset directory. There is no source-build or provider fallback when a download or prerequisite fails.
 
-The installer refuses to overwrite an existing unmanaged `adm` or `adm-repositories` command. For an older manual installation, stop its runner, move those executables aside, install, then run `adm setup` to replace any checkout-based service. Keep the existing state directory. This migrates the runtime without moving your workspaces.
+The installer refuses to overwrite an existing unmanaged `adm` or `adm-repositories` command. This early-alpha design does not migrate host-runner state or configuration. Retire an older installation separately before using the in-cluster lifecycle design.
 
 ## zsh completions
 
@@ -95,7 +88,7 @@ Contributors still use the checkout with Node.js 24+, Rust, and Go as pinned in 
 ```sh
 npm ci
 cargo run -- doctor
-cargo run -- start
+cargo run -- create my-project
 ```
 
 `--project-dir` / `ADM_PROJECT_DIR` explicitly select a development checkout. Installed binaries normally discover the matching runtime beside their executable. The release bundle carries its matching published workspace image reference; source development defaults to the published `latest` image. Pass `--image adm-dev:0.1.0` for a locally built image.

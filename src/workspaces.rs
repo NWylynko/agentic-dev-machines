@@ -1,4 +1,4 @@
-use crate::{Cli, runner};
+use crate::Cli;
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -115,7 +115,7 @@ pub struct CreateOptions {
     /// Stable lifecycle operation UUID used to replay this create request.
     #[arg(long)]
     pub operation_id: Option<String>,
-    /// Bot agents run in the management-host runner and have no workspace Pod.
+    /// Runtime role; both coding and bot agents run in private workspace Pods.
     #[arg(long,default_value="coding",value_parser=["coding","bot"])]
     pub role: String,
     /// Workspace image; otherwise use the configured or matching release image.
@@ -441,7 +441,47 @@ impl WorkspaceStore {
             return Ok(receipt);
         }
         let created_workspace = match request {
-            OperationRequest::Create { spec, .. } => Some(spec.clone().allocate(operation_id)?),
+            OperationRequest::Create { spec, .. } => {
+                let requested = spec.clone().allocate(operation_id)?;
+                let existing = transaction
+                    .query_row(
+                        "SELECT spec FROM workspaces WHERE name=?1 AND phase!='deleted'",
+                        [&requested.name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|encoded| serde_json::from_str::<Workspace>(&encoded))
+                    .transpose()?;
+                match existing {
+                    Some(existing)
+                        if existing.phase == "failed" || existing.phase == "provisioning" =>
+                    {
+                        if existing.repository != requested.repository {
+                            let requested_repository = match requested.repository.as_deref() {
+                                Some(repository) => format!("recreating with --repo {repository}"),
+                                None => "recreating without --repo".into(),
+                            };
+                            bail!(
+                                "workspace {} has an unfinished creation for repository {}; inspect its status/error and deliberately destroy it before {} (failed workspace files are retained)",
+                                existing.name,
+                                existing.repository.as_deref().unwrap_or("none"),
+                                requested_repository
+                            );
+                        }
+                        ensure!(
+                            same_creation_spec(&existing, &requested),
+                            "workspace {} has an unfinished creation with different options; destroy it before changing its configuration",
+                            requested.name
+                        );
+                        Some(existing)
+                    }
+                    Some(_) => bail!(
+                        "workspace name {} already exists; inspect it and deliberately destroy it before recreating",
+                        requested.name
+                    ),
+                    None => Some(requested),
+                }
+            }
             OperationRequest::Delete { .. } => None,
         };
         let workspace_id = created_workspace
@@ -456,38 +496,13 @@ impl WorkspaceStore {
                 let spec = created_workspace
                     .as_ref()
                     .expect("create workspace was allocated");
-                let existing = transaction
-                    .query_row(
-                        "SELECT phase,spec FROM workspaces WHERE name=?1 AND phase!='deleted'",
-                        [&spec.name],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .optional()?;
-                if let Some((phase, encoded)) = existing {
-                    let previous: Workspace = serde_json::from_str(&encoded)?;
-                    if phase == "failed" || phase == "provisioning" {
-                        let requested_repository = match spec.repository.as_deref() {
-                            Some(repository) => format!("recreating with --repo {repository}"),
-                            None => "recreating without --repo".to_owned(),
-                        };
-                        ensure!(
-                            previous.repository == spec.repository,
-                            "workspace {} has an unfinished creation for repository {}; inspect its status/error and deliberately destroy it before {} (failed workspace files are retained)",
-                            spec.name,
-                            previous.repository.as_deref().unwrap_or("none"),
-                            requested_repository
-                        );
-                        anyhow::bail!(
-                            "workspace {} has an unfinished creation; retry the same operation ID or inspect its status and deliberately destroy it",
-                            spec.name
-                        );
-                    }
-                    anyhow::bail!("workspace name {} already exists", spec.name);
-                }
                 transaction.execute(
                     "INSERT INTO workspaces(id,name,phase,spec,fencing_token) VALUES(?1,?2,?3,?4,?5)",
                     params![spec.id, spec.name, spec.phase, serde_json::to_string(spec)?, self.fencing_token as i64],
-                )?;
+                ).with_context(|| format!(
+                    "workspace name {} already exists; inspect it and deliberately destroy it before recreating",
+                    spec.name
+                ))?;
             }
             OperationRequest::Delete { workspace_id, .. } => {
                 let raw: String = transaction
@@ -702,6 +717,7 @@ impl WorkspaceStore {
         stage: &str,
         error: Option<&str>,
     ) -> Result<()> {
+        ensure_store_fence(&self.connection, self.fencing_token)?;
         let accepted_at: i64 = self.connection.query_row(
             "SELECT accepted_at FROM lifecycle_operations WHERE operation_id=?1",
             [operation_id],
@@ -732,6 +748,14 @@ impl WorkspaceStore {
         Ok(())
     }
     pub fn record_workspace_error(&self, workspace_id: &str, error: &str) -> Result<()> {
+        ensure_store_fence(&self.connection, self.fencing_token)?;
+        let raw: String = self.connection.query_row(
+            "SELECT spec FROM workspaces WHERE id=?1",
+            [workspace_id],
+            |row| row.get(0),
+        )?;
+        let mut workspace: Workspace = serde_json::from_str(&raw)?;
+        workspace.last_error = Some(error.to_owned());
         let changed = self.connection.execute(
             "UPDATE workspaces SET phase=CASE WHEN phase='provisioning' THEN 'failed' ELSE phase END,spec=json_set(spec,'$.last_error',?2,'$.phase',CASE WHEN phase='provisioning' THEN 'failed' ELSE phase END),fencing_token=?3 WHERE id=?1 AND fencing_token<=?3 AND ?3>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
             params![workspace_id, error, self.fencing_token as i64],
@@ -775,8 +799,10 @@ impl WorkspaceStore {
         Ok(workspace)
     }
     pub fn insert(&self, w: &Workspace) -> Result<()> {
-        let changed = self.connection.execute(
-                "INSERT INTO workspaces(id,name,phase,spec,fencing_token) SELECT ?1,?2,?3,?4,?5 WHERE ?5>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
+        ensure_store_fence(&self.connection, self.fencing_token)?;
+        self.connection
+            .execute(
+                "INSERT INTO workspaces(id,name,phase,spec,fencing_token) VALUES(?1,?2,?3,?4,?5)",
                 params![
                     w.id,
                     w.name,
@@ -784,24 +810,28 @@ impl WorkspaceStore {
                     serde_json::to_string(w)?,
                     self.fencing_token as i64
                 ],
-            ).with_context(|| format!("workspace name {} already exists or lifecycle fence is stale", w.name))?;
-        ensure!(changed == 1, "workspace lifecycle fencing token is stale");
+            )
+            .with_context(|| format!(
+                "workspace name {} already exists; inspect it and deliberately destroy it before recreating",
+                w.name
+            ))?;
         Ok(())
     }
     pub fn save(&self, w: &Workspace) -> Result<()> {
+        ensure_store_fence(&self.connection, self.fencing_token)?;
         let changed = self.connection.execute(
-            "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?4 WHERE id=?1 AND fencing_token<=?4 AND ?4>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
+            "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?4 WHERE id=?1 AND fencing_token<=?4",
             params![w.id, w.phase, serde_json::to_string(w)?, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "workspace lifecycle fencing token is stale");
         Ok(())
     }
     pub fn save_if_phase(&self, w: &Workspace, expected: &str) -> Result<bool> {
-        let changed = self.connection.execute(
-            "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?5 WHERE id=?1 AND phase=?4 AND fencing_token<=?5 AND ?5>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
+        ensure_store_fence(&self.connection, self.fencing_token)?;
+        Ok(self.connection.execute(
+            "UPDATE workspaces SET phase=?2,spec=?3,fencing_token=?5 WHERE id=?1 AND phase=?4 AND fencing_token<=?5",
             params![w.id, w.phase, serde_json::to_string(w)?, expected, self.fencing_token as i64],
-        )? == 1;
-        Ok(changed)
+        )? == 1)
     }
     pub fn admit_if_provisioning(
         &mut self,
@@ -882,7 +912,11 @@ fn kubectl_with_timeout(
     }
     let mut command = cli.kubectl_command()?;
     command.args(args);
-    if bounded && !args.iter().any(|arg| arg.starts_with("--request-timeout=")) {
+    if bounded
+        && !args
+            .iter()
+            .any(|argument| argument.starts_with("--request-timeout="))
+    {
         command.arg("--request-timeout=1s");
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -924,31 +958,78 @@ fn kubectl_with_timeout(
 }
 
 fn labels(w: &Workspace) -> Value {
-    json!({"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/workspace-id":w.id})
+    json!({"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/workspace-id":w.id,"adm.dev/role":w.role})
 }
 fn metadata(w: &Workspace, name: &str) -> Value {
     json!({"name":name,"namespace":w.namespace,"labels":labels(w)})
 }
 
 pub fn manifest(w: &Workspace) -> Result<Value> {
+    let lifecycle_namespace =
+        std::env::var("ADM_LIFECYCLE_NAMESPACE").unwrap_or_else(|_| "adm-system".to_owned());
+    ensure!(
+        !lifecycle_namespace.is_empty()
+            && lifecycle_namespace.len() <= 63
+            && lifecycle_namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && lifecycle_namespace
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && lifecycle_namespace
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric),
+        "ADM_LIFECYCLE_NAMESPACE must be a lowercase Kubernetes namespace name"
+    );
     let labels = labels(w);
     let namespace = json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":w.namespace,"labels":labels}});
-    let mut items = vec![namespace];
-    if w.role == "bot" {
-        return Ok(json!({"apiVersion":"v1","kind":"List","items":items}));
-    }
+    let mut items = vec![
+        namespace,
+        json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":metadata(w,"adm-runtime"),"automountServiceAccountToken":false}),
+    ];
     let claim = json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":metadata(w,"work"),"spec":{"accessModes":["ReadWriteOnce"],"storageClassName":w.storage_class,"resources":{"requests":{"storage":w.storage_size}}}});
+    let mut workspace_config = json!({
+        "id":w.id,
+        "name":w.name,
+        "role":w.role,
+        "environment":"pod",
+        "model":w.model,
+        "allowedAgents":w.allowed_agents,
+        "mcpServers":w.mcp_servers,
+    });
+    if workspace_config["mcpServers"].is_null() {
+        workspace_config
+            .as_object_mut()
+            .unwrap()
+            .remove("mcpServers");
+    }
+    if w.role == "coding" {
+        workspace_config["localRoot"] = json!("/workspace");
+        workspace_config["cwd"] = json!(w.cwd);
+    }
+    let runtime_config = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"workspace-runtime"),"data":{"workspace.json":serde_json::to_string(&workspace_config)?}});
+    let service = json!({"apiVersion":"v1","kind":"Service","metadata":metadata(w,"workspace"),"spec":{"selector":labels,"ports":[{"name":"http","port":7432,"targetPort":7432}]}});
     let mounts = vec![
         json!({"name":"work","mountPath":"/workspace","mountPropagation":"HostToContainer"}),
         json!({"name":"shm","mountPath":"/dev/shm"}),
+        json!({"name":"runtime-config","mountPath":"/run/adm","readOnly":true}),
+        json!({"name":"runtime-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true}),
     ];
     let mut volumes = vec![
         json!({"name":"work","persistentVolumeClaim":{"claimName":"work"}}),
         json!({"name":"shm","emptyDir":{"medium":"Memory","sizeLimit":"256Mi"}}),
+        json!({"name":"runtime-config","configMap":{"name":"workspace-runtime","items":[{"key":"workspace.json","path":"workspace.json"}]}}),
+        json!({"name":"runtime-token","projected":{"sources":[{"serviceAccountToken":{"audience":"adm-lifecycle","expirationSeconds":3600,"path":"token"}}]}}),
     ];
-    let mut dev = json!({"name":"dev","image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/repos","securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"exec":{"command":["test","-d","/repos"]},"initialDelaySeconds":1,"periodSeconds":2}});
-    if !w.credential_env.is_empty() {
-        dev["env"] = Value::Array(w.credential_env.iter().map(|reference| json!({"name":reference.name,"valueFrom":{"secretKeyRef":{"name":reference.secret_name,"key":reference.key}}})).collect());
+    let mut dev = json!({"name":if w.role == "coding" { "dev" } else { "bot" },"image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":if w.role == "coding" { "/repos" } else { "/workspace" },"ports":[{"name":"http","containerPort":7432}],"securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":1,"periodSeconds":2},"livenessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":10,"periodSeconds":10,"failureThreshold":3}});
+    dev["env"] = json!([
+        {"name":"ADM_LIFECYCLE_URL","value":format!("http://adm-lifecycle.{lifecycle_namespace}.svc.cluster.local:7433")},
+        {"name":"ADM_POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}
+    ]);
+    for reference in &w.credential_env {
+        dev["env"].as_array_mut().unwrap().push(json!({"name":reference.name,"valueFrom":{"secretKeyRef":{"name":reference.secret_name,"key":reference.key}}}));
     }
     let mut containers = vec![dev];
     if w.repositories {
@@ -957,9 +1038,22 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         items.push(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"repositories"),"data":{"catalog.json":serde_json::to_string(&w.catalog)?}}));
     }
     let init = json!({"name":"initialize","image":w.image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
-    let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
-    let network = json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":metadata(w,"workspace-isolation"),"spec":{"podSelector":{},"policyTypes":["Ingress","Egress"],"ingress":[{"from":[{"podSelector":{}}]}],"egress":[{"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}}}],"ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]},{"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.42.0.0/16","10.43.0.0/16","169.254.0.0/16"]}}]}]}});
-    items.extend([claim, deployment, network]);
+    let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"serviceAccountName":"adm-runtime","automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
+    let mut ingress = vec![
+        json!({"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":lifecycle_namespace}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"adm-lifecycle"}}}],"ports":[{"protocol":"TCP","port":7432}]}),
+    ];
+    let mut egress = vec![
+        json!({"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}}}],"ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]}),
+        json!({"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":lifecycle_namespace}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"adm-lifecycle"}}}],"ports":[{"protocol":"TCP","port":7433}]}),
+        json!({"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.42.0.0/16","10.43.0.0/16","169.254.0.0/16"]}}]}),
+    ];
+    if w.role == "coding" {
+        ingress.push(json!({"from":[{"namespaceSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"bot"}},"podSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"bot"}}}],"ports":[{"protocol":"TCP","port":7432}]}));
+    } else {
+        egress.push(json!({"to":[{"namespaceSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"coding"}},"podSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"coding"}}}],"ports":[{"protocol":"TCP","port":7432}]}));
+    }
+    let network = json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":metadata(w,"workspace-isolation"),"spec":{"podSelector":{},"policyTypes":["Ingress","Egress"],"ingress":ingress,"egress":egress}});
+    items.extend([runtime_config, claim, service, deployment, network]);
     Ok(json!({"apiVersion":"v1","kind":"List","items":items}))
 }
 
@@ -990,6 +1084,60 @@ pub fn verify_ownership(cli: &Cli, w: &Workspace) -> Result<()> {
         w.namespace
     );
     Ok(())
+}
+
+pub fn cluster_status(cli: &Cli, w: &Workspace) -> Result<Value> {
+    verify_ownership(cli, w)?;
+    let pods: Value = serde_json::from_slice(&kubectl_bounded(
+        cli,
+        &[
+            "get",
+            "pods",
+            "-n",
+            &w.namespace,
+            "-l",
+            &format!("adm.dev/workspace-id={}", w.id),
+            "-o",
+            "json",
+        ],
+        None,
+    )?)?;
+    let first_pod = pods["items"].as_array().and_then(|items| items.first());
+    let waiting = first_pod.and_then(|pod| {
+        pod["status"]["initContainerStatuses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                pod["status"]["containerStatuses"]
+                    .as_array()
+                    .into_iter()
+                    .flatten(),
+            )
+            .find_map(|container| {
+                let state = &container["state"]["waiting"];
+                state["reason"].as_str().map(|reason| {
+                    state["message"]
+                        .as_str()
+                        .map(|message| format!("{reason}: {message}"))
+                        .unwrap_or_else(|| reason.to_owned())
+                })
+            })
+    });
+    let readiness = first_pod.and_then(|pod| {
+        pod["status"]["conditions"]
+            .as_array()?
+            .iter()
+            .find(|condition| condition["type"] == "Ready" && condition["status"] == "False")
+            .and_then(|condition| condition["reason"].as_str())
+            .map(str::to_owned)
+    });
+    let container_reason = waiting.or(readiness);
+    Ok(json!({
+        "namespace":w.namespace,
+        "pods":pods["items"],
+        "containerReason":container_reason
+    }))
 }
 
 pub fn navigation_guidance(workspace: &Workspace, opening_shell: bool) -> String {
@@ -1132,71 +1280,50 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
                 Ok(())
             },
         )?;
-        if w.role == "coding" {
-            lifecycle_stage(
-                cli,
-                "create",
-                &w.name,
-                "waiting for deployment readiness",
-                || {
-                    kubectl(
-                        cli,
-                        &[
-                            "wait",
-                            "--for=condition=available",
-                            "deployment/workspace",
-                            "-n",
-                            &w.namespace,
-                            "--timeout=180s",
-                        ],
-                        None,
-                    )?;
-                    Ok(())
-                },
-            )?;
-        }
         if let Some(repository) = &w.repository {
+            // Wait for the Pod to run so the private checkout exists before readiness.
+            lifecycle_stage(cli, "create", &w.name, "waiting for workspace Pod", || {
+                kubectl(
+                    cli,
+                    &[
+                        "wait",
+                        "--for=jsonpath='{.status.phase}'=Running",
+                        "pod",
+                        "-l",
+                        &format!("adm.dev/workspace-id={}", w.id),
+                        "-n",
+                        &w.namespace,
+                        "--timeout=180s",
+                    ],
+                    None,
+                )?;
+                Ok(())
+            })?;
             prepare_repository(cli, &w, repository)?;
         }
+        lifecycle_stage(
+            cli,
+            "create",
+            &w.name,
+            "waiting for deployment readiness",
+            || {
+                kubectl(
+                    cli,
+                    &[
+                        "wait",
+                        "--for=condition=available",
+                        "deployment/workspace",
+                        "-n",
+                        &w.namespace,
+                        "--timeout=180s",
+                    ],
+                    None,
+                )?;
+                Ok(())
+            },
+        )?;
         w.phase = "ready".into();
-        if w.agent_enabled {
-            lifecycle_stage(cli, "create", &w.name, "starting agent runner", || {
-                runner::ensure_started(cli)
-            })?;
-            let mut registration = json!({"id":w.id,"name":w.name,"role":w.role,"environment":"kubernetes","allowedAgents":w.allowed_agents});
-            if w.role == "coding" {
-                registration["namespace"] = w.namespace.clone().into();
-                registration["container"] = "dev".into();
-                registration["cwd"] = w.cwd.clone().into();
-                registration["kubectl"] = cli.kubectl.clone().into();
-                registration["kubeconfig"] = cli.kubeconfig_reference()?.into();
-            }
-            if let Some(model) = &w.model {
-                registration["model"] = model.clone();
-            }
-            if let Some(mcp_servers) = &w.mcp_servers {
-                registration["mcpServers"] = mcp_servers.clone();
-            }
-            lifecycle_stage(
-                cli,
-                "create",
-                &w.name,
-                "registering agent workspace",
-                || {
-                    store.admit_if_provisioning(&w, || {
-                        cli.request(
-                            "PUT",
-                            &format!("/v1/workspaces/{}", w.id),
-                            Some(&registration),
-                        )?;
-                        Ok(())
-                    })?;
-                    Ok(())
-                },
-            )?;
-        } else {
-            store.admit_if_provisioning(&w, || Ok(()))?;
-        }
+        store.admit_if_provisioning(&w, || Ok(()))?;
         Ok(())
     })();
     if let Err(error) = provision {
@@ -1275,7 +1402,7 @@ mv -- "$staging" "$target"
         )
         .with_context(|| {
             format!(
-                "preparing repository {repository} failed; verify the OWNER/REPO spelling and whether the repository is public or accessible from the workspace. Retry the same repository after transient failures. Correcting it requires inspecting and deliberately destroying this failed workspace, then recreating with --repo OWNER/REPO"
+                "repository {repository} preparation failed; verify the OWNER/REPO spelling and whether the repository is public or accessible from the workspace. Retry the same repository after transient failures. Correcting it requires inspecting and deliberately destroying this failed workspace, then recreating with --repo OWNER/REPO"
             )
         })?;
             Ok(())
@@ -1329,39 +1456,17 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
         },
     )?;
     w.phase = "deleting".into();
-    store.save(&w)?;
-    let directory = cli.state_path().join("runner/tombstones");
-    fs::create_dir_all(&directory)?;
-    let tombstone = directory.join(format!("{}.json", w.id));
-    if !tombstone.exists() {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tombstone)?;
-        file.write_all(&serde_json::to_vec(&json!({"id":w.id,"deletedAt":now()}))?)?;
-        file.sync_all()?;
-        fs::File::open(&directory)?.sync_all()?;
-    }
-    if w.agent_enabled {
-        lifecycle_stage(cli, "destroy", &w.name, "cancelling agent activity", || {
-            runner::ensure_started(cli)?;
-            if let Err(error) = cli.request("DELETE", &format!("/v1/workspaces/{}", w.id), None) {
-                let missing = error
-                    .downcast_ref::<runner::HttpError>()
-                    .is_some_and(|error| {
-                        error.status == reqwest::StatusCode::NOT_FOUND
-                            && error.code.as_deref() == Some("WORKSPACE_NOT_FOUND")
-                    });
-                let deleted = error
-                    .downcast_ref::<runner::HttpError>()
-                    .is_some_and(|error| {
-                        error.status == reqwest::StatusCode::GONE
-                            && error.code.as_deref() == Some("WORKSPACE_DELETED")
-                    });
-                ensure!(missing || deleted, "{error:#}");
-            }
-            Ok(())
-        })?;
+    if !store.save_if_phase(&w, "deleting")? {
+        w = store.find(&w.id)?;
+        if w.phase == "deleted" {
+            lifecycle_complete("destroy", &w.name, "already deleted", started);
+            return Ok(w);
+        }
+        anyhow::ensure!(
+            w.phase == "deleting",
+            "workspace {} changed lifecycle phase before namespace cleanup",
+            w.name
+        );
     }
     lifecycle_stage(
         cli,
@@ -1391,25 +1496,6 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
     Ok(w)
 }
 
-pub fn cluster_status(cli: &Cli, w: &Workspace) -> Result<Value> {
-    verify_ownership(cli, w)?;
-    let pods: Value = serde_json::from_slice(&kubectl(
-        cli,
-        &[
-            "get",
-            "pods",
-            "-n",
-            &w.namespace,
-            "-l",
-            &format!("adm.dev/workspace-id={}", w.id),
-            "-o",
-            "json",
-        ],
-        None,
-    )?)?;
-    Ok(json!({"namespace":w.namespace,"pods":pods["items"]}))
-}
-
 #[cfg(test)]
 mod lifecycle_fence_tests {
     use super::*;
@@ -1434,35 +1520,6 @@ mod lifecycle_fence_tests {
         assert!(
             stale
                 .lifecycle_operation("c0a0ad14-a514-4c27-9e4c-acb1a05b272c")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn recording_a_provisioning_error_cannot_reopen_an_admitted_deletion() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = WorkspaceStore::open_fenced(directory.path(), 4).unwrap();
-        let mut workspace: Workspace = serde_json::from_value(json!({
-            "id":"e39f7d2667d64ca8a75c9c926611991d", "name":"deletion-race",
-            "role":"coding", "namespace":"adm-e39f7d2667d64ca8",
-            "phase":"provisioning", "image":"adm-dev:test", "storage_class":"adm-replicated",
-            "storage_size":"1Gi", "cpu":"1", "memory":"1Gi", "agent_enabled":true,
-            "repositories":false, "catalog":{}, "model":{"provider":"test","id":"model"},
-            "allowed_agents":[], "created_at":1, "last_error":null
-        }))
-        .unwrap();
-        store.insert(&workspace).unwrap();
-        workspace.phase = "deleting".into();
-        store.save(&workspace).unwrap();
-        store
-            .record_workspace_error(&workspace.id, "provisioning failed")
-            .unwrap();
-        let persisted = store.find(&workspace.id).unwrap();
-        assert_eq!(persisted.phase, "deleting");
-        assert_eq!(persisted.last_error.as_deref(), Some("provisioning failed"));
-        assert!(
-            store
-                .claim_runtime_lease(&workspace.id, "pod-uid", 30)
                 .is_err()
         );
     }
