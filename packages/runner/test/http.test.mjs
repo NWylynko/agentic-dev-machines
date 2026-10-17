@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
+import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import {
@@ -21,16 +22,17 @@ const main = new URL("../src/main.ts", import.meta.url);
 async function startRunner(
   directory,
   env = {},
-  { useFaux = true, defaultModel = true } = {},
+  { useFaux = true, defaultModel = true, port = 0, tokenFile } = {},
 ) {
   const child = spawn(
     process.execPath,
     [
       main.pathname,
       "--port",
-      "0",
+      String(port),
       "--state-dir",
       directory,
+      ...(tokenFile ? ["--token-file", tokenFile] : []),
       ...(useFaux
         ? ["--provider", "faux", ...(defaultModel ? ["--model", "faux-1"] : [])]
         : ["--auth-path", join(directory, "empty-auth.json")]),
@@ -82,6 +84,122 @@ async function startRunner(
       });
       return { status: response.status, body: await response.json() };
     },
+  };
+}
+
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = server.address().port;
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
+}
+
+async function startBotLifecycle(
+  directory,
+  workspaces,
+  { holdDirectory = false } = {},
+) {
+  await mkdir(directory, { recursive: true });
+  const tokenFile = join(directory, "projected-token");
+  await writeFile(tokenFile, "fixture-runtime-token\n", { mode: 0o600 });
+  const authorizations = [];
+  const operations = new Map();
+  let signalDirectoryRequest;
+  let signalDirectoryAbort;
+  const directoryRequest = new Promise((resolve) => {
+    signalDirectoryRequest = resolve;
+  });
+  const directoryAbort = new Promise((resolve) => {
+    signalDirectoryAbort = resolve;
+  });
+  const server = createServer(async (request, response) => {
+    const headers = { "content-type": "application/json" };
+    if (request.headers.authorization !== "Bearer fixture-runtime-token") {
+      response
+        .writeHead(403, headers)
+        .end(JSON.stringify({ error: { message: "forbidden" } }));
+      return;
+    }
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    const value = body ? JSON.parse(body) : {};
+    if (request.method === "GET" && request.url === "/v1/runtime/workspaces") {
+      if (holdDirectory) {
+        signalDirectoryRequest();
+        response.once("close", signalDirectoryAbort);
+        return;
+      }
+      response.writeHead(200, headers).end(JSON.stringify(workspaces));
+      return;
+    }
+    const authorize = /^\/v1\/workspaces\/([^/]+)\/runtime\/authorize$/.exec(
+      request.url ?? "",
+    );
+    if (request.method === "POST" && authorize) {
+      const id = decodeURIComponent(authorize[1]);
+      authorizations.push({ id, action: value.action });
+      const allowed = workspaces.some((workspace) => workspace.id === id);
+      response
+        .writeHead(allowed ? 200 : 403, headers)
+        .end(
+          JSON.stringify(
+            allowed
+              ? { allowed: true }
+              : { error: { message: "not authorized" } },
+          ),
+        );
+      return;
+    }
+    if (request.method === "POST" && request.url === "/v1/runtime/operations") {
+      const previous = operations.get(value.operationId);
+      if (
+        previous &&
+        JSON.stringify(previous.request) !== JSON.stringify(value)
+      ) {
+        response.writeHead(409, headers).end(
+          JSON.stringify({
+            error: {
+              message: "operationId was already used with a different request",
+            },
+          }),
+        );
+        return;
+      }
+      const receipt = previous?.receipt ?? {
+        operationId: value.operationId,
+        kind: value.kind,
+        status: "accepted",
+        workspaceId: value.workspaceId ?? `created-${value.operationId}`,
+      };
+      operations.set(value.operationId, { request: value, receipt });
+      response.writeHead(202, headers).end(JSON.stringify(receipt));
+      return;
+    }
+    response
+      .writeHead(404, headers)
+      .end(JSON.stringify({ error: { message: "not found" } }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    tokenFile,
+    authorizations,
+    operations,
+    directoryRequest,
+    directoryAbort,
+    close: () =>
+      new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      ),
   };
 }
 
@@ -1176,7 +1294,89 @@ process.stdin.on("data", (chunk) => {
 );
 
 test(
-  "a bot publishes only explicit messages, cannot use coding tools through Code Mode, and supervises only permitted agents",
+  "goal and loop request receipts survive retries and reject request ID reuse",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-schedule-receipts-"),
+    );
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const config = {
+      id: "receipt-coder",
+      name: "receipt coder",
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, "repo"),
+      model: { provider: "faux", id: "faux-1" },
+    };
+    assert.equal(
+      (await runner.request(`/v1/workspaces/${config.id}`, "PUT", config))
+        .status,
+      200,
+    );
+    async function receiptRequest(path, value) {
+      const response = await fetch(
+        `${runner.url}/v1/workspaces/${config.id}/${path}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(value),
+        },
+      );
+      const text = await response.text();
+      return {
+        status: response.status,
+        body: text ? JSON.parse(text) : undefined,
+      };
+    }
+    const goal = { description: "Ship the durable feature" };
+    const firstGoal = await receiptRequest("goals", {
+      requestId: "goal-create-1",
+      value: goal,
+    });
+    const replayGoal = await receiptRequest("goals", {
+      requestId: "goal-create-1",
+      value: goal,
+    });
+    assert.equal(firstGoal.status, 200, JSON.stringify(firstGoal));
+    assert.equal(replayGoal.status, 200, JSON.stringify(replayGoal));
+    assert.deepEqual(
+      replayGoal.body,
+      firstGoal.body,
+      `replay=${JSON.stringify(replayGoal)}`,
+    );
+    const reusedGoal = await receiptRequest("goals", {
+      requestId: "goal-create-1",
+      value: { description: "Different request" },
+    });
+    assert.equal(reusedGoal.status, 409);
+
+    const loop = {
+      prompt: "Review progress",
+      intervalMs: 60000,
+      nextAt: 2000000000000,
+    };
+    const firstLoop = await receiptRequest("loops", {
+      requestId: "loop-create-1",
+      value: loop,
+    });
+    const replayLoop = await receiptRequest("loops", {
+      requestId: "loop-create-1",
+      value: loop,
+    });
+    assert.equal(firstLoop.status, 200);
+    assert.deepEqual(replayLoop.body, firstLoop.body);
+    const reusedLoop = await receiptRequest("loops", {
+      requestId: "loop-create-1",
+      value: { ...loop, prompt: "Different request" },
+    });
+    assert.equal(reusedLoop.status, 409);
+  },
+);
+
+test(
+  "a bot publishes only explicit messages and cannot use coding tools through Code Mode",
   { timeout: 20000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-"));
@@ -1195,7 +1395,6 @@ test(
       name: "bot",
       role: "bot",
       environment: "local",
-      allowedAgents: ["allowed-coder"],
       model: { provider: "faux", id: "faux-1" },
     };
     assert.equal(
@@ -1248,44 +1447,6 @@ test(
       true,
     );
     assert.equal(codeResult.data.isError, true);
-    const supervise = {
-      calls: [
-        {
-          tool: "promptAgent",
-          args: {
-            agentId: coding.id,
-            message: "Please summarize your progress.",
-          },
-        },
-      ],
-      answer: "Private supervision result.",
-    };
-    await runner.request("/v1/workspaces/private-bot/input", "POST", {
-      message: "/faux " + JSON.stringify(supervise),
-      requestId: "supervision",
-    });
-    await nextEvent(
-      runner,
-      coding.id,
-      (event) =>
-        event.kind === "assistant" && event.data.text.includes("summarize"),
-    );
-    const forbidden = {
-      calls: [{ tool: "monitorAgent", args: { agentId: "unpermitted-coder" } }],
-      answer: "Private unauthorized result.",
-    };
-    await runner.request("/v1/workspaces/private-bot/input", "POST", {
-      message: "/faux " + JSON.stringify(forbidden),
-      requestId: "denied-target",
-    });
-    const forbiddenResult = await nextEvent(
-      runner,
-      bot.id,
-      (event) => event.kind === "tool" && event.data.name === "monitorAgent",
-      codeResult.seq,
-      true,
-    );
-    assert.equal(forbiddenResult.data.isError, true);
     const history = await runner.request(
       "/v1/workspaces/private-bot/history?limit=1000",
     );
@@ -1302,14 +1463,30 @@ test(
 );
 
 test(
-  "a bot discovers only its live coding grants across Code Mode, deletion, and restart",
+  "a bot discovers all live coding agents across Code Mode, deletion, and restart",
   { timeout: 30000 },
   async (t) => {
     const directory = await mkdtemp(
       join(tmpdir(), "adm-runner-agent-directory-"),
     );
-    let runner = await startRunner(directory);
-    t.after(() => runner.stop());
+    const port = await freePort();
+    const workspaces = [];
+    const lifecycle = await startBotLifecycle(
+      join(directory, "management"),
+      workspaces,
+    );
+    const botEnv = {
+      ADM_LIFECYCLE_URL: lifecycle.url,
+      ADM_RUNTIME_PORT: String(port),
+    };
+    let runner = await startRunner(directory, botEnv, {
+      port,
+      tokenFile: lifecycle.tokenFile,
+    });
+    t.after(async () => {
+      await runner.stop();
+      await lifecycle.close();
+    });
     const coder = (id, name) => ({
       id,
       name,
@@ -1323,7 +1500,6 @@ test(
       name: "bot",
       role: "bot",
       environment: "local",
-      allowedAgents: ["granted-coder"],
       model: { provider: "faux", id: "faux-1" },
     };
     for (const config of [
@@ -1335,6 +1511,21 @@ test(
           .status,
         200,
       );
+    workspaces.push(
+      { id: "granted-coder", name: "project-albatross" },
+      { id: "ungranted-coder", name: "project-bee" },
+    );
+    for (const workspace of workspaces)
+      Object.assign(workspace, {
+        role: "coding",
+        phase: "ready",
+        namespace: `fixture-${workspace.id}`,
+        runtime_status: {
+          podIP: "127.0.0.1",
+          ready: true,
+          activity: { status: "idle" },
+        },
+      });
     const registration = await runner.request(
       `/v1/workspaces/${bot.id}`,
       "PUT",
@@ -1380,19 +1571,19 @@ test(
     }
 
     const listed = JSON.parse(toolText(await call("listAgents", {}, "list")));
-    assert.deepEqual(listed, {
-      agents: [
-        { id: "granted-coder", name: "project-albatross", status: "idle" },
+    assert.deepEqual(
+      listed.agents.map(({ id, name }) => ({ id, name })),
+      [
+        { id: "granted-coder", name: "project-albatross" },
+        { id: "ungranted-coder", name: "project-bee" },
       ],
-      unavailable: [],
-      message: "",
-    });
+    );
     const codeModeText = toolText(
       await call("listAgents", {}, "list-codemode", true),
     );
     assert.match(codeModeText, /\"id\":\"granted-coder\"/);
     assert.match(codeModeText, /\"name\":\"project-albatross\"/);
-    assert.doesNotMatch(codeModeText, /ungranted-coder|project-bee/);
+    assert.match(codeModeText, /ungranted-coder|project-bee/);
 
     const monitored = JSON.parse(
       toolText(
@@ -1400,6 +1591,53 @@ test(
       ),
     );
     assert.equal(monitored.id, "granted-coder");
+    const toolRun = {
+      calls: [
+        {
+          tool: "write",
+          args: { path: join(directory, "tool.txt"), content: "done" },
+        },
+      ],
+      answer: "The file is written.",
+    };
+    await runner.request("/v1/workspaces/granted-coder/input", "POST", {
+      message: "/faux " + JSON.stringify(toolRun),
+      requestId: "remote-history-tool",
+    });
+    await nextEvent(
+      runner,
+      "granted-coder",
+      (event) => event.kind === "tool" && event.data.name === "write",
+    );
+    const historyPage = JSON.parse(
+      toolText(
+        await call(
+          "monitorAgent",
+          { agentId: "granted-coder", after: 0, limit: 2 },
+          "monitor-history-page-1",
+        ),
+      ),
+    ).history;
+    assert.ok(historyPage.events.length > 0 && historyPage.events.length <= 2);
+    assert.equal(historyPage.hasMore, true);
+    const nextHistoryPage = JSON.parse(
+      toolText(
+        await call(
+          "monitorAgent",
+          {
+            agentId: "granted-coder",
+            after: historyPage.nextAfter,
+            limit: 1000,
+          },
+          "monitor-history-page-2",
+        ),
+      ),
+    ).history;
+    assert.ok(
+      [...historyPage.events, ...nextHistoryPage.events].some(
+        (event) => event.kind === "tool" && event.data.name === "write",
+      ),
+    );
     await call(
       "promptAgent",
       { agentId: listed.agents[0].id, message: "Report your status." },
@@ -1412,31 +1650,100 @@ test(
         event.kind === "assistant" &&
         event.data.text.includes("Report your status."),
     );
+    const savedGoal = JSON.parse(
+      toolText(
+        await call(
+          "saveAgentGoal",
+          { agentId: "granted-coder", goal: { description: "Ship it" } },
+          "goal",
+        ),
+      ),
+    );
+    assert.equal(savedGoal.description, "Ship it");
+    const savedLoop = JSON.parse(
+      toolText(
+        await call(
+          "saveAgentLoop",
+          {
+            agentId: "ungranted-coder",
+            loop: {
+              prompt: "Check progress",
+              intervalMs: 60000,
+              nextAt: 2000000000000,
+            },
+          },
+          "loop",
+        ),
+      ),
+    );
+    assert.equal(savedLoop.prompt, "Check progress");
+    const changedModel = await call(
+      "configureAgentModel",
+      {
+        agentId: "ungranted-coder",
+        provider: "faux",
+        modelId: "faux-1",
+      },
+      "model",
+    );
+    assert.equal(changedModel.isError, false);
+    const created = JSON.parse(
+      toolText(
+        await call(
+          "createAgent",
+          {
+            name: "new-agent",
+            image: "adm-dev:0.1.0",
+            storageClass: "fast",
+            storageSize: "10Gi",
+            cpu: "2",
+            memory: "4Gi",
+            model: { provider: "faux", id: "faux-1" },
+          },
+          "create",
+        ),
+      ),
+    );
+    assert.equal(created.kind, "create");
+    assert.equal(created.status, "accepted");
+    const destroyed = JSON.parse(
+      toolText(
+        await call("destroyAgent", { agentId: "ungranted-coder" }, "destroy"),
+      ),
+    );
+    assert.equal(destroyed.kind, "delete");
+    assert.equal(destroyed.workspaceId, "ungranted-coder");
 
     const ungranted = await call(
       "monitorAgent",
       { agentId: "ungranted-coder" },
       "monitor-ungranted",
     );
-    assert.equal(ungranted.isError, true);
-    const deniedCodeMode = await call(
+    assert.equal(ungranted.isError, false);
+    const codeModeMonitor = await call(
       "monitorAgent",
       { agentId: "ungranted-coder" },
       "monitor-ungranted-codemode",
       true,
     );
-    assert.equal(deniedCodeMode.isError, true);
+    assert.equal(codeModeMonitor.isError, false);
 
     assert.equal(
       (await runner.request("/v1/workspaces/granted-coder", "DELETE")).status,
       200,
     );
+    workspaces.splice(
+      workspaces.findIndex((workspace) => workspace.id === "granted-coder"),
+      1,
+    );
     const afterDelete = JSON.parse(
       toolText(await call("listAgents", {}, "list-deleted")),
     );
-    assert.deepEqual(afterDelete.agents, []);
-    assert.deepEqual(afterDelete.unavailable, ["granted-coder"]);
-    assert.match(afterDelete.message, /unavailable/i);
+    assert.deepEqual(
+      afterDelete.agents.map((agent) => agent.id),
+      ["ungranted-coder"],
+    );
+    assert.deepEqual(afterDelete.unavailable, []);
 
     assert.equal(
       (
@@ -1448,26 +1755,47 @@ test(
       ).status,
       200,
     );
+    workspaces.push({
+      id: "replacement-coder",
+      name: "project-albatross",
+      role: "coding",
+      phase: "ready",
+      namespace: "fixture-replacement-coder",
+      runtime_status: {
+        podIP: "127.0.0.1",
+        ready: true,
+        activity: { status: "idle" },
+      },
+    });
     const afterReuse = JSON.parse(
       toolText(await call("listAgents", {}, "list-reused-name")),
     );
-    assert.deepEqual(afterReuse.agents, []);
-    assert.deepEqual(afterReuse.unavailable, ["granted-coder"]);
+    assert.deepEqual(
+      afterReuse.agents.map(({ id, name }) => ({ id, name })),
+      [
+        { id: "ungranted-coder", name: "project-bee" },
+        { id: "replacement-coder", name: "project-albatross" },
+      ],
+    );
 
     await runner.stop();
-    runner = await startRunner(directory);
+    runner = await startRunner(directory, botEnv, {
+      port,
+      tokenFile: lifecycle.tokenFile,
+    });
     const afterRestart = await runner.request(`/v1/workspaces/${bot.id}`);
     assert.equal(afterRestart.status, 200);
     const persisted = JSON.parse(
       toolText(await call("listAgents", {}, "list-after-restart")),
     );
-    assert.deepEqual(persisted.agents, []);
-    assert.deepEqual(persisted.unavailable, ["granted-coder"]);
+    assert.deepEqual(
+      persisted.agents.map((agent) => agent.id),
+      ["ungranted-coder", "replacement-coder"],
+    );
 
     const emptyBot = {
       ...bot,
       id: "empty-directory-bot",
-      allowedAgents: [],
     };
     assert.equal(
       (await runner.request(`/v1/workspaces/${emptyBot.id}`, "PUT", emptyBot))
@@ -1496,9 +1824,194 @@ test(
       true,
     );
     const emptyListing = JSON.parse(toolText(emptyResult.data));
-    assert.deepEqual(emptyListing.agents, []);
+    assert.equal(emptyListing.agents.length, 2);
     assert.deepEqual(emptyListing.unavailable, []);
-    assert.match(emptyListing.message, /no coding agents are assigned/i);
+  },
+);
+
+test(
+  "aborting a bot turn cancels its in-flight lifecycle request",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-cancel-"));
+    const port = await freePort();
+    const workspaces = [
+      {
+        id: "cancel-target",
+        name: "cancel target",
+        role: "coding",
+        phase: "ready",
+        namespace: "fixture-cancel-target",
+        runtime_status: { podIP: "127.0.0.1", ready: true },
+      },
+    ];
+    const lifecycle = await startBotLifecycle(
+      join(directory, "management"),
+      workspaces,
+      { holdDirectory: true },
+    );
+    const runner = await startRunner(
+      directory,
+      {
+        ADM_LIFECYCLE_URL: lifecycle.url,
+        ADM_RUNTIME_PORT: String(port),
+      },
+      { port, tokenFile: lifecycle.tokenFile },
+    );
+    t.after(async () => {
+      await runner.stop();
+      await lifecycle.close();
+    });
+    const bot = {
+      id: "cancel-bot",
+      name: "bot",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    };
+    assert.equal(
+      (
+        await runner.request("/v1/workspaces/cancel-target", "PUT", {
+          id: "cancel-target",
+          name: "cancel target",
+          role: "coding",
+          environment: "local",
+          localRoot: join(directory, "repo"),
+          model: { provider: "faux", id: "faux-1" },
+        })
+      ).status,
+      200,
+    );
+    assert.equal(
+      (await runner.request(`/v1/workspaces/${bot.id}`, "PUT", bot)).status,
+      200,
+    );
+    await runner.request(`/v1/workspaces/${bot.id}/input`, "POST", {
+      message: `/faux ${JSON.stringify({
+        calls: [{ tool: "listAgents", args: {} }],
+      })}`,
+      requestId: "cancel-management-request",
+    });
+    await lifecycle.directoryRequest;
+    assert.equal(
+      (await runner.request(`/v1/workspaces/${bot.id}/abort`, "POST", {}))
+        .status,
+      200,
+    );
+    await lifecycle.directoryAbort;
+  },
+);
+
+test(
+  "a bot discovers coding agents created after it through direct tools and Code Mode",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-bot-late-agent-"),
+    );
+    const workspaces = [];
+    const lifecycle = await startBotLifecycle(
+      join(directory, "management"),
+      workspaces,
+    );
+    const target = await startRunner(join(directory, "target"));
+    const botRunner = await startRunner(join(directory, "bot"), {
+      ADM_LIFECYCLE_URL: lifecycle.url,
+      ADM_LIFECYCLE_IDENTITY_TOKEN_FILE: lifecycle.tokenFile,
+      ADM_RUNTIME_PORT: new URL(target.url).port,
+    });
+    t.after(async () => {
+      await botRunner.stop();
+      await target.stop();
+      await lifecycle.close();
+    });
+    const bot = {
+      id: "late-agent-bot",
+      name: "bot",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    };
+    const coder = {
+      id: "created-after-bot",
+      name: "new-project",
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, "new-project"),
+      model: { provider: "faux", id: "faux-1" },
+    };
+    assert.equal(
+      (await botRunner.request(`/v1/workspaces/${bot.id}`, "PUT", bot)).status,
+      200,
+    );
+    assert.equal(
+      (await target.request(`/v1/workspaces/${coder.id}`, "PUT", coder)).status,
+      200,
+    );
+    workspaces.push({
+      id: coder.id,
+      name: coder.name,
+      role: "coding",
+      phase: "ready",
+      namespace: "fixture-coding",
+      runtime_status: {
+        podIP: "127.0.0.1",
+        ready: true,
+        activity: { status: "idle" },
+      },
+    });
+
+    let cursor = 0;
+    async function call(tool, args, requestId, code = false) {
+      const calls = code
+        ? [
+            {
+              tool: "codemode",
+              args: {
+                code: `return await tools.${tool}(${JSON.stringify(args)})`,
+              },
+            },
+          ]
+        : [{ tool, args }];
+      await botRunner.request(`/v1/workspaces/${bot.id}/input`, "POST", {
+        message:
+          "/faux " +
+          JSON.stringify({ calls, answer: "Private lifecycle result." }),
+        requestId,
+      });
+      const event = await nextEvent(
+        botRunner,
+        bot.id,
+        (value) =>
+          value.kind === "tool" &&
+          value.data.name === (code ? "codemode" : tool),
+        cursor,
+        true,
+      );
+      cursor = event.seq;
+      return event.data;
+    }
+
+    const direct = JSON.parse((await call("listAgents", {}, "late-list")).text);
+    assert.deepEqual(direct.agents, [
+      {
+        id: coder.id,
+        name: coder.name,
+        status: "idle",
+        phase: "ready",
+        ready: true,
+      },
+    ]);
+    assert.deepEqual(direct.unavailable, []);
+
+    const throughCodeMode = await call(
+      "listAgents",
+      {},
+      "late-list-codemode",
+      true,
+    );
+    assert.equal(throughCodeMode.isError, false);
+    assert.match(throughCodeMode.text, new RegExp(coder.id));
   },
 );
 

@@ -31,6 +31,7 @@ import {
 } from "./navigation.ts";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { BotProfileDocument, botExtension } from "./bot.ts";
+import type { BotAgentManagement } from "./bot-management.ts";
 import { openMcpExtension } from "./mcp.ts";
 import {
   applyGoal,
@@ -167,7 +168,7 @@ export class Workspace {
     directory: string,
     assertActive: () => Promise<void>,
     authPath?: string,
-    lookup?: (id: string) => Promise<Workspace>,
+    botAgents?: BotAgentManagement,
     passive = false,
     deferActivation = false,
     runtimeProvider?: string,
@@ -238,7 +239,9 @@ export class Workspace {
           registry.install(mcp.extension);
         }
         sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });
-        registry.install(botExtension(config, assertActive, lookup!));
+        if (!botAgents)
+          throw new Error("Bot agent management transport is not configured");
+        registry.install(botExtension(config, assertActive, botAgents));
         registry.install(createCodemodeExtension({ sandbox, models: false }));
       }
       registry.install(
@@ -621,13 +624,15 @@ export class Workspace {
     });
   }
 
-  saveGoal(input: unknown) {
-    return this.withAdmission(() => applyGoal(this.conversation, input));
+  saveGoal(input: unknown, requestId?: string) {
+    return this.withAdmission(() =>
+      applyGoal(this.conversation, input, requestId),
+    );
   }
 
-  saveLoop(input: unknown) {
+  saveLoop(input: unknown, requestId?: string) {
     return this.withAdmission(() =>
-      applyLoop(this.conversation, input, this.loopTask),
+      applyLoop(this.conversation, input, this.loopTask, requestId),
     );
   }
 

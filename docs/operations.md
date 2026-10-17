@@ -150,11 +150,11 @@ Use names actually present in your catalog. The root and owner listings are read
 ## Bot workspaces
 
 ```sh
-adm create supervisor --role bot --model PROVIDER/MODEL_ID --allow-agent CODING_WORKSPACE_ID
+adm create supervisor --role bot --model PROVIDER/MODEL_ID
 adm attach supervisor
 ```
 
-Bots execute their model and tools in the long-running management-host runner. Their Kubernetes namespace intentionally has no workspace Pod. Creation reports this location on stderr while stdout remains the workspace JSON. `adm status supervisor` identifies the management host and distinguishes a reachable agent from an unavailable runner; `adm inspect supervisor` provides detailed diagnostics.
+Bots execute their model and tools in their own workspace Pod. They can discover and control all live coding-agent workspaces through the authenticated lifecycle and runtime APIs, without repository, shell, or general cross-workspace access. `adm status supervisor` reports runtime readiness; `adm inspect supervisor` provides detailed diagnostics.
 
 On that host, inspect a service runner with `systemctl --user show adm-runner.service -p MainPID -p ActiveState` and `journalctl --user -u adm-runner.service`. A runner launched by `adm start` writes `runner.pid` and `runner.log` in the ADM state directory (default `$XDG_DATA_HOME/adm`, or `~/.local/share/adm`). Registration and conversations are under `runner/workspaces.json` and `runner/sessions/ID/session.sqlite`. Use the same `--state-dir` and `--runner-url` as the owning runner when inspecting it.
 
@@ -182,7 +182,7 @@ The config stores only the environment reference name, never its value. Only lis
 
 Use immutable IDs from `adm list` for supervision grants. A bot can use `listAgents` to discover the names and status of its live permitted coding agents, then observe and prompt those targets. Deleted or missing grants are reported as unavailable and never transfer to a workspace that reuses the same name. The bot can also manage goals and loops and publish through `sendMessage`. It has no coding filesystem, shell, or development browser, including through Code Mode. `adm attach supervisor --diagnostics` explicitly opts in to seeing diagnostics.
 
-`adm list` shows each workspace's persisted phase and agent configuration alongside current activity and the full immutable ID. It makes one bounded runner directory request for all activity and does not contact Kubernetes; if the runner or an individual record is unavailable, activity is shown as `unavailable` with its cause. `adm list --json` returns the complete stored records plus an `activity` object; add `--all` to include deleted workspaces. `adm status NAME` expands the selected workspace with namespace, model, CPU, memory, storage, runtime readiness/state, agent activity, node, and available failure causes. Its table labels persisted `PHASE`, runtime readiness, and agent `ACTIVITY` separately. Bot workspaces currently have no Pod and identify the management host as their location. Use `adm status NAME --json` for the complete status payload, or `adm inspect NAME` for labeled diagnostics. `adm inspect NAME --json` returns the same payload as status JSON.
+`adm list` shows each workspace's persisted phase and agent configuration alongside current activity and the full immutable ID. It makes one bounded runner directory request for all activity and does not contact Kubernetes; if the runner or an individual record is unavailable, activity is shown as `unavailable` with its cause. `adm list --json` returns the complete stored records plus an `activity` object; add `--all` to include deleted workspaces. `adm status NAME` expands the selected workspace with namespace, model, CPU, memory, storage, runtime readiness/state, agent activity, node, and available failure causes. Its table labels persisted `PHASE`, runtime readiness, and agent `ACTIVITY` separately. Bots also run in workspace Pods. Use `adm status NAME --json` for the complete status payload, or `adm inspect NAME` for labeled diagnostics. `adm inspect NAME --json` returns the same payload as status JSON.
 
 ## Errors and recovery
 

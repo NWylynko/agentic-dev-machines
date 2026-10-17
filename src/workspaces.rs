@@ -93,7 +93,6 @@ pub struct Workspace {
     pub model: Option<Value>,
     #[serde(default)]
     pub credential_env: Vec<CredentialEnvRef>,
-    pub allowed_agents: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Option<Value>,
     pub herdr_space: Option<String>,
@@ -151,8 +150,6 @@ pub struct CreateOptions {
     pub allow_node_local_storage: bool,
     #[arg(long)]
     pub herdr_space: Option<String>,
-    #[arg(long)]
-    pub allow_agent: Vec<String>,
     /// JSON file containing host-configured stdio MCP servers and exact tool grants.
     #[arg(long)]
     pub mcp_config: Option<std::path::PathBuf>,
@@ -338,7 +335,6 @@ impl CreateOptions {
             cwd,
             model,
             credential_env,
-            allowed_agents: self.allow_agent.clone(),
             mcp_servers,
             herdr_space: self.herdr_space.clone(),
             created_at: now(),
@@ -1163,7 +1159,8 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
             lifecycle_stage(cli, "create", &w.name, "starting agent runner", || {
                 runner::ensure_started(cli)
             })?;
-            let mut registration = json!({"id":w.id,"name":w.name,"role":w.role,"environment":"kubernetes","allowedAgents":w.allowed_agents});
+            let mut registration =
+                json!({"id":w.id,"name":w.name,"role":w.role,"environment":"kubernetes"});
             if w.role == "coding" {
                 registration["namespace"] = w.namespace.clone().into();
                 registration["container"] = "dev".into();
@@ -1298,7 +1295,6 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.cwd == requested.cwd
         && existing.model == requested.model
         && existing.credential_env == requested.credential_env
-        && existing.allowed_agents == requested.allowed_agents
         && existing.mcp_servers == requested.mcp_servers
         && existing.herdr_space == requested.herdr_space
 }
@@ -1448,7 +1444,7 @@ mod lifecycle_fence_tests {
             "phase":"provisioning", "image":"adm-dev:test", "storage_class":"adm-replicated",
             "storage_size":"1Gi", "cpu":"1", "memory":"1Gi", "agent_enabled":true,
             "repositories":false, "catalog":{}, "model":{"provider":"test","id":"model"},
-            "allowed_agents":[], "created_at":1, "last_error":null
+            "created_at":1, "last_error":null
         }))
         .unwrap();
         store.insert(&workspace).unwrap();

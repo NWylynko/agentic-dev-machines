@@ -58,8 +58,6 @@ pub struct CreateIntent {
     #[serde(default)]
     pub credential_env: Vec<crate::workspaces::CredentialEnvRef>,
     #[serde(default)]
-    pub allowed_agents: Vec<String>,
-    #[serde(default)]
     pub mcp_servers: Option<Value>,
     #[serde(default)]
     pub herdr_space: Option<String>,
@@ -87,7 +85,6 @@ impl CreateIntent {
             cwd: workspace.cwd.clone(),
             model: workspace.model.clone(),
             credential_env: workspace.credential_env.clone(),
-            allowed_agents: workspace.allowed_agents.clone(),
             mcp_servers: workspace.mcp_servers.clone(),
             herdr_space: workspace.herdr_space.clone(),
         }
@@ -215,7 +212,6 @@ impl CreateIntent {
             cwd: self.cwd,
             model: self.model,
             credential_env: self.credential_env,
-            allowed_agents: self.allowed_agents,
             mcp_servers: self.mcp_servers,
             herdr_space: self.herdr_space,
             created_at: crate::workspaces::now(),
@@ -468,6 +464,9 @@ fn handle_http(
             let (status, code) = if message.contains("operationId was already used") {
                 (409, "OPERATION_CONFLICT")
             } else if message.contains("not authorized for workspace")
+                || message.contains("not authorized for lifecycle operations")
+                || message.contains("not authorized to create this workspace role")
+                || message.contains("not authorized to delete this workspace role")
                 || message.contains("held by another pod")
                 || message.contains("runtime lease fencing token is stale")
                 || message.contains("runtime status is restricted to its own workspace")
@@ -568,6 +567,68 @@ fn route(
         ));
     }
     let mut store = cli.store()?;
+    if method == "GET" && path == "/v1/runtime/workspaces" {
+        cli.check_lifecycle_fence()?;
+        let caller = authorize_runtime_caller(&cli, &store, authorization)?;
+        ensure!(
+            caller.role == "bot",
+            "runtime caller is not authorized for workspace directory"
+        );
+        let mut workspaces = store
+            .list(true)?
+            .into_iter()
+            .filter(|workspace| {
+                workspace.role == "coding"
+                    && workspace.phase != "deleting"
+                    && workspace.phase != "deleted"
+            })
+            .collect::<Vec<_>>();
+        enrich_runtime_status(&cli, &mut workspaces)?;
+        let directory = workspaces
+            .into_iter()
+            .map(|workspace| {
+                serde_json::json!({
+                    "id": workspace.id,
+                    "name": workspace.name,
+                    "role": workspace.role,
+                    "phase": workspace.phase,
+                    "namespace": workspace.namespace,
+                    "runtime_status": workspace.runtime_status,
+                })
+            })
+            .collect::<Vec<_>>();
+        return Ok((200, serde_json::Value::Array(directory)));
+    }
+    if method == "POST" && path == "/v1/runtime/operations" {
+        cli.check_lifecycle_fence()?;
+        let caller = authorize_runtime_caller(&cli, &store, authorization)?;
+        ensure!(
+            caller.role == "bot",
+            "runtime caller is not authorized for lifecycle operations"
+        );
+        let value: Value = serde_json::from_slice(body)?;
+        let request = request_from_json(&value)?;
+        match &request {
+            OperationRequest::Create { spec, .. } => ensure!(
+                spec.role == "coding",
+                "runtime caller is not authorized to create this workspace role"
+            ),
+            OperationRequest::Delete { workspace_id, .. } => {
+                let target = store.find(workspace_id)?;
+                ensure!(
+                    target.role == "coding",
+                    "runtime caller is not authorized to delete this workspace role"
+                );
+                authorize_workspace_action(&cli, &store, workspace_id, "delete", authorization)?;
+            }
+        }
+        let operation_id = request.operation_id().to_owned();
+        let receipt = admit(&mut store, &request)?;
+        if receipt.status != "completed" {
+            let _ = wake.send(operation_id);
+        }
+        return Ok((202, serde_json::to_value(receipt)?));
+    }
     if method == "POST" && path == "/v1/operations" {
         cli.check_lifecycle_fence()?;
         let value: Value = serde_json::from_slice(body)?;
@@ -995,6 +1056,7 @@ fn pod_runtime_status(pod: &Value) -> Value {
     let failed = pod["status"]["phase"] == "Failed";
     serde_json::json!({
         "podName":pod["metadata"]["name"],
+        "podIP":pod["status"]["podIP"],
         "nodeName":pod["spec"]["nodeName"],
         "podPhase":pod["status"]["phase"],
         "ready":ready,

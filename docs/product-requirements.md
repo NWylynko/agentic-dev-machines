@@ -194,7 +194,7 @@ GitHub repository at commit X
 
 Both workspaces see the same repository path, while edits remain independent. This applies equally to `main` and to any other branch name. Branch names, refs, indexes, local commits, and writable filesystem metadata are private to each workspace. Published upstream content can be shared; unpushed work must not become visible through a shared mutable cache.
 
-Isolation must be enforced by mounts and access permissions. A coding workspace must not be able to mount, inspect, modify, or attach to another workspace through filesystem access or management credentials. A bot's explicitly permitted monitoring/prompting interface is a separate capability; it must not grant direct repository access or general cross-workspace credentials. The implementation must satisfy this without relying on agents to follow instructions.
+Isolation must be enforced by mounts and access permissions. A coding workspace must not be able to mount, inspect, modify, or attach to another workspace through filesystem access or management credentials. A bot's broad lifecycle/runtime interface is a separate capability; it permits monitoring and control of live coding agents by immutable ID while denying direct repository access, shell access, and general cross-workspace credentials. Lifecycle APIs verify the bot's current Pod UID and runtime lease before granting those actions. The implementation must satisfy this without relying on agents to follow instructions.
 
 “Only store the differences” is a storage goal, not a promise of byte-level patches. The chosen filesystem may copy an entire changed file. Untracked files, dependencies, build outputs, metadata, and replicas also consume space. Shared data may be cached separately on different nodes.
 
@@ -235,7 +235,7 @@ Important integration findings:
 - Reopening a store must be followed by scheduling/resume. Closing the harness preserves recoverable work; ordinary abort excludes background tasks. Space destruction needs explicit admission revocation and cancellation including background work.
 - SQLite is a starting backend, not cluster replication or ownership fencing. Its WAL requirements rule out treating an arbitrary NFS mount as a ready solution. See the report for storage constraints and locally verified recovery behavior.
 
-The runner and terminal now implement this local proof. The runner lives on the management host, while coding tools run in the selected workspace environment. These tests do not establish cross-node filesystem durability or compatibility with every real provider account.
+The runner and terminal now implement this local proof. Bot and coding runners live in their workspace Pods; the management host provides access and lifecycle routing. These tests do not establish cross-node filesystem durability or compatibility with every real provider account.
 
 [celld](https://github.com/denoland/celld) provides self-hosted, distributed Durable Objects and is a candidate for durable application state. Its role here would need to be demonstrated with the chosen agent harness. It does not establish recovery guarantees for this project's Linux filesystem or shell processes.
 
@@ -250,9 +250,9 @@ Coding agents and bots can reuse durable execution infrastructure, but have diff
 | Role         | User interaction                                                                           | Tools and access                                                                                                       |
 | ------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
 | Coding agent | Normal visible Pi-style terminal interaction in Herdr                                      | Its own repositories and development tools; works unattended                                                           |
-| Bot          | Pi-style terminal conversation in Herdr; only `sendMessage` publishes AI-authored messages | No repository access or coding tools; can monitor and prompt permitted agents, use Code Mode, and maintain goals/loops |
+| Bot          | Pi-style terminal conversation in Herdr; only `sendMessage` publishes AI-authored messages | No repository access or coding tools; can discover and control all live coding-agent lifecycles, use Code Mode, and maintain goals/loops |
 
-The optional bot acts as a supervisor and general assistant with explicitly permitted monitoring, prompting, messaging, and goal/loop tools. This role does not select a particular model provider.
+The bot acts as a supervisor and general assistant with broad monitoring, prompting, lifecycle, messaging, and goal/loop tools. Runtime APIs enforce bot identity and coding-agent role while denying repository, shell, and general cross-workspace access. This role does not select a particular model provider.
 
 In bot mode, streaming tokens, ordinary responses, intermediate notes, and raw tool results are not automatically forwarded to the user. Finishing a model turn does not itself send a chat message. The agent must explicitly call `sendMessage` when it decides there is something to communicate.
 
@@ -314,10 +314,10 @@ Use end-to-end tests first for implementation changes. Provisioning, scheduling,
 | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | Exact recovery time and recent-work loss window             | Determines how long a failure interrupts work and how much recent progress may be lost                                                 |
 | Storage and lazy-filesystem implementation                  | Determines startup time, disk use, Git compatibility, and recovery behavior                                                            |
-| Agent backend and location of the supervised runner         | The runner is Pi Durable 1.2.0 on the management host, with coding tools sent into the workspace. Moving that owner has not been tried |
+| Agent backend and location of the supervised runner         | The runner is Pi Durable 1.2.0 in each workspace Pod; the management host is an access plane. Cross-node recovery remains unproven      |
 | Attach transport and exact Herdr integration                | `adm herdr` consumes explicit removal events. A live Herdr plugin install is not part of the tests                                     |
 | Pi-style terminal adapter and inbound message transport     | The terminal client speaks the runner HTTP API. Herdr pane wiring beyond `adm attach` is still local to the management box             |
-| Bot ownership, permitted agents, and control-tool interface | A bot supervises only the agent ids it was given. Whether it has its own Herdr space is still open                                     |
+| Bot ownership and Herdr space assignment                | Bot lifecycle control is broad across coding agents; whether each bot has its own Herdr space remains open                                 |
 | Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop        |
 | Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                |
 | Browser automation and development-port transport           | Determines how browsers run and how client laptops reach development sites and ports                                                   |

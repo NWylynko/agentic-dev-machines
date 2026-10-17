@@ -11,7 +11,6 @@ export type WorkspaceConfig = {
   kubeconfig?: string;
   remoteEnv?: string;
   model?: { provider: string; id: string };
-  allowedAgents?: string[];
   /** Runner-managed flag persisted only for newly registered bot conversations. */
   onboardingRequired?: boolean;
   mcpServers?: {

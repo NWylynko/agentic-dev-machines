@@ -1,11 +1,13 @@
 import { Type } from "@earendil-works/pi-ai";
+import type { Context } from "@earendil-works/chord";
 import {
   defineDoc,
   defineExtension,
   defineTool,
 } from "@earendil-works/pi-durable";
-import type { Workspace } from "./workspace.ts";
-import { ApiError, type WorkspaceConfig } from "./types.ts";
+import { randomUUID } from "node:crypto";
+import type { BotAgentManagement } from "./bot-management.ts";
+import type { WorkspaceConfig } from "./types.ts";
 
 const MessageReceipts = defineDoc<{ receipts: Record<string, number> }>({
   kind: "adm.bot-messages",
@@ -40,17 +42,8 @@ export const BotProfileDocument = defineDoc<BotProfile>({
 export function botExtension(
   config: WorkspaceConfig,
   assertActive: () => Promise<void>,
-  lookup: (id: string) => Promise<Workspace>,
+  agents: BotAgentManagement,
 ) {
-  async function permittedAgent(id: string) {
-    await assertActive();
-    if (!config.allowedAgents?.includes(id))
-      throw new Error("This bot is not permitted to supervise that agent");
-    const agent = await lookup(id);
-    if (agent.config.role !== "coding")
-      throw new Error("Supervision targets must be coding agents");
-    return agent;
-  }
   return defineExtension({
     name: "bot-supervision",
     sections: [
@@ -100,57 +93,31 @@ export function botExtension(
       defineTool({
         name: "listAgents",
         description:
-          "List live coding agents this bot is explicitly permitted to supervise, with their immutable IDs, names, and status.",
+          "List live coding agents in this ADM installation, with immutable IDs, names, runtime phase, and agent activity.",
         parameters: Type.Object({}),
         replay: "safe",
-        execute: async () => {
+        execute: async (_args, _api, context) => {
           await assertActive();
-          const agents: { id: string; name: string; status: string }[] = [];
-          const unavailable: string[] = [];
-          for (const id of config.allowedAgents ?? []) {
-            try {
-              const agent = await lookup(id);
-              if (
-                agent.config.role !== "coding" ||
-                agent.closed ||
-                agent.passive
-              ) {
-                unavailable.push(id);
-                continue;
-              }
-              const status = await agent.status();
-              if (status.status === "deleted") {
-                unavailable.push(id);
-                continue;
-              }
-              agents.push({
-                id,
-                name: agent.config.name,
-                status: status.status,
-              });
-            } catch (error) {
-              if (
-                error instanceof ApiError &&
-                [404, 410].includes(error.status)
-              ) {
-                unavailable.push(id);
-                continue;
-              }
-              throw error;
-            }
-          }
+          const directory = await agents.list(context.abortSignal);
           return {
             output: [
               {
                 type: "text",
                 text: JSON.stringify({
-                  agents,
-                  unavailable,
-                  message: unavailable.length
-                    ? `Permitted agents unavailable: ${unavailable.join(", ")}`
-                    : agents.length
-                      ? ""
-                      : "No coding agents are assigned to this bot.",
+                  agents: directory.map((agent) => ({
+                    id: agent.id,
+                    name: agent.name,
+                    status:
+                      agent.runtime_status?.activity?.status ?? agent.phase,
+                    phase: agent.phase,
+                    ready: agent.runtime_status?.ready ?? false,
+                    ...(agent.runtime_status?.activity?.error
+                      ? { error: agent.runtime_status.activity.error }
+                      : {}),
+                  })),
+                  unavailable: directory
+                    .filter((agent) => !agent.runtime_status?.podIP)
+                    .map((agent) => agent.id),
                 }),
               },
             ],
@@ -185,27 +152,29 @@ export function botExtension(
       defineTool({
         name: "monitorAgent",
         description:
-          "Inspect status and recent conversation output of an explicitly permitted coding agent.",
-        parameters: Type.Object({ agentId: Type.String() }),
+          "Inspect a coding agent's status and one cursor page of full history, including tool activity. Continue with after=nextAfter while hasMore is true.",
+        parameters: Type.Object({
+          agentId: Type.String(),
+          after: Type.Optional(Type.Integer({ minimum: 0 })),
+          limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+        }),
         replay: "safe",
-        execute: async ({ agentId }) => {
-          const agent = await permittedAgent(agentId);
-          const status = await agent.status();
-          const history = await agent.history(0, 1000, false);
-          const recent = history.events
-            .filter((event) => event.kind !== "tool")
-            .slice(-20);
+        execute: async ({ agentId, after, limit }, _api, context) => {
+          await assertActive();
+          const [status, history] = await Promise.all([
+            agents.status(agentId, context.abortSignal),
+            agents.history(
+              agentId,
+              after ?? 0,
+              limit ?? 200,
+              context.abortSignal,
+            ),
+          ]);
           return {
             output: [
               {
                 type: "text",
-                text: JSON.stringify({
-                  id: agentId,
-                  status: status.status,
-                  goals: status.goals,
-                  loops: status.loops,
-                  recent,
-                }),
+                text: JSON.stringify({ id: agentId, status, history }),
               },
             ],
           };
@@ -214,18 +183,213 @@ export function botExtension(
       defineTool({
         name: "promptAgent",
         description:
-          "Send a prompt to an explicitly permitted coding agent. Delivery is deduplicated if this tool resumes.",
+          "Prompt a coding agent, steering its current turn or queuing a follow-up. Delivery is deduplicated after a lost acknowledgement.",
         parameters: Type.Object({
           agentId: Type.String(),
           message: Type.String({ minLength: 1, maxLength: 100000 }),
+          whenBusy: Type.Optional(
+            Type.Union([
+              Type.Literal("steer"),
+              Type.Literal("followUp"),
+              Type.Literal("reject"),
+            ]),
+          ),
         }),
         replay: "safe",
-        execute: async ({ agentId, message }, api) => {
-          const agent = await permittedAgent(agentId);
-          const result = await agent.input(
+        execute: async ({ agentId, message, whenBusy }, api, context) => {
+          await assertActive();
+          const result = await agents.prompt(
+            agentId,
             message,
             `bot:${config.id}:${api.taskId}`,
-            "steer",
+            whenBusy ?? "steer",
+            context.abortSignal,
+          );
+          return { output: [{ type: "text", text: JSON.stringify(result) }] };
+        },
+      }),
+      defineTool({
+        name: "resumeAgent",
+        description: "Resume a coding agent after a provider failure.",
+        parameters: Type.Object({ agentId: Type.String() }),
+        replay: "safe",
+        execute: async ({ agentId }, _api, context) => {
+          await assertActive();
+          const result = await agents.resume(agentId, context.abortSignal);
+          return { output: [{ type: "text", text: JSON.stringify(result) }] };
+        },
+      }),
+      defineTool({
+        name: "abortAgent",
+        description: "Abort a coding agent's current turn or background task.",
+        parameters: Type.Object({
+          agentId: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        replay: "safe",
+        execute: async ({ agentId, background }, _api, context) => {
+          await assertActive();
+          const result = await agents.abort(
+            agentId,
+            background ?? false,
+            context.abortSignal,
+          );
+          return { output: [{ type: "text", text: JSON.stringify(result) }] };
+        },
+      }),
+      defineTool({
+        name: "saveAgentGoal",
+        description:
+          "Create or update a coding agent's durable goal. Pass an id and status to update or complete an existing goal.",
+        parameters: Type.Object({
+          agentId: Type.String(),
+          goal: Type.Object({
+            description: Type.Optional(
+              Type.String({ minLength: 1, maxLength: 100000 }),
+            ),
+            id: Type.Optional(Type.String()),
+            status: Type.Optional(
+              Type.Union([
+                Type.Literal("active"),
+                Type.Literal("completed"),
+                Type.Literal("cancelled"),
+              ]),
+            ),
+          }),
+        }),
+        replay: "safe",
+        execute: async ({ agentId, goal }, api, context) => {
+          await assertActive();
+          const result = await agents.saveGoal(
+            agentId,
+            goal,
+            `bot:${config.id}:${api.taskId}`,
+            context.abortSignal,
+          );
+          return { output: [{ type: "text", text: JSON.stringify(result) }] };
+        },
+      }),
+      defineTool({
+        name: "saveAgentLoop",
+        description:
+          "Create or update recurring work for a coding agent. Loop creation is durable and deduplicated after a lost acknowledgement.",
+        parameters: Type.Object({
+          agentId: Type.String(),
+          loop: Type.Object({
+            prompt: Type.Optional(
+              Type.String({ minLength: 1, maxLength: 100000 }),
+            ),
+            intervalMs: Type.Optional(Type.Integer({ minimum: 1000 })),
+            nextAt: Type.Optional(Type.Integer()),
+            id: Type.Optional(Type.String()),
+            status: Type.Optional(
+              Type.Union([Type.Literal("active"), Type.Literal("cancelled")]),
+            ),
+          }),
+        }),
+        replay: "safe",
+        execute: async ({ agentId, loop }, api, context) => {
+          await assertActive();
+          const result = await agents.saveLoop(
+            agentId,
+            loop,
+            `bot:${config.id}:${api.taskId}`,
+            context.abortSignal,
+          );
+          return { output: [{ type: "text", text: JSON.stringify(result) }] };
+        },
+      }),
+      defineTool({
+        name: "configureAgentModel",
+        description: "Change the selected model for a coding agent.",
+        parameters: Type.Object({
+          agentId: Type.String(),
+          provider: Type.String({ minLength: 1 }),
+          modelId: Type.String({ minLength: 1 }),
+        }),
+        replay: "safe",
+        execute: async ({ agentId, provider, modelId }, _api, context) => {
+          await assertActive();
+          const result = await agents.changeModel(
+            agentId,
+            provider,
+            modelId,
+            context.abortSignal,
+          );
+          return { output: [{ type: "text", text: JSON.stringify(result) }] };
+        },
+      }),
+      defineTool({
+        name: "createAgent",
+        description:
+          "Create a coding-agent workspace through the durable lifecycle service. Creation choices are explicit and the operation receipt can be replayed after a lost acknowledgement.",
+        parameters: Type.Object({
+          name: Type.String({ minLength: 1, maxLength: 63 }),
+          image: Type.String({ minLength: 1 }),
+          storageClass: Type.String({ minLength: 1 }),
+          storageSize: Type.String({ minLength: 1 }),
+          cpu: Type.String({ minLength: 1 }),
+          memory: Type.String({ minLength: 1 }),
+          model: Type.Optional(
+            Type.Object({
+              provider: Type.String({ minLength: 1 }),
+              id: Type.String({ minLength: 1 }),
+            }),
+          ),
+          repository: Type.Optional(Type.String({ minLength: 1 })),
+        }),
+        replay: "safe",
+        execute: async (args, api, context: Context) => {
+          await assertActive();
+          const operationId = await api.memo(
+            "create-agent-operation-id",
+            randomUUID(),
+            context,
+          );
+          const spec = {
+            name: args.name,
+            role: "coding",
+            image: args.image,
+            storage_class: args.storageClass,
+            storage_size: args.storageSize,
+            cpu: args.cpu,
+            memory: args.memory,
+            agent_enabled: true,
+            allow_node_local_storage: false,
+            repositories: false,
+            catalog: {},
+            repository: args.repository,
+            cwd: args.repository ? `/repos/${args.repository}` : "/repos",
+            model: args.model,
+            credential_env: [],
+            mcp_servers: null,
+            herdr_space: null,
+          };
+          const result = await agents.createAgent(
+            operationId,
+            spec,
+            context.abortSignal,
+          );
+          return { output: [{ type: "text", text: JSON.stringify(result) }] };
+        },
+      }),
+      defineTool({
+        name: "destroyAgent",
+        description:
+          "Durably admit destruction of a coding agent by immutable workspace ID. The receipt remains inspectable and replayable if the acknowledgement is lost.",
+        parameters: Type.Object({ agentId: Type.String() }),
+        replay: "safe",
+        execute: async ({ agentId }, api, context: Context) => {
+          await assertActive();
+          const operationId = await api.memo(
+            "destroy-agent-operation-id",
+            randomUUID(),
+            context,
+          );
+          const result = await agents.destroyAgent(
+            operationId,
+            agentId,
+            context.abortSignal,
           );
           return { output: [{ type: "text", text: JSON.stringify(result) }] };
         },

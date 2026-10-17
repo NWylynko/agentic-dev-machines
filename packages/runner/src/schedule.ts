@@ -42,6 +42,10 @@ type ScheduleState = {
   loops: LoopRecord[];
 };
 
+type ScheduleReceipts = {
+  requests: { id: string; fingerprint: string; result: string }[];
+};
+
 type LoopInput = { loopId: string; generation?: number };
 type LoopState =
   | { phase: "wait"; epoch: number }
@@ -57,6 +61,52 @@ const Schedule = defineDoc<ScheduleState>({
   fork: "initial",
   initial: () => ({ goals: [], loops: [] }),
 });
+
+const ScheduleRequests = defineDoc<ScheduleReceipts>({
+  kind: "adm.schedule-requests",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ requests: [] }),
+});
+
+async function commitRequest<T>(
+  conversation: Conversation,
+  action: "goal" | "loop",
+  requestId: string | undefined,
+  input: unknown,
+  mutate: (tx: Tx) => Promise<T>,
+) {
+  if (requestId === undefined) return conversation.commit(mutate, context);
+  if (!requestId.trim() || requestId.length > 512)
+    throw new ApiError(
+      400,
+      "INVALID_REQUEST_ID",
+      "requestId must be a nonempty string up to 512 characters",
+    );
+  const fingerprint = JSON.stringify([action, input]);
+  return conversation.commit(async (tx) => {
+    const receipts = await tx.doc(ScheduleRequests, conversation.id);
+    const previous = receipts.requests.find((item) => item.id === requestId);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint)
+        throw new ApiError(
+          409,
+          "REQUEST_ID_REUSED",
+          "requestId was already used with a different request",
+        );
+      return JSON.parse(previous.result) as T;
+    }
+    const result = await mutate(tx);
+    receipts.requests.push({
+      id: requestId,
+      fingerprint,
+      result: JSON.stringify(result),
+    });
+    return result;
+  }, context);
+}
 
 function requestIdFor(loopId: string, scheduledAt: number) {
   return `loop:${loopId}:${scheduledAt}`;
@@ -379,13 +429,16 @@ export function publicSchedule(state: ScheduleState | undefined) {
 
 export const scheduleDocument = Schedule;
 
-export async function applyGoal(conversation: Conversation, input: unknown) {
+export async function applyGoal(
+  conversation: Conversation,
+  input: unknown,
+  requestId?: string,
+) {
   const body = objectBody(input, "INVALID_GOAL");
   if (body.id === undefined) {
     const description = text(body.description, "description", "INVALID_GOAL");
-    return conversation.commit(
-      (tx) => insertGoal(tx, conversation.id, description),
-      context,
+    return commitRequest(conversation, "goal", requestId, input, (tx) =>
+      insertGoal(tx, conversation.id, description),
     );
   }
   if (typeof body.id !== "string" || body.id === "")
@@ -406,7 +459,7 @@ export async function applyGoal(conversation: Conversation, input: unknown) {
       "INVALID_GOAL",
       "Goal status must be active, completed, or cancelled",
     );
-  return conversation.commit(async (tx) => {
+  return commitRequest(conversation, "goal", requestId, input, async (tx) => {
     const doc = await tx.doc(Schedule, conversation.id);
     const current = doc.goals.find((goal) => goal.id === body.id);
     if (!current) throw new ApiError(404, "GOAL_NOT_FOUND", "Goal not found");
@@ -418,13 +471,14 @@ export async function applyGoal(conversation: Conversation, input: unknown) {
     };
     doc.goals[index] = next;
     return next;
-  }, context);
+  });
 }
 
 export async function applyLoop(
   conversation: Conversation,
   input: unknown,
   loopTask: ReturnType<typeof createLoopTask>,
+  requestId?: string,
 ) {
   const body = objectBody(input, "INVALID_LOOP");
   if (body.id === undefined) {
@@ -454,19 +508,17 @@ export async function applyLoop(
       typeof body.nextAt === "number"
         ? body.nextAt
         : Date.now() + body.intervalMs;
-    return conversation.commit(
-      (tx) =>
-        insertLoop(
-          tx,
-          conversation.id,
-          {
-            prompt,
-            intervalMs: body.intervalMs as number,
-            nextAt,
-          },
-          loopTask,
-        ),
-      context,
+    return commitRequest(conversation, "loop", requestId, input, (tx) =>
+      insertLoop(
+        tx,
+        conversation.id,
+        {
+          prompt,
+          intervalMs: body.intervalMs as number,
+          nextAt,
+        },
+        loopTask,
+      ),
     );
   }
   if (typeof body.id !== "string" || body.id === "")
@@ -478,7 +530,7 @@ export async function applyLoop(
       "INVALID_LOOP",
       "Loop status must be active or cancelled",
     );
-  return conversation.commit(async (tx) => {
+  return commitRequest(conversation, "loop", requestId, input, async (tx) => {
     const doc = await tx.doc(Schedule, conversation.id);
     const index = doc.loops.findIndex((loop) => loop.id === body.id);
     const current = doc.loops[index];
@@ -510,7 +562,7 @@ export async function applyLoop(
       nextAt: next.nextAt,
       status: next.status,
     };
-  }, context);
+  });
 }
 
 export function createScheduleExtension(
