@@ -8,6 +8,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 #[derive(Subcommand)]
@@ -29,6 +30,7 @@ pub fn run(cli: &Cli, action: &HerdrAction) -> Result<()> {
     match action {
         HerdrAction::Bind { name, space } => {
             ensure!(!space.is_empty(), "Herdr space ID must not be empty");
+            validate_herdr_space(space)?;
             let workspace = cli.active_workspace(name)?;
             crate::print_json(&cli.request_lifecycle(
                 "PUT",
@@ -36,11 +38,24 @@ pub fn run(cli: &Cli, action: &HerdrAction) -> Result<()> {
                 Some(&json!({"spaceId":space})),
             )?)
         }
-        HerdrAction::Hook => crate::print_json(&json!({
-            "command": "adm herdr watch --socket \"$HERDR_SOCKET_PATH\"",
-            "requires": ["HERDR_ENV=1", "HERDR_SOCKET_PATH"],
-            "description": "Run this in a supervised pane of the Herdr session that owns the bound spaces. Explicit close events are journaled before cleanup; Herdr exposes no replay cursor, so closes missed while disconnected cannot be recovered."
-        })),
+        HerdrAction::Hook => {
+            println!(
+                "Run these commands on the management host, from the Herdr pane that should own the ADM workspace:"
+            );
+            println!("  herdr workspace get \"$HERDR_WORKSPACE_ID\"");
+            println!("  adm create NAME");
+            println!("  adm herdr bind NAME \"$HERDR_WORKSPACE_ID\"");
+            println!(
+                "  systemd-run --user --unit=adm-herdr-watch --property=Restart=on-failure --property=RestartSec=3s --setenv=HERDR_ENV=1 --setenv=\"HERDR_SOCKET_PATH=$HERDR_SOCKET_PATH\" adm herdr watch --socket \"$HERDR_SOCKET_PATH\""
+            );
+            println!(
+                "Check or restart the watcher with `systemctl --user status adm-herdr-watch` or `systemctl --user restart adm-herdr-watch`."
+            );
+            println!(
+                "Herdr has no replay cursor; close events missed while the watcher is disconnected cannot be recovered."
+            );
+            Ok(())
+        }
         HerdrAction::Events => {
             for line in io::stdin().lock().lines() {
                 let line = line?;
@@ -54,6 +69,31 @@ pub fn run(cli: &Cli, action: &HerdrAction) -> Result<()> {
         }
         HerdrAction::Watch { socket } => watch(cli, socket),
     }
+}
+
+fn validate_herdr_space(space_id: &str) -> Result<()> {
+    let output = Command::new("herdr")
+        .args(["workspace", "get", space_id])
+        .output()
+        .context("could not run `herdr workspace get`; install Herdr and run bind from its management host")?;
+    ensure!(
+        output.status.success(),
+        "Herdr workspace {space_id} could not be verified: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)
+        .context("`herdr workspace get` returned invalid JSON")?;
+    let returned_id = response["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .or_else(|| response["result"]["workspace"]["workspaceId"].as_str())
+        .or_else(|| response["workspace"]["workspace_id"].as_str())
+        .or_else(|| response["workspace"]["workspaceId"].as_str())
+        .context("`herdr workspace get` did not return a workspace ID")?;
+    ensure!(
+        returned_id == space_id,
+        "Herdr returned workspace {returned_id} while verifying {space_id}"
+    );
+    Ok(())
 }
 
 fn closed_space_id(event: &Value) -> Result<Option<&str>> {

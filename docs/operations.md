@@ -71,7 +71,7 @@ If coding tools cannot use Kubernetes, verify that the selected host kubeconfig 
 
 Every workspace starts with a durable agent. Without a configured default, select a model after attaching with `/model`; input remains paused until a model is selected. By default `/repos` is an ordinary writable directory, so normal cloning works. `--repo OWNER/REPO` performs a normal full clone of a public GitHub repository into `/repos/OWNER/REPO`; Git checks out the remote's advertised default branch. The shell and coding agent start there. The clone uses the private workspace volume and does not enable the lazy catalog. Private repository authentication is not configured by this option, and the clone does not use shallow or filtered fetches. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. `--repo` cannot be combined with `--catalog`, `--no-repositories`, or bot workspaces.
 
-`adm shell NAME` opens a login shell at the workspace's selected working directory (`/repos` by default, or the selected repository root). For a catalog workspace, `pwd -P` may show its backing storage path under `/workspace/.adm`; that is the same directory through the `/repos` view. Commands supplied to `adm shell NAME -- COMMAND...` or `adm exec` run as given and keep their own working-directory behavior.
+`adm shell NAME` opens zsh with pinned Oh My Zsh at the workspace's selected working directory (`/repos` by default, or the selected repository root). Its editable `.zshrc` and history live under `/workspace/.adm/zsh` (`ZDOTDIR`), are seeded once, and survive Pod replacement. Shell startup never downloads updates. For a catalog workspace, `pwd -P` may show its backing storage path under `/workspace/.adm`; that is the same directory through the `/repos` view. Commands supplied to `adm shell NAME -- COMMAND...` or `adm exec` run as given and keep their own working-directory behavior.
 
 Use `adm shell NAME --manage` when you also need the current agent controls from inside that shell. The private `adm` client supports `adm status [--json]`, `adm history [--after N] [--limit N]`, `adm prompt MESSAGE`, `adm abort [--background]`, and `adm help`. History defaults to 200 entries; its response limit is 1 MiB, so use a smaller `--limit` if it reports an oversized response. It can address only the workspace selected on the management host; workspace IDs, host state, credentials, and the runner URL are not passed into the development container. Same-workspace processes can use the allowed actions while the managed session is open. Closing the shell closes the temporary management relay and leaves the agent running. The ordinary `adm shell NAME` path does not start a relay. Use the management host for `adm list`, creation/deletion, port forwarding, `exec`, and other workspace operations.
 
@@ -199,16 +199,42 @@ From your laptop, forward that management-host port over your normal SSH connect
 
 ## Herdr ownership and deletion
 
-Associate a workspace with the immutable Herdr workspace ID using `--herdr-space ID` during creation or `adm herdr bind NAME ID`. The removal bridge consumes actual Herdr `workspace_closed` events. Losing the event connection or restarting Herdr is not a removal event.
+Create or bind the ADM workspace from the management host, using the immutable Herdr workspace ID. `adm herdr bind` checks the ID with the installed Herdr CLI before saving the association. The removal bridge consumes actual Herdr `workspace_closed` events. Losing the event connection or restarting Herdr is not a removal event.
 
 ```sh
+# On the management host
+adm start
+adm doctor
+
+# In a pane of the Herdr workspace that should own the ADM workspace
+herdr workspace get "$HERDR_WORKSPACE_ID"
+adm create my-project
+adm herdr bind my-project "$HERDR_WORKSPACE_ID"
+
+# Open sibling shell and agent panes without changing focus
+herdr pane split --current --direction right --cwd "$PWD" --no-focus
+# Copy the returned .result.pane.pane_id, then open a shell there:
+herdr pane run SHELL_PANE_ID adm shell my-project
+
+herdr pane split --current --direction down --cwd "$PWD" --no-focus
+# Copy its pane ID, then open the agent terminal there:
+herdr pane run AGENT_PANE_ID adm attach my-project
+
+# Start a supervised watcher for this Herdr session
+systemd-run --user --unit=adm-herdr-watch --property=Restart=on-failure \
+  --property=RestartSec=3s --setenv=HERDR_ENV=1 \
+  --setenv="HERDR_SOCKET_PATH=$HERDR_SOCKET_PATH" \
+  adm herdr watch --socket "$HERDR_SOCKET_PATH"
+systemctl --user status adm-herdr-watch
 adm herdr hook
 adm destroy my-project
 adm destroy my-project --wait
 adm list --all
 ```
 
-In a supervised pane inside the owning Herdr session, run `adm herdr watch --socket "$HERDR_SOCKET_PATH"`. The watcher requires `HERDR_ENV=1` and that exact session socket; it never attaches to another session by guessing its path. It journals every received close event before attempting cleanup, then replays unfinished cleanup on restart. Restart the watcher on failure. The current Herdr API has no replay cursor, so a close event missed while disconnected is not recoverable from its feed. The watcher never destroys a workspace merely because a list is empty after startup. Live Herdr installation and delivery remain an operator validation step.
+Run the watcher on the management host under the same user that runs Herdr, after entering the owning Herdr pane so `HERDR_SOCKET_PATH` names that session. It requires `HERDR_ENV=1` and that exact socket; it never attaches to another session by guessing a path. Check it with `systemctl --user status adm-herdr-watch`; recover it with `systemctl --user restart adm-herdr-watch`. The watcher journals every received close event before submitting durable deletion admission, then clears the journal after admission succeeds. On restart, it resubmits any close that was journaled but not admitted. The current Herdr API has no replay cursor, so a close event missed while disconnected is not recoverable from its feed. The watcher never destroys a workspace merely because a list is empty after startup. Live Herdr delivery remains an operator validation step.
+
+If you already have an ADM workspace, run `adm herdr bind NAME "$HERDR_WORKSPACE_ID"` from the management host instead of creating another one. To inspect ownership and cleanup, use `adm list --all` and `adm status NAME` from the management host. Removing the Herdr workspace is the explicit deletion action; closing a pane or disconnecting a terminal leaves the ADM workspace running.
 
 Deletion writes a durable tombstone before cancellation and runtime cleanup. Repeating it finishes interrupted cleanup, and recreating the same label gets a different ID. Old goals, loops, input, and supervision grants cannot attach to that new ID. Retained conversation history is passive; archive expiry is not implemented.
 

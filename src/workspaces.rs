@@ -16,11 +16,16 @@ use uuid::Uuid;
 pub const MANAGED_BY: &str = "adm";
 
 fn lifecycle_stage<T>(
+    cli: &Cli,
     operation: &str,
     name: &str,
     stage: &str,
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    if let Some(operation_id) = &cli.lifecycle_operation_id {
+        cli.store()?
+            .record_lifecycle_stage(operation_id, stage, "started", None)?;
+    }
     eprintln!("adm: {operation} {name}: {stage} started");
     let started = Instant::now();
     let result = action();
@@ -33,6 +38,14 @@ fn lifecycle_stage<T>(
         "adm: {operation} {name}: {stage} {outcome} in {:.3}s",
         started.elapsed().as_secs_f64()
     );
+    if let Some(operation_id) = &cli.lifecycle_operation_id {
+        cli.store()?.record_lifecycle_stage(
+            operation_id,
+            stage,
+            outcome,
+            Some(started.elapsed().as_secs_f64()),
+        )?;
+    }
     result
 }
 
@@ -654,8 +667,24 @@ impl WorkspaceStore {
         )?;
         let elapsed = (now() as i64 - accepted_at).max(0);
         let changed = self.connection.execute(
-            "UPDATE lifecycle_operations SET status=?2,stage=?3,last_error=?4,updated_at=?5,timings=?6,fencing_token=?7 WHERE operation_id=?1 AND fencing_token<=?7",
-            params![operation_id, status, stage, error, now() as i64, serde_json::to_string(&json!({"elapsedSeconds":elapsed}))?, self.fencing_token as i64],
+            "UPDATE lifecycle_operations SET status=?2,stage=?3,last_error=?4,updated_at=?5,timings=json_set(timings,'$.elapsedSeconds',?6),fencing_token=?7 WHERE operation_id=?1 AND fencing_token<=?7 AND ?7>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
+            params![operation_id, status, stage, error, now() as i64, elapsed, self.fencing_token as i64],
+        )?;
+        ensure!(changed == 1, "lifecycle operation fencing token is stale");
+        Ok(())
+    }
+    pub fn record_lifecycle_stage(
+        &self,
+        operation_id: &str,
+        stage: &str,
+        outcome: &str,
+        elapsed: Option<f64>,
+    ) -> Result<()> {
+        let mut timings = self.lifecycle_operation(operation_id)?.timings;
+        timings["stages"][stage] = json!({"status":outcome,"elapsedSeconds":elapsed});
+        let changed = self.connection.execute(
+            "UPDATE lifecycle_operations SET stage=?2,timings=?3,updated_at=?4 WHERE operation_id=?1 AND fencing_token<=?5 AND ?5>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
+            params![operation_id, format!("{stage} {outcome}"), serde_json::to_string(&timings)?, now() as i64, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "lifecycle operation fencing token is stale");
         Ok(())
@@ -670,12 +699,8 @@ impl WorkspaceStore {
         let mut workspace: Workspace = serde_json::from_str(&raw)?;
         workspace.last_error = Some(error.to_owned());
         let changed = self.connection.execute(
-            "UPDATE workspaces SET spec=?2,fencing_token=?3 WHERE id=?1 AND fencing_token<=?3",
-            params![
-                workspace.id,
-                serde_json::to_string(&workspace)?,
-                self.fencing_token as i64
-            ],
+            "UPDATE workspaces SET phase=CASE WHEN phase='provisioning' THEN 'failed' ELSE phase END,spec=json_set(spec,'$.last_error',?2,'$.phase',CASE WHEN phase='provisioning' THEN 'failed' ELSE phase END),fencing_token=?3 WHERE id=?1 AND fencing_token<=?3 AND ?3>=(SELECT fencing_token FROM lifecycle_owner WHERE singleton=1)",
+            params![workspace_id, error, self.fencing_token as i64],
         )?;
         ensure!(changed == 1, "workspace lifecycle fencing token is stale");
         Ok(())
@@ -1110,7 +1135,7 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
         None => requested,
     };
     if w.role == "coding" {
-        lifecycle_stage("create", &w.name, "checking storage class", || {
+        lifecycle_stage(cli, "create", &w.name, "checking storage class", || {
             let storage: Value = serde_json::from_slice(
                 &kubectl(
                     cli,
@@ -1127,19 +1152,25 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
         })?;
     }
     if resuming {
-        lifecycle_stage("create", &w.name, "checking namespace ownership", || {
-            if let Err(error) = verify_ownership(cli, &w) {
-                ensure!(format!("{error:#}").contains("NotFound"), "{error:#}");
-            }
-            Ok(())
-        })?;
+        lifecycle_stage(
+            cli,
+            "create",
+            &w.name,
+            "checking namespace ownership",
+            || {
+                if let Err(error) = verify_ownership(cli, &w) {
+                    ensure!(format!("{error:#}").contains("NotFound"), "{error:#}");
+                }
+                Ok(())
+            },
+        )?;
     }
     if !resuming {
         store.insert(&w)?;
     }
     let provision = (|| -> Result<()> {
         let manifest = manifest(&w)?;
-        lifecycle_stage("create", &w.name, "applying workspace resources", || {
+        lifecycle_stage(cli, "create", &w.name, "applying workspace resources", || {
             kubectl(
                 cli,
                 &["apply", "-f", "-"],
@@ -1148,10 +1179,8 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
             Ok(())
         })?;
         if let Some(repository) = &w.repository {
-            // A missing checkout can prevent the runtime from becoming
-            // Deployment-ready. Wait for its container to run, prepare the
-            // private checkout, then require the normal readiness condition.
-            lifecycle_stage("create", &w.name, "waiting for workspace Pod", || {
+            // Wait for the Pod to run so the private checkout exists before readiness.
+            lifecycle_stage(cli, "create", &w.name, "waiting for workspace Pod", || {
                 kubectl(
                     cli,
                     &[
@@ -1171,6 +1200,7 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
             prepare_repository(cli, &w, repository)?;
         }
         lifecycle_stage(
+            cli,
             "create",
             &w.name,
             "waiting for deployment readiness",
@@ -1241,8 +1271,13 @@ test "$(git -C "$staging" config --get remote.origin.url)" = "$remote"
 git -C "$staging" config --local adm.preparedWorkspaceId "$workspace_id"
 mv -- "$staging" "$target"
 "#;
-    lifecycle_stage("create", &workspace.name, "preparing repository", || {
-        kubectl(
+    lifecycle_stage(
+        cli,
+        "create",
+        &workspace.name,
+        "preparing repository",
+        || {
+            kubectl(
             cli,
             &[
                 "exec",
@@ -1268,8 +1303,9 @@ mv -- "$staging" "$target"
                 "repository {repository} preparation failed; verify the OWNER/REPO spelling and whether the repository is public or accessible from the workspace. Retry the same repository after transient failures. Correcting it requires inspecting and deliberately destroying this failed workspace, then recreating with --repo OWNER/REPO"
             )
         })?;
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
@@ -1300,20 +1336,26 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
         lifecycle_complete("destroy", &w.name, "already deleted", started);
         return Ok(w);
     }
-    lifecycle_stage("destroy", &w.name, "checking namespace ownership", || {
-        match verify_ownership(cli, &w) {
-            Ok(()) => {}
-            Err(error) => {
-                if !format!("{error:#}").contains("NotFound") {
-                    return Err(error);
+    lifecycle_stage(
+        cli,
+        "destroy",
+        &w.name,
+        "checking namespace ownership",
+        || {
+            match verify_ownership(cli, &w) {
+                Ok(()) => {}
+                Err(error) => {
+                    if !format!("{error:#}").contains("NotFound") {
+                        return Err(error);
+                    }
                 }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     w.phase = "deleting".into();
     store.save(&w)?;
-    lifecycle_stage("destroy", &w.name, "waiting for namespace removal", || {
+    lifecycle_stage(cli, "destroy", &w.name, "waiting for namespace removal", || {
         kubectl(
             cli,
             &[

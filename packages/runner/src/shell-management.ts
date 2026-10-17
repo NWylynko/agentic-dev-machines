@@ -517,7 +517,7 @@ try {
         "bash",
         "-l",
         "-c",
-        'cd -- "$1" && export PWD="$1" PATH="$2:$PATH" ADM_MANAGE_SOCKET="$3" && exec bash',
+        'cd -- "$1" && export PWD="$1" PATH="$2:$PATH" ADM_MANAGE_SOCKET="$3" && exec env ZDOTDIR=/workspace/.adm/zsh zsh -l',
         "adm-shell",
         cwd,
         ready.directory,

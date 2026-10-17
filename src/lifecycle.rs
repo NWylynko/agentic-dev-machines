@@ -348,6 +348,8 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
 
 fn lifecycle_worker(cli: crate::Cli, work: mpsc::Receiver<String>) {
     for operation_id in work {
+        let mut cli = cli.clone_for_lifecycle();
+        cli.lifecycle_operation_id = Some(operation_id.clone());
         let outcome = (|| -> Result<()> {
             cli.check_lifecycle_fence()?;
             let store = cli.store()?;
