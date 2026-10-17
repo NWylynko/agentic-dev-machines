@@ -2,6 +2,7 @@ keep this file up to date
 
 # Project notes
 
+- `adm destroy NAME` returns its durable lifecycle operation receipt after admission; `--wait` observes confirmed cleanup and returns the deleted workspace record. Repeating destroy resumes the original operation, including after service restart; immutable workspace IDs protect reused names.
 - Confirmed target, not yet implemented (2026-10-16): all coding/bot agent execution belongs in workspace pods; the host is an access plane only. Bots broadly control coding-agent lifecycles, and agents have unattended root/sudo inside their own pods. Older host-runner, individual-grant, and opt-in-sudo notes below describe current implementation, not the target policy.
 - Early-alpha policy (2026-10-16): prioritize a simple fresh implementation. No old-data/configuration migration, legacy upgrade paths, or backwards-compatibility layers are required. Keep persistence, restart recovery, and deletion correctness for the new design.
 - Todo investigation and implementation boundaries are in `docs/todo-investigation-2026-10-16.md` and its linked runtime/management/CLI research notes. TASK-22 owns pod runtime/routing; TASK-47 owns shared in-cluster lifecycle operations. TASK-48 is merged into TASK-22 and TASK-49 is canceled. No implementation was made during this investigation.

@@ -67,7 +67,7 @@ adm status my-project
 adm inspect my-project
 ```
 
-`adm create` and `adm destroy` write lifecycle stage starts and elapsed stage/total durations to stderr. Their JSON result remains on stdout. Creation reports the StorageClass lookup, resource apply, deployment readiness, optional repository preparation, and runner startup/registration separately. Destruction reports ownership checks, agent cancellation, and the wait for namespace removal. These timings cover ADM's synchronous calls; for example, deployment readiness includes whatever Kubernetes waits on before the Deployment becomes Available, such as storage binding, scheduling, and initialization. Use the slowest stage to guide further measurements; the CLI does not infer a cause or split Kubernetes internals into separate durations.
+`adm create` writes lifecycle stage starts and elapsed stage/total durations to stderr and returns its workspace record on stdout. It reports the StorageClass lookup, resource apply, deployment readiness, optional repository preparation, and runner startup/registration separately. `adm destroy` returns its durable operation receipt after deletion is admitted; use `adm destroy NAME --wait` to wait for completion and receive the deleted workspace record. A repeated destroy by name resumes the same deletion operation. The lifecycle service records cleanup stages, timings, and failures in the operation receipt and workspace status. These timings cover ADM's synchronous calls; for example, deployment readiness includes whatever Kubernetes waits on before the Deployment becomes Available, such as storage binding, scheduling, and initialization. Use the slowest stage to guide further measurements; the CLI does not infer a cause or split Kubernetes internals into separate durations.
 
 If an older coding workspace's tool calls report that no Kubernetes connection is pinned, verify that the selected host kubeconfig reaches the intended cluster and run `adm reconnect NAME --kubeconfig PATHS`. The command checks the namespace's `adm.dev/workspace-id` ownership label, then updates the runner's persisted host connection while retaining the same namespace, workspace ID, files, Durable history, goals, and loops. If active work blocks the rebind, stop it deliberately with `adm abort NAME`, then retry. Restarting the runner alone does not change a registered connection. The `--kubeconfig` argument accepts the ordinary colon-separated merge list; CLI-relative entries are resolved from the current directory.
 
@@ -194,6 +194,7 @@ Associate a workspace with the immutable Herdr workspace ID using `--herdr-space
 ```sh
 adm herdr hook
 adm destroy my-project
+adm destroy my-project --wait
 adm list --all
 ```
 

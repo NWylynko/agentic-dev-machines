@@ -8,26 +8,56 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-fn start_service(root: &Path, port: u16) -> Child {
+struct ServiceProcess(Child);
+
+impl std::ops::Deref for ServiceProcess {
+    type Target = Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ServiceProcess {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ServiceProcess {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn start_service(root: &Path, port: u16) -> ServiceProcess {
+    use std::os::unix::process::CommandExt;
     let status_port =
         fs::read_to_string(root.join("runtime-status-port")).unwrap_or_else(|_| "7432".into());
     let runner_url = fs::read_to_string(root.join("runner-url")).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_adm"))
-        .args(["--state-dir"])
-        .arg(root.join("state"))
-        .args(["--kubectl"])
-        .arg(root.join("kubectl"))
-        // The service fixture must never fall through to a shared host runner.
-        .args(["--runner-url", runner_url.trim()])
-        .args(["--runtime-status-port", status_port.trim()])
-        .args(["--lifecycle-token-file"])
-        .arg(root.join("token"))
-        .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
-        .arg(port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("start lifecycle service")
+    ServiceProcess(
+        Command::new(env!("CARGO_BIN_EXE_adm"))
+            .process_group(0)
+            .args(["--state-dir"])
+            .arg(root.join("state"))
+            .args(["--kubectl"])
+            .arg(root.join("kubectl"))
+            // The service fixture must never fall through to a shared host runner.
+            .args(["--runner-url", runner_url.trim()])
+            .args(["--runtime-status-port", status_port.trim()])
+            .args(["--lifecycle-token-file"])
+            .arg(root.join("token"))
+            .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
+            .arg(port.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start lifecycle service"),
+    )
 }
 
 fn start_runner_stub() -> (String, u16, thread::JoinHandle<()>) {
@@ -199,7 +229,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     fs::write(
         root.path().join("kubectl"),
         r##"#!/usr/bin/env python3
-import json, pathlib, sys, time
+import fcntl, json, pathlib, sys, time
 root=pathlib.Path(__file__).parent
 args=sys.argv[1:]
 args=[arg for arg in args if not arg.startswith('--request-timeout=')]
@@ -208,8 +238,11 @@ state=json.loads(state_path.read_text()) if state_path.exists() else {}
 lease_path=root/'lease.json'
 if args[:2] == ['get','lease']:
     count_path=root/'lease-gets'
-    count=int(count_path.read_text()) if count_path.exists() else 0
-    count_path.write_text(str(count+1))
+    with count_path.open('a+') as counter:
+        fcntl.flock(counter, fcntl.LOCK_EX)
+        counter.seek(0)
+        count=int(counter.read() or '0')
+        counter.seek(0); counter.truncate(); counter.write(str(count+1)); counter.flush()
     if not lease_path.exists():
         print('Error from server (NotFound): leases not found',file=sys.stderr); sys.exit(1)
     print(lease_path.read_text())
@@ -298,6 +331,7 @@ elif args[0] == 'wait': pass
 elif args[:2] == ['delete','namespace']:
     if (root/'hold-delete').exists():
         (root/'deleting-entered').write_text('yes')
+        (root/'delete-process').write_text(str(__import__('os').getpid()))
         while not (root/'delete-release').exists(): time.sleep(.01)
     state.pop(args[2],None); state_path.write_text(json.dumps(state))
 else:
@@ -664,6 +698,208 @@ else:
     assert_eq!(cli_receipt["phase"], "ready");
     assert_eq!(cli_receipt["name"], "cli-created");
     assert!(cli_receipt["creation_operation_id"].is_string());
+
+    let destroy_operation = "e006ec7b-2520-45cb-81db-452930f37732";
+    fs::write(root.path().join("hold-delete"), "yes").unwrap();
+    let mut destroy = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--runner-url", &runner_url, "--lifecycle-url", &url])
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("token"))
+        .args([
+            "destroy",
+            "cli-created",
+            "--operation-id",
+            destroy_operation,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start asynchronous destroy");
+    wait_for(|| root.path().join("deleting-entered").exists().then_some(()));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while destroy.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let default_finished = destroy.try_wait().unwrap().is_some();
+    if !default_finished {
+        fs::write(root.path().join("delete-release"), "go").unwrap();
+    }
+    let destroy_output = destroy.wait_with_output().unwrap();
+    assert!(
+        default_finished,
+        "default destroy waited for namespace finalization"
+    );
+    assert!(
+        destroy_output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&destroy_output.stdout),
+        String::from_utf8_lossy(&destroy_output.stderr)
+    );
+    let destroy_receipt: Value = serde_json::from_slice(&destroy_output.stdout).unwrap();
+    assert_eq!(destroy_receipt["operationId"], destroy_operation);
+    assert_eq!(destroy_receipt["workspaceId"], cli_receipt["id"]);
+    assert!(matches!(
+        destroy_receipt["status"].as_str(),
+        Some("accepted" | "running" | "completed")
+    ));
+    let deletion_id = destroy_receipt["workspaceId"].as_str().unwrap();
+    let deleting: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/workspaces/{deletion_id}"),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(deleting["phase"], "deleting");
+    assert_eq!(deleting["deletion_operation_id"], destroy_operation);
+
+    // Another entry point may admit its own durable request while cleanup is held.
+    // It must not replace the operation the original CLI caller resumes by name.
+    let concurrent_delete = json!({
+        "operationId":"9bd0ee01-f814-4475-b1b7-02326bd9a1ff",
+        "kind":"delete",
+        "workspaceId":deletion_id,
+    });
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&concurrent_delete),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let same_deletion: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/workspaces/{deletion_id}"),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(
+        same_deletion["deletion_operation_id"], destroy_operation,
+        "concurrent deletion entry points must retain the original resumable operation"
+    );
+
+    let repeated = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--runner-url", &runner_url, "--lifecycle-url", &url])
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("token"))
+        .args(["destroy", "cli-created"])
+        .output()
+        .expect("repeat destroy by workspace name");
+    assert!(repeated.status.success());
+    let repeated_receipt: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated_receipt["operationId"], destroy_operation);
+    assert_eq!(repeated_receipt["workspaceId"], cli_receipt["id"]);
+    let conflicting_retry = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--runner-url", &runner_url, "--lifecycle-url", &url])
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("token"))
+        .args([
+            "destroy",
+            "cli-created",
+            "--operation-id",
+            "cd5044e2-362f-40b9-ac7a-6eb540a2d287",
+        ])
+        .output()
+        .expect("reject a second destroy identity");
+    assert!(!conflicting_retry.status.success());
+    assert!(String::from_utf8_lossy(&conflicting_retry.stderr).contains(destroy_operation));
+
+    restarted.kill().unwrap();
+    restarted.wait().unwrap();
+    let delete_process = fs::read_to_string(root.path().join("delete-process"))
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    unsafe {
+        libc::kill(delete_process, libc::SIGKILL);
+    }
+    let lease_path = root.path().join("lease.json");
+    let mut lease: Value = serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
+    lease["metadata"]["annotations"]["adm.dev/renew-unix"] = "0".into();
+    fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+    fs::remove_file(root.path().join("deleting-entered")).unwrap();
+    restarted = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+
+    let mut waiter = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--runner-url", &runner_url, "--lifecycle-url", &url])
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("token"))
+        .args(["destroy", "cli-created", "--wait"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start destroy waiter");
+    thread::sleep(Duration::from_millis(150));
+    let waiter_blocked = waiter.try_wait().unwrap().is_none();
+    fs::write(root.path().join("delete-release"), "go").unwrap();
+    let waited = waiter.wait_with_output().unwrap();
+    assert!(
+        waiter_blocked,
+        "--wait returned before namespace finalization"
+    );
+    assert!(
+        waited.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&waited.stdout),
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let deleted: Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(deleted["id"], cli_receipt["id"]);
+    assert_eq!(deleted["phase"], "deleted");
+
+    let concurrent_wait = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--runner-url", &runner_url, "--lifecycle-url", &url])
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("token"))
+        .args([
+            "destroy",
+            deletion_id,
+            "--operation-id",
+            "9bd0ee01-f814-4475-b1b7-02326bd9a1ff",
+            "--wait",
+        ])
+        .output()
+        .expect("resume an already-admitted concurrent delete receipt");
+    assert!(
+        concurrent_wait.status.success(),
+        "{}",
+        String::from_utf8_lossy(&concurrent_wait.stderr)
+    );
+    let concurrently_deleted: Value = serde_json::from_slice(&concurrent_wait.stdout).unwrap();
+    assert_eq!(concurrently_deleted["id"], cli_receipt["id"]);
+    assert_eq!(concurrently_deleted["phase"], "deleted");
+
     let cli_directory: Vec<Value> = request_with_token(
         &url,
         "GET",
@@ -771,6 +1007,29 @@ else:
             .as_str()
             .unwrap()
             .contains("ownership mismatch")
+    );
+    let cli_failed_delete = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--runner-url", &runner_url, "--lifecycle-url", &url])
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("token"))
+        .args([
+            "destroy",
+            "durable-test",
+            "--operation-id",
+            failed_delete_id,
+            "--wait",
+        ])
+        .output()
+        .expect("wait for failed destroy from CLI");
+    assert!(!cli_failed_delete.status.success());
+    assert!(
+        String::from_utf8_lossy(&cli_failed_delete.stderr).contains("ownership mismatch"),
+        "{}",
+        String::from_utf8_lossy(&cli_failed_delete.stderr)
     );
     let directory: Vec<Value> = request_with_token(
         &url,
