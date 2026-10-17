@@ -8,6 +8,13 @@ case "$mode" in
   *) echo "adm-init-workspace: expected plain or repositories" >&2; exit 1 ;;
 esac
 mkdir -p /workspace/.adm/catalog /workspace/.adm/repositories /workspace/.adm/git /workspace/.adm/views
+mkdir -p /workspace/.adm/zsh/custom /workspace/.adm/zsh/cache
+if [ ! -e /workspace/.adm/zsh/.zshrc ]; then
+  install -m 0644 /usr/local/share/adm/zshrc /workspace/.adm/zsh/.zshrc
+fi
+touch /workspace/.adm/zsh/.zsh_history
 chown -R 1000:1000 /workspace
 chmod 755 /workspace /workspace/.adm /workspace/.adm/catalog /workspace/.adm/git
 chmod 700 /workspace/.adm/repositories /workspace/.adm/views
+chmod 700 /workspace/.adm/zsh /workspace/.adm/zsh/custom /workspace/.adm/zsh/cache
+chmod 600 /workspace/.adm/zsh/.zsh_history

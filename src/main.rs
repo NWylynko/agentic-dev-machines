@@ -1089,10 +1089,12 @@ fn run(cli: &Cli) -> Result<()> {
             if command.is_empty() {
                 let working_directory = &workspace.cwd;
                 child.args([
-                    "bash",
+                    "env",
+                    "ZDOTDIR=/workspace/.adm/zsh",
+                    "zsh",
                     "-l",
                     "-c",
-                    "cd -- \"$1\" && export PWD=\"$1\" && exec bash -l",
+                    "cd -- \"$1\" && export PWD=\"$1\" && exec zsh -l",
                     "adm-shell",
                     working_directory,
                 ]);
