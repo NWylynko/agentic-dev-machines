@@ -22,7 +22,13 @@ RUN npx esbuild packages/runner/src/remote-env-server.ts --bundle --platform=nod
 FROM node:24.18.0-bookworm
 COPY LICENSE /usr/share/licenses/adm/LICENSE
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bash ca-certificates git tini fuse3 chromium nano sudo \
+ && apt-get install -y --no-install-recommends bash ca-certificates git tini fuse3 chromium nano sudo wget \
+ && install -d -m 0755 /etc/apt/keyrings \
+ && wget -qO /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh \
  && printf '#1000 ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/adm \
  && chmod 0440 /etc/sudoers.d/adm \
  && rm -rf /var/lib/apt/lists/*
