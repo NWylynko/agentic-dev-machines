@@ -293,7 +293,7 @@ export class WorkspaceTerminal extends Container {
       }
     }
     this.statusLine.setText(
-      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · Ctrl+O: tool details · Ctrl+T: thinking · Shift+Tab: cycle thinking · /model · /settings · /tree · /resume · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
+      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · Ctrl+O: tool details · Ctrl+T: thinking · Shift+Tab: cycle thinking · /model · /settings · /thinking · /session · /resume · /fork · /tree · /hotkeys · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
     );
     this.options.onRender?.();
   }
@@ -672,7 +672,7 @@ export class WorkspaceTerminal extends Container {
     try {
       if (message === "/help") {
         this.status =
-          "/model · /settings · /tree · /resume · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /resume selects a durable workspace branch; /retry retries a safe failed provider turn.";
+          "/model · /settings · /thinking · /session · /resume · /fork · /tree · /hotkeys · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /thinking changes the durable thinking level; /session shows the selected workspace conversation; /resume selects a durable branch; /fork opens the durable tree; /retry retries a safe failed provider turn.";
         clearInput();
         return;
       }
@@ -716,6 +716,29 @@ export class WorkspaceTerminal extends Container {
         clearInput();
         return;
       }
+      if (message === "/thinking") {
+        if (!this.connected)
+          throw new Error("Reconnect before changing settings");
+        this.openThinkingSelector();
+        clearInput();
+        return;
+      }
+      if (message === "/session") {
+        if (!this.connected)
+          throw new Error("Reconnect before viewing session information");
+        const navigation = await this.request("/branches");
+        if (
+          !Number.isSafeInteger(navigation.activeConversationId) ||
+          !Array.isArray(navigation.branches)
+        )
+          throw new Error(
+            "Runner returned invalid workspace session information",
+          );
+        const branches = navigation.branches;
+        this.status = `Workspace session ${clean(navigation.activeConversationId)} · ${branches.length} durable conversations`;
+        clearInput();
+        return;
+      }
       if (message === "/resume") {
         if (!this.connected)
           throw new Error("Reconnect before selecting a branch");
@@ -723,10 +746,23 @@ export class WorkspaceTerminal extends Container {
         clearInput();
         return;
       }
+      if (message === "/fork") {
+        if (!this.connected)
+          throw new Error("Reconnect before opening the tree");
+        await this.openTreeSelector();
+        clearInput();
+        return;
+      }
       if (message === "/tree") {
         if (!this.connected)
           throw new Error("Reconnect before opening the tree");
         await this.openTreeSelector();
+        clearInput();
+        return;
+      }
+      if (message === "/hotkeys") {
+        this.status =
+          "Keyboard shortcuts\nEnter: send or steer · Shift+Enter: new line · Ctrl+O: expand tool details · Ctrl+T: toggle thinking · Shift+Tab: cycle thinking · Esc: abort · Ctrl+R: reconnect · Ctrl+C: detach\nCommands: /model · /settings · /thinking · /session · /resume · /fork · /tree · /hotkeys · /compact · /reset · /retry";
         clearInput();
         return;
       }

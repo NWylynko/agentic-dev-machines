@@ -9,6 +9,113 @@ import {
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
 
+test("Pi command aliases open their Durable-backed controls and hotkey help", async () => {
+  let stream: import("node:http").ServerResponse | undefined;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history")) {
+      response.end(
+        JSON.stringify({ events: [], nextAfter: 0, hasMore: false }),
+      );
+    } else if (url.pathname.endsWith("/models")) {
+      response.end(
+        JSON.stringify({
+          selected: { provider: "faux", id: "faux-1" },
+          providers: [],
+          models: [{ provider: "faux", id: "faux-1", reasoning: true }],
+        }),
+      );
+    } else if (url.pathname.endsWith("/settings")) {
+      response.end(JSON.stringify({ thinkingLevel: "off" }));
+    } else if (url.pathname.endsWith("/branches")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId: 9,
+          branches: [{ conversationId: 9 }],
+        }),
+      );
+    } else if (url.pathname.endsWith("/tree")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId: 9,
+          events: [
+            {
+              seq: 1,
+              kind: "user",
+              timestamp: new Date().toISOString(),
+              data: {
+                message: {
+                  role: "user",
+                  content: [{ type: "text", text: "hello" }],
+                },
+              },
+            },
+          ],
+          nextAfter: 1,
+          hasMore: false,
+        }),
+      );
+    } else if (url.pathname.endsWith("/events")) {
+      stream = response;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else if (request.method === "GET") {
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          role: "coding",
+          status: "idle",
+        }),
+      );
+    } else {
+      response.end(JSON.stringify({ status: "accepted" }));
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const ui = new TuiMainScreen(new ProcessTerminal());
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+    tui: ui,
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit("/thinking");
+    assert.ok(
+      (terminal as any).activeSelector,
+      "/thinking should open the Pi selector",
+    );
+    terminal.handleInput("\x1b");
+
+    await terminal.submit("/session");
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /Workspace session 9/,
+    );
+
+    await terminal.submit("/fork");
+    assert.ok(
+      (terminal as any).activeSelector,
+      "/fork should open the Durable tree selector",
+    );
+    terminal.handleInput("\x1b");
+
+    await terminal.submit("/hotkeys");
+    const rendered = stripTerminalSequences(terminal.render(100).join("\n"));
+    assert.match(rendered, /Ctrl\+O/);
+    assert.match(rendered, /Shift\+Tab/);
+  } finally {
+    terminal.close();
+    stream?.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 test("Pi compact and retry controls call the Durable workspace operations", async () => {
   const requests: { method: string; path: string; body: string }[] = [];
   let stream: import("node:http").ServerResponse | undefined;

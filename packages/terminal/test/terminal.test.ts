@@ -859,6 +859,17 @@ test(
             /Echo: The runner continued after terminal detach/,
           );
 
+          firstOutput = "";
+          second.stdin.write("/session\r");
+          await waitForOutput(second, "Workspace session");
+          firstOutput = "";
+          second.stdin.write("/hotkeys\r");
+          await waitForOutput(second, "Keyboard shortcuts");
+          await waitForOutput(second, "Ctrl+O");
+          await waitForOutput(second, "Shift+Tab");
+          assert.match(stripTerminalSequences(firstOutput), /Ctrl\+O/);
+          assert.match(stripTerminalSequences(firstOutput), /Shift\+Tab/);
+
           const failedInput = await fetch(`${runnerUrl}${path}/input`, {
             method: "POST",
             headers: { "content-type": "application/json" },
