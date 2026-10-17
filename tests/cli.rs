@@ -813,7 +813,10 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
         .iter()
         .map(|value| value.as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(&command[..3], ["bash", "-l", "-c"]);
+    assert_eq!(
+        &command[..5],
+        ["env", "ZDOTDIR=/workspace/.adm/zsh", "zsh", "-l", "-c"]
+    );
     assert_eq!(command.last().map(String::as_str), Some("/repos"));
 
     let backing = root.path().join("workspace/.adm/catalog");
@@ -822,6 +825,7 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
     fs::create_dir_all(&backing).unwrap();
     fs::create_dir_all(&home).unwrap();
     symlink(&backing, &public).unwrap();
+    command[1] = format!("ZDOTDIR={}", home.display());
     *command.last_mut().unwrap() = public.to_string_lossy().into_owned();
     let mut runtime = Command::new(&command[0])
         .args(&command[1..])
@@ -834,13 +838,13 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run the Bash argv emitted by adm shell");
+        .expect("run the zsh argv emitted by adm shell");
     runtime
         .stdin
         .take()
         .unwrap()
         .write_all(
-            b"printf 'PWD=%s\\n' \"$PWD\"; printf 'pwd=%s\\n' \"$(pwd)\"; printf 'physical=%s\\n' \"$(pwd -P)\"; PS1='\\w'; printf 'prompt=%s\\n' \"${PS1@P}\"\n",
+            b"printf 'PWD=%s\\n' \"$PWD\"; printf 'pwd=%s\\n' \"$(pwd)\"; printf 'physical=%s\\n' \"$(pwd -P)\"; PS1='%~'; printf 'prompt=%s\\n' \"${(%)PS1}\"\n",
         )
         .unwrap();
     let runtime = runtime.wait_with_output().unwrap();
@@ -882,6 +886,27 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
     assert_eq!(
         actual,
         [Some("bash"), Some("-lc"), Some("printf '%s' \"$PWD\""),]
+    );
+
+    let executed = adm(
+        root.path(),
+        &[
+            "exec",
+            "shell-cwd",
+            "--",
+            "printf",
+            "%s",
+            "argument with spaces",
+        ],
+    );
+    assert!(executed.status.success(), "{executed:?}");
+    let args: Value =
+        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
+    let actual = args.as_array().unwrap();
+    let command_start = actual.iter().position(|arg| arg == "--").unwrap() + 1;
+    assert_eq!(
+        &actual[command_start..],
+        ["printf", "%s", "argument with spaces"]
     );
 }
 
@@ -2261,6 +2286,7 @@ fn manifest_exposes_the_workspace_security_profile_and_isolated_storage() {
     assert_eq!(deployment["spec"]["strategy"]["type"], "Recreate");
     assert!(pod["containers"].as_array().unwrap().len() == 1);
     assert_eq!(pod["initContainers"][0]["command"][1], "plain");
+    assert_eq!(pod["initContainers"][0]["securityContext"]["runAsUser"], 0);
 }
 
 #[test]

@@ -11,6 +11,9 @@ if [ "${1:-}" = "--check" ]; then
   test -x /usr/local/bin/artifact-fs
   test -x /usr/local/bin/adm-init-workspace
   test -x /usr/local/lib/adm-repositories/git
+  test -x /usr/bin/zsh
+  test -f /usr/local/share/adm/zshrc
+  test -f /opt/adm/oh-my-zsh/oh-my-zsh.sh
   exit 0
 fi
 exec sleep infinity

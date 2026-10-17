@@ -1,0 +1,15 @@
+export ZSH=/opt/adm/oh-my-zsh
+export ZSH_CUSTOM=/workspace/.adm/zsh/custom
+export ZSH_CACHE_DIR=/workspace/.adm/zsh/cache
+export HISTFILE=/workspace/.adm/zsh/.zsh_history
+export HISTSIZE=10000
+export SAVEHIST=10000
+export DISABLE_AUTO_UPDATE=true
+export DISABLE_UPDATE_PROMPT=true
+
+setopt APPEND_HISTORY
+setopt INC_APPEND_HISTORY
+
+ZSH_THEME="robbyrussell"
+plugins=(git)
+source "$ZSH/oh-my-zsh.sh"

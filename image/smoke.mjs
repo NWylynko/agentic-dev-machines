@@ -102,6 +102,134 @@ async function verifySignalForwarding() {
   }
 }
 
+async function verifyZshPersistenceAndShellEntrypoints() {
+  const volume = `${container}-workspace`;
+  const workingDirectory = "/workspace/shell-fixture";
+  const zshDirectory = "/workspace/.adm/zsh";
+  const marker = "ADM_ZSH_CUSTOM_TEST=persisted";
+  const check = `print -r -- "ZSH=$ZSH_VERSION UID=$UID PWD=$PWD CUSTOM=$ADM_ZSH_CUSTOM_TEST INTERACTIVE=$([[ -o interactive ]] && print yes || print no) AUTO_UPDATE=$DISABLE_AUTO_UPDATE UPDATE_PROMPT=$DISABLE_UPDATE_PROMPT"; print -s ADM_ZSH_HISTORY_TOKEN; fc -W "$HISTFILE"`;
+  const quote = (value) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+  const assertInteractiveZsh = async (entrypoint) => {
+    const shell =
+      entrypoint === "plain"
+        ? `cd -- ${quote(workingDirectory)} && env TERM=xterm ZDOTDIR=${quote(zshDirectory)} zsh -l -i -c ${quote(check)}`
+        : `bash -l -c ${quote(`cd -- "$1" && export PWD="$1" PATH="$2:$PATH" ADM_MANAGE_SOCKET="$3" && exec env TERM=xterm ZDOTDIR=${zshDirectory} zsh -l -i -c ${quote(check)}`)} adm-shell ${quote(workingDirectory)} /tmp/adm-managed-bin /tmp/adm-managed.sock`;
+    const { stdout } = await docker(
+      "run",
+      "--rm",
+      "--user",
+      "1000:1000",
+      "--network",
+      "none",
+      "--mount",
+      `type=volume,src=${volume},dst=/workspace`,
+      "--workdir",
+      workingDirectory,
+      "--entrypoint",
+      "/usr/bin/script",
+      image,
+      "-qec",
+      shell,
+      "/dev/null",
+    );
+    assert.match(stdout, /ZSH=\d/);
+    assert.match(stdout, /UID=1000/);
+    assert.match(stdout, new RegExp(`PWD=${workingDirectory.replaceAll("/", "\\/")}`));
+    assert.match(stdout, /CUSTOM=persisted/);
+    assert.match(stdout, /INTERACTIVE=yes/);
+    assert.match(stdout, /AUTO_UPDATE=true UPDATE_PROMPT=true/);
+    return stdout;
+  };
+
+  await docker("volume", "create", volume);
+  try {
+    await docker(
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--mount",
+      `type=volume,src=${volume},dst=/workspace`,
+      "--entrypoint",
+      "/usr/local/bin/adm-init-workspace",
+      image,
+      "plain",
+    );
+    await docker(
+      "run",
+      "--rm",
+      "--user",
+      "1000:1000",
+      "--network",
+      "none",
+      "--mount",
+      `type=volume,src=${volume},dst=/workspace`,
+      "--entrypoint",
+      "/bin/sh",
+      image,
+      "-eu",
+      "-c",
+      `mkdir -p '${workingDirectory}' && printf '\nexport ${marker}\n' >> '${zshDirectory}/.zshrc'`,
+    );
+
+    await assertInteractiveZsh("plain");
+    await assertInteractiveZsh("managed");
+
+    // A replacement Pod runs the initializer again against the same private PVC.
+    await docker(
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--mount",
+      `type=volume,src=${volume},dst=/workspace`,
+      "--entrypoint",
+      "/usr/local/bin/adm-init-workspace",
+      image,
+      "plain",
+    );
+    const { stdout: config } = await docker(
+      "run",
+      "--rm",
+      "--user",
+      "1000:1000",
+      "--network",
+      "none",
+      "--mount",
+      `type=volume,src=${volume},dst=/workspace`,
+      "--entrypoint",
+      "/bin/sh",
+      image,
+      "-c",
+      `cat '${zshDirectory}/.zshrc' && test -w '${zshDirectory}/.zsh_history'`,
+    );
+    assert.equal(
+      config.split("\n").filter((line) => line === `export ${marker}`).length,
+      1,
+      "workspace initialization must preserve user edits instead of reseeding configuration",
+    );
+    await assertInteractiveZsh("plain");
+    const { stdout: history } = await docker(
+      "run",
+      "--rm",
+      "--user",
+      "1000:1000",
+      "--network",
+      "none",
+      "--mount",
+      `type=volume,src=${volume},dst=/workspace`,
+      "--entrypoint",
+      "/bin/sh",
+      image,
+      "-c",
+      `cat '${zshDirectory}/.zsh_history'`,
+    );
+    assert.match(history, /ADM_ZSH_HISTORY_TOKEN/);
+  } finally {
+    await docker("volume", "rm", volume);
+  }
+}
+
 async function verifyPackageInstallation() {
   const packageRoot = await mkdtemp(join(tmpdir(), "adm-package-fixture-"));
   const { stdout: architecture } = await exec("dpkg", ["--print-architecture"]);
@@ -356,6 +484,7 @@ try {
   assert.match(ghVersion.stdout, /^gh version \d+\.\d+\.\d+/m);
   const ghHelp = await docker("exec", container, "gh", "help");
   assert.match(ghHelp.stdout, /USAGE\s+gh <command>/);
+  assert.match((await docker("exec", container, "zsh", "--version")).stdout, /^zsh 5\./);
   const root = await docker(
     "exec",
     container,
@@ -389,6 +518,7 @@ try {
     "-e",
     browserFixture,
   );
+  await verifyZshPersistenceAndShellEntrypoints();
   process.stdout.write(`Image smoke passed for ${image} in ${container}\n`);
 } catch (error) {
   failure = error;

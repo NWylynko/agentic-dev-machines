@@ -39,9 +39,10 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/kubectl
 
 FROM node:24.18.0-bookworm
+ARG OH_MY_ZSH_REVISION=4d4cfc287e9d887b81242c0e431b5f49f9cec5c1
 COPY LICENSE /usr/share/licenses/adm/LICENSE
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bash ca-certificates git tini fuse3 chromium nano sudo wget \
+ && apt-get install -y --no-install-recommends bash ca-certificates git tini fuse3 chromium nano sudo wget zsh \
  && install -d -m 0755 /etc/apt/keyrings \
  && wget -qO /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -51,6 +52,11 @@ RUN apt-get update \
  && printf '#1000 ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/adm \
  && chmod 0440 /etc/sudoers.d/adm \
  && rm -rf /var/lib/apt/lists/*
+RUN git init /opt/adm/oh-my-zsh \
+ && git -C /opt/adm/oh-my-zsh remote add origin https://github.com/ohmyzsh/ohmyzsh.git \
+ && git -C /opt/adm/oh-my-zsh fetch --depth=1 origin "$OH_MY_ZSH_REVISION" \
+ && git -C /opt/adm/oh-my-zsh checkout --detach FETCH_HEAD
+COPY image/zshrc /usr/local/share/adm/zshrc
 COPY --from=go-build /out/adm-repositories /usr/local/bin/adm-repositories
 COPY --from=go-build /go/bin/artifact-fs /usr/local/bin/artifact-fs
 COPY packages/repositories/git /usr/local/lib/adm-repositories/git
@@ -68,12 +74,14 @@ RUN chown root:root \
       /usr/local/bin/adm-dev-entrypoint \
       /usr/local/bin/adm-init-workspace \
       /usr/local/lib/adm-repositories/git \
+      /usr/local/share/adm/zshrc \
  && chmod 755 \
       /usr/local/bin/adm-repositories \
       /usr/local/bin/artifact-fs \
       /usr/local/bin/adm-dev-entrypoint \
       /usr/local/bin/adm-init-workspace \
       /usr/local/lib/adm-repositories/git \
+      /usr/local/share/adm/zshrc \
  && ln -sfn /workspace/.adm/catalog /repos
 WORKDIR /
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/adm-dev-entrypoint"]
