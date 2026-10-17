@@ -744,7 +744,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|compact|reset|settings))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|compact|reset|settings))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -917,6 +917,13 @@ const server = createServer(async (request, response) => {
     await assertActive(id);
     if (request.method === "GET" && action === "branches")
       return json(response, 200, await workspace.branches());
+    if (request.method === "POST" && action === "new") {
+      await body(request);
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(response, 200, await workspace.newSession());
+      });
+    }
     if (request.method === "PUT" && action === "branch") {
       const data = await body(request);
       if (

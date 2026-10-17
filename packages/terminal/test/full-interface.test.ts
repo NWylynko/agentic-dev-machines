@@ -2,12 +2,460 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile as writeFileFs,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { WorkspaceTerminal } from "../src/terminal.ts";
+import {
+  configureTerminalKeybindings,
+  terminalKeybindings,
+} from "../src/keybindings.ts";
+import { SettingsSelectorComponent } from "@earendil-works/pi-coding-agent";
 import {
   ProcessTerminal,
   stripTerminalSequences,
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
+
+test("Pi command aliases open their Durable-backed controls and hotkey help", async () => {
+  let stream: import("node:http").ServerResponse | undefined;
+  let activeConversationId = 9;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history")) {
+      response.end(
+        JSON.stringify(
+          activeConversationId === 9
+            ? {
+                events: [
+                  {
+                    seq: 1,
+                    workspaceId: "work",
+                    kind: "user",
+                    data: { text: "hello" },
+                    timestamp: 1,
+                  },
+                  {
+                    seq: 2,
+                    workspaceId: "work",
+                    kind: "assistant",
+                    data: {
+                      text: "hello there",
+                      message: {
+                        role: "assistant",
+                        usage: {
+                          input: 10,
+                          output: 4,
+                          cacheRead: 2,
+                          cacheWrite: 1,
+                          totalTokens: 17,
+                          cost: { total: 0.02 },
+                        },
+                      },
+                    },
+                    timestamp: 2,
+                  },
+                ],
+                nextAfter: 2,
+                hasMore: false,
+              }
+            : { events: [], nextAfter: 0, hasMore: false },
+        ),
+      );
+    } else if (url.pathname.endsWith("/models")) {
+      response.end(
+        JSON.stringify({
+          selected: { provider: "faux", id: "faux-1" },
+          providers: [],
+          models: [{ provider: "faux", id: "faux-1", reasoning: true }],
+        }),
+      );
+    } else if (url.pathname.endsWith("/settings")) {
+      response.end(JSON.stringify({ thinkingLevel: "off" }));
+    } else if (url.pathname.endsWith("/branches")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          branches: [{ conversationId: 9 }, { conversationId: 10 }],
+        }),
+      );
+    } else if (url.pathname.endsWith("/tree")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          events: [
+            {
+              seq: 1,
+              kind: "user",
+              timestamp: new Date().toISOString(),
+              data: {
+                message: {
+                  role: "user",
+                  content: [{ type: "text", text: "hello" }],
+                },
+              },
+            },
+          ],
+          nextAfter: 1,
+          hasMore: false,
+        }),
+      );
+    } else if (url.pathname.endsWith("/events")) {
+      stream = response;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else if (url.pathname.endsWith("/new")) {
+      activeConversationId = 10;
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          model: { provider: "faux", id: "faux-1" },
+        }),
+      );
+    } else if (request.method === "GET") {
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          role: "coding",
+          status: "idle",
+        }),
+      );
+    } else {
+      response.end(JSON.stringify({ status: "accepted" }));
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const ui = new TuiMainScreen(new ProcessTerminal());
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+    tui: ui,
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit("/thinking");
+    assert.ok(
+      (terminal as any).activeSelector,
+      "/thinking should open the Pi selector",
+    );
+    terminal.handleInput("\x1b");
+
+    await terminal.submit("/session");
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /Workspace session 9/,
+    );
+    const sessionStats = stripTerminalSequences(
+      terminal.render(100).join("\n"),
+    );
+    assert.match(sessionStats, /1 prompt/);
+    assert.match(sessionStats, /1 reply/);
+    assert.match(sessionStats, /17 tokens/);
+    assert.match(sessionStats, /\$0\.020/);
+
+    await terminal.submit("/fork");
+    assert.ok(
+      (terminal as any).activeSelector,
+      "/fork should open the Durable tree selector",
+    );
+    terminal.handleInput("\x1b");
+
+    await terminal.submit("/hotkeys");
+    const rendered = stripTerminalSequences(terminal.render(100).join("\n"));
+    assert.match(rendered, /Ctrl\+O/);
+    assert.match(rendered, /Shift\+Tab/);
+
+    await terminal.submit("/settings");
+    const settingsWrapper = (terminal as any).activeSelector;
+    assert.ok(settingsWrapper.children[0] instanceof SettingsSelectorComponent);
+    const settingsText = stripTerminalSequences(
+      terminal.render(100).join("\n"),
+    );
+    assert.match(settingsText, /Auto-compact/);
+    terminal.handleInput("\r");
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /Auto-compact is not configurable through adm attach/,
+    );
+
+    await terminal.submit("/new");
+    assert.equal(activeConversationId, 10);
+    assert.equal((terminal as any).cursor, 0);
+    assert.equal((terminal as any).records.length, 0);
+    assert.match(
+      stripTerminalSequences(terminal.render(100).join("\n")),
+      /New workspace session 10/,
+    );
+  } finally {
+    terminal.close();
+    stream?.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("/copy copies the selected assistant reply and only explicit bot messages", async () => {
+  let role: "coding" | "bot" = "coding";
+  const copied: string[] = [];
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId: 1,
+          events:
+            role === "coding"
+              ? [
+                  {
+                    seq: 1,
+                    workspaceId: "work",
+                    kind: "assistant",
+                    data: { text: "Coding reply" },
+                    timestamp: 1,
+                  },
+                ]
+              : [
+                  {
+                    seq: 1,
+                    workspaceId: "work",
+                    kind: "assistant",
+                    data: { text: "Private bot reasoning" },
+                    timestamp: 1,
+                  },
+                  {
+                    seq: 2,
+                    workspaceId: "work",
+                    kind: "message",
+                    data: { text: "Published bot message" },
+                    timestamp: 2,
+                  },
+                ],
+          nextAfter: role === "coding" ? 1 : 2,
+          hasMore: false,
+        }),
+      );
+    } else if (url.pathname.endsWith("/models")) {
+      response.end(JSON.stringify({ models: [], providers: [] }));
+    } else if (url.pathname.endsWith("/settings")) {
+      response.end(JSON.stringify({ thinkingLevel: "off" }));
+    } else if (url.pathname.endsWith("/branches")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId: 1,
+          branches: [{ conversationId: 1 }],
+        }),
+      );
+    } else if (url.pathname.endsWith("/events")) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else {
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          role,
+          conversationId: 1,
+          status: "idle",
+        }),
+      );
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const directory = await mkdtemp(join(tmpdir(), "adm-bot-export-"));
+  const exportPath = join(directory, "bot.md");
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+    diagnostics: true,
+    writeClipboard: async (text) => void copied.push(text),
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit("/copy");
+    assert.deepEqual(copied, ["Coding reply"]);
+    role = "bot";
+    await terminal.connect();
+    await terminal.submit("/copy");
+    assert.deepEqual(copied, ["Coding reply", "Published bot message"]);
+    await terminal.submit("/session");
+    assert.equal(
+      (terminal as any).status,
+      "Workspace session 1 · 1 durable conversations · 0 prompts",
+      "bot session stats must not reveal private replies, tool output, or usage",
+    );
+    await terminal.submit(`/export "${exportPath}"`);
+    const botExport = await readFile(exportPath, "utf8");
+    assert.match(botExport, /Published bot message/);
+    assert.doesNotMatch(botExport, /Private bot reasoning/);
+  } finally {
+    terminal.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("/export writes the selected Durable transcript as local Markdown", async () => {
+  let stream: import("node:http").ServerResponse | undefined;
+  const server = createServer((request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history")) {
+      response.end(
+        JSON.stringify({
+          activeConversationId: 1,
+          events: [
+            {
+              seq: 1,
+              workspaceId: "work",
+              kind: "user",
+              data: { text: "Please inspect" },
+              timestamp: 1,
+            },
+            {
+              seq: 2,
+              workspaceId: "work",
+              kind: "assistant",
+              data: { text: "I inspected it." },
+              timestamp: 2,
+            },
+            {
+              seq: 3,
+              workspaceId: "work",
+              kind: "tool",
+              data: { name: "read", text: "file contents", isError: false },
+              timestamp: 3,
+            },
+          ],
+          nextAfter: 3,
+          hasMore: false,
+        }),
+      );
+    } else if (url.pathname.endsWith("/events")) {
+      stream = response;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else if (request.method === "GET")
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          conversationId: 1,
+          role: "coding",
+          status: "idle",
+        }),
+      );
+    else response.end(JSON.stringify({ status: "accepted" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const directory = await mkdtemp(join(tmpdir(), "adm-export-"));
+  const path = join(directory, "session notes.md");
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit(`/export "${path}"`);
+    const contents =
+      "# Workspace session 1\n\n## You\n\nPlease inspect\n\n## Assistant\n\nI inspected it.\n\n## Tool: read\n\nfile contents\n";
+    assert.equal(await readFile(path, "utf8"), contents);
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+    assert.match((terminal as any).status, /Exported transcript to/);
+    await terminal.submit(`/export "${path}"`);
+    assert.match((terminal as any).status, /EEXIST/);
+    assert.equal(await readFile(path, "utf8"), contents);
+  } finally {
+    terminal.close();
+    stream?.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("Pi keybindings.json configures mapped shortcuts while detach stays fixed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-keybindings-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = directory;
+  try {
+    await writeFileFs(
+      join(directory, "keybindings.json"),
+      JSON.stringify({
+        "app.tools.expand": "ctrl+e",
+        "app.thinking.toggle": "ctrl+g",
+        "app.clear": "ctrl+x",
+      }),
+    );
+    await configureTerminalKeybindings();
+    assert.deepEqual(terminalKeybindings.getKeys("app.tools.expand" as any), [
+      "ctrl+e",
+    ]);
+    assert.deepEqual(
+      terminalKeybindings.getKeys("app.thinking.toggle" as any),
+      ["ctrl+g"],
+    );
+    assert.deepEqual(terminalKeybindings.getKeys("app.thinking.cycle" as any), [
+      "shift+tab",
+    ]);
+    assert.deepEqual(terminalKeybindings.getKeys("app.clear" as any), []);
+    const remapped = new WorkspaceTerminal({
+      url: "http://127.0.0.1",
+      workspaceId: "work",
+    });
+    remapped.handleInput("\x05");
+    assert.equal((remapped as any).toolsExpanded, true);
+    remapped.close();
+    let detached = false;
+    const detachTerminal = new WorkspaceTerminal({
+      url: "http://127.0.0.1",
+      workspaceId: "work",
+      onDetach: () => {
+        detached = true;
+      },
+    });
+    detachTerminal.handleInput("\x03");
+    assert.equal(
+      detached,
+      true,
+      "Ctrl+C must always detach even when app.clear is configured",
+    );
+    await writeFileFs(
+      join(directory, "keybindings.json"),
+      JSON.stringify({ "app.tools.expand": [] }),
+    );
+    await configureTerminalKeybindings();
+    assert.deepEqual(
+      terminalKeybindings.getKeys("app.tools.expand" as any),
+      [],
+    );
+    await writeFileFs(join(directory, "keybindings.json"), "[]");
+    await assert.rejects(
+      configureTerminalKeybindings(),
+      /expected a JSON object/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    terminalKeybindings.setUserBindings({});
+    await rm(directory, { recursive: true });
+  }
+});
 
 test("Pi compact and retry controls call the Durable workspace operations", async () => {
   const requests: { method: string; path: string; body: string }[] = [];

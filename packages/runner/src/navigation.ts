@@ -3,7 +3,9 @@ import {
   defineDoc,
   type Conversation,
   type ConversationId,
+  type ConversationInit,
   type EntryId,
+  type AgentChange,
   type Harness,
 } from "@earendil-works/pi-durable";
 
@@ -86,6 +88,39 @@ export async function selectWorkspaceBranch(
     navigation.activeConversationId = conversationId;
   }, context);
   return { activeConversationId: conversationId };
+}
+
+export async function createWorkspaceConversation(
+  harness: Harness,
+  parentConversationId: number,
+  agent: AgentChange,
+  initialize?: ConversationInit,
+) {
+  const state = await workspaceBranches(harness);
+  if (state.activeConversationId !== parentConversationId)
+    throw new Error("Workspace conversation changed; retry creating a session");
+  const conversation = await harness.createConversation(
+    {
+      ownership: { kind: "ownerless" },
+      agent,
+      init: async (tx, conversationId) => {
+        const navigation = await tx.doc(navigationDocument);
+        if (navigation.activeConversationId !== parentConversationId)
+          throw new Error(
+            "Workspace conversation changed; retry creating a session",
+          );
+        navigation.branches.push({
+          conversationId: Number(conversationId),
+          parentConversationId,
+          createdAt: Date.now(),
+        });
+        navigation.activeConversationId = Number(conversationId);
+        await initialize?.(tx, conversationId);
+      },
+    },
+    context,
+  );
+  return { activeConversationId: Number(conversation.id) };
 }
 
 export async function forkWorkspaceBranch(

@@ -10,7 +10,6 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -119,7 +118,13 @@ test(
     await execute(
       process.execPath,
       [join(project, "tests/shell-management.test.mjs"), adm],
-      { cwd: unrelated, env: environment, maxBuffer: 1024 * 1024 },
+      {
+        cwd: unrelated,
+        // Unix socket paths must fit Linux's 108-byte sun_path, even when
+        // the release archive is built under a longer disk-backed TMPDIR.
+        env: { ...environment, TMPDIR: "/tmp" },
+        maxBuffer: 1024 * 1024,
+      },
     );
     assert.equal(
       await readFile(join(installed, "IMAGE"), "utf8"),
@@ -158,21 +163,67 @@ test(
     );
     assert.equal(provider.stderr, "");
 
-    const socket = createServer();
-    socket.listen(0, "127.0.0.1");
-    await once(socket, "listening");
-    const port = socket.address().port;
-    await new Promise((resolve, reject) =>
-      socket.close((error) => (error ? reject(error) : resolve())),
+    const identity = "release-fixture-pod-identity";
+    const holder = "731db50f-237a-4f43-af54-a9d033e9c3b1";
+    const tokenFile = join(directory, "projected-token");
+    const workspaceConfig = join(directory, "workspace.json");
+    await writeFile(tokenFile, identity + "\n", { mode: 0o600 });
+    await writeFile(
+      workspaceConfig,
+      JSON.stringify({
+        id: "release-bot",
+        name: "release",
+        role: "bot",
+        environment: "pod",
+        model: { provider: "faux", id: "faux-1" },
+      }),
     );
+    const lifecycle = createHttpServer(async (request, response) => {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : {};
+      const authorized = request.headers.authorization === `Bearer ${identity}`;
+      const initial = request.url.endsWith("/lease");
+      const action = request.url.endsWith("/authorize");
+      const valid =
+        authorized &&
+        (action ||
+          (body.holder === holder && (initial || body.fencingToken === 1)));
+      response.writeHead(valid ? 200 : 403, {
+        "content-type": "application/json",
+      });
+      response.end(
+        JSON.stringify(
+          valid
+            ? { holder, fencingToken: 1 }
+            : { error: { message: "invalid fixture identity or fence" } },
+        ),
+      );
+    });
+    lifecycle.listen(0, "127.0.0.1");
+    await once(lifecycle, "listening");
+    t.after(() => {
+      lifecycle.closeAllConnections();
+      return new Promise((resolve) => lifecycle.close(resolve));
+    });
     const child = spawn(
-      adm,
+      process.execPath,
       [
-        "--runner-url",
-        `http://127.0.0.1:${port}`,
+        join(installed, "runtime/runner.mjs"),
+        "--port",
+        "0",
         "--state-dir",
         join(directory, "state"),
-        "serve",
+        "--workspace-config",
+        workspaceConfig,
+        "--token-file",
+        tokenFile,
+        "--lifecycle-url",
+        `http://127.0.0.1:${lifecycle.address().port}`,
+        "--pod-uid",
+        holder,
+        "--provider",
+        "faux",
       ],
       {
         cwd: unrelated,
@@ -214,7 +265,10 @@ test(
     async function request(path, method = "GET", body) {
       const response = await fetch(url + path, {
         method,
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${identity}`,
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const result = await response.json();
@@ -223,13 +277,7 @@ test(
     }
     assert.equal((await request("/health")).status, "ok");
     const path = "/v1/workspaces/release-bot";
-    await request(path, "PUT", {
-      id: "release-bot",
-      name: "release",
-      role: "bot",
-      environment: "local",
-      model: { provider: "faux", id: "faux-1" },
-    });
+    assert.equal((await request(path)).role, "bot");
     await request(path + "/input", "POST", {
       requestId: "release-worker",
       whenBusy: "followUp",
@@ -249,6 +297,7 @@ test(
     });
     const controller = new AbortController();
     const response = await fetch(url + path + "/events", {
+      headers: { authorization: `Bearer ${identity}` },
       signal: AbortSignal.any([controller.signal, t.signal]),
     });
     assert.equal(response.status, 200);
