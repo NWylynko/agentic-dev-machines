@@ -673,6 +673,21 @@ impl WorkspaceStore {
         tx.commit()?;
         Ok(())
     }
+    pub fn check_runtime_owner(&self, workspace_id: &str, holder: &str) -> Result<()> {
+        let (active_holder, expires_at): (String, i64) = self
+            .connection
+            .query_row(
+                "SELECT holder,expires_at FROM runtime_leases WHERE workspace_id=?1",
+                [workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .with_context(|| "runtime caller is not authorized for workspace")?;
+        ensure!(
+            active_holder == holder && expires_at as u64 > now(),
+            "runtime caller is not authorized for workspace"
+        );
+        Ok(())
+    }
     pub fn pending_lifecycle_operations(&self) -> Result<Vec<(String, String)>> {
         let mut statement = self.connection.prepare(
             "SELECT operation_id,request FROM lifecycle_operations WHERE status IN ('accepted','running','failed') ORDER BY accepted_at,operation_id",

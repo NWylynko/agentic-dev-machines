@@ -1092,7 +1092,27 @@ fn authorize_workspace_action(
         "unknown runtime action"
     );
     let target = store.find(target_id)?;
-    let (username, _) = review_runtime_token(cli, authorization)?;
+    let source = authorize_runtime_caller(cli, store, authorization)?;
+    if target.phase == "deleting" || target.phase == "deleted" {
+        anyhow::bail!("workspace lifecycle is deleting");
+    }
+    ensure!(
+        action != "status" || source.id == target.id,
+        "runtime status is restricted to its own workspace"
+    );
+    ensure!(
+        source.id == target.id || (source.role == "bot" && target.role == "coding"),
+        "runtime caller is not authorized for workspace"
+    );
+    Ok(())
+}
+
+pub(crate) fn authorize_runtime_caller(
+    cli: &crate::Cli,
+    store: &WorkspaceStore,
+    authorization: &str,
+) -> Result<Workspace> {
+    let (username, pod_uid) = review_runtime_token(cli, authorization)?;
     let (service_account, name) = username
         .rsplit_once(':')
         .context("runtime identity is invalid")?;
@@ -1112,20 +1132,39 @@ fn authorize_workspace_action(
         .into_iter()
         .find(|workspace| workspace.namespace == namespace)
         .context("runtime caller is not authorized for workspace")?;
-    if target.phase == "deleting" || target.phase == "deleted" {
-        anyhow::bail!("workspace lifecycle is deleting");
-    }
     ensure!(
         source.phase != "deleting" && source.phase != "deleted",
         "runtime caller is not authorized for workspace"
     );
+    let pods = crate::workspaces::kubectl(
+        cli,
+        &[
+            "get",
+            "pods",
+            "--all-namespaces",
+            "-l",
+            "app.kubernetes.io/managed-by=adm",
+            "-o",
+            "json",
+        ],
+        None,
+    )?;
+    let pods: Value = serde_json::from_slice(&pods).context("decode runtime owner Pod list")?;
+    let live_owner_pods = pods["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|pod| {
+            pod["metadata"]["namespace"] == source.namespace
+                && pod["metadata"]["uid"] == pod_uid
+                && pod["metadata"]["labels"]["adm.dev/workspace-id"] == source.id
+                && pod["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "adm"
+        })
+        .count();
     ensure!(
-        action != "status" || source.id == target.id,
-        "runtime status is restricted to its own workspace"
-    );
-    ensure!(
-        source.id == target.id || (source.role == "bot" && target.role == "coding"),
+        live_owner_pods == 1,
         "runtime caller is not authorized for workspace"
     );
-    Ok(())
+    store.check_runtime_owner(&source.id, &pod_uid)?;
+    Ok(source)
 }
