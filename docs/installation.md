@@ -20,6 +20,23 @@ Settings are nonsecret JSON at `$XDG_CONFIG_HOME/adm/config.json`, normally `$HO
 
 The generated runner service does not inherit keys from your login shell. Configure each coding workspace's credentials with Pi login in that workspace or references to keys in a Secret in that workspace's namespace. For API keys, pass references such as `--credential-env OPENAI_API_KEY=provider-auth:openai`; ADM stores only the environment name and Secret/key reference and maps the value into that workspace's dev container. No particular secret manager is required. Do not put values in ADM config, service files, or project `.env` files. Persistent user services after logout require operator-configured systemd lingering; setup reports this requirement.
 
+## In-cluster lifecycle owner
+
+The CLI uses the in-cluster lifecycle API for workspace creation, deletion, and directory reads. Install the control plane after configuring the `adm-replicated` StorageClass and publishing an ADM image containing the matching `adm` and `kubectl` binaries. The [lifecycle API guide](lifecycle-api.md) describes the API and authentication boundary.
+
+Create the namespace, then create a protected client token file and put the same token in the Kubernetes Secret. Generate and transfer the token through your secret manager; keep it out of shell history, manifests, and repository files. The Secret must be named `adm-lifecycle-token` in `adm-system`, with key `token`. Apply `deploy/lifecycle/control-plane.yaml` after the Secret exists. It creates the service account and RBAC, persistent state claim, single-owner Deployment, and private ClusterIP Service.
+
+The management host reaches that private Service through a supervised local port-forward:
+
+```sh
+kubectl create namespace adm-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n adm-system create secret generic adm-lifecycle-token --from-file=token=/secure/path/lifecycle-token
+kubectl apply -f deploy/lifecycle/control-plane.yaml
+kubectl -n adm-system port-forward service/adm-lifecycle 7433:7433
+```
+
+Point `ADM_LIFECYCLE_URL` to `http://127.0.0.1:7433` and `ADM_LIFECYCLE_TOKEN_FILE` to the protected client token file. Supervise the port-forward separately from the CLI. The service token grants full lifecycle API access; keep it on trusted management clients and do not mount it into workspace Pods. The manifest and API behavior have fake-Kubernetes test coverage; this install path has not been applied to the live cluster.
+
 ```sh
 adm doctor
 adm start  # when not using the background service

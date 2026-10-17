@@ -1,4 +1,4 @@
-use crate::{Cli, workspaces};
+use crate::{Cli, lifecycle};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -29,11 +29,12 @@ pub fn run(cli: &Cli, action: &HerdrAction) -> Result<()> {
     match action {
         HerdrAction::Bind { name, space } => {
             ensure!(!space.is_empty(), "Herdr space ID must not be empty");
-            let store = cli.store()?;
-            let mut workspace = store.active(name)?;
-            workspace.herdr_space = Some(space.clone());
-            store.save(&workspace)?;
-            crate::print_json(&workspace)
+            let workspace = cli.active_workspace(name)?;
+            crate::print_json(&cli.request_lifecycle(
+                "PUT",
+                &format!("/v1/workspaces/{}/herdr", workspace.id),
+                Some(&json!({"spaceId":space})),
+            )?)
         }
         HerdrAction::Hook => crate::print_json(&json!({
             "command": "adm herdr watch --socket \"$HERDR_SOCKET_PATH\"",
@@ -103,12 +104,23 @@ fn record_close(cli: &Cli, space: &str) -> Result<()> {
 
 fn destroy_bound_space(cli: &Cli, space: &str, compact: bool) -> Result<()> {
     for workspace in cli
-        .store()?
-        .list(false)?
+        .workspaces(false)?
         .into_iter()
         .filter(|workspace| workspace.herdr_space.as_deref() == Some(space))
     {
-        let destroyed = workspaces::destroy(cli, &workspace.id)?;
+        // The immutable workspace UUID is a stable, unique key for its one
+        // destruction operation across Herdr journal replay.
+        let operation_id = workspace.id.clone();
+        let destroyed = cli.request_lifecycle(
+            "POST",
+            "/v1/operations",
+            Some(&serde_json::to_value(
+                lifecycle::OperationRequest::Delete {
+                    operation_id,
+                    workspace_id: workspace.id,
+                },
+            )?),
+        )?;
         if compact {
             println!("{}", serde_json::to_string(&destroyed)?);
         } else {

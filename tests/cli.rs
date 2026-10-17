@@ -10,6 +10,24 @@ use std::{
 };
 use tempfile::TempDir;
 
+struct TestFixture {
+    root: TempDir,
+    lifecycle: std::process::Child,
+}
+
+impl TestFixture {
+    fn path(&self) -> &Path {
+        self.root.path()
+    }
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        let _ = self.lifecycle.kill();
+        let _ = self.lifecycle.wait();
+    }
+}
+
 #[test]
 fn fresh_runner_start_returns_and_daemon_survives_cli_exit() {
     let root = tempfile::tempdir().unwrap();
@@ -63,15 +81,27 @@ fn prompt_omits_absent_request_id_and_preserves_explicit_id_deduplication() {
 }
 
 fn adm(root: &Path, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
         .arg(root.join("kubectl"))
-        .args(arguments)
-        .output()
-        .expect("run public CLI")
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    command.output().expect("run public CLI")
+}
+
+fn configure_lifecycle(command: &mut Command, root: &Path) {
+    let url = root.join("lifecycle-url");
+    if url.exists() {
+        command
+            .arg("--lifecycle-url")
+            .arg(fs::read_to_string(url).unwrap())
+            .arg("--lifecycle-token-file")
+            .arg(root.join("lifecycle-token"));
+    }
 }
 
 #[test]
@@ -139,7 +169,6 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
         "stop",
         "doctor",
         "herdr",
-        "completions",
         "help",
     ] {
         assert_eq!(help.matches(&format!("  {command} ")).count(), 1, "{help}");
@@ -155,88 +184,9 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
     assert_eq!(run(&["list", "--bad-flag"], true).status.code(), Some(2));
 }
 
-#[test]
-fn zsh_completions_load_and_complete_cli_commands_and_flags_offline() {
-    let root = tempfile::tempdir().unwrap();
-    fs::create_dir_all(root.path().join("config/adm")).unwrap();
-    fs::write(root.path().join("config/adm/config.json"), "not json").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_DATA_HOME", root.path().join("data"))
-        .env("ADM_STATE_DIR", root.path().join("state"))
-        .env("KUBECONFIG", root.path().join("missing-kubeconfig"))
-        .args([
-            "--runner-url",
-            "http://127.0.0.1:1",
-            "--kubectl",
-            "/missing/kubectl",
-            "completions",
-            "zsh",
-        ])
-        .output()
-        .expect("run completion generation through the public CLI");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let script = String::from_utf8(output.stdout).unwrap();
-    assert!(script.contains("_adm"), "{script}");
-    assert!(script.contains("herdr"), "{script}");
-    assert!(!root.path().join("data/adm").exists());
-    assert!(!root.path().join("state").exists());
-
-    let script_path = root.path().join("_adm");
-    fs::write(&script_path, script).unwrap();
-    if Command::new("zsh").arg("--version").output().is_err() {
-        eprintln!("skipping interactive completion assertions because zsh is unavailable");
-        return;
-    }
-    let driver = root.path().join("completion-test.zsh");
-    fs::write(
-        &driver,
-        r#"zmodload zsh/zpty
-zpty adm-completion zsh -f -i
-zpty -w adm-completion $'stty -echo\nautoload -Uz compinit\ncompinit -D\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() { print -r -- "__ADM_RESULT__:$*"; }\nprint __ADM_READY__\n'
-zpty -r -m adm-completion output '*__ADM_READY__*'
-for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t'; do
-  zpty -w adm-completion "$input"
-  zpty -r -m adm-completion output '*__ADM_RESULT__*'
-  print -r -- "$output"
-done
-zpty -d adm-completion
-"#,
-    )
-    .unwrap();
-    let zsh = Command::new("zsh")
-        .env("ZDOTDIR", root.path())
-        .env("ADM_TEST_COMPLETION_SCRIPT", &script_path)
-        .arg("-f")
-        .arg(&driver)
-        .output()
-        .expect("load completion script in zsh");
-    assert!(
-        zsh.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&zsh.stdout),
-        String::from_utf8_lossy(&zsh.stderr)
-    );
-    let candidates = String::from_utf8_lossy(&zsh.stdout);
-    for candidate in [
-        "adm list",
-        "adm herdr bind",
-        "adm list --json",
-        "adm --state-dir",
-    ] {
-        assert!(
-            candidates.contains(candidate),
-            "missing {candidate:?}: {candidates}"
-        );
-    }
-}
-
 fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
@@ -244,7 +194,9 @@ fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output 
         .arg(root.join("kubectl"))
         .arg("--runner-url")
         .arg(runner_url)
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    command
         .output()
         .expect("run public CLI with runner fixture")
 }
@@ -255,7 +207,8 @@ fn adm_with_runner_env(
     arguments: &[&str],
     git_config: (&str, &str),
 ) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -269,7 +222,9 @@ fn adm_with_runner_env(
         .arg(root.join("kubectl"))
         .arg("--runner-url")
         .arg(runner_url)
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    command
         .output()
         .expect("run public CLI with Git and runner fixtures")
 }
@@ -316,13 +271,16 @@ fn serve_runner_status_fixture(listener: TcpListener) {
 }
 
 fn adm_with_input(root: &Path, arguments: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
         .arg(root.join("kubectl"))
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -347,7 +305,7 @@ fn assert_ok(output: Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON response")
 }
 
-fn fixture() -> TempDir {
+fn fixture() -> TestFixture {
     let root = tempfile::tempdir().unwrap();
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, r##"#!/usr/bin/env python3
@@ -363,7 +321,27 @@ def wait_for_release(stage):
     entered.write_text('waiting')
     while not release.exists():
         __import__('time').sleep(0.01)
-if args[:2] == ['get', 'storageclass']:
+if args[:2] == ['get','lease']:
+    lease=pathlib.Path(__file__).parent / 'lease.json'
+    if not lease.exists(): print('Error from server (NotFound): leases not found',file=sys.stderr);sys.exit(1)
+    print(lease.read_text())
+elif args[:2] == ['create','-f']:
+    lease=json.load(sys.stdin); lease['metadata']['resourceVersion']='1'
+    (pathlib.Path(__file__).parent / 'lease.json').write_text(json.dumps(lease));print(json.dumps(lease))
+elif args[:2] == ['replace','-f']:
+    lease=json.load(sys.stdin); leasepath=pathlib.Path(__file__).parent / 'lease.json'
+    current=json.loads(leasepath.read_text())
+    if lease['metadata'].get('resourceVersion') != current['metadata']['resourceVersion']:
+        print('Error from server (Conflict): resourceVersion conflict',file=sys.stderr);sys.exit(1)
+    lease['metadata']['resourceVersion']=str(int(current['metadata']['resourceVersion'])+1)
+    leasepath.write_text(json.dumps(lease));print(json.dumps(lease))
+elif args[:2] == ['get','pods']:
+    items=[]
+    for namespace, resource in state.items():
+        workspace_id=resource['metadata'].get('labels',{}).get('adm.dev/workspace-id')
+        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':{'phase':'Running','containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
+    print(json.dumps({'kind':'PodList','items':items}))
+elif args[:2] == ['get', 'storageclass']:
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
 elif args[0] == 'apply':
     doc=json.load(sys.stdin)
@@ -414,7 +392,42 @@ elif args and args[0] == 'exec':
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
 "##).unwrap();
     fs::set_permissions(kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    root
+    fs::write(
+        root.path().join("lifecycle-token"),
+        "fixture-lifecycle-token\n",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    fs::write(
+        root.path().join("lifecycle-url"),
+        format!("http://127.0.0.1:{port}"),
+    )
+    .unwrap();
+    let lifecycle = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("lifecycle-token"))
+        .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("start lifecycle service fixture");
+    let url = format!("http://127.0.0.1:{port}/health");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while reqwest::blocking::get(&url).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lifecycle fixture failed to start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    TestFixture { root, lifecycle }
 }
 
 #[test]
@@ -433,13 +446,16 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         mpsc::Receiver<String>,
         std::thread::JoinHandle<String>,
     ) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+        command
             .env("XDG_CONFIG_HOME", root.join("config"))
             .arg("--state-dir")
             .arg(root.join("state"))
             .arg("--kubectl")
             .arg(root.join("kubectl"))
-            .args(args)
+            .args(args);
+        configure_lifecycle(&mut command, root);
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -488,7 +504,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let readiness = root.path().join("release-readiness");
     let (create, create_progress, create_stderr) = launch(
         root.path(),
-        &["create", "progress-demo", "--no-repositories"],
+        &["create", "progress-demo", "--no-agent", "--no-repositories"],
     );
     wait_for_file(&root.path().join("entered-readiness"));
     let active_create_stage =
@@ -531,7 +547,6 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         wait_for_stage(&destroy_progress, "waiting for namespace removal started");
     let during_destroy = assert_ok(adm(root.path(), &["list", "--json"]));
     assert_eq!(during_destroy[0]["phase"], "deleting");
-    assert_eq!(during_destroy[0]["activity"]["status"], "deleted");
     let cluster: Value =
         serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
     assert!(
@@ -569,7 +584,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
 }
 
 #[test]
-fn list_shows_activity_and_keeps_full_records_with_json() {
+fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
     let root = fixture();
 
     let empty = adm(root.path(), &["list"]);
@@ -589,13 +604,16 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
 
     let coding = assert_ok(adm(
         root.path(),
-        &["create", "coding-agent", "--no-repositories"],
+        &["create", "coding-agent", "--no-agent", "--no-repositories"],
     ));
     let shell = assert_ok(adm(
         root.path(),
-        &["create", "shell-only", "--no-repositories"],
+        &["create", "shell-only", "--no-agent", "--no-repositories"],
     ));
-    let bot = assert_ok(adm(root.path(), &["create", "observer", "--role", "bot"]));
+    let bot = assert_ok(adm(
+        root.path(),
+        &["create", "observer", "--role", "bot", "--no-agent"],
+    ));
 
     let table = adm(root.path(), &["list"]);
     assert!(
@@ -608,15 +626,14 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
         table.contains("NAME")
             && table.contains("ROLE")
             && table.contains("PHASE")
-            && table.contains("AGENT CONFIG")
-            && table.contains("ACTIVITY")
+            && table.contains("AGENT")
             && table.contains("ID"),
         "{table}"
     );
     for (name, role, agent, record) in [
-        ("coding-agent", "coding", "needs_model", &coding),
-        ("shell-only", "coding", "needs_model", &shell),
-        ("observer", "bot", "needs_model", &bot),
+        ("coding-agent", "coding", "disabled", &coding),
+        ("shell-only", "coding", "disabled", &shell),
+        ("observer", "bot", "disabled", &bot),
     ] {
         assert!(table.contains(name), "{table}");
         assert!(table.contains(role), "{table}");
@@ -652,7 +669,7 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
         3
     );
 
-    // A runner outage leaves stored records listable and never calls kubectl.
+    // Listing is local even when both external dependencies are unavailable.
     let marker = root.path().join("kubectl-contacted");
     let kubectl = root.path().join("kubectl");
     fs::write(
@@ -677,194 +694,11 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
 }
 
 #[test]
-fn list_joins_activity_from_one_runner_directory_request() {
-    let root = fixture();
-    let needs_model = assert_ok(adm(
-        root.path(),
-        &["create", "disabled", "--no-repositories"],
-    ));
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let creation_server = std::thread::spawn(move || {
-        let mut ids = Vec::new();
-        for _ in 0..8 {
-            let (stream, _) = listener.accept().unwrap();
-            let mut request = BufReader::new(stream);
-            let mut line = String::new();
-            request.read_line(&mut line).unwrap();
-            let method = line.split_whitespace().next().unwrap().to_owned();
-            let mut content_length = 0;
-            loop {
-                line.clear();
-                request.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                if line.to_ascii_lowercase().starts_with("content-length:") {
-                    content_length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; content_length];
-            request.read_exact(&mut body).unwrap();
-            if method == "PUT" {
-                ids.push(
-                    serde_json::from_slice::<Value>(&body).unwrap()["id"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                );
-            }
-            let response = if method == "GET" {
-                r#"{"status":"ok"}"#
-            } else {
-                "{}"
-            };
-            let mut stream = request.into_inner();
-            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).unwrap();
-        }
-        ids
-    });
-    for name in ["idle", "running", "error", "missing"] {
-        let created = adm_with_runner(
-            root.path(),
-            &runner_url,
-            &["create", name, "--role", "bot", "--model", "faux/faux-1"],
-        );
-        assert!(
-            created.status.success(),
-            "{}",
-            String::from_utf8_lossy(&created.stderr)
-        );
-    }
-    let ids = creation_server.join().unwrap();
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let batch = serde_json::json!({"workspaces":[
-        {"id":ids[0],"status":"idle"},
-        {"id":ids[1],"status":"running"},
-        {"id":ids[2],"status":"error","error":"provider token expired"}
-    ]})
-    .to_string();
-    let request_server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut request = BufReader::new(stream);
-        let mut line = String::new();
-        request.read_line(&mut line).unwrap();
-        let path = line.split_whitespace().nth(1).unwrap().to_owned();
-        let mut stream = request.into_inner();
-        write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{batch}", batch.len()).unwrap();
-        path
-    });
-    let listed = adm_with_runner(root.path(), &runner_url, &["list", "--json"]);
-    assert!(
-        listed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&listed.stderr)
-    );
-    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(listed[0]["id"], needs_model["id"]);
-    assert_eq!(listed[0]["activity"]["status"], "unavailable");
-    for (name, activity) in [("idle", "idle"), ("running", "running"), ("error", "error")] {
-        let row = listed
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["name"] == name)
-            .unwrap();
-        assert_eq!(row["activity"]["status"], activity);
-    }
-    assert_eq!(
-        listed
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["name"] == "error")
-            .unwrap()["activity"]["error"],
-        "provider token expired"
-    );
-    let missing = listed
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "missing")
-        .unwrap();
-    assert_eq!(missing["activity"]["status"], "unavailable");
-    assert!(
-        missing["activity"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("directory omitted")
-    );
-    assert_eq!(request_server.join().unwrap(), "/v1/workspaces");
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let running_id = ids[1].clone();
-    let status_server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut request = BufReader::new(stream);
-        let mut line = String::new();
-        request.read_line(&mut line).unwrap();
-        let path = line.split_whitespace().nth(1).unwrap().to_owned();
-        let body = format!(r#"{{"id":"{running_id}","status":"running"}}"#);
-        let mut stream = request.into_inner();
-        write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
-        path
-    });
-    let status = adm_with_runner(root.path(), &runner_url, &["status", "running", "--json"]);
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["activity"]["status"], "running");
-    assert_eq!(status["agent"]["status"], "running");
-    assert_eq!(
-        status_server.join().unwrap(),
-        format!("/v1/workspaces/{}", ids[1])
-    );
-
-    assert_ok(adm(root.path(), &["destroy", "disabled"]));
-    let kubectl_contact = root.path().join("list-kubectl-contact");
-    fs::write(
-        root.path().join("kubectl"),
-        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", kubectl_contact.display()),
-    )
-    .unwrap();
-    let all = adm_with_runner(
-        root.path(),
-        "http://127.0.0.1:1",
-        &["list", "--all", "--json"],
-    );
-    assert!(all.status.success());
-    let all: Value = serde_json::from_slice(&all.stdout).unwrap();
-    let deleted = all
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "disabled")
-        .unwrap();
-    assert_eq!(deleted["phase"], "deleted");
-    assert_eq!(deleted["activity"]["status"], "deleted");
-    assert_eq!(
-        all.as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["name"] == "running")
-            .unwrap()["activity"]["status"],
-        "unavailable"
-    );
-    assert!(!kubectl_contact.exists());
-}
-
-#[test]
 fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
     let root = fixture();
     assert_ok(adm(
         root.path(),
-        &["create", "shell-cwd", "--no-repositories"],
+        &["create", "shell-cwd", "--no-agent", "--no-repositories"],
     ));
 
     let shell = adm(root.path(), &["shell", "shell-cwd"]);
@@ -1293,7 +1127,13 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
     let other = adm_with_runner_env(
         root.path(),
         &runner_url,
-        &["create", "repo-other", "--repo", "owner/project"],
+        &[
+            "create",
+            "repo-other",
+            "--no-agent",
+            "--repo",
+            "owner/project",
+        ],
         (&rewrite, "https://github.com/"),
     );
     let other_guidance = String::from_utf8_lossy(&other.stderr);
@@ -1433,7 +1273,7 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "runner-error", "--no-repositories"],
+        &["create", "runner-error", "--no-agent", "--no-repositories"],
     ));
     let database = rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
     let mut spec: Value = serde_json::from_str(
@@ -1510,7 +1350,10 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
 #[test]
 fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
     let root = fixture();
-    let created = adm(root.path(), &["create", "navigation", "--no-repositories"]);
+    let created = adm(
+        root.path(),
+        &["create", "navigation", "--no-agent", "--no-repositories"],
+    );
     assert!(created.status.success(), "{created:?}");
     let workspace: Value =
         serde_json::from_slice(&created.stdout).expect("create keeps its workspace JSON on stdout");
@@ -1565,6 +1408,7 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
         &[
             "create",
             "catalog-navigation",
+            "--no-agent",
             "--catalog",
             catalog.to_str().unwrap(),
         ],
@@ -1620,38 +1464,48 @@ fn managed_shell_client_is_scoped_and_closes_without_aborting_the_agent() {
 fn public_cli_rejects_unsafe_names_before_touching_the_cluster() {
     let root = tempfile::tempdir().unwrap();
     for name in ["../escape", "UPPER", "a/b", "", "bad name"] {
-        let output = adm(root.path(), &["create", name, "--no-repositories"]);
+        let output = adm(
+            root.path(),
+            &["create", name, "--no-agent", "--no-repositories"],
+        );
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("name"));
     }
 }
 
 #[test]
-fn agent_workspace_can_be_created_before_a_model_is_selected() {
+fn agent_workspace_requires_an_explicit_model_before_provisioning() {
     let root = fixture();
     let output = adm(root.path(), &["create", "needs-model"]);
+    assert!(!output.status.success());
     assert!(
-        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).contains("--model PROVIDER/MODEL_ID"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let workspace: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(workspace["agent_enabled"], true);
-    assert!(workspace["model"].is_null());
-    assert_eq!(workspace["phase"], "ready");
+    assert!(
+        !root.path().join("state/workspaces.sqlite").exists(),
+        "invalid agent configuration must fail before local or cluster provisioning"
+    );
 }
 
 #[test]
 fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() {
     let root = fixture();
-    let first = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
+    let first = assert_ok(adm(
+        root.path(),
+        &["create", "demo", "--no-agent", "--no-repositories"],
+    ));
     assert_eq!(first["name"], "demo");
     assert_eq!(first["phase"], "ready");
     assert_eq!(
         assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"],
         first["id"]
     );
-    let duplicate = adm(root.path(), &["create", "demo", "--no-repositories"]);
+    let duplicate = adm(
+        root.path(),
+        &["create", "demo", "--no-agent", "--no-repositories"],
+    );
     assert!(
         !duplicate.status.success(),
         "duplicate names must be explicit errors"
@@ -1672,15 +1526,24 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
         assert_ok(adm(root.path(), &["list", "--json", "--all"]))[0]["phase"],
         "deleted"
     );
-    let second = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
+    let second = assert_ok(adm(
+        root.path(),
+        &["create", "demo", "--no-agent", "--no-repositories"],
+    ));
     assert_ne!(first["id"], second["id"]);
 }
 
 #[test]
 fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let root = fixture();
-    let coding = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
-    let bot = assert_ok(adm(root.path(), &["create", "supervisor", "--role", "bot"]));
+    let coding = assert_ok(adm(
+        root.path(),
+        &["create", "demo", "--no-agent", "--no-repositories"],
+    ));
+    let bot = assert_ok(adm(
+        root.path(),
+        &["create", "supervisor", "--role", "bot", "--no-agent"],
+    ));
 
     let status = adm(root.path(), &["status", "demo"]);
     assert!(
@@ -1693,8 +1556,8 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         status.contains("NAME")
             && status.contains("ROLE")
             && status.contains("PHASE")
-            && status.contains("RUNTIME")
-            && status.contains("ACTIVITY")
+            && status.contains("POD")
+            && status.contains("AGENT")
             && status.contains("NODE"),
         "{status}"
     );
@@ -1702,12 +1565,8 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         status.contains("demo")
             && status.contains("coding")
             && status.contains("NotReady (Running)")
-            && status.contains("Runtime readiness: NotReady (Running)")
-            && status.contains("needs_model")
+            && status.contains("disabled")
             && status.contains("node-a")
-            && status.contains(&format!("ID: {}", coding["id"].as_str().unwrap()))
-            && status.contains("Namespace:")
-            && status.contains("Resources: CPU 2, memory 2Gi, storage 4Gi")
             && status.contains("ContainersNotReady"),
         "{status}"
     );
@@ -1748,8 +1607,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let full = assert_ok(adm(root.path(), &["status", "demo", "--json"]));
     assert_eq!(full["workspace"]["id"], coding["id"]);
     assert_eq!(full["cluster"]["pods"][0]["status"]["phase"], "Running");
-    assert_eq!(full["agent"]["status"], "needs_model");
-    assert_eq!(full["activity"]["status"], "needs_model");
+    assert_eq!(full["agent"]["status"], "disabled");
     assert_eq!(
         assert_ok(adm(root.path(), &["inspect", "demo", "--json"])),
         full
@@ -1786,7 +1644,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         bot_status.contains("bot")
             && bot_status.contains("n/a")
             && bot_status.contains("management host")
-            && bot_status.contains("needs_model"),
+            && bot_status.contains("disabled"),
         "{bot_status}"
     );
     assert_eq!(
@@ -1803,19 +1661,6 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     assert!(
         bot_inspect.contains("Location: management host (no workspace Pod)"),
         "{bot_inspect}"
-    );
-
-    assert_ok(adm(root.path(), &["destroy", "supervisor"]));
-    let deleted_bot = adm(root.path(), &["status", "supervisor"]);
-    assert!(deleted_bot.status.success());
-    let deleted_bot = String::from_utf8_lossy(&deleted_bot.stdout);
-    assert!(
-        deleted_bot.contains("Runtime readiness: deleted"),
-        "{deleted_bot}"
-    );
-    assert!(
-        deleted_bot.contains("Agent activity: deleted"),
-        "{deleted_bot}"
     );
 
     assert_eq!(
@@ -1881,34 +1726,13 @@ fn status_distinguishes_agent_provider_errors_from_unavailable_runner() {
     );
     let status = String::from_utf8_lossy(&status.stdout);
     assert!(
-        status.contains("ACTIVITY")
+        status.contains("AGENT")
             && status.contains("error")
             && status.contains("Agent failure: provider token expired"),
         "{status}"
     );
     assert!(!status.contains("Agent unavailable"), "{status}");
     server.join().unwrap();
-
-    let unavailable = adm_with_runner(
-        root.path(),
-        "http://127.0.0.1:1",
-        &["status", "supervisor", "--json"],
-    );
-    assert!(unavailable.status.success());
-    let unavailable: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
-    assert_eq!(unavailable["activity"]["status"], "unavailable");
-    assert_eq!(
-        unavailable["activity"]["error"], unavailable["agent"]["error"],
-        "normalized activity keeps the actual runner failure cause"
-    );
-    assert!(
-        unavailable["activity"]["error"]
-            .as_str()
-            .unwrap()
-            .to_lowercase()
-            .contains("connection refused"),
-        "{unavailable}"
-    );
 }
 
 #[test]
@@ -1916,7 +1740,10 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     let root = fixture();
     fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
 
-    let first = adm(root.path(), &["create", "retry-me", "--no-repositories"]);
+    let first = adm(
+        root.path(),
+        &["create", "retry-me", "--no-agent", "--no-repositories"],
+    );
     assert!(
         !first.status.success(),
         "stdout={} stderr={}",
@@ -1931,23 +1758,17 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     );
     let original_id = failed[0]["id"].as_str().unwrap();
     assert_eq!(failed[0]["phase"], "failed");
-    assert_eq!(failed[0]["activity"]["status"], "unavailable");
-    assert!(failed[0]["last_error"].as_str().is_some());
-    let failure_status = adm(root.path(), &["status", "retry-me"]);
-    assert!(failure_status.status.success());
-    let failure_status = String::from_utf8_lossy(&failure_status.stdout);
-    assert!(
-        failure_status.contains("Workspace failure:"),
-        "{failure_status}"
-    );
-    assert!(
-        failure_status.contains("deployment did not become available"),
-        "{failure_status}"
-    );
 
     let retried = assert_ok(adm(
         root.path(),
-        &["create", "retry-me", "--no-repositories"],
+        &[
+            "create",
+            "retry-me",
+            "--no-agent",
+            "--no-repositories",
+            "--operation-id",
+            failed[0]["creation_operation_id"].as_str().unwrap(),
+        ],
     ));
     assert_eq!(retried["phase"], "ready");
     assert_eq!(retried["id"], original_id);
@@ -1958,28 +1779,13 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
 }
 
 #[test]
-fn failed_creation_retry_keeps_the_standard_workspace_security_policy() {
-    let root = fixture();
-    fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
-
-    let first = adm(root.path(), &["create", "sudo-choice", "--no-repositories"]);
-    assert!(!first.status.success());
-    let saved = assert_ok(adm(root.path(), &["list", "--json"]));
-    let original_id = saved[0]["id"].clone();
-
-    let retry = assert_ok(adm(
-        root.path(),
-        &["create", "sudo-choice", "--no-repositories"],
-    ));
-    assert_eq!(retry["id"], original_id);
-    assert_eq!(retry["phase"], "ready");
-}
-
-#[test]
 fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
     let root = fixture();
     fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
-    let first = adm(root.path(), &["create", "retry-safe", "--no-repositories"]);
+    let first = adm(
+        root.path(),
+        &["create", "retry-safe", "--no-agent", "--no-repositories"],
+    );
     assert!(!first.status.success());
     let failed = assert_ok(adm(root.path(), &["list", "--json"]));
     let namespace = failed[0]["namespace"].as_str().unwrap();
@@ -1988,7 +1794,17 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
     cluster[namespace]["metadata"]["labels"]["adm.dev/workspace-id"] = "someone-else".into();
     fs::write(&cluster_path, serde_json::to_vec(&cluster).unwrap()).unwrap();
 
-    let retry = adm(root.path(), &["create", "retry-safe", "--no-repositories"]);
+    let retry = adm(
+        root.path(),
+        &[
+            "create",
+            "retry-safe",
+            "--no-agent",
+            "--no-repositories",
+            "--operation-id",
+            failed[0]["creation_operation_id"].as_str().unwrap(),
+        ],
+    );
     assert!(
         !retry.status.success(),
         "retry must refuse a namespace with changed ownership"
@@ -2004,7 +1820,10 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
 #[test]
 fn destruction_refuses_a_namespace_whose_immutable_ownership_changed() {
     let root = fixture();
-    let workspace = assert_ok(adm(root.path(), &["create", "safe", "--no-repositories"]));
+    let workspace = assert_ok(adm(
+        root.path(),
+        &["create", "safe", "--no-agent", "--no-repositories"],
+    ));
     let cluster_path = root.path().join("cluster.json");
     let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
     cluster[workspace["namespace"].as_str().unwrap()]["metadata"]["labels"]["adm.dev/workspace-id"] =
@@ -2026,15 +1845,15 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-owned", "--no-repositories"],
+        &["create", "herdr-owned", "--no-agent", "--no-repositories"],
     ));
     let other_workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-other", "--no-repositories"],
+        &["create", "herdr-other", "--no-agent", "--no-repositories"],
     ));
     let stale_workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-stale", "--no-repositories"],
+        &["create", "herdr-stale", "--no-agent", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2201,7 +2020,7 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "journaled", "--no-repositories"],
+        &["create", "journaled", "--no-agent", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2248,7 +2067,7 @@ fn browser_refuses_to_enter_a_namespace_whose_immutable_ownership_changed() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "browser-safe", "--no-repositories"],
+        &["create", "browser-safe", "--no-agent", "--no-repositories"],
     ));
     let cluster_path = root.path().join("cluster.json");
     let mut cluster: Value = serde_json::from_slice(&fs::read(&cluster_path).unwrap()).unwrap();
@@ -2269,7 +2088,7 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "herdr-owned", "--no-repositories"],
+        &["create", "herdr-owned", "--no-agent", "--no-repositories"],
     ));
     assert_ok(adm(
         root.path(),
@@ -2302,7 +2121,12 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
     let root = fixture();
     let workspace = assert_ok(adm(
         root.path(),
-        &["create", "offline-status", "--no-repositories"],
+        &[
+            "create",
+            "offline-status",
+            "--no-agent",
+            "--no-repositories",
+        ],
     ));
     fs::write(root.path().join("fail-status"), "offline").unwrap();
 
@@ -2332,7 +2156,7 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
 }
 
 #[test]
-fn manifest_gives_the_workspace_unattended_container_administration() {
+fn manifest_exposes_the_workspace_security_profile_and_isolated_storage() {
     let root = tempfile::tempdir().unwrap();
     let manifest = assert_ok(adm(root.path(), &["manifest", "example"]));
     let items = manifest["items"].as_array().unwrap();
@@ -2350,17 +2174,11 @@ fn manifest_gives_the_workspace_unattended_container_administration() {
         "Kubernetes must preserve the workspace image's tini entrypoint so it forwards termination signals"
     );
     assert_eq!(dev["securityContext"]["runAsUser"], 1000);
-    assert_eq!(dev["securityContext"]["runAsGroup"], 1000);
-    assert_eq!(dev["securityContext"]["runAsNonRoot"], true);
     assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
     assert_eq!(dev["securityContext"]["capabilities"]["drop"][0], "ALL");
     assert_eq!(
         dev["securityContext"]["capabilities"]["add"],
         serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
-    );
-    assert_eq!(
-        dev["securityContext"]["seccompProfile"]["type"],
-        "RuntimeDefault"
     );
     assert!(
         items
@@ -2371,25 +2189,6 @@ fn manifest_gives_the_workspace_unattended_container_administration() {
     assert_eq!(deployment["spec"]["strategy"]["type"], "Recreate");
     assert!(pod["containers"].as_array().unwrap().len() == 1);
     assert_eq!(pod["initContainers"][0]["command"][1], "plain");
-}
-
-#[test]
-fn sudo_is_the_standard_workspace_policy_and_has_no_opt_in_flag() {
-    let root = tempfile::tempdir().unwrap();
-    let manifest = assert_ok(adm(root.path(), &["manifest", "normal"]));
-    let forbidden = adm(root.path(), &["manifest", "normal", "--allow-sudo"]);
-    assert!(
-        !forbidden.status.success(),
-        "the obsolete opt-in flag must be removed"
-    );
-    assert!(String::from_utf8_lossy(&forbidden.stderr).contains("unexpected argument"));
-    let dev = &manifest["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["kind"] == "Deployment")
-        .unwrap()["spec"]["template"]["spec"]["containers"][0];
-    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
 }
 
 #[test]
@@ -2470,13 +2269,20 @@ fn repository_catalog_options_must_match_the_workspace_role() {
     let fixture = fixture();
     for (args, error) in [
         (
-            vec!["create", "bad-repo", "--repo", "owner//project"],
+            vec![
+                "create",
+                "bad-repo",
+                "--no-agent",
+                "--repo",
+                "owner//project",
+            ],
             "repository name",
         ),
         (
             vec![
                 "create",
                 "no-repos",
+                "--no-agent",
                 "--no-repositories",
                 "--repo",
                 "owner/project",
@@ -2487,6 +2293,7 @@ fn repository_catalog_options_must_match_the_workspace_role() {
             vec![
                 "create",
                 "bot-repo",
+                "--no-agent",
                 "--role",
                 "bot",
                 "--repo",
@@ -2498,6 +2305,7 @@ fn repository_catalog_options_must_match_the_workspace_role() {
             vec![
                 "create",
                 "catalog-repo",
+                "--no-agent",
                 "--catalog",
                 catalog.to_str().unwrap(),
                 "--repo",
@@ -2524,7 +2332,13 @@ fn repository_catalog_options_must_match_the_workspace_role() {
     );
     assert_ok(adm(
         fixture.path(),
-        &["manifest", "punctuation", "--repo", "_owner/project."],
+        &[
+            "manifest",
+            "punctuation",
+            "--no-agent",
+            "--repo",
+            "_owner/project.",
+        ],
     ));
 }
 
@@ -2555,7 +2369,7 @@ fn missing_replicated_storage_points_at_the_deploy_note() {
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, "#!/bin/sh\necho 'Error from server (NotFound): storageclasses.storage.k8s.io \"adm-replicated\" not found' >&2\nexit 1\n").unwrap();
     fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    let output = adm(root.path(), &["create", "demo"]);
+    let output = adm(root.path(), &["create", "demo", "--no-agent"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("deploy/storage.md"), "{stderr}");
@@ -2569,30 +2383,36 @@ fn missing_replicated_storage_points_at_the_deploy_note() {
 }
 
 #[test]
-fn manifest_delivers_only_referenced_workspace_credentials_to_the_dev_pod() {
+fn credential_environment_flags_emit_only_workspace_scoped_secret_references() {
     let root = tempfile::tempdir().unwrap();
-    let manifest = assert_ok(adm(
+    let output = adm(
         root.path(),
         &[
             "manifest",
-            "example",
+            "credentials",
+            "--no-agent",
             "--credential-env",
-            "OPENAI_API_KEY=provider-auth:openai",
+            "API_KEY=provider-secret:token",
         ],
-    ));
-    let items = manifest["items"].as_array().unwrap();
-    let deployment = items
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dev = manifest["items"]
+        .as_array()
+        .unwrap()
         .iter()
         .find(|item| item["kind"] == "Deployment")
-        .unwrap();
-    let dev = &deployment["spec"]["template"]["spec"]["containers"][0];
-    assert_eq!(dev["env"][0]["name"], "OPENAI_API_KEY");
+        .unwrap()["spec"]["template"]["spec"]["containers"][0]
+        .clone();
+    assert_eq!(dev["env"][0]["name"], "API_KEY");
     assert_eq!(
-        dev["env"][0]["valueFrom"]["secretKeyRef"]["name"],
-        "provider-auth"
+        dev["env"][0]["valueFrom"]["secretKeyRef"],
+        serde_json::json!({"name":"provider-secret","key":"token"})
     );
-    assert_eq!(dev["env"][0]["valueFrom"]["secretKeyRef"]["key"], "openai");
-    let serialized = serde_json::to_string(&manifest).unwrap();
-    assert!(!serialized.contains("synthetic"));
-    assert!(!serialized.contains("OPENAI_API_KEY="));
+    assert!(dev["env"][0].get("value").is_none());
 }
