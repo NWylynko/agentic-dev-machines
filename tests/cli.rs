@@ -646,7 +646,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
     let removal = root.path().join("release-delete");
     fs::write(root.path().join("delay-delete"), "delay").unwrap();
     let (destroy, destroy_progress, destroy_stderr) =
-        launch(root.path(), &["destroy", "progress-demo"]);
+        launch(root.path(), &["destroy", "progress-demo", "--wait"]);
     wait_for_file(&root.path().join("entered-delete"));
     let active_destroy_stage =
         wait_for_stage(&destroy_progress, "waiting for namespace removal started");
@@ -758,7 +758,7 @@ fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
     );
 
     assert_eq!(
-        assert_ok(adm(root.path(), &["destroy", "shell-only"]))["phase"],
+        assert_ok(adm(root.path(), &["destroy", "shell-only", "--wait"]))["phase"],
         "deleted"
     );
     let active = assert_ok(adm(root.path(), &["list", "--json"]));
@@ -1354,7 +1354,11 @@ fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace(
         "create never reached repository preparation"
     );
 
-    let deleted = adm_with_runner(root.path(), &runner_url, &["destroy", "delete-during-repo"]);
+    let deleted = adm_with_runner(
+        root.path(),
+        &runner_url,
+        &["destroy", "delete-during-repo", "--wait"],
+    );
     assert!(
         deleted.status.success(),
         "{}",
@@ -1431,7 +1435,11 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
             .unwrap();
         }
     });
-    let deleted = adm_with_runner(root.path(), &runner_url, &["destroy", "runner-error"]);
+    let deleted = adm_with_runner(
+        root.path(),
+        &runner_url,
+        &["destroy", "runner-error", "--wait"],
+    );
     runner.join().unwrap();
     assert!(
         !deleted.status.success(),
@@ -1612,7 +1620,7 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
         first["id"]
     );
     assert_eq!(
-        assert_ok(adm(root.path(), &["destroy", "demo"]))["phase"],
+        assert_ok(adm(root.path(), &["destroy", "demo", "--wait"]))["phase"],
         "deleted"
     );
     assert_eq!(
@@ -1752,7 +1760,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     );
 
     assert_eq!(
-        assert_ok(adm(root.path(), &["destroy", "demo"]))["phase"],
+        assert_ok(adm(root.path(), &["destroy", "demo", "--wait"]))["phase"],
         "deleted"
     );
     let deleted = adm(root.path(), &["status", "demo"]);
@@ -1906,7 +1914,7 @@ fn destruction_refuses_a_namespace_whose_immutable_ownership_changed() {
     cluster[workspace["namespace"].as_str().unwrap()]["metadata"]["labels"]["adm.dev/workspace-id"] =
         "someone-else".into();
     fs::write(cluster_path, serde_json::to_vec(&cluster).unwrap()).unwrap();
-    let output = adm(root.path(), &["destroy", "safe"]);
+    let output = adm(root.path(), &["destroy", "safe", "--wait"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("ownership"));
     assert_eq!(

@@ -60,6 +60,8 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<Value>,
     pub image: String,
     pub storage_class: String,
@@ -308,6 +310,7 @@ impl CreateOptions {
             namespace: format!("adm-{}", &id[..16]),
             phase: "provisioning".into(),
             creation_operation_id: None,
+            deletion_operation_id: None,
             runtime_status: None,
             image: self.image.clone(),
             storage_class: self.storage_class.clone(),
@@ -488,6 +491,7 @@ impl WorkspaceStore {
                     workspace.name
                 );
                 workspace.phase = "deleting".into();
+                workspace.deletion_operation_id = Some(operation_id.to_owned());
                 workspace.last_error = None;
                 let changed = transaction.execute(
                     "UPDATE workspaces SET phase='deleting',spec=?2,fencing_token=?3 WHERE id=?1 AND fencing_token<=?3",

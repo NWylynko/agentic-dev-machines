@@ -200,6 +200,7 @@ impl CreateIntent {
             namespace: format!("adm-{}", &id[..16]),
             phase: "provisioning".into(),
             creation_operation_id: Some(operation_id.to_owned()),
+            deletion_operation_id: None,
             runtime_status: None,
             image: self.image,
             storage_class: self.storage_class,
