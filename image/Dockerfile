@@ -19,6 +19,25 @@ RUN npm ci --ignore-scripts
 COPY packages/runner packages/runner
 RUN npx esbuild packages/runner/src/remote-env-server.ts --bundle --platform=node --format=esm --outfile=/out/workspace-env.mjs
 
+FROM rust:1.89-bookworm AS adm-build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --bin adm
+
+FROM debian:bookworm-slim AS kubectl-build
+ARG TARGETARCH
+ARG KUBECTL_VERSION=v1.34.1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl"; \
+    curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl.sha256"; \
+    echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum --check; \
+    chmod 0755 /usr/local/bin/kubectl
+
 FROM node:24.18.0-bookworm
 COPY LICENSE /usr/share/licenses/adm/LICENSE
 RUN apt-get update \
@@ -33,8 +52,12 @@ COPY image/adm-dev-entrypoint /usr/local/bin/adm-dev-entrypoint
 COPY image/adm-init-workspace /usr/local/bin/adm-init-workspace
 COPY image/browser.mjs /opt/adm/browser.mjs
 COPY --from=js-build /out/workspace-env.mjs /opt/adm/workspace-env.mjs
+COPY --from=adm-build /src/target/release/adm /usr/local/bin/adm
+COPY --from=kubectl-build /usr/local/bin/kubectl /usr/local/bin/kubectl
 RUN chown root:root \
       /usr/local/bin/adm-repositories \
+      /usr/local/bin/adm \
+      /usr/local/bin/kubectl \
       /usr/local/bin/artifact-fs \
       /usr/local/bin/adm-dev-entrypoint \
       /usr/local/bin/adm-init-workspace \

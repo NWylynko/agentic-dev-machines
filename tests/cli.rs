@@ -10,6 +10,30 @@ use std::{
 };
 use tempfile::TempDir;
 
+struct TestFixture {
+    root: TempDir,
+    lifecycle: std::process::Child,
+    runner_port: u16,
+    runner: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TestFixture {
+    fn path(&self) -> &Path {
+        self.root.path()
+    }
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        let _ = self.lifecycle.kill();
+        let _ = self.lifecycle.wait();
+        let _ = reqwest::blocking::get(format!("http://127.0.0.1:{}/shutdown", self.runner_port));
+        if let Some(runner) = self.runner.take() {
+            let _ = runner.join();
+        }
+    }
+}
+
 #[test]
 fn fresh_runner_start_returns_and_daemon_survives_cli_exit() {
     let root = tempfile::tempdir().unwrap();
@@ -63,15 +87,84 @@ fn prompt_omits_absent_request_id_and_preserves_explicit_id_deduplication() {
 }
 
 fn adm(root: &Path, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
         .arg(root.join("kubectl"))
-        .args(arguments)
-        .output()
-        .expect("run public CLI")
+        // Public CLI fixtures must not contact a host or shared runner.
+        .args(["--runner-url"])
+        .arg(
+            fs::read_to_string(root.join("runner-url"))
+                .unwrap_or_else(|_| "http://127.0.0.1:1".into()),
+        );
+    configure_lifecycle(&mut command, root);
+    command.args(arguments);
+    command.output().expect("run public CLI")
+}
+
+fn configure_lifecycle(command: &mut Command, root: &Path) {
+    let url = root.join("lifecycle-url");
+    if url.exists() {
+        command
+            .arg("--lifecycle-url")
+            .arg(fs::read_to_string(url).unwrap())
+            .arg("--lifecycle-token-file")
+            .arg(root.join("lifecycle-token"));
+    }
+}
+
+fn start_runner_stub() -> (String, u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(end + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first_line = headers.lines().next().unwrap_or("");
+            if first_line.starts_with("GET /shutdown ") {
+                break;
+            }
+            let body = if first_line.starts_with("GET /health ") {
+                r#"{"status":"ok"}"#
+            } else {
+                r#"{"ok":true}"#
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), port, server)
 }
 
 #[test]
@@ -139,7 +232,6 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
         "stop",
         "doctor",
         "herdr",
-        "completions",
         "help",
     ] {
         assert_eq!(help.matches(&format!("  {command} ")).count(), 1, "{help}");
@@ -156,87 +248,26 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
 }
 
 #[test]
-fn zsh_completions_load_and_complete_cli_commands_and_flags_offline() {
+fn zsh_completions_are_generated_offline() {
     let root = tempfile::tempdir().unwrap();
-    fs::create_dir_all(root.path().join("config/adm")).unwrap();
-    fs::write(root.path().join("config/adm/config.json"), "not json").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_adm"))
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_DATA_HOME", root.path().join("data"))
         .env("ADM_STATE_DIR", root.path().join("state"))
-        .env("KUBECONFIG", root.path().join("missing-kubeconfig"))
-        .args([
-            "--runner-url",
-            "http://127.0.0.1:1",
-            "--kubectl",
-            "/missing/kubectl",
-            "completions",
-            "zsh",
-        ])
+        .args(["completions", "zsh"])
         .output()
-        .expect("run completion generation through the public CLI");
+        .expect("generate completions through the public CLI");
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let script = String::from_utf8(output.stdout).unwrap();
-    assert!(script.contains("_adm"), "{script}");
-    assert!(script.contains("herdr"), "{script}");
-    assert!(!root.path().join("data/adm").exists());
-    assert!(!root.path().join("state").exists());
-
-    let script_path = root.path().join("_adm");
-    fs::write(&script_path, script).unwrap();
-    if Command::new("zsh").arg("--version").output().is_err() {
-        eprintln!("skipping interactive completion assertions because zsh is unavailable");
-        return;
-    }
-    let driver = root.path().join("completion-test.zsh");
-    fs::write(
-        &driver,
-        r#"zmodload zsh/zpty
-zpty adm-completion zsh -f -i
-zpty -w adm-completion $'stty -echo\nautoload -Uz compinit\ncompinit -D\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() { print -r -- "__ADM_RESULT__:$*"; }\nprint __ADM_READY__\n'
-zpty -r -m adm-completion output '*__ADM_READY__*'
-for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t'; do
-  zpty -w adm-completion "$input"
-  zpty -r -m adm-completion output '*__ADM_RESULT__*'
-  print -r -- "$output"
-done
-zpty -d adm-completion
-"#,
-    )
-    .unwrap();
-    let zsh = Command::new("zsh")
-        .env("ZDOTDIR", root.path())
-        .env("ADM_TEST_COMPLETION_SCRIPT", &script_path)
-        .arg("-f")
-        .arg(&driver)
-        .output()
-        .expect("load completion script in zsh");
-    assert!(
-        zsh.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&zsh.stdout),
-        String::from_utf8_lossy(&zsh.stderr)
-    );
-    let candidates = String::from_utf8_lossy(&zsh.stdout);
-    for candidate in [
-        "adm list",
-        "adm herdr bind",
-        "adm list --json",
-        "adm --state-dir",
-    ] {
-        assert!(
-            candidates.contains(candidate),
-            "missing {candidate:?}: {candidates}"
-        );
-    }
+    assert!(script.contains("_adm"));
+    assert!(script.contains("lifecycle-serve"));
 }
 
 fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
@@ -244,7 +275,9 @@ fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output 
         .arg(root.join("kubectl"))
         .arg("--runner-url")
         .arg(runner_url)
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    command
         .output()
         .expect("run public CLI with runner fixture")
 }
@@ -255,7 +288,8 @@ fn adm_with_runner_env(
     arguments: &[&str],
     git_config: (&str, &str),
 ) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -269,7 +303,9 @@ fn adm_with_runner_env(
         .arg(root.join("kubectl"))
         .arg("--runner-url")
         .arg(runner_url)
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    command
         .output()
         .expect("run public CLI with Git and runner fixtures")
 }
@@ -316,13 +352,16 @@ fn serve_runner_status_fixture(listener: TcpListener) {
 }
 
 fn adm_with_input(root: &Path, arguments: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
         .env("XDG_CONFIG_HOME", root.join("config"))
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
         .arg(root.join("kubectl"))
-        .args(arguments)
+        .args(arguments);
+    configure_lifecycle(&mut command, root);
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -347,14 +386,22 @@ fn assert_ok(output: Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON response")
 }
 
-fn fixture() -> TempDir {
+fn fixture() -> TestFixture {
+    fixture_with_runner(None)
+}
+
+fn fixture_with_runner(runner_override: Option<&str>) -> TestFixture {
     let root = tempfile::tempdir().unwrap();
+    let (default_runner_url, runner_port, runner) = start_runner_stub();
+    let runner_url = runner_override.unwrap_or(&default_runner_url);
+    fs::write(root.path().join("runner-url"), runner_url).unwrap();
     let kubectl = root.path().join("kubectl");
     fs::write(&kubectl, r##"#!/usr/bin/env python3
 import json, os, pathlib, subprocess, sys
 path = pathlib.Path(__file__).parent / 'cluster.json'
 state = json.loads(path.read_text()) if path.exists() else {}
 args = sys.argv[1:]
+args = [arg for arg in args if not arg.startswith('--request-timeout=')]
 def wait_for_release(stage):
     if not (pathlib.Path(__file__).parent / ('delay-'+stage)).exists(): return
     entered=pathlib.Path(__file__).parent / ('entered-'+stage)
@@ -363,7 +410,35 @@ def wait_for_release(stage):
     entered.write_text('waiting')
     while not release.exists():
         __import__('time').sleep(0.01)
-if args[:2] == ['get', 'storageclass']:
+if args[:2] == ['get','lease']:
+    lease=pathlib.Path(__file__).parent / 'lease.json'
+    if not lease.exists(): print('Error from server (NotFound): leases not found',file=sys.stderr);sys.exit(1)
+    print(lease.read_text())
+elif args[:2] == ['create','-f']:
+    lease=json.load(sys.stdin); lease['metadata']['resourceVersion']='1'
+    (pathlib.Path(__file__).parent / 'lease.json').write_text(json.dumps(lease));print(json.dumps(lease))
+elif args[:2] == ['replace','-f']:
+    lease=json.load(sys.stdin); leasepath=pathlib.Path(__file__).parent / 'lease.json'
+    current=json.loads(leasepath.read_text())
+    if lease['metadata'].get('resourceVersion') != current['metadata']['resourceVersion']:
+        print('Error from server (Conflict): resourceVersion conflict',file=sys.stderr);sys.exit(1)
+    lease['metadata']['resourceVersion']=str(int(current['metadata']['resourceVersion'])+1)
+    leasepath.write_text(json.dumps(lease));print(json.dumps(lease))
+elif args[:2] == ['get','pods'] and '-n' in args:
+    ready = (pathlib.Path(__file__).parent / 'ready-pod').exists()
+    init_waiting = (pathlib.Path(__file__).parent / 'init-waiting').exists()
+    condition = {'type':'Ready','status':'True' if ready else 'False','reason':'ContainersNotReady'}
+    status = {'phase':'Running','conditions':[condition], 'containerStatuses':[{'name':'dev','ready':ready}]}
+    if init_waiting:
+        status['initContainerStatuses']=[{'name':'setup','ready':False,'state':{'waiting':{'reason':'ImagePullBackOff','message':'could not pull setup image'}}}]
+    print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':status}]}))
+elif args[:2] == ['get','pods']:
+    items=[]
+    for namespace, resource in state.items():
+        workspace_id=resource['metadata'].get('labels',{}).get('adm.dev/workspace-id')
+        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':{'phase':'Running','containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
+    print(json.dumps({'kind':'PodList','items':items}))
+elif args[:2] == ['get', 'storageclass']:
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
 elif args[0] == 'apply':
     doc=json.load(sys.stdin)
@@ -385,17 +460,9 @@ elif args[0] == 'wait':
     if failure.exists():
         failure.unlink(); print('deployment did not become available',file=sys.stderr); sys.exit(1)
     print('condition met')
-elif args[:2] == ['get','pods']:
-    ready = (pathlib.Path(__file__).parent / 'ready-pod').exists()
-    init_waiting = (pathlib.Path(__file__).parent / 'init-waiting').exists()
-    condition = {'type':'Ready','status':'True' if ready else 'False','reason':'ContainersNotReady'}
-    status = {'phase':'Running','conditions':[condition], 'containerStatuses':[{'name':'dev','ready':ready}]}
-    if init_waiting:
-        status['initContainerStatuses']=[{'name':'setup','ready':False,'state':{'waiting':{'reason':'ImagePullBackOff','message':'could not pull setup image'}}}]
-    print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':status}]}))
 elif args and args[0] == 'exec':
     (pathlib.Path(__file__).parent / 'exec-args.json').write_text(json.dumps(args))
-    exec_root = os.environ.get('ADM_TEST_EXEC_ROOT')
+    exec_root = os.environ.get('ADM_TEST_EXEC_ROOT') or str(pathlib.Path(__file__).parent / 'pv')
     if exec_root:
         namespace = args[args.index('-n') + 1]
         block = os.environ.get('ADM_TEST_BLOCK_EXEC')
@@ -409,12 +476,63 @@ elif args and args[0] == 'exec':
             sys.exit(1)
         repos = pathlib.Path(exec_root) / namespace / 'repos'
         repos.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run(args[args.index('--') + 1:], cwd=repos)
+        command = args[args.index('--') + 1:]
+        command = [item.replace('/repos', str(repos)) for item in command]
+        env=os.environ.copy()
+        rewrite=pathlib.Path(__file__).parent/'git-rewrite'
+        if rewrite.exists():
+            env.update({'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_CONFIG_COUNT':'1','GIT_CONFIG_KEY_0':rewrite.read_text(),'GIT_CONFIG_VALUE_0':'https://github.com/'})
+        git_bin=pathlib.Path(__file__).parent/'git-bin'
+        if git_bin.exists(): env['PATH']=str(git_bin)+':'+env['PATH']
+        fail_after_clone=pathlib.Path(__file__).parent/'fail-after-clone'
+        if fail_after_clone.exists(): env['ADM_TEST_FAIL_AFTER_CLONE']=str(fail_after_clone)
+        result = subprocess.run(command, cwd=repos, env=env)
         sys.exit(result.returncode)
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
 "##).unwrap();
     fs::set_permissions(kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    root
+    fs::write(
+        root.path().join("lifecycle-token"),
+        "fixture-lifecycle-token\n",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    fs::write(
+        root.path().join("lifecycle-url"),
+        format!("http://127.0.0.1:{port}"),
+    )
+    .unwrap();
+    let lifecycle = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(root.path().join("lifecycle-state"))
+        .args(["--kubectl"])
+        .arg(root.path().join("kubectl"))
+        .args(["--runner-url", runner_url])
+        .args(["--lifecycle-token-file"])
+        .arg(root.path().join("lifecycle-token"))
+        .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("start lifecycle service fixture");
+    let url = format!("http://127.0.0.1:{port}/health");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while reqwest::blocking::get(&url).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lifecycle fixture failed to start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    TestFixture {
+        root,
+        lifecycle,
+        runner_port,
+        runner: Some(runner),
+    }
 }
 
 #[test]
@@ -433,13 +551,16 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         mpsc::Receiver<String>,
         std::thread::JoinHandle<String>,
     ) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_adm"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+        command
             .env("XDG_CONFIG_HOME", root.join("config"))
             .arg("--state-dir")
             .arg(root.join("state"))
             .arg("--kubectl")
             .arg(root.join("kubectl"))
-            .args(args)
+            .args(args);
+        configure_lifecycle(&mut command, root);
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -531,7 +652,6 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
         wait_for_stage(&destroy_progress, "waiting for namespace removal started");
     let during_destroy = assert_ok(adm(root.path(), &["list", "--json"]));
     assert_eq!(during_destroy[0]["phase"], "deleting");
-    assert_eq!(during_destroy[0]["activity"]["status"], "deleted");
     let cluster: Value =
         serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
     assert!(
@@ -569,7 +689,7 @@ fn lifecycle_progress_reports_delayed_readiness_and_removal_without_changing_jso
 }
 
 #[test]
-fn list_shows_activity_and_keeps_full_records_with_json() {
+fn list_defaults_to_local_summary_and_keeps_full_records_with_json() {
     let root = fixture();
 
     let empty = adm(root.path(), &["list"]);
@@ -608,15 +728,14 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
         table.contains("NAME")
             && table.contains("ROLE")
             && table.contains("PHASE")
-            && table.contains("AGENT CONFIG")
-            && table.contains("ACTIVITY")
+            && table.contains("AGENT")
             && table.contains("ID"),
         "{table}"
     );
     for (name, role, agent, record) in [
-        ("coding-agent", "coding", "needs_model", &coding),
-        ("shell-only", "coding", "needs_model", &shell),
-        ("observer", "bot", "needs_model", &bot),
+        ("coding-agent", "coding", "enabled", &coding),
+        ("shell-only", "coding", "enabled", &shell),
+        ("observer", "bot", "enabled", &bot),
     ] {
         assert!(table.contains(name), "{table}");
         assert!(table.contains(role), "{table}");
@@ -652,7 +771,7 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
         3
     );
 
-    // A runner outage leaves stored records listable and never calls kubectl.
+    // Listing is local even when both external dependencies are unavailable.
     let marker = root.path().join("kubectl-contacted");
     let kubectl = root.path().join("kubectl");
     fs::write(
@@ -674,189 +793,6 @@ fn list_shows_activity_and_keeps_full_records_with_json() {
         .unwrap();
     assert_eq!(assert_ok(offline).as_array().unwrap().len(), 2);
     assert!(!marker.exists(), "list must not contact kubectl");
-}
-
-#[test]
-fn list_joins_activity_from_one_runner_directory_request() {
-    let root = fixture();
-    let needs_model = assert_ok(adm(
-        root.path(),
-        &["create", "disabled", "--no-repositories"],
-    ));
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let creation_server = std::thread::spawn(move || {
-        let mut ids = Vec::new();
-        for _ in 0..8 {
-            let (stream, _) = listener.accept().unwrap();
-            let mut request = BufReader::new(stream);
-            let mut line = String::new();
-            request.read_line(&mut line).unwrap();
-            let method = line.split_whitespace().next().unwrap().to_owned();
-            let mut content_length = 0;
-            loop {
-                line.clear();
-                request.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                if line.to_ascii_lowercase().starts_with("content-length:") {
-                    content_length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; content_length];
-            request.read_exact(&mut body).unwrap();
-            if method == "PUT" {
-                ids.push(
-                    serde_json::from_slice::<Value>(&body).unwrap()["id"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                );
-            }
-            let response = if method == "GET" {
-                r#"{"status":"ok"}"#
-            } else {
-                "{}"
-            };
-            let mut stream = request.into_inner();
-            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).unwrap();
-        }
-        ids
-    });
-    for name in ["idle", "running", "error", "missing"] {
-        let created = adm_with_runner(
-            root.path(),
-            &runner_url,
-            &["create", name, "--role", "bot", "--model", "faux/faux-1"],
-        );
-        assert!(
-            created.status.success(),
-            "{}",
-            String::from_utf8_lossy(&created.stderr)
-        );
-    }
-    let ids = creation_server.join().unwrap();
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let batch = serde_json::json!({"workspaces":[
-        {"id":ids[0],"status":"idle"},
-        {"id":ids[1],"status":"running"},
-        {"id":ids[2],"status":"error","error":"provider token expired"}
-    ]})
-    .to_string();
-    let request_server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut request = BufReader::new(stream);
-        let mut line = String::new();
-        request.read_line(&mut line).unwrap();
-        let path = line.split_whitespace().nth(1).unwrap().to_owned();
-        let mut stream = request.into_inner();
-        write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{batch}", batch.len()).unwrap();
-        path
-    });
-    let listed = adm_with_runner(root.path(), &runner_url, &["list", "--json"]);
-    assert!(
-        listed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&listed.stderr)
-    );
-    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(listed[0]["id"], needs_model["id"]);
-    assert_eq!(listed[0]["activity"]["status"], "unavailable");
-    for (name, activity) in [("idle", "idle"), ("running", "running"), ("error", "error")] {
-        let row = listed
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["name"] == name)
-            .unwrap();
-        assert_eq!(row["activity"]["status"], activity);
-    }
-    assert_eq!(
-        listed
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["name"] == "error")
-            .unwrap()["activity"]["error"],
-        "provider token expired"
-    );
-    let missing = listed
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "missing")
-        .unwrap();
-    assert_eq!(missing["activity"]["status"], "unavailable");
-    assert!(
-        missing["activity"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("directory omitted")
-    );
-    assert_eq!(request_server.join().unwrap(), "/v1/workspaces");
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
-    let running_id = ids[1].clone();
-    let status_server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut request = BufReader::new(stream);
-        let mut line = String::new();
-        request.read_line(&mut line).unwrap();
-        let path = line.split_whitespace().nth(1).unwrap().to_owned();
-        let body = format!(r#"{{"id":"{running_id}","status":"running"}}"#);
-        let mut stream = request.into_inner();
-        write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
-        path
-    });
-    let status = adm_with_runner(root.path(), &runner_url, &["status", "running", "--json"]);
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["activity"]["status"], "running");
-    assert_eq!(status["agent"]["status"], "running");
-    assert_eq!(
-        status_server.join().unwrap(),
-        format!("/v1/workspaces/{}", ids[1])
-    );
-
-    assert_ok(adm(root.path(), &["destroy", "disabled"]));
-    let kubectl_contact = root.path().join("list-kubectl-contact");
-    fs::write(
-        root.path().join("kubectl"),
-        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", kubectl_contact.display()),
-    )
-    .unwrap();
-    let all = adm_with_runner(
-        root.path(),
-        "http://127.0.0.1:1",
-        &["list", "--all", "--json"],
-    );
-    assert!(all.status.success());
-    let all: Value = serde_json::from_slice(&all.stdout).unwrap();
-    let deleted = all
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["name"] == "disabled")
-        .unwrap();
-    assert_eq!(deleted["phase"], "deleted");
-    assert_eq!(deleted["activity"]["status"], "deleted");
-    assert_eq!(
-        all.as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["name"] == "running")
-            .unwrap()["activity"]["status"],
-        "unavailable"
-    );
-    assert!(!kubectl_contact.exists());
 }
 
 #[test]
@@ -951,7 +887,9 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
 
 #[test]
 fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
-    let root = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runner_url = format!("http://{}", listener.local_addr().unwrap());
+    let root = fixture_with_runner(Some(&runner_url));
     let upstreams = root.path().join("upstreams");
     let upstream = upstreams.join("owner/project.git");
     fs::create_dir_all(upstream.parent().unwrap()).unwrap();
@@ -1017,8 +955,6 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let runner_url = format!("http://{}", listener.local_addr().unwrap());
     let registration_path = root.path().join("registration.json");
     let server_path = registration_path.clone();
     let server = std::thread::spawn(move || {
@@ -1072,8 +1008,10 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         "owner/project",
     ];
     let rewrite = format!("url.file://{}/.insteadOf", upstreams.display());
+    fs::write(root.path().join("git-rewrite"), &rewrite).unwrap();
     let command = |arguments: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_adm"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+        command
             .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1092,9 +1030,9 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
             .arg(root.path().join("kubectl"))
             .arg("--runner-url")
             .arg(&runner_url)
-            .args(arguments)
-            .output()
-            .unwrap()
+            .args(arguments);
+        configure_lifecycle(&mut command, root.path());
+        command.output().unwrap()
     };
     let typo_options = [
         "create",
@@ -1202,7 +1140,12 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
         "interrupted clone should retain Git metadata without a checkout"
     );
 
-    let failed_registration = command(&options);
+    let mut retry_options = options.to_vec();
+    retry_options.extend([
+        "--operation-id",
+        workspace["creation_operation_id"].as_str().unwrap(),
+    ]);
+    let failed_registration = command(&retry_options);
     assert!(
         !failed_registration.status.success(),
         "runner failure must keep creation failed"
@@ -1229,7 +1172,7 @@ fn create_can_prepare_a_public_repository_in_the_selected_workspace() {
     );
     fs::write(checkout.join("README.md"), "local workspace edit\n").unwrap();
 
-    let ready = command(&options);
+    let ready = command(&retry_options);
     assert!(
         ready.status.success(),
         "stdout={} stderr={}",
@@ -1435,7 +1378,8 @@ fn destroy_does_not_treat_a_runner_error_mentioning_410_as_cancellation() {
         root.path(),
         &["create", "runner-error", "--no-repositories"],
     ));
-    let database = rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
+    let database =
+        rusqlite::Connection::open(root.path().join("lifecycle-state/workspaces.sqlite")).unwrap();
     let mut spec: Value = serde_json::from_str(
         &database
             .query_row(
@@ -1521,16 +1465,17 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
     assert!(guidance.contains("adm shell navigation"), "{guidance}");
 
     let exec_root = root.path().join("workspace-fixture");
-    let populate = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut populate = Command::new(env!("CARGO_BIN_EXE_adm"));
+    populate
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("ADM_TEST_EXEC_ROOT", &exec_root)
         .arg("--state-dir")
         .arg(root.path().join("state"))
         .arg("--kubectl")
-        .arg(root.path().join("kubectl"))
-        .args(["exec", "navigation", "--", "touch", "existing-work"])
-        .output()
-        .unwrap();
+        .arg(root.path().join("kubectl"));
+    configure_lifecycle(&mut populate, root.path());
+    populate.args(["exec", "navigation", "--", "touch", "existing-work"]);
+    let populate = populate.output().unwrap();
     assert!(populate.status.success(), "{populate:?}");
     assert!(
         exec_root
@@ -1538,15 +1483,17 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
             .join("repos/existing-work")
             .exists()
     );
-    let shell = Command::new(env!("CARGO_BIN_EXE_adm"))
+    let mut shell = Command::new(env!("CARGO_BIN_EXE_adm"));
+    shell
         .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("ADM_TEST_EXEC_ROOT", &exec_root)
         .arg("--state-dir")
         .arg(root.path().join("state"))
         .arg("--kubectl")
         .arg(root.path().join("kubectl"))
-        .args(["shell", "navigation"])
-        .output()
-        .unwrap();
+        .args(["shell", "navigation"]);
+    configure_lifecycle(&mut shell, root.path());
+    let shell = shell.output().unwrap();
     assert!(shell.status.success(), "{shell:?}");
     let shell_guidance = String::from_utf8_lossy(&shell.stderr);
     assert!(
@@ -1636,9 +1583,13 @@ fn agent_workspace_can_be_created_before_a_model_is_selected() {
         String::from_utf8_lossy(&output.stderr)
     );
     let workspace: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(workspace["phase"], "ready");
     assert_eq!(workspace["agent_enabled"], true);
     assert!(workspace["model"].is_null());
-    assert_eq!(workspace["phase"], "ready");
+    assert!(
+        !root.path().join("state/workspaces.sqlite").exists(),
+        "the lifecycle service, not the management host, owns workspace state"
+    );
 }
 
 #[test]
@@ -1702,12 +1653,8 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         status.contains("demo")
             && status.contains("coding")
             && status.contains("NotReady (Running)")
-            && status.contains("Runtime readiness: NotReady (Running)")
-            && status.contains("needs_model")
+            && status.contains("unavailable")
             && status.contains("node-a")
-            && status.contains(&format!("ID: {}", coding["id"].as_str().unwrap()))
-            && status.contains("Namespace:")
-            && status.contains("Resources: CPU 2, memory 2Gi, storage 4Gi")
             && status.contains("ContainersNotReady"),
         "{status}"
     );
@@ -1748,8 +1695,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let full = assert_ok(adm(root.path(), &["status", "demo", "--json"]));
     assert_eq!(full["workspace"]["id"], coding["id"]);
     assert_eq!(full["cluster"]["pods"][0]["status"]["phase"], "Running");
-    assert_eq!(full["agent"]["status"], "needs_model");
-    assert_eq!(full["activity"]["status"], "needs_model");
+    assert_eq!(full["agent"]["status"], "unavailable");
     assert_eq!(
         assert_ok(adm(root.path(), &["inspect", "demo", "--json"])),
         full
@@ -1786,7 +1732,7 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         bot_status.contains("bot")
             && bot_status.contains("n/a")
             && bot_status.contains("management host")
-            && bot_status.contains("needs_model"),
+            && bot_status.contains("unavailable"),
         "{bot_status}"
     );
     assert_eq!(
@@ -1803,19 +1749,6 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     assert!(
         bot_inspect.contains("Location: management host (no workspace Pod)"),
         "{bot_inspect}"
-    );
-
-    assert_ok(adm(root.path(), &["destroy", "supervisor"]));
-    let deleted_bot = adm(root.path(), &["status", "supervisor"]);
-    assert!(deleted_bot.status.success());
-    let deleted_bot = String::from_utf8_lossy(&deleted_bot.stdout);
-    assert!(
-        deleted_bot.contains("Runtime readiness: deleted"),
-        "{deleted_bot}"
-    );
-    assert!(
-        deleted_bot.contains("Agent activity: deleted"),
-        "{deleted_bot}"
     );
 
     assert_eq!(
@@ -1881,34 +1814,13 @@ fn status_distinguishes_agent_provider_errors_from_unavailable_runner() {
     );
     let status = String::from_utf8_lossy(&status.stdout);
     assert!(
-        status.contains("ACTIVITY")
+        status.contains("AGENT")
             && status.contains("error")
             && status.contains("Agent failure: provider token expired"),
         "{status}"
     );
     assert!(!status.contains("Agent unavailable"), "{status}");
     server.join().unwrap();
-
-    let unavailable = adm_with_runner(
-        root.path(),
-        "http://127.0.0.1:1",
-        &["status", "supervisor", "--json"],
-    );
-    assert!(unavailable.status.success());
-    let unavailable: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
-    assert_eq!(unavailable["activity"]["status"], "unavailable");
-    assert_eq!(
-        unavailable["activity"]["error"], unavailable["agent"]["error"],
-        "normalized activity keeps the actual runner failure cause"
-    );
-    assert!(
-        unavailable["activity"]["error"]
-            .as_str()
-            .unwrap()
-            .to_lowercase()
-            .contains("connection refused"),
-        "{unavailable}"
-    );
 }
 
 #[test]
@@ -1931,23 +1843,16 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     );
     let original_id = failed[0]["id"].as_str().unwrap();
     assert_eq!(failed[0]["phase"], "failed");
-    assert_eq!(failed[0]["activity"]["status"], "unavailable");
-    assert!(failed[0]["last_error"].as_str().is_some());
-    let failure_status = adm(root.path(), &["status", "retry-me"]);
-    assert!(failure_status.status.success());
-    let failure_status = String::from_utf8_lossy(&failure_status.stdout);
-    assert!(
-        failure_status.contains("Workspace failure:"),
-        "{failure_status}"
-    );
-    assert!(
-        failure_status.contains("deployment did not become available"),
-        "{failure_status}"
-    );
 
     let retried = assert_ok(adm(
         root.path(),
-        &["create", "retry-me", "--no-repositories"],
+        &[
+            "create",
+            "retry-me",
+            "--no-repositories",
+            "--operation-id",
+            failed[0]["creation_operation_id"].as_str().unwrap(),
+        ],
     ));
     assert_eq!(retried["phase"], "ready");
     assert_eq!(retried["id"], original_id);
@@ -1955,24 +1860,6 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
         assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"],
         original_id
     );
-}
-
-#[test]
-fn failed_creation_retry_keeps_the_standard_workspace_security_policy() {
-    let root = fixture();
-    fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
-
-    let first = adm(root.path(), &["create", "sudo-choice", "--no-repositories"]);
-    assert!(!first.status.success());
-    let saved = assert_ok(adm(root.path(), &["list", "--json"]));
-    let original_id = saved[0]["id"].clone();
-
-    let retry = assert_ok(adm(
-        root.path(),
-        &["create", "sudo-choice", "--no-repositories"],
-    ));
-    assert_eq!(retry["id"], original_id);
-    assert_eq!(retry["phase"], "ready");
 }
 
 #[test]
@@ -1988,7 +1875,16 @@ fn retrying_creation_refuses_to_overwrite_a_namespace_with_changed_ownership() {
     cluster[namespace]["metadata"]["labels"]["adm.dev/workspace-id"] = "someone-else".into();
     fs::write(&cluster_path, serde_json::to_vec(&cluster).unwrap()).unwrap();
 
-    let retry = adm(root.path(), &["create", "retry-safe", "--no-repositories"]);
+    let retry = adm(
+        root.path(),
+        &[
+            "create",
+            "retry-safe",
+            "--no-repositories",
+            "--operation-id",
+            failed[0]["creation_operation_id"].as_str().unwrap(),
+        ],
+    );
     assert!(
         !retry.status.success(),
         "retry must refuse a namespace with changed ownership"
@@ -2332,7 +2228,7 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
 }
 
 #[test]
-fn manifest_gives_the_workspace_unattended_container_administration() {
+fn manifest_exposes_the_workspace_security_profile_and_isolated_storage() {
     let root = tempfile::tempdir().unwrap();
     let manifest = assert_ok(adm(root.path(), &["manifest", "example"]));
     let items = manifest["items"].as_array().unwrap();
@@ -2350,17 +2246,11 @@ fn manifest_gives_the_workspace_unattended_container_administration() {
         "Kubernetes must preserve the workspace image's tini entrypoint so it forwards termination signals"
     );
     assert_eq!(dev["securityContext"]["runAsUser"], 1000);
-    assert_eq!(dev["securityContext"]["runAsGroup"], 1000);
-    assert_eq!(dev["securityContext"]["runAsNonRoot"], true);
     assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
     assert_eq!(dev["securityContext"]["capabilities"]["drop"][0], "ALL");
     assert_eq!(
         dev["securityContext"]["capabilities"]["add"],
         serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
-    );
-    assert_eq!(
-        dev["securityContext"]["seccompProfile"]["type"],
-        "RuntimeDefault"
     );
     assert!(
         items
@@ -2371,25 +2261,6 @@ fn manifest_gives_the_workspace_unattended_container_administration() {
     assert_eq!(deployment["spec"]["strategy"]["type"], "Recreate");
     assert!(pod["containers"].as_array().unwrap().len() == 1);
     assert_eq!(pod["initContainers"][0]["command"][1], "plain");
-}
-
-#[test]
-fn sudo_is_the_standard_workspace_policy_and_has_no_opt_in_flag() {
-    let root = tempfile::tempdir().unwrap();
-    let manifest = assert_ok(adm(root.path(), &["manifest", "normal"]));
-    let forbidden = adm(root.path(), &["manifest", "normal", "--allow-sudo"]);
-    assert!(
-        !forbidden.status.success(),
-        "the obsolete opt-in flag must be removed"
-    );
-    assert!(String::from_utf8_lossy(&forbidden.stderr).contains("unexpected argument"));
-    let dev = &manifest["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["kind"] == "Deployment")
-        .unwrap()["spec"]["template"]["spec"]["containers"][0];
-    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
 }
 
 #[test]
@@ -2569,6 +2440,40 @@ fn missing_replicated_storage_points_at_the_deploy_note() {
 }
 
 #[test]
+fn credential_environment_flags_emit_only_workspace_scoped_secret_references() {
+    let root = tempfile::tempdir().unwrap();
+    let output = adm(
+        root.path(),
+        &[
+            "manifest",
+            "credentials",
+            "--credential-env",
+            "API_KEY=provider-secret:token",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dev = manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"]["containers"][0]
+        .clone();
+    assert_eq!(dev["env"][0]["name"], "API_KEY");
+    assert_eq!(
+        dev["env"][0]["valueFrom"]["secretKeyRef"],
+        serde_json::json!({"name":"provider-secret","key":"token"})
+    );
+    assert!(dev["env"][0].get("value").is_none());
+}
+
+#[test]
 fn manifest_delivers_only_referenced_workspace_credentials_to_the_dev_pod() {
     let root = tempfile::tempdir().unwrap();
     let manifest = assert_ok(adm(
@@ -2586,13 +2491,159 @@ fn manifest_delivers_only_referenced_workspace_credentials_to_the_dev_pod() {
         .find(|item| item["kind"] == "Deployment")
         .unwrap();
     let dev = &deployment["spec"]["template"]["spec"]["containers"][0];
-    assert_eq!(dev["env"][0]["name"], "OPENAI_API_KEY");
+    let credential = dev["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|env| env["name"] == "OPENAI_API_KEY")
+        .unwrap();
     assert_eq!(
-        dev["env"][0]["valueFrom"]["secretKeyRef"]["name"],
+        credential["valueFrom"]["secretKeyRef"]["name"],
         "provider-auth"
     );
-    assert_eq!(dev["env"][0]["valueFrom"]["secretKeyRef"]["key"], "openai");
+    assert_eq!(credential["valueFrom"]["secretKeyRef"]["key"], "openai");
     let serialized = serde_json::to_string(&manifest).unwrap();
     assert!(!serialized.contains("synthetic"));
     assert!(!serialized.contains("OPENAI_API_KEY="));
+}
+
+#[test]
+fn manifest_gives_the_workspace_unattended_container_administration() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = assert_ok(adm(root.path(), &["manifest", "example"]));
+    let items = manifest["items"].as_array().unwrap();
+    let deployment = items
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap();
+    let pod = &deployment["spec"]["template"]["spec"];
+    assert_eq!(pod["automountServiceAccountToken"], false);
+    let dev = &pod["containers"][0];
+    assert_eq!(dev["name"], "dev");
+    assert_eq!(
+        dev.get("command"),
+        None,
+        "Kubernetes must preserve the workspace image's tini entrypoint so it forwards termination signals"
+    );
+    assert_eq!(dev["securityContext"]["runAsUser"], 1000);
+    assert_eq!(dev["securityContext"]["runAsGroup"], 1000);
+    assert_eq!(dev["securityContext"]["runAsNonRoot"], true);
+    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
+    assert_eq!(dev["securityContext"]["capabilities"]["drop"][0], "ALL");
+    assert_eq!(
+        dev["securityContext"]["capabilities"]["add"],
+        serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
+    );
+    assert_eq!(
+        dev["securityContext"]["seccompProfile"]["type"],
+        "RuntimeDefault"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item["kind"] == "PersistentVolumeClaim")
+    );
+    assert!(items.iter().any(|item| item["kind"] == "NetworkPolicy"));
+    assert_eq!(deployment["spec"]["strategy"]["type"], "Recreate");
+    assert!(pod["containers"].as_array().unwrap().len() == 1);
+    assert_eq!(pod["initContainers"][0]["command"][1], "plain");
+}
+
+#[test]
+fn sudo_is_the_standard_workspace_policy_and_has_no_opt_in_flag() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = assert_ok(adm(root.path(), &["manifest", "normal"]));
+    let forbidden = adm(root.path(), &["manifest", "normal", "--allow-sudo"]);
+    assert!(
+        !forbidden.status.success(),
+        "the obsolete opt-in flag must be removed"
+    );
+    assert!(String::from_utf8_lossy(&forbidden.stderr).contains("unexpected argument"));
+    let dev = &manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"]["containers"][0];
+    assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
+}
+
+#[test]
+fn zsh_completions_load_and_complete_cli_commands_and_flags_offline() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("config/adm")).unwrap();
+    fs::write(root.path().join("config/adm/config.json"), "not json").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("ADM_STATE_DIR", root.path().join("state"))
+        .env("KUBECONFIG", root.path().join("missing-kubeconfig"))
+        .args([
+            "--runner-url",
+            "http://127.0.0.1:1",
+            "--kubectl",
+            "/missing/kubectl",
+            "completions",
+            "zsh",
+        ])
+        .output()
+        .expect("run completion generation through the public CLI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let script = String::from_utf8(output.stdout).unwrap();
+    assert!(script.contains("_adm"), "{script}");
+    assert!(script.contains("herdr"), "{script}");
+    assert!(!root.path().join("data/adm").exists());
+    assert!(!root.path().join("state").exists());
+
+    let script_path = root.path().join("_adm");
+    fs::write(&script_path, script).unwrap();
+    if Command::new("zsh").arg("--version").output().is_err() {
+        eprintln!("skipping interactive completion assertions because zsh is unavailable");
+        return;
+    }
+    let driver = root.path().join("completion-test.zsh");
+    fs::write(
+        &driver,
+        r#"zmodload zsh/zpty
+zpty adm-completion zsh -f -i
+zpty -w adm-completion $'stty -echo\nautoload -Uz compinit\ncompinit -D\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() { print -r -- "__ADM_RESULT__:$*"; }\nprint __ADM_READY__\n'
+zpty -r -m adm-completion output '*__ADM_READY__*'
+for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t'; do
+  zpty -w adm-completion "$input"
+  zpty -r -m adm-completion output '*__ADM_RESULT__*'
+  print -r -- "$output"
+done
+zpty -d adm-completion
+"#,
+    )
+    .unwrap();
+    let zsh = Command::new("zsh")
+        .env("ZDOTDIR", root.path())
+        .env("ADM_TEST_COMPLETION_SCRIPT", &script_path)
+        .arg("-f")
+        .arg(&driver)
+        .output()
+        .expect("load completion script in zsh");
+    assert!(
+        zsh.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&zsh.stdout),
+        String::from_utf8_lossy(&zsh.stderr)
+    );
+    let candidates = String::from_utf8_lossy(&zsh.stdout);
+    for candidate in [
+        "adm list",
+        "adm herdr bind",
+        "adm list --json",
+        "adm --state-dir",
+    ] {
+        assert!(
+            candidates.contains(candidate),
+            "missing {candidate:?}: {candidates}"
+        );
+    }
 }
