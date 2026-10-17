@@ -16,6 +16,8 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
+// Git requires the fixture containers to own their bind-mounted working trees.
+const fixtureContainerUser = `${process.getuid()}:${process.getgid()}`;
 
 export function runGitHttpBackend(
   request,
@@ -156,7 +158,7 @@ async function createWorkspace({
     "--name",
     name,
     "--user",
-    "1000:1000",
+    fixtureContainerUser,
     "--network",
     "host",
     "--add-host",
@@ -411,7 +413,7 @@ export async function verifyGitHubPushAuthentication(image) {
       "--name",
       containerNames[2],
       "--user",
-      "1000:1000",
+      fixtureContainerUser,
       "--network",
       "host",
       "--add-host",

@@ -107,17 +107,32 @@ async function verifySignalForwarding() {
 
 async function verifyPodOwnedRuntime() {
   const runtimeRoot = await mkdtemp(join(tmpdir(), "adm-pod-runtime-smoke-"));
-  const workspaceRoot = join(runtimeRoot, "workspace");
-  const repoRoot = join(workspaceRoot, "repo");
   const configPath = join(runtimeRoot, "workspace.json");
   const tokenPath = join(runtimeRoot, "token");
   const lifecyclePath = join(runtimeRoot, "lifecycle-fixture.mjs");
   const runtimeContainer = `${container}-runtime`;
+  const runtimeVolume = `${runtimeContainer}-workspace`;
+  let volumeExists = false;
   let exists = false;
   let running = false;
   try {
-    await mkdir(repoRoot, { recursive: true });
-    await writeFile(tokenPath, "pod-runtime-smoke-token\n", { mode: 0o600 });
+    await docker("volume", "create", runtimeVolume);
+    volumeExists = true;
+    await docker(
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--mount",
+      `type=volume,src=${runtimeVolume},dst=/workspace`,
+      "--entrypoint",
+      "/bin/sh",
+      image,
+      "-eu",
+      "-c",
+      "mkdir -p /workspace/repo && exec /usr/local/bin/adm-init-workspace plain",
+    );
+    await writeFile(tokenPath, "pod-runtime-smoke-token\n", { mode: 0o444 });
     await writeFile(
       configPath,
       JSON.stringify({
@@ -183,7 +198,7 @@ server.listen(7433, "127.0.0.1", () => {
       "--network",
       "none",
       "--mount",
-      `type=bind,src=${workspaceRoot},dst=/workspace`,
+      `type=volume,src=${runtimeVolume},dst=/workspace`,
       "--mount",
       `type=bind,src=${configPath},dst=/run/adm/workspace.json,readonly`,
       "--mount",
@@ -233,10 +248,13 @@ for (let attempt = 0; attempt < 100; attempt++) {
       const logs = await docker("logs", runtimeContainer).catch(() => ({ stdout: "" }));
       throw new Error(`${error.message}\nworkspace runtime logs:\n${logs.stdout}${logs.stderr ?? ""}`, { cause: error });
     }
-    assert.equal(
-      await readFile(join(repoRoot, "pod-owned.txt"), "utf8"),
-      "executed inside workspace Pod",
+    const { stdout: podOwnedFile } = await docker(
+      "exec",
+      runtimeContainer,
+      "cat",
+      "/workspace/repo/pod-owned.txt",
     );
+    assert.equal(podOwnedFile, "executed inside workspace Pod");
 
     await docker("stop", "--time", "5", runtimeContainer);
     running = false;
@@ -263,6 +281,7 @@ if (!history.events.some((event) => event.kind === "assistant")) throw new Error
   } finally {
     if (running) await docker("stop", "--time", "5", runtimeContainer);
     if (exists) await docker("rm", runtimeContainer);
+    if (volumeExists) await docker("volume", "rm", runtimeVolume);
     await rm(runtimeRoot, { recursive: true });
   }
 }
