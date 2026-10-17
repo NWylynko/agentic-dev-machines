@@ -259,7 +259,7 @@ elif args[:3] == ['create','--raw','/apis/authentication.k8s.io/v1/tokenreviews'
         print(json.dumps({'status':{'authenticated':True,'audiences':['adm-lifecycle'],'user':user}}))
     elif request['spec']['token']=='bot-token':
         namespace=(root/'expected-bot-namespace').read_text()
-        uid=(root/'expected-bot-pod-uid').read_text()
+        uid=(root/'expected-bot-token-uid').read_text()
         user={'username':'system:serviceaccount:'+namespace+':adm-runtime','extra':{'authentication.kubernetes.io/pod-uid':[uid]}}
         print(json.dumps({'status':{'authenticated':True,'audiences':['adm-lifecycle'],'user':user}}))
     elif request['spec']['token']=='lifecycle-token':
@@ -295,6 +295,8 @@ elif args[:2] == ['get','pods']:
     for namespace, resource in state.items():
         workspace_id=resource['metadata']['labels'].get('adm.dev/workspace-id')
         pod_uid=(root/'expected-pod-uid').read_text() if (root/'expected-pod-uid').exists() else '4b53eaa6-4e4d-42dd-9a02-4702a842155a'
+        if (root/'expected-bot-namespace').exists() and namespace == (root/'expected-bot-namespace').read_text():
+            pod_uid=(root/'expected-bot-pod-uid').read_text()
         items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'test-node'},'status':{'phase':'Running','podIP':runtime_ip,'containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:2] == ['get','namespace']:
@@ -1275,7 +1277,40 @@ else:
         "dca2c1a7-ed5f-44a8-a53e-9e64197fdb05",
     )
     .unwrap();
+    fs::write(
+        root.path().join("expected-bot-token-uid"),
+        "dca2c1a7-ed5f-44a8-a53e-9e64197fdb05",
+    )
+    .unwrap();
     let bot_id = bot_receipt["workspaceId"].as_str().unwrap();
+    let bot_uid = fs::read_to_string(root.path().join("expected-bot-pod-uid")).unwrap();
+    let bot_lease_path = format!("/v1/workspaces/{bot_id}/runtime/lease");
+    let bot_lease_body = json!({"holder":bot_uid.trim()});
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &bot_lease_path,
+            Some(&bot_lease_body),
+            Some("bot-token")
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &authorize_path,
+            Some(&prompt_action),
+            Some("bot-token")
+        )
+        .unwrap()
+        .status(),
+        200,
+        "a live bot runtime owner can authorize lifecycle actions"
+    );
     assert_eq!(
         request_with_token(
             &url,
@@ -1309,6 +1344,76 @@ else:
             &authorize_path,
             Some(&prompt_action),
             Some("bot-token")
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    {
+        let connection =
+            rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE runtime_leases SET expires_at=0 WHERE workspace_id=?1",
+                [bot_id],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &authorize_path,
+            Some(&prompt_action),
+            Some("bot-token")
+        )
+        .unwrap()
+        .status(),
+        403,
+        "an expired source runtime lease cannot retain bot lifecycle authority"
+    );
+    let replacement_uid = "f57d0d45-e3d1-4fd8-9db5-84a32e9720be";
+    fs::write(root.path().join("expected-bot-pod-uid"), replacement_uid).unwrap();
+    let replacement_lease_body = json!({"holder":replacement_uid});
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &bot_lease_path,
+            Some(&replacement_lease_body),
+            Some(&format!(
+                "target-token:{}:{replacement_uid}",
+                bot_workspace["namespace"].as_str().unwrap()
+            ))
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &authorize_path,
+            Some(&prompt_action),
+            Some("bot-token")
+        )
+        .unwrap()
+        .status(),
+        403,
+        "a replaced bot Pod token cannot retain lifecycle authority"
+    );
+    let fresh_bot_token = format!(
+        "target-token:{}:{replacement_uid}",
+        bot_workspace["namespace"].as_str().unwrap()
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &authorize_path,
+            Some(&prompt_action),
+            Some(&fresh_bot_token)
         )
         .unwrap()
         .status(),
