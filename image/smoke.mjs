@@ -486,6 +486,10 @@ try {
     /^\s*GNU nano, version /,
     "nano should be available in every workspace image",
   );
+  const ghVersion = await docker("exec", container, "gh", "--version");
+  assert.match(ghVersion.stdout, /^gh version \d+\.\d+\.\d+/m);
+  const ghHelp = await docker("exec", container, "gh", "help");
+  assert.match(ghHelp.stdout, /USAGE\s+gh <command>/);
   const root = await docker(
     "exec",
     container,

@@ -11,6 +11,7 @@ import {
   Harness,
   ToolTask,
   type EntryRecord,
+  type ConversationId,
   type TaskInspection,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -21,6 +22,13 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { workspaceModels } from "./models.ts";
+import {
+  activeWorkspaceConversation,
+  forkWorkspaceBranch,
+  initializeNavigation,
+  selectWorkspaceBranch,
+  workspaceBranches,
+} from "./navigation.ts";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { BotProfileDocument, botExtension } from "./bot.ts";
 import { openMcpExtension } from "./mcp.ts";
@@ -64,7 +72,7 @@ export function entryEvent(
     return {
       ...base,
       kind: "user",
-      data: { text: textContent(message.content) },
+      data: { text: textContent(message.content), message },
     };
   if (message?.role === "assistant")
     return {
@@ -72,7 +80,9 @@ export function entryEvent(
       kind: "assistant",
       data: {
         text: textContent(message.content),
+        message,
         stopReason: message.stopReason,
+        usage: message.usage,
         ...(message.errorMessage ? { error: message.errorMessage } : {}),
       },
     };
@@ -84,6 +94,10 @@ export function entryEvent(
         name: message.toolName,
         text: textContent(message.content),
         isError: message.isError,
+        message,
+        toolCallId: message.toolCallId,
+        details: message.details,
+        durationMs: message.durationMs,
       },
     };
   return undefined;
@@ -182,7 +196,7 @@ export class Workspace {
     };
     const registry = createRegistry();
     const schedule = createScheduleExtension(
-      (message, requestId, loopId, generation, call) => {
+      (message, requestId, loopId, generation, conversationId, call) => {
         if (!openedWorkspace)
           throw new Error("Workspace is not ready to admit scheduled input");
         return openedWorkspace.admitLoopInput(
@@ -190,6 +204,7 @@ export class Workspace {
           requestId,
           loopId,
           generation,
+          conversationId,
           call,
         );
       },
@@ -310,7 +325,9 @@ export class Workspace {
               }
             : undefined,
       });
-      const selectedModel = (await conversation.agent(context)).model;
+      await initializeNavigation(harness, Number(conversation.id));
+      const activeConversation = await activeWorkspaceConversation(harness);
+      const selectedModel = (await activeConversation.agent(context)).model;
       const effectiveConfig: WorkspaceConfig = {
         ...config,
         ...(selectedModel
@@ -325,7 +342,7 @@ export class Workspace {
       const workspace = new Workspace(
         effectiveConfig,
         harness,
-        conversation,
+        activeConversation,
         models,
         assertActive,
         schedule.loopTask,
@@ -411,6 +428,7 @@ export class Workspace {
               : "idle";
     return {
       ...this.config,
+      conversationId: Number(this.conversation.id),
       ...(profile ? { profile } : {}),
       status,
       goals: schedule.goals,
@@ -631,12 +649,13 @@ export class Workspace {
     requestId: string,
     loopId: string,
     generation: number,
+    conversationId: ConversationId,
     call: Context,
   ) {
     return this.withAdmission(async () => {
       const schedule = await this.harness.snapshot(
         scheduleDocument,
-        this.conversation.id,
+        conversationId,
         call,
       );
       const loop = schedule?.loops.find((entry) => entry.id === loopId);
@@ -647,7 +666,9 @@ export class Workspace {
         loop.pendingRequestId !== requestId
       )
         return false;
-      await this.conversation.submit(
+      const owner = await this.harness.conversation(conversationId, call);
+      if (!owner) return false;
+      await owner.submit(
         { type: "input", content: message, requestId, whenBusy: "followUp" },
         call,
       );
@@ -737,6 +758,147 @@ export class Workspace {
     });
   }
 
+  async branches() {
+    return workspaceBranches(this.harness);
+  }
+
+  async selectBranch(conversationId: number) {
+    return this.withAdmission(async () => {
+      await this.assertIdleForNavigation();
+      const navigation = await workspaceBranches(this.harness);
+      if (
+        !navigation.branches.some(
+          (branch) => branch.conversationId === conversationId,
+        )
+      )
+        throw new ApiError(
+          404,
+          "BRANCH_NOT_FOUND",
+          "Unknown workspace conversation",
+        );
+      await selectWorkspaceBranch(this.harness, conversationId);
+      const conversation = await activeWorkspaceConversation(this.harness);
+      this.conversation = conversation;
+      const selected = (await conversation.agent(context)).model;
+      this.config = {
+        ...this.config,
+        model: selected
+          ? { provider: selected.provider, id: selected.modelId }
+          : undefined,
+      };
+      this.events.emit("branch");
+      return {
+        activeConversationId: Number(conversation.id),
+        model: this.config.model,
+      };
+    });
+  }
+
+  async forkBranch(entryId: number) {
+    return this.withAdmission(async () => {
+      await this.assertIdleForNavigation();
+      const entry = await this.conversation.entries(
+        { order: "ascending", minEntryId: entryId as never },
+        1,
+        undefined,
+        context,
+      );
+      if (Number(entry.items[0]?.id) !== entryId)
+        throw new ApiError(
+          404,
+          "ENTRY_NOT_FOUND",
+          "Entry is not part of the selected workspace conversation",
+        );
+      const fork = await forkWorkspaceBranch(
+        this.harness,
+        Number(this.conversation.id),
+        entryId,
+      );
+      this.conversation = await activeWorkspaceConversation(this.harness);
+      const selected = (await this.conversation.agent(context)).model;
+      this.config = {
+        ...this.config,
+        model: selected
+          ? { provider: selected.provider, id: selected.modelId }
+          : undefined,
+      };
+      this.events.emit("branch");
+      return fork;
+    });
+  }
+
+  async tree(after = 0, limit = 200, diagnostics = false) {
+    const page = await this.conversation.entries(
+      { order: "ascending", minEntryId: (after + 1) as never },
+      limit,
+      undefined,
+      context,
+    );
+    return {
+      activeConversationId: Number(this.conversation.id),
+      events: page.items
+        .map((entry) => entryEvent(this.config, entry))
+        .filter(
+          (event): event is RunnerEvent =>
+            !!event &&
+            (diagnostics ||
+              this.config.role !== "bot" ||
+              ["user", "message", "status"].includes(event.kind)),
+        ),
+      nextAfter: Number(page.items.at(-1)?.id ?? after),
+      hasMore: page.next !== undefined,
+    };
+  }
+
+  async compact(instructions?: string) {
+    return this.withAdmission(async () => ({
+      taskId: Number(await this.conversation.compact(instructions, context)),
+    }));
+  }
+
+  async reset(handoff?: string) {
+    return this.withAdmission(async () => {
+      await this.conversation.reset(handoff, context);
+      return {
+        activeConversationId: Number(this.conversation.id),
+        status: "accepted",
+      };
+    });
+  }
+
+  async settings() {
+    const agent = await this.conversation.agent(context);
+    return { thinkingLevel: agent.thinkingLevel };
+  }
+
+  async changeThinkingLevel(level: string) {
+    const valid = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    if (!valid.includes(level))
+      throw new ApiError(
+        400,
+        "INVALID_THINKING_LEVEL",
+        "Thinking level is not supported by Pi",
+      );
+    return this.withAdmission(async () => {
+      await this.assertIdleForNavigation();
+      await this.conversation.configure(
+        { thinkingLevel: level as never },
+        context,
+      );
+      return this.settings();
+    });
+  }
+
+  private async assertIdleForNavigation() {
+    const inspection = await this.harness.inspect(context);
+    if (inspection.tasks.some((task) => agentIsBusy(task)))
+      throw new ApiError(
+        409,
+        "WORKSPACE_BUSY",
+        "Wait for active workspace work to finish before changing the conversation",
+      );
+  }
+
   private async withAdmission<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.admissions.then(async () => {
       if (!this.accepting || this.passive || this.closed)
@@ -755,14 +917,20 @@ export class Workspace {
     return result;
   }
 
-  async history(after: number, limit: number, diagnostics: boolean) {
-    const page = await this.conversation.entries(
+  async history(
+    after: number,
+    limit: number,
+    diagnostics: boolean,
+    conversation = this.conversation,
+  ) {
+    const page = await conversation.entries(
       { order: "ascending", minEntryId: (after + 1) as never },
       limit,
       undefined,
       context,
     );
     return {
+      activeConversationId: Number(conversation.id),
       events: page.items
         .map((entry) => entryEvent(this.config, entry))
         .filter(

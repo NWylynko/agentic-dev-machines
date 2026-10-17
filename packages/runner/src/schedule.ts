@@ -131,6 +131,7 @@ function createLoopTask(
     requestId: string,
     loopId: string,
     generation: number,
+    conversationId: ConversationId,
     call: Context,
   ) => Promise<boolean>,
 ) {
@@ -246,6 +247,7 @@ function createLoopTask(
             requestId,
             task.input.loopId,
             task.input.generation ?? 1,
+            runtime.conversationId,
             call,
           );
         }
@@ -517,6 +519,7 @@ export function createScheduleExtension(
     requestId: string,
     loopId: string,
     generation: number,
+    conversationId: ConversationId,
     call: Context,
   ) => Promise<boolean>,
 ) {

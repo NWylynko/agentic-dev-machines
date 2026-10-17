@@ -28,7 +28,7 @@ export const BotProfileDocument = defineDoc<BotProfile>({
   version: 1,
   scope: "conversation",
   history: "latest",
-  fork: "initial",
+  fork: "current",
   initial: () => ({
     state: "needs_setup",
     identity: "",

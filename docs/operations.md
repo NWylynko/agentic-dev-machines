@@ -75,7 +75,7 @@ Every workspace starts with a durable agent. Without a configured default, selec
 
 Use `adm shell NAME --manage` when you also need the current agent controls from inside that shell. The private `adm` client supports `adm status [--json]`, `adm history [--after N] [--limit N]`, `adm prompt MESSAGE`, `adm abort [--background]`, and `adm help`. History defaults to 200 entries; its response limit is 1 MiB, so use a smaller `--limit` if it reports an oversized response. It can address only the workspace selected on the management host; workspace IDs, host state, credentials, and the runner URL are not passed into the development container. Same-workspace processes can use the allowed actions while the managed session is open. Closing the shell closes the temporary management relay and leaves the agent running. The ordinary `adm shell NAME` path does not start a relay. Use the management host for `adm list`, creation/deletion, port forwarding, `exec`, and other workspace operations.
 
-The workspace image includes `nano` and passwordless `sudo`. New coding workspaces permit unattended administration inside their own container by default:
+The workspace image includes `nano`, GitHub CLI (`gh`), and passwordless `sudo`. `gh` comes from GitHub's signed Debian repository and takes the current stable package when the image is built; an existing image stays at that package version until rebuilt. This supplies the executable only: authenticating GitHub CLI for private repository access or Git pushes is a separate per-workspace setup. New coding workspaces permit unattended administration inside their own container by default:
 
 ```sh
 adm create package-workspace
