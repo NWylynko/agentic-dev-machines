@@ -468,9 +468,13 @@ test("two existing and a new agent stream use shared auth without local or ambie
       await import("../src/credentials.ts");
     const observedApiKeys = [];
     const observedIdentityTokens = [];
-    authority.server.on("request", (request) =>
-      observedIdentityTokens.push(request.headers.authorization),
-    );
+    authority.server.on("request", (request) => {
+      if (
+        request.method === "POST" &&
+        request.url === "/v1/provider-auth/resolve"
+      )
+        observedIdentityTokens.push(request.headers.authorization);
+    });
     let providerRequests = 0;
     const model = {
       id: "synthetic-model",
