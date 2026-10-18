@@ -85,7 +85,7 @@ pub enum Action {
     Create(CreateOptions),
     /// Print provisioning resources without mutating the cluster.
     Manifest(CreateOptions),
-    /// List locally owned workspaces.
+    /// List cluster-owned workspaces.
     List {
         #[arg(long)]
         all: bool,
@@ -93,14 +93,14 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Show a concise local, cluster, and agent summary.
+    /// Show a concise workspace, runtime, and agent summary.
     Status {
         name: String,
         /// Print the complete local, cluster, and agent records as JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Show detailed local, cluster, and agent diagnostics.
+    /// Show detailed workspace, runtime, and agent diagnostics.
     Inspect {
         name: String,
         /// Print the complete local, cluster, and agent records as JSON.
@@ -140,7 +140,7 @@ pub enum Action {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Forward a development port to the management host.
+    /// Forward a development port to this client device.
     Port {
         name: String,
         port: u16,
