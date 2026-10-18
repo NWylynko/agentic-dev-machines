@@ -1324,7 +1324,14 @@ fn main() {
         if let Action::Create(options) = &cli.command {
             workspaces::validate_name(&options.name)?;
         }
-        let _connection = if cli.lifecycle_forward && !matches!(cli.command, Action::Connect) {
+        let _connection = if cli.lifecycle_forward
+            && !matches!(
+                cli.command,
+                Action::Connect
+                    | Action::Herdr {
+                        command: Some(herdr::HerdrAction::RouteShell { .. }),
+                    }
+            ) {
             let connection = setup_connection::connect(&cli)?;
             cli.lifecycle_url = connection.url.clone();
             Some(connection)
@@ -1341,25 +1348,37 @@ fn main() {
 fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
     cli.lifecycle_url_explicit =
         matches.value_source("lifecycle_url") != Some(ValueSource::DefaultValue);
+    let route_shell = matches!(
+        cli.command,
+        Action::Herdr {
+            command: Some(herdr::HerdrAction::RouteShell { .. }),
+        }
+    );
     let workspace_defaults = matches!(
         cli.command,
         Action::Create(_) | Action::Manifest(_) | Action::Doctor { .. }
     );
-    let connection_defaults = !matches!(
-        cli.command,
-        Action::Completions { .. }
-            | Action::Setup
-            | Action::LifecycleServe { .. }
-            | Action::LifecycleForward
-            | Action::Manifest(_)
-            | Action::Start
-            | Action::Serve
-            | Action::Stop
-            | Action::Herdr {
-                command: None | Some(herdr::HerdrAction::Hook)
-            }
-    );
-    if connection_defaults && !cli.lifecycle_url_explicit {
+    let connection_defaults = route_shell
+        || !matches!(
+            cli.command,
+            Action::Completions { .. }
+                | Action::Setup
+                | Action::LifecycleServe { .. }
+                | Action::LifecycleForward
+                | Action::Manifest(_)
+                | Action::Start
+                | Action::Serve
+                | Action::Stop
+                | Action::Herdr {
+                    command: None
+                        | Some(herdr::HerdrAction::Hook)
+                        | Some(herdr::HerdrAction::Status { .. })
+                        | Some(herdr::HerdrAction::Disable)
+                        | Some(herdr::HerdrAction::RouteShell { .. })
+                        | Some(herdr::HerdrAction::CreateSpace { .. })
+                }
+        );
+    if connection_defaults && !route_shell && !cli.lifecycle_url_explicit {
         cli.lifecycle_forward = true;
         cli.lifecycle_token_secret = cli.lifecycle_token_file.is_none();
     }

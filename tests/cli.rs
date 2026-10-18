@@ -352,29 +352,58 @@ fn adm_with_runner(root: &Path, runner_url: &str, arguments: &[&str]) -> Output 
         .expect("run public CLI with runner fixture")
 }
 
-fn adm_with_input(root: &Path, arguments: &[&str], input: &str) -> Output {
+fn adm_in_herdr(root: &Path, arguments: &[&str], socket: &Path) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
     command
         .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", socket)
+        .env("ADM_HERDR_INITIAL_PANE", "local")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("herdr-bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .arg("--state-dir")
         .arg(root.join("state"))
         .arg("--kubectl")
-        .arg(root.join("kubectl"))
-        .args(arguments);
+        .arg(root.join("kubectl"));
     configure_lifecycle(&mut command, root);
-    let mut child = command
+    command
+        .args(arguments)
+        .output()
+        .expect("run CLI in fixture Herdr session")
+}
+
+fn adm_in_herdr_with_input(root: &Path, arguments: &[&str], input: &str, socket: &Path) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", socket)
+        .arg("--state-dir")
+        .arg(root.join("state"))
+        .arg("--kubectl")
+        .arg(root.join("kubectl"));
+    configure_lifecycle(&mut command, root);
+    command
+        .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("run public CLI");
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("run CLI in fixture Herdr session");
     child
         .stdin
         .take()
         .unwrap()
         .write_all(input.as_bytes())
         .unwrap();
-    child.wait_with_output().expect("wait for public CLI")
+    child
+        .wait_with_output()
+        .expect("wait for fixture Herdr CLI")
 }
 
 fn assert_ok(output: Output) -> Value {
@@ -1957,17 +1986,29 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
         root.path(),
         &["create", "herdr-stale", "--no-repositories"],
     ));
-    assert_ok(adm(
+    let same_id_other_session = assert_ok(adm(
+        root.path(),
+        &["create", "herdr-other-session", "--no-repositories"],
+    ));
+    assert_ok(adm_in_herdr(
         root.path(),
         &["herdr", "bind", "herdr-owned", "space-123"],
+        &root.path().join("herdr.sock"),
     ));
-    assert_ok(adm(
+    assert_ok(adm_in_herdr(
         root.path(),
         &["herdr", "bind", "herdr-other", "space-456"],
+        &root.path().join("herdr.sock"),
     ));
-    assert_ok(adm(
+    assert_ok(adm_in_herdr(
         root.path(),
         &["herdr", "bind", "herdr-stale", "space-missing"],
+        &root.path().join("herdr.sock"),
+    ));
+    assert_ok(adm_in_herdr(
+        root.path(),
+        &["herdr", "bind", "herdr-other-session", "space-123"],
+        &root.path().join("different-session.sock"),
     ));
     let socket = root.path().join("herdr.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -1999,7 +2040,23 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
             writer,
             "{}",
             serde_json::json!({
+                "event":"workspace_closed",
+                "data":{"type":"workspace_closed","workspace_id":"space-123"}
+            })
+        );
+        let _ = writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
                 "id":subscribe["id"],"result":{"type":"subscription_started"}
+            })
+        );
+        let _ = writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "event":"workspace_closed",
+                "data":{"type":"workspace_closed","workspace_id":"space-123"}
             })
         );
         let _ = writeln!(
@@ -2081,6 +2138,9 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
     assert!(remaining.as_array().unwrap().iter().any(|workspace| {
         workspace["id"] == stale_workspace["id"] && workspace["phase"] == "ready"
     }));
+    assert!(remaining.as_array().unwrap().iter().any(|workspace| {
+        workspace["id"] == same_id_other_session["id"] && workspace["phase"] == "ready"
+    }));
     for name in ["herdr-owned", "herdr-other"] {
         let phase = assert_ok(adm(root.path(), &["status", name, "--json"]))["workspace"]["phase"]
             .as_str()
@@ -2094,6 +2154,16 @@ fn herdr_watch_only_destroys_on_an_explicit_workspace_closed_event() {
 #[test]
 fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     use std::io::BufRead;
+
+    fn receipt_path(root: &Path, workspace_id: &str) -> PathBuf {
+        let hash = workspace_id
+            .bytes()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        root.join("state")
+            .join(format!("herdr-closed-{hash:016x}.json"))
+    }
 
     fn fake_socket(path: &Path, close_space: Option<&'static str>) -> std::thread::JoinHandle<()> {
         let listener = UnixListener::bind(path).unwrap();
@@ -2143,9 +2213,25 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
         root.path(),
         &["create", "journaled", "--no-repositories"],
     ));
-    assert_ok(adm(
+    let other_workspace = assert_ok(adm(
+        root.path(),
+        &["create", "journaled-other-session", "--no-repositories"],
+    ));
+    assert_ok(adm_in_herdr(
         root.path(),
         &["herdr", "bind", "journaled", "space-journal"],
+        &root.path().join("herdr-first.sock"),
+    ));
+    let other_socket = root.path().join("herdr-second.sock");
+    assert_ok(adm_in_herdr(
+        root.path(),
+        &[
+            "herdr",
+            "bind",
+            "journaled-other-session",
+            "space-other-session",
+        ],
+        &other_socket,
     ));
     let lifecycle_url_path = root.path().join("lifecycle-url");
     let lifecycle_url = fs::read_to_string(&lifecycle_url_path).unwrap();
@@ -2159,28 +2245,49 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     assert!(
         String::from_utf8_lossy(&failed_cleanup.stderr).contains("lifecycle service unavailable")
     );
-    let journal = root.path().join("state/herdr-closed-events.jsonl");
-    assert!(
-        fs::read_to_string(&journal)
-            .unwrap()
-            .contains("space-journal")
-    );
+    let first_receipt = receipt_path(root.path(), workspace["id"].as_str().unwrap());
+    assert!(first_receipt.exists());
 
     fs::write(&lifecycle_url_path, lifecycle_url).unwrap();
-    let second_socket = root.path().join("herdr-second.sock");
-    let second_server = fake_socket(&second_socket, None);
-    let recovered_cleanup = watch(root.path(), &second_socket);
-    second_server.join().unwrap();
+    let other_event = r#"{"event":"workspace_closed","data":{"type":"workspace_closed","workspace_id":"space-other-session"}}"#;
+    let other_cleanup = adm_in_herdr_with_input(
+        root.path(),
+        &["herdr", "events"],
+        &format!("{other_event}\n"),
+        &other_socket,
+    );
+    assert!(
+        other_cleanup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&other_cleanup.stderr)
+    );
+    let other_receipt = receipt_path(root.path(), other_workspace["id"].as_str().unwrap());
+    assert!(!other_receipt.exists());
+    assert!(
+        first_receipt.exists(),
+        "another session cleared this pending close receipt"
+    );
+
+    let retry_socket = root.path().join("herdr-retry.sock");
+    let retry_server = fake_socket(&retry_socket, None);
+    let recovered_cleanup = watch(root.path(), &retry_socket);
+    retry_server.join().unwrap();
     let stdout = String::from_utf8_lossy(&recovered_cleanup.stdout);
     assert!(stdout.contains("\"status\":\"accepted\""), "{stdout}");
-    assert!(!journal.exists() || fs::read(&journal).unwrap().is_empty());
+    assert!(!first_receipt.exists());
     let remaining = assert_ok(adm(root.path(), &["list", "--json"]));
-    assert_eq!(remaining.as_array().unwrap().len(), 1);
-    assert_eq!(remaining[0]["id"], workspace["id"]);
-    assert!(matches!(
-        remaining[0]["phase"].as_str().unwrap(),
-        "deleting" | "deleted"
-    ));
+    for workspace in [&workspace, &other_workspace] {
+        let entry = remaining
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == workspace["id"])
+            .unwrap();
+        assert!(matches!(
+            entry["phase"].as_str().unwrap(),
+            "deleting" | "deleted"
+        ));
+    }
 }
 
 #[test]
@@ -2211,13 +2318,19 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
         root.path(),
         &["create", "herdr-owned", "--no-repositories"],
     ));
-    assert_ok(adm(
+    assert_ok(adm_in_herdr(
         root.path(),
         &["herdr", "bind", "herdr-owned", "space-123"],
+        &root.path().join("events.sock"),
     ));
 
     let event = r#"{"event":"workspace_closed","data":{"type":"workspace_closed","workspace_id":"space-123"}}"#;
-    let output = adm_with_input(root.path(), &["herdr", "events"], &format!("{event}\n"));
+    let output = adm_in_herdr_with_input(
+        root.path(),
+        &["herdr", "events"],
+        &format!("{event}\n"),
+        &root.path().join("events.sock"),
+    );
     assert!(
         output.status.success(),
         "stdout={} stderr={}",
@@ -2247,6 +2360,508 @@ fn herdr_schema_workspace_closed_event_destroys_only_its_bound_workspace() {
 }
 
 #[test]
+fn herdr_bind_renames_the_explicit_space_and_scopes_ownership_to_its_session() {
+    let root = fixture();
+    let lifecycle_url = fs::read_to_string(root.path().join("lifecycle-url")).unwrap();
+    let workspace = assert_ok(adm(
+        root.path(),
+        &["create", "bound-project", "--no-repositories"],
+    ));
+    let prior_shell = root.path().join("prior-shell");
+    let prior_args = root.path().join("prior-shell-args");
+    let prior_marker = root.path().join("prior-shell-marker");
+    fs::write(
+        &prior_shell,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' \"${{ADM_HERDR_INITIAL_PANE-unset}}\" > '{}'\n",
+            prior_args.display(),
+            prior_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&prior_shell, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(root.path().join("config/herdr")).unwrap();
+    fs::write(
+        root.path().join("config/herdr/config.toml"),
+        format!(
+            "# user setting\n[terminal]\ndefault_shell = \"{}\"\nshell_mode = \"login\"\n",
+            prior_shell.display()
+        ),
+    )
+    .unwrap();
+    let calls = root.path().join("herdr-calls");
+    let herdr = root.path().join("herdr-bin/herdr");
+    fs::write(
+        &herdr,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'workspace get' ]; then printf '{{\"result\":{{\"workspace\":{{\"workspace_id\":\"%s\"}}}}}}\\n' \"$3\"; fi\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = root.path().join("herdr-session-a.sock");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.path().join("herdr-bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .arg("--kubectl")
+        .arg(root.path().join("kubectl"));
+    configure_lifecycle(&mut command, root.path());
+    command.args(["herdr", "bind", "bound-project", "w1"]);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(calls).unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|call| call == "workspace rename w1 bound-project"),
+        "{calls}"
+    );
+    let stored = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(stored[0]["id"], workspace["id"]);
+    assert!(
+        stored[0]["herdr_space"]
+            .as_str()
+            .unwrap()
+            .contains("herdr-session-a.sock")
+    );
+    let config_path = root.path().join("config/herdr/config.toml");
+    let enabled = fs::read_to_string(&config_path).unwrap();
+    assert!(enabled.contains("herdr-shell-router"), "{enabled}");
+    assert!(enabled.contains("shell_mode = \"login\""), "{enabled}");
+    assert!(enabled.contains("# user setting"), "{enabled}");
+    fs::create_dir_all(root.path().join("config/adm")).unwrap();
+    fs::write(
+        root.path().join("config/adm/config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "lifecycle": {
+                "url": fs::read_to_string(root.path().join("lifecycle-url")).unwrap(),
+                "forward": false,
+                "namespace": "adm-system",
+                "kubectl": root.path().join("kubectl"),
+                "kubeconfig": "fixture-kubeconfig",
+                "tokenFile": root.path().join("lifecycle-token")
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let initial_pane = adm_in_herdr(root.path(), &["herdr", "route-shell", "--"], &socket);
+    assert!(
+        initial_pane.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial_pane.stderr)
+    );
+    assert_eq!(fs::read_to_string(&prior_args).unwrap(), "\n");
+    assert_eq!(fs::read_to_string(&prior_marker).unwrap(), "unset\n");
+    let mut bound_pane = Command::new(env!("CARGO_BIN_EXE_adm"));
+    bound_pane
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .env("HERDR_WORKSPACE_ID", "w1")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.path().join("herdr-bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .arg("--kubectl")
+        .arg(root.path().join("kubectl"));
+    bound_pane.args(["herdr", "route-shell", "--"]);
+    let bound_pane = bound_pane.output().unwrap();
+    assert!(
+        bound_pane.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&bound_pane.stdout),
+        String::from_utf8_lossy(&bound_pane.stderr)
+    );
+    let exec: Value =
+        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
+    assert_eq!(
+        exec[exec
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|arg| arg == "-n")
+            .unwrap()
+            + 1],
+        workspace["namespace"]
+    );
+    assert!(exec.as_array().unwrap().iter().any(|arg| arg == "/repos"));
+    fs::write(root.path().join("lifecycle-url"), "http://127.0.0.1:1").unwrap();
+    let client_config_path = root.path().join("config/adm/config.json");
+    let mut client_config: Value =
+        serde_json::from_slice(&fs::read(&client_config_path).unwrap()).unwrap();
+    client_config["lifecycle"]["forward"] = true.into();
+    fs::write(
+        &client_config_path,
+        serde_json::to_vec(&client_config).unwrap(),
+    )
+    .unwrap();
+    let unbound = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .env("HERDR_WORKSPACE_ID", "unbound-space")
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .arg("--kubectl")
+        .arg(root.path().join("kubectl"))
+        .args(["herdr", "route-shell", "--", "passed-argument"])
+        .output()
+        .unwrap();
+    assert!(
+        unbound.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unbound.stderr)
+    );
+    fs::write(root.path().join("lifecycle-url"), lifecycle_url).unwrap();
+    assert_eq!(
+        fs::read_to_string(&prior_args).unwrap(),
+        "passed-argument\n"
+    );
+    let disabled = adm(root.path(), &["herdr", "disable"]);
+    assert!(
+        disabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    let restored = fs::read_to_string(&config_path).unwrap();
+    assert!(restored.contains(&format!("default_shell = \"{}\"", prior_shell.display())));
+    assert!(restored.contains("shell_mode = \"login\""));
+    let updated_shell = root.path().join("updated-shell");
+    fs::write(
+        &config_path,
+        format!(
+            "# updated by the user\n[terminal]\ndefault_shell = \"{}\"\nshell_mode = \"login\"\n",
+            updated_shell.display()
+        ),
+    )
+    .unwrap();
+    let rebound = adm_in_herdr(
+        root.path(),
+        &["herdr", "bind", "bound-project", "w1"],
+        &socket,
+    );
+    assert!(
+        rebound.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&rebound.stdout),
+        String::from_utf8_lossy(&rebound.stderr)
+    );
+    let disabled_again = adm(root.path(), &["herdr", "disable"]);
+    assert!(
+        disabled_again.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&disabled_again.stdout),
+        String::from_utf8_lossy(&disabled_again.stderr)
+    );
+    let restored_again = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        restored_again.contains(&format!("default_shell = \"{}\"", updated_shell.display())),
+        "{restored_again}"
+    );
+    assert!(restored_again.contains("# updated by the user"));
+    let second_device = root.path().join("second-device");
+    let separate = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("XDG_CONFIG_HOME", second_device.join("config"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .arg("--state-dir")
+        .arg(second_device.join("state"))
+        .arg("--kubectl")
+        .arg(root.path().join("kubectl"))
+        .args(["herdr", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        separate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&separate.stderr)
+    );
+    let separate: Value = serde_json::from_slice(&separate.stdout).unwrap();
+    assert_eq!(separate["binding_count"], 0);
+    assert_eq!(separate["pane_routing"], "disabled");
+    assert_eq!(separate["event_delivery"], "unavailable");
+}
+
+#[test]
+fn herdr_open_returns_ids_from_a_stock_protocol_workspace_create_response() {
+    use std::io::BufRead;
+
+    let root = fixture();
+    let local_cwd = root.path().join("local-project");
+    fs::create_dir_all(&local_cwd).unwrap();
+    let expected_cwd = local_cwd.clone();
+    let socket = root.path().join("herdr-create.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "workspace.create");
+        assert_eq!(request["params"]["label"], "api-project");
+        assert_eq!(
+            request["params"]["cwd"],
+            expected_cwd.to_string_lossy().as_ref()
+        );
+        assert_eq!(request["params"]["focus"], false);
+        assert_eq!(
+            request["params"]["env"],
+            serde_json::json!({"ADM_HERDR_INITIAL_PANE":"local"})
+        );
+        let workspace = serde_json::json!({
+            "workspace_id":"w22","number":2,"label":"api-project","focused":false,
+            "pane_count":1,"tab_count":1,"active_tab_id":"w22:t3","agent_status":"idle"
+        });
+        let tab = serde_json::json!({
+            "tab_id":"w22:t3","workspace_id":"w22","number":1,"label":"api-project",
+            "focused":false,"pane_count":1,"agent_status":"idle"
+        });
+        let pane = serde_json::json!({
+            "pane_id":"w22:p7","terminal_id":"term-7","workspace_id":"w22","tab_id":"w22:t3",
+            "focused":false,"agent_status":"idle","revision":1
+        });
+        writeln!(
+            reader.get_mut(),
+            "{}",
+            serde_json::json!({
+                "id":request["id"],"result":{"type":"workspace_created","workspace":workspace,"tab":tab,"root_pane":pane}
+            })
+        )
+        .unwrap();
+    });
+    let output = adm_in_herdr(
+        root.path(),
+        &[
+            "herdr",
+            "create-space",
+            "api-project",
+            local_cwd.to_str().unwrap(),
+        ],
+        &socket,
+    );
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let opened: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(opened["workspace_id"], "w22");
+    assert_eq!(opened["tab_id"], "w22:t3");
+    assert_eq!(opened["pane_id"], "w22:p7");
+
+    let workspace = assert_ok(adm(
+        root.path(),
+        &["create", "initial-pane-race", "--no-repositories"],
+    ));
+    let prior_shell = root.path().join("initial-pane-shell");
+    let prior_args = root.path().join("initial-pane-args");
+    let prior_marker = root.path().join("initial-pane-marker");
+    fs::write(
+        &prior_shell,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' \"${{ADM_HERDR_INITIAL_PANE-unset}}\" > '{}'\n",
+            prior_args.display(),
+            prior_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&prior_shell, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(root.path().join("config/herdr")).unwrap();
+    fs::write(
+        root.path().join("config/herdr/config.toml"),
+        format!(
+            "[terminal]\ndefault_shell = \"{}\"\n",
+            prior_shell.display()
+        ),
+    )
+    .unwrap();
+    let bound = adm_in_herdr(
+        root.path(),
+        &["herdr", "bind", "initial-pane-race", "w22"],
+        &socket,
+    );
+    assert!(
+        bound.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&bound.stdout),
+        String::from_utf8_lossy(&bound.stderr)
+    );
+
+    let route = |pane_id: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+        command
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("HERDR_ENV", "1")
+            .env("HERDR_SOCKET_PATH", &socket)
+            .env("HERDR_WORKSPACE_ID", "w22")
+            .env("HERDR_PANE_ID", pane_id)
+            .env("ADM_HERDR_INITIAL_PANE", "local")
+            .arg("--state-dir")
+            .arg(root.path().join("state"))
+            .arg("--kubectl")
+            .arg(root.path().join("kubectl"));
+        configure_lifecycle(&mut command, root.path());
+        command
+            .args(["herdr", "route-shell", "--"])
+            .output()
+            .unwrap()
+    };
+    // A sibling pane may enter the router before the root pane starts. It must
+    // not consume the root pane's local-only marker.
+    let sibling = route("w22:p8");
+    assert!(
+        sibling.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&sibling.stdout),
+        String::from_utf8_lossy(&sibling.stderr)
+    );
+    let exec: Value =
+        serde_json::from_slice(&fs::read(root.path().join("exec-args.json")).unwrap()).unwrap();
+    assert!(exec.as_array().unwrap().iter().any(|arg| arg == "/repos"));
+
+    let root_pane = route("w22:p7");
+    assert!(
+        root_pane.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&root_pane.stdout),
+        String::from_utf8_lossy(&root_pane.stderr)
+    );
+    assert_eq!(fs::read_to_string(prior_args).unwrap(), "\n");
+    assert_eq!(fs::read_to_string(prior_marker).unwrap(), "unset\n");
+    assert_eq!(
+        workspace["id"],
+        assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"]
+    );
+}
+
+#[test]
+fn herdr_status_only_reports_event_delivery_when_watcher_and_socket_are_live() {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+
+    let root = fixture();
+    let socket = root.path().join("herdr-status.sock");
+    let unavailable = adm_in_herdr(root.path(), &["herdr", "status", "--json"], &socket);
+    assert!(unavailable.status.success());
+    let unavailable: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
+    assert_eq!(unavailable["event_delivery"], "unavailable");
+    assert_eq!(unavailable["pane_routing"], "disabled");
+    assert!(
+        unavailable["event_delivery_error"]
+            .as_str()
+            .unwrap()
+            .contains("no live watcher control socket")
+    );
+
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (watch_stream, _) = listener.accept().unwrap();
+        let mut watch_reader = std::io::BufReader::new(watch_stream.try_clone().unwrap());
+        let mut line = String::new();
+        watch_reader.read_line(&mut line).unwrap();
+        let watch_request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(watch_request["method"], "events.subscribe");
+        writeln!(
+            watch_reader.get_mut(),
+            "{}",
+            serde_json::json!({
+                "id":watch_request["id"],"result":{"type":"subscription_started"}
+            })
+        )
+        .unwrap();
+        ready_tx.send(()).unwrap();
+        let mut line = String::new();
+        let _ = watch_reader.read_line(&mut line);
+        drop(watch_stream);
+    });
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_adm"));
+    watcher
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .arg("--kubectl")
+        .arg(root.path().join("kubectl"))
+        .args(["herdr", "watch", "--socket"])
+        .arg(&socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_lifecycle(&mut watcher, root.path());
+    let mut watcher = watcher.spawn().unwrap();
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap();
+    let mut watcher_stdout = std::io::BufReader::new(watcher.stdout.take().unwrap());
+    let mut line = String::new();
+    watcher_stdout.read_line(&mut line).unwrap();
+    assert!(line.contains("\"status\":\"watching\""), "{line}");
+    let healthy = adm_in_herdr(root.path(), &["herdr", "status", "--json"], &socket);
+    assert!(
+        healthy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&healthy.stderr)
+    );
+    let healthy: Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert_eq!(healthy["event_delivery"], "watching");
+    let disabled = adm(root.path(), &["herdr", "disable"]);
+    if !disabled.status.success() {
+        let exited = watcher.try_wait().unwrap();
+        let watcher_error = if exited.is_some() {
+            let mut error = String::new();
+            watcher
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut error)
+                .unwrap();
+            error
+        } else {
+            "watcher process is still running".to_owned()
+        };
+        panic!(
+            "stdout={} stderr={} watcher={watcher_error}",
+            String::from_utf8_lossy(&disabled.stdout),
+            String::from_utf8_lossy(&disabled.stderr)
+        );
+    }
+    server.join().unwrap();
+    let mut rest = String::new();
+    watcher_stdout.read_to_string(&mut rest).unwrap();
+    assert!(watcher.wait().unwrap().success(), "{rest}");
+}
+
+#[test]
 fn herdr_bind_requires_a_live_herdr_workspace_id() {
     let root = fixture();
     let setup = adm(root.path(), &["herdr"]);
@@ -2255,7 +2870,7 @@ fn herdr_bind_requires_a_live_herdr_workspace_id() {
         "{}",
         String::from_utf8_lossy(&setup.stderr)
     );
-    assert!(String::from_utf8_lossy(&setup.stdout).contains("HERDR_WORKSPACE_ID"));
+    assert!(String::from_utf8_lossy(&setup.stdout).contains("Close-event cleanup is optional"));
     assert_ok(adm(
         root.path(),
         &["create", "herdr-owned", "--no-repositories"],
@@ -2263,18 +2878,15 @@ fn herdr_bind_requires_a_live_herdr_workspace_id() {
     let hook = adm(root.path(), &["herdr", "hook"]);
     assert!(hook.status.success());
     let hook = String::from_utf8(hook.stdout).unwrap();
-    assert!(hook.contains("HERDR_WORKSPACE_ID"), "{hook}");
-    assert!(
-        hook.contains("systemctl --user status adm-herdr-watch"),
-        "{hook}"
-    );
+    assert!(hook.contains("herdr bind"), "{hook}");
+    assert!(hook.contains("herdr status"), "{hook}");
     assert!(hook.contains("no replay cursor"), "{hook}");
     let fake_bin = root.path().join("fake-bin");
     fs::create_dir_all(&fake_bin).unwrap();
     let herdr = fake_bin.join("herdr");
     fs::write(
         &herdr,
-        "#!/bin/sh\nif [ \"$1\" = workspace ] && [ \"$2\" = get ] && [ \"$3\" = live-space ]; then\n  printf '%s\\n' '{\"result\":{\"workspace\":{\"workspace_id\":\"live-space\"}}}'\n  exit 0\nfi\nprintf '%s\\n' '{\"error\":{\"message\":\"workspace not found\"}}' >&2\nexit 1\n",
+        "#!/bin/sh\nif [ \"$1\" = workspace ] && [ \"$2\" = get ] && [ \"$3\" = live-space ]; then\n  printf '%s\\n' '{\"result\":{\"workspace\":{\"workspace_id\":\"live-space\"}}}'\n  exit 0\nfi\nif [ \"$1\" = workspace ] && [ \"$2\" = rename ] && [ \"$3\" = live-space ]; then exit 0; fi\nprintf '%s\\n' '{\"error\":{\"message\":\"workspace not found\"}}' >&2\nexit 1\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&herdr).unwrap().permissions();
@@ -2286,6 +2898,8 @@ fn herdr_bind_requires_a_live_herdr_workspace_id() {
         command
             .env("PATH", &path)
             .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("HERDR_ENV", "1")
+            .env("HERDR_SOCKET_PATH", root.path().join("herdr-session.sock"))
             .arg("--state-dir")
             .arg(root.path().join("state"))
             .arg("--kubectl")
