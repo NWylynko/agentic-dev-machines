@@ -166,6 +166,7 @@ async function startBotLifecycle(
   directory,
   workspaces,
   { holdDirectory = false } = {},
+  testContext,
 ) {
   await mkdir(directory, { recursive: true });
   const tokenFile = join(directory, "projected-token");
@@ -220,7 +221,7 @@ async function startBotLifecycle(
         response.writeHead(403, headers).end(JSON.stringify({ error: { message: "not authorized" } }));
         return;
       }
-      response.writeHead(200, headers).end(JSON.stringify({ workspaceId: id, holder: value.holder, fencingToken: 1, expiresAt: Math.floor(Date.now() / 1000) + 60 }));
+      response.writeHead(200, headers).end(JSON.stringify({ workspaceId: id, holder: value.holder, fencingToken: 1, expiresAt: Math.floor(Date.now() / 1000) + 60, valid: true }));
       return;
     }
     const authorize = /^\/v1\/workspaces\/([^/]+)\/runtime\/authorize$/.exec(
@@ -280,6 +281,13 @@ async function startBotLifecycle(
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
   });
+  const close = () =>
+    server.listening
+      ? new Promise((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        )
+      : Promise.resolve();
+  testContext?.after(close);
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     tokenFile,
@@ -297,10 +305,7 @@ async function startBotLifecycle(
     operations,
     directoryRequest,
     directoryAbort,
-    close: () =>
-      new Promise((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      ),
+    close,
   };
 }
 
@@ -526,8 +531,8 @@ test("workspace requests are authorized by lifecycle against the caller's projec
     `${runner.url}/v1/workspaces/workspace-lifecycle-auth`,
     { headers: { authorization: "Bearer rotating-pod-identity-token" } },
   );
-  assert.equal(closed.status, 503);
-  assert.equal((await closed.json()).error.code, "RUNTIME_OWNERSHIP_LOST");
+  assert.equal(closed.status, 410);
+  assert.equal((await closed.json()).error.code, "WORKSPACE_DELETED");
 });
 
 test(
@@ -2147,7 +2152,7 @@ test(
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-agent-directory-"));
     const workspaces = [];
     const port = await freePort();
-    const lifecycle = await startBotLifecycle(join(directory, "management"), workspaces);
+    const lifecycle = await startBotLifecycle(join(directory, "management"), workspaces, {}, t);
     const botId = "directory-bot";
     const botWorkspace = { id: botId, name: "bot", role: "bot", phase: "ready", namespace: "fixture-directory-bot" };
     const botPod = await startPodRunner(directory, lifecycle, {
@@ -2260,7 +2265,7 @@ test(
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-cancel-"));
     const port = await freePort();
-    const lifecycle = await startBotLifecycle(join(directory, "management"), [], { holdDirectory: true });
+    const lifecycle = await startBotLifecycle(join(directory, "management"), [], { holdDirectory: true }, t);
     const pod = await startPodRunner(directory, lifecycle, {
       id: "cancel-bot", name: "bot", role: "bot", host: "127.0.0.1", port,
       podUid: "11111111-1111-4111-8111-111111111111",
@@ -2283,7 +2288,7 @@ test(
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-late-agent-"));
     const port = await freePort();
-    const lifecycle = await startBotLifecycle(join(directory, "management"), []);
+    const lifecycle = await startBotLifecycle(join(directory, "management"), [], {}, t);
     const bot = await startPodRunner(directory, lifecycle, {
       id: "late-agent-bot", name: "bot", role: "bot", host: "127.0.0.1", port,
       podUid: "11111111-1111-4111-8111-111111111111",
