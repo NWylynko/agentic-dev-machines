@@ -25,6 +25,9 @@ import {
 function terminalText(terminal: WorkspaceTerminal) {
   return stripTerminalSequences(terminal.render(100).join("\n"));
 }
+function visibleTerminalText(text: string) {
+  return stripTerminalSequences(text).replace(/\s+/g, " ");
+}
 async function fixture(
   role = "coding",
   events: any[] = [],
@@ -180,13 +183,22 @@ function changedTerminal(
     },
   });
   const waitFor = (text: string) =>
-    new Promise<void>((resolve) => {
-      if (terminalText(terminal).includes(text)) {
+    new Promise<void>((resolve, reject) => {
+      const visibleText = () => visibleTerminalText(terminalText(terminal));
+      if (visibleText().includes(text)) {
         resolve();
         return;
       }
+      const deadline = setTimeout(
+        () =>
+          reject(new Error(`Timed out waiting for ${text}: ${visibleText()}`)),
+        3000,
+      );
       notify = () => {
-        if (terminalText(terminal).includes(text)) resolve();
+        if (visibleText().includes(text)) {
+          clearTimeout(deadline);
+          resolve();
+        }
       };
     });
   return { terminal, waitFor };
@@ -634,7 +646,9 @@ test(
         );
         child.stdout.on("data", (chunk) => {
           output += chunk;
-          if (output.includes("Model selected · faux/faux-1")) {
+          if (
+            visibleTerminalText(output).includes("Model selected · faux/faux-1")
+          ) {
             clearTimeout(limit);
             resolve();
           }
@@ -932,7 +946,7 @@ test(
         child: ReturnType<typeof attach>,
         contains: string,
       ) => {
-        if (stripTerminalSequences(firstOutput).includes(contains))
+        if (visibleTerminalText(firstOutput).includes(contains))
           return Promise.resolve();
         return new Promise<void>((resolve, reject) => {
           const cleanup = () => {
@@ -948,13 +962,11 @@ test(
           };
           const onStdout = (chunk: Buffer) => {
             firstOutput += chunk.toString();
-            if (stripTerminalSequences(firstOutput).includes(contains))
-              complete();
+            if (visibleTerminalText(firstOutput).includes(contains)) complete();
           };
           const onStderr = (chunk: Buffer) => {
             firstOutput += chunk.toString();
-            if (stripTerminalSequences(firstOutput).includes(contains))
-              complete();
+            if (visibleTerminalText(firstOutput).includes(contains)) complete();
           };
           const onError = (error: Error) => {
             cleanup();
@@ -1055,7 +1067,7 @@ test(
           second.stdin.write("/status\r");
           await waitForOutput(second, "0 goals · 0 loops");
           assert.match(
-            stripTerminalSequences(firstOutput),
+            visibleTerminalText(firstOutput),
             /Provider error · Authentication credentials are invalid/,
           );
           second.stdin.write("/retry\r");
