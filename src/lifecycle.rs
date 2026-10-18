@@ -552,7 +552,11 @@ fn handle_http(
 fn is_runtime_auth_route(method: &str, path: &str) -> bool {
     (method == "GET" && path == "/v1/runtime/workspaces")
         || (method == "POST" && path == "/v1/runtime/operations")
-        || (method == "POST" && path == "/v1/provider-auth/resolve")
+        || (method == "POST"
+            && matches!(
+                path,
+                "/v1/provider-auth/resolve" | "/v1/provider-auth/catalog"
+            ))
         || (method == "GET"
             && path
                 .strip_prefix("/v1/runtime/operations/")
@@ -705,7 +709,12 @@ fn route(
     if path.starts_with("/v1/provider-auth/") {
         cli.check_lifecycle_fence()?;
     }
-    if method == "POST" && path == "/v1/provider-auth/resolve" {
+    if method == "POST"
+        && matches!(
+            path,
+            "/v1/provider-auth/resolve" | "/v1/provider-auth/catalog"
+        )
+    {
         let caller = authorize_runtime_caller(cli, &store, authorization)?;
         ensure!(
             caller.phase == "ready",
@@ -921,6 +930,7 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
                 | "/v1/provider-auth/login"
                 | "/v1/provider-auth/logout"
                 | "/v1/provider-auth/resolve"
+                | "/v1/provider-auth/catalog"
         ) || path.starts_with("/v1/provider-auth/login/") && login_route,
         "unknown provider auth route"
     );
@@ -1456,6 +1466,8 @@ mod provider_auth_wait_tests {
     #[test]
     fn projected_identity_bypass_is_limited_to_exact_runtime_routes() {
         assert!(is_runtime_auth_route("POST", "/v1/provider-auth/resolve"));
+        assert!(is_runtime_auth_route("POST", "/v1/provider-auth/catalog"));
+        assert!(!is_runtime_auth_route("GET", "/v1/provider-auth/catalog"));
         assert!(is_runtime_auth_route("GET", "/v1/runtime/workspaces"));
         assert!(is_runtime_auth_route("POST", "/v1/runtime/operations"));
         assert!(is_runtime_auth_route(

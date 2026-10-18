@@ -6,7 +6,21 @@ import {
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { AuthEvent, AuthPrompt, AuthType } from "@earendil-works/pi-ai";
+import type {
+  AuthCheck,
+  AuthEvent,
+  AuthPrompt,
+  AuthType,
+} from "@earendil-works/pi-ai";
+
+export type SharedProviderCatalog = Record<
+  string,
+  {
+    auth?: AuthCheck;
+    models: string[];
+    allModels: string[];
+  }
+>;
 
 type AuthorityOptions = {
   authPath: string;
@@ -103,6 +117,37 @@ export async function createProviderAuthAuthority({
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       if (request.method === "GET" && url.pathname === "/health")
         return send(response, 200, { status: "ok" });
+      if (
+        request.method === "POST" &&
+        url.pathname === "/v1/provider-auth/catalog"
+      ) {
+        // Account restrictions are evaluated beside the credential. Only the
+        // resulting model IDs and auth classification cross into a workspace.
+        const [models, allModels, checks] = await Promise.all([
+          runtime.getAvailable(),
+          runtime.getAllAvailable(),
+          Promise.all(
+            runtime
+              .getProviders()
+              .map(
+                async ({ id }) => [id, await runtime.checkAuth(id)] as const,
+              ),
+          ),
+        ]);
+        const catalog: SharedProviderCatalog = {};
+        for (const [id, auth] of checks) {
+          catalog[id] = {
+            ...(auth ? { auth } : {}),
+            models: models
+              .filter((model) => model.provider === id)
+              .map((model) => model.id),
+            allModels: allModels
+              .filter((model) => model.provider === id)
+              .map((model) => model.id),
+          };
+        }
+        return send(response, 200, catalog);
+      }
       if (
         request.method === "GET" &&
         url.pathname === "/v1/provider-auth/providers"

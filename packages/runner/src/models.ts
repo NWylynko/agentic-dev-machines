@@ -9,11 +9,13 @@ import {
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { workspaceCredentialRuntime } from "./credentials.ts";
+import type { SharedProviderCatalog } from "./provider-auth-authority.ts";
 
 export async function workspaceModels(
   provider: string | undefined,
   authPath?: string,
   workspaceRoot = "/workspace",
+  waitForAuthority?: (signal?: AbortSignal) => Promise<void>,
 ): Promise<Models> {
   if (provider !== "faux") {
     const runtime = await workspaceCredentialRuntime(workspaceRoot, {
@@ -30,7 +32,9 @@ export async function workspaceModels(
           }
         : {}),
     });
-    return configureSharedProviderAuth(runtime);
+    return configureSharedProviderAuth(runtime, undefined, {
+      waitForAuthority,
+    });
   }
   const models = createModels();
   const faux = fauxProvider({ tokensPerSecond: 100_000 });
@@ -118,12 +122,61 @@ export async function configureSharedProviderAuth<
     getProvider(id: string): any;
     registerNativeProvider(provider: any): void;
   },
->(runtime: T, selectedProviders?: readonly string[]): Promise<T> {
+>(
+  runtime: T,
+  selectedProviders?: readonly string[],
+  options: {
+    waitForAuthority?: (signal?: AbortSignal) => Promise<void>;
+  } = {},
+): Promise<T> {
   const lifecycleUrl = process.env.ADM_LIFECYCLE_URL;
   if (!lifecycleUrl) return runtime;
   const identityFile =
     process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE ??
     "/var/run/secrets/kubernetes.io/serviceaccount/token";
+  async function sharedRequest(
+    path: string,
+    signal?: AbortSignal,
+    body?: unknown,
+  ) {
+    await options.waitForAuthority?.(signal);
+    signal?.throwIfAborted();
+    const token = (await readFile(identityFile, "utf8")).trim();
+    if (!token) throw new Error("Projected lifecycle identity token is empty");
+    return fetch(
+      `${lifecycleUrl!.replace(/\/$/, "")}/v1/provider-auth/${path}`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal,
+      },
+    );
+  }
+  let catalog: SharedProviderCatalog = {};
+  const catalogRequests = new Map<
+    AbortSignal | undefined,
+    Promise<SharedProviderCatalog>
+  >();
+  function sharedCatalog(signal?: AbortSignal): Promise<SharedProviderCatalog> {
+    const pending = catalogRequests.get(signal);
+    if (pending) return pending;
+    const request = (async () => {
+      const response = await sharedRequest("catalog", signal);
+      if (!response.ok)
+        throw new Error(
+          `Shared provider catalogue failed (${response.status})`,
+        );
+      catalog = (await response.json()) as SharedProviderCatalog;
+      return catalog;
+    })();
+    catalogRequests.set(signal, request);
+    void request.finally(() => catalogRequests.delete(signal)).catch(() => {});
+    return request;
+  }
   for (const id of selectedProviders ??
     runtime.getProviders().map(({ id }) => id)) {
     const provider = runtime.getProvider(id);
@@ -132,25 +185,22 @@ export async function configureSharedProviderAuth<
       provider.auth.oauth?.name ?? provider.auth.apiKey?.name ?? provider.name;
     runtime.registerNativeProvider({
       ...provider,
+      filterModels: (models: { id: string }[]) =>
+        models.filter((model) => catalog[id]?.models.includes(model.id)),
+      filterAllModels: (models: { id: string }[]) =>
+        models.filter((model) => catalog[id]?.allModels.includes(model.id)),
       auth: {
+        // Retain Pi's subscription classification. The workspace credential
+        // store is empty; credential delivery and refresh stay in the authority.
+        ...(provider.auth.oauth ? { oauth: provider.auth.oauth } : {}),
         apiKey: {
           name,
+          check: async ({ signal }: { signal: AbortSignal }) =>
+            (await sharedCatalog(signal))[id]?.auth,
           resolve: async ({ signal }: { signal: AbortSignal }) => {
-            const token = (await readFile(identityFile, "utf8")).trim();
-            if (!token)
-              throw new Error("Projected lifecycle identity token is empty");
-            const response = await fetch(
-              `${lifecycleUrl.replace(/\/$/, "")}/v1/provider-auth/resolve`,
-              {
-                method: "POST",
-                headers: {
-                  authorization: `Bearer ${token}`,
-                  "content-type": "application/json",
-                },
-                body: JSON.stringify({ provider: id }),
-                signal,
-              },
-            );
+            const response = await sharedRequest("resolve", signal, {
+              provider: id,
+            });
             if (response.status === 401)
               throw new Error("Provider is not authenticated");
             if (!response.ok)

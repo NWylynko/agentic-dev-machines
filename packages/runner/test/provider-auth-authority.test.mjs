@@ -6,6 +6,134 @@ import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
 import { createProviderAuthAuthority } from "../src/provider-auth-authority.ts";
 
+test("shared model selection preserves missing-login state and OAuth account model restrictions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-provider-catalog-"));
+  const identityPath = join(directory, "identity");
+  await writeFile(identityPath, "synthetic-catalog-pod-token");
+  const providerId = "adm-catalog-fixture";
+  const models = ["allowed-model", "excluded-model"].map((id) => ({
+    id,
+    provider: providerId,
+    name: id,
+    api: "openai-completions",
+    baseUrl: "https://provider.invalid",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1000,
+    maxTokens: 100,
+  }));
+  const provider = {
+    id: providerId,
+    name: "Synthetic OAuth account",
+    auth: {
+      oauth: {
+        name: "Synthetic OAuth",
+        isSubscription: true,
+        login: async () => ({
+          type: "oauth",
+          access: "catalog-access-secret",
+          refresh: "catalog-refresh-secret",
+          expires: Date.now() + 3_600_000,
+          availableModelIds: ["allowed-model"],
+        }),
+        refresh: async () => {
+          throw new Error("unexpired credential must not refresh");
+        },
+        toAuth: async (credential) => ({ apiKey: credential.access }),
+      },
+    },
+    getModels: () => models,
+    filterModels: (catalog, credential) =>
+      credential?.type === "oauth"
+        ? catalog.filter((model) =>
+            credential.availableModelIds.includes(model.id),
+          )
+        : catalog,
+    stream: () => {
+      throw new Error("catalog must not issue provider requests");
+    },
+    streamSimple: () => {
+      throw new Error("catalog must not issue provider requests");
+    },
+  };
+  const authority = await createProviderAuthAuthority({
+    authPath: join(directory, "auth.json"),
+    configure: (runtime) => runtime.registerNativeProvider(provider),
+  });
+  const previousUrl = process.env.ADM_LIFECYCLE_URL;
+  const previousIdentity = process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE;
+  try {
+    await new Promise((resolve) =>
+      authority.server.listen(0, "127.0.0.1", resolve),
+    );
+    const url = `http://127.0.0.1:${authority.server.address().port}`;
+    process.env.ADM_LIFECYCLE_URL = url;
+    process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE = identityPath;
+    const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+    const { InMemoryCredentialStore } = await import("@earendil-works/pi-ai");
+    const { configureSharedProviderAuth } = await import("../src/models.ts");
+    const runtime = await ModelRuntime.create({
+      credentials: new InMemoryCredentialStore(),
+      refreshOnCreate: false,
+    });
+    runtime.registerNativeProvider(provider);
+    await configureSharedProviderAuth(runtime, [providerId]);
+    assert.deepEqual(await runtime.getAvailable(providerId), []);
+    assert.equal(await runtime.checkAuth(providerId), undefined);
+    const login = await fetch(`${url}/v1/provider-auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: providerId, type: "oauth" }),
+    });
+    assert.equal(login.status, 202);
+    const { operationId } = await login.json();
+    const completion = await fetch(
+      `${url}/v1/provider-auth/login/${operationId}/events`,
+    );
+    assert.equal((await completion.json()).event.type, "complete");
+    assert.deepEqual(
+      (await runtime.getAvailable(providerId)).map((model) => model.id),
+      ["allowed-model"],
+    );
+    assert.deepEqual(
+      (await runtime.getAllAvailable(providerId)).map((model) => model.id),
+      ["allowed-model"],
+    );
+    assert.deepEqual(await runtime.checkAuth(providerId), {
+      source: "OAuth",
+      type: "oauth",
+    });
+    await runtime.refresh({ allowNetwork: false, providers: [providerId] });
+    assert.equal(runtime.isUsingOAuth(providerId), true);
+    assert.equal(runtime.isUsingSubscription(providerId), true);
+    const catalog = await fetch(`${url}/v1/provider-auth/catalog`, {
+      method: "POST",
+    });
+    assert.equal(catalog.status, 200);
+    const serializedCatalog = await catalog.text();
+    assert.doesNotMatch(
+      serializedCatalog,
+      /catalog-(access|refresh)-secret|synthetic-catalog-pod-token/,
+    );
+    const logout = await fetch(`${url}/v1/provider-auth/logout`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: providerId }),
+    });
+    assert.equal(logout.status, 200);
+    assert.deepEqual(await runtime.getAvailable(providerId), []);
+  } finally {
+    if (previousUrl === undefined) delete process.env.ADM_LIFECYCLE_URL;
+    else process.env.ADM_LIFECYCLE_URL = previousUrl;
+    if (previousIdentity === undefined)
+      delete process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE;
+    else process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE = previousIdentity;
+    await authority.close();
+    await rm(directory, { recursive: true });
+  }
+});
+
 test("shared provider auth survives authority restart and logout is visible to every client", async () => {
   const directory = await mkdtemp(join(tmpdir(), "adm-provider-auth-"));
   const authPath = join(directory, "auth.json");
