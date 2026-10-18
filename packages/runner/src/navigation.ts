@@ -8,6 +8,7 @@ import {
   type AgentChange,
   type Harness,
 } from "@earendil-works/pi-durable";
+import type { Message } from "@earendil-works/pi-ai";
 
 type Branch = {
   conversationId: number;
@@ -19,6 +20,7 @@ type Branch = {
 type WorkspaceNavigation = {
   activeConversationId: number;
   branches: Branch[];
+  incompleteImports?: { conversationId: number; createdAt: number }[];
 };
 
 const navigationDocument = defineDoc<WorkspaceNavigation>({
@@ -121,6 +123,129 @@ export async function createWorkspaceConversation(
     context,
   );
   return { activeConversationId: Number(conversation.id) };
+}
+
+export async function createWorkspaceImportedTree(
+  harness: Harness,
+  parentConversationId: number,
+  agent: AgentChange,
+  selectedLeafId: string,
+  branches: readonly {
+    leafId: string;
+    entries: readonly {
+      id: string;
+      parentId: string | null;
+      message: Message;
+    }[];
+  }[],
+  sourceSession?: { id?: string; cwd?: string },
+) {
+  const selected = branches.find((branch) => branch.leafId === selectedLeafId);
+  if (!selected) throw new Error("Imported selected branch is missing");
+  const state = await workspaceBranches(harness);
+  if (state.activeConversationId !== parentConversationId)
+    throw new Error("Workspace conversation changed; retry importing the session");
+  const selectedDurableIds = new Map<string, EntryId>();
+  const appendEntry = async (
+    tx: Parameters<Parameters<Harness["commit"]>[0]>[0],
+    target: ConversationId,
+    entry: (typeof selected.entries)[number],
+  ) => {
+    const record = await tx.appendEntry(target, {
+      kind: "adm.imported-message",
+      model: [entry.message],
+      data: {
+        imported: true,
+        sourceEntryId: entry.id,
+        timestamp:
+          typeof entry.message.timestamp === "number"
+            ? entry.message.timestamp
+            : Date.now(),
+        ...(sourceSession ? { sourceSession } : {}),
+      },
+    });
+    return record.id;
+  };
+  const root = await harness.createConversation(
+    {
+      ownership: { kind: "ownerless" },
+      agent,
+      init: async (tx, conversationId) => {
+        for (const entry of selected.entries)
+          selectedDurableIds.set(
+            entry.id,
+            await appendEntry(tx, conversationId, entry),
+          );
+      },
+    },
+    context,
+  );
+  const importedBranches: Branch[] = [
+    {
+      conversationId: Number(root.id),
+      parentConversationId,
+      createdAt: Date.now(),
+    },
+  ];
+  try {
+    await harness.commit(async (tx) => {
+      for (const branch of branches) {
+        if (branch.leafId === selectedLeafId) continue;
+        let shared = 0;
+        while (
+          shared < selected.entries.length &&
+          shared < branch.entries.length &&
+          selected.entries[shared].id === branch.entries[shared].id
+        )
+          shared++;
+        if (shared === 0)
+          throw new Error("Imported native branches have no shared history root");
+        const forkEntryId = selectedDurableIds.get(selected.entries[shared - 1].id);
+        if (!forkEntryId) throw new Error("Imported branch point was not persisted");
+        const child = await tx.forkConversation(root.id, forkEntryId, {
+          ownership: { kind: "ownerless" },
+        });
+        for (const entry of branch.entries.slice(shared))
+          await appendEntry(tx, child.id, entry);
+        importedBranches.push({
+          conversationId: Number(child.id),
+          parentConversationId: Number(root.id),
+          forkEntryId: Number(forkEntryId),
+          createdAt: Date.now(),
+        });
+      }
+      const navigation = await tx.doc(navigationDocument);
+      if (navigation.activeConversationId !== parentConversationId)
+        throw new Error("Workspace conversation changed; retry importing the session");
+      navigation.branches.push(...importedBranches);
+      navigation.activeConversationId = Number(root.id);
+    }, context);
+  } catch (error) {
+    try {
+      await harness.commit(async (tx) => {
+        const navigation = await tx.doc(navigationDocument);
+        navigation.incompleteImports ??= [];
+        navigation.incompleteImports.push({
+          conversationId: Number(root.id),
+          createdAt: Date.now(),
+        });
+      }, context);
+    } catch (trackingError) {
+      throw new Error(
+        `Import failed before branch publication; staged conversation ${Number(root.id)} could not be recorded for inspection.`,
+        { cause: new AggregateError([error, trackingError]) },
+      );
+    }
+    throw new Error(
+      `Import could not publish its Durable branch tree. The previous selection is unchanged by this import; staged conversation ${Number(root.id)} is recorded as incomplete.`,
+      { cause: error },
+    );
+  }
+  return {
+    activeConversationId: Number(root.id),
+    importedBranches: branches.length,
+    importedMessages: selected.entries.length,
+  };
 }
 
 export async function forkWorkspaceBranch(

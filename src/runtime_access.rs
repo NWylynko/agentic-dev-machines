@@ -189,15 +189,23 @@ fn forward(cli: &Cli, workspace: &Workspace, pod: &str) -> Result<(Forward, Stri
 
 fn terminal_admin_args(cli: &Cli) -> Result<Vec<String>> {
     let mut args = vec![
+        "--project-dir".into(),
+        cli.project_dir.to_string_lossy().into_owned(),
         "--kubectl".into(),
         cli.kubectl.clone(),
         "--kubeconfig".into(),
         cli.kubeconfig_reference()?,
-        "--lifecycle-url".into(),
-        cli.lifecycle_url.clone(),
         "--lifecycle-namespace".into(),
         cli.lifecycle_namespace.clone(),
     ];
+    if let Some(path) = &cli.state_dir {
+        args.push("--state-dir".into());
+        args.push(path.to_string_lossy().into_owned());
+    }
+    if cli.lifecycle_url_explicit {
+        args.push("--lifecycle-url".into());
+        args.push(cli.lifecycle_url.clone());
+    }
     if let Some(path) = &cli.lifecycle_token_file {
         args.push("--lifecycle-token-file".into());
         args.push(path.to_string_lossy().into_owned());
@@ -423,9 +431,9 @@ mod forward_pipe_tests {
         )
         .unwrap();
         let kubeconfig = directory.path().join("client.kubeconfig");
+        let state_dir = directory.path().join("state");
         fs::write(&kubeconfig, "synthetic kubeconfig path only").unwrap();
         let token_path = directory.path().join("lifecycle-token");
-        fs::write(&token_path, "synthetic-bearer-that-must-not-be-forwarded").unwrap();
         let pod_fixture = directory.path().join("pod.json");
         fs::write(
             &pod_fixture,
@@ -458,21 +466,21 @@ mod forward_pipe_tests {
         )
         .unwrap();
         fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-        let cli = Cli {
-            state_dir: Some(directory.path().join("state")),
+        let mut cli = Cli {
+            state_dir: Some(state_dir.clone()),
             kubectl: kubectl.to_string_lossy().into_owned(),
             kubeconfig: Some(kubeconfig.to_string_lossy().into_owned()),
             runner_url: String::new(),
             lifecycle_url: "http://127.0.0.1:45331".into(),
-            lifecycle_url_explicit: true,
+            lifecycle_url_explicit: false,
             lifecycle_forward: false,
             lifecycle_namespace: "adm-system-fixture".into(),
-            lifecycle_token_file: Some(token_path.clone()),
+            lifecycle_token_file: None,
             lifecycle_token_secret: false,
             runtime_status_port: 7432,
             lifecycle_fence: None,
             lifecycle_operation_id: None,
-            project_dir: project,
+            project_dir: project.clone(),
             command: crate::Action::Attach {
                 name: "demo".into(),
                 diagnostics: false,
@@ -501,18 +509,32 @@ mod forward_pipe_tests {
             .unwrap();
         let admin_args: Vec<String> = serde_json::from_str(&argv[json + 1]).unwrap();
         for pair in [
+            ["--project-dir", project.to_str().unwrap()],
+            ["--state-dir", state_dir.to_str().unwrap()],
             ["--kubectl", kubectl.to_str().unwrap()],
             ["--kubeconfig", kubeconfig.to_str().unwrap()],
-            ["--lifecycle-url", "http://127.0.0.1:45331"],
             ["--lifecycle-namespace", "adm-system-fixture"],
-            ["--lifecycle-token-file", token_path.to_str().unwrap()],
         ] {
             assert!(
                 admin_args.windows(2).any(|actual| actual == pair),
                 "missing {pair:?} in {admin_args:?}"
             );
         }
+        assert!(!admin_args.iter().any(|arg| arg == "--lifecycle-url"));
+        assert!(!admin_args.iter().any(|arg| arg == "--lifecycle-token-file"));
         assert!(!argv.join(" ").contains("synthetic-bearer"));
         assert!(!admin_args.join(" ").contains("synthetic-bearer"));
+        cli.lifecycle_url_explicit = true;
+        cli.lifecycle_token_file = Some(token_path.clone());
+        let explicit_admin_args = terminal_admin_args(&cli).unwrap();
+        for pair in [
+            ["--lifecycle-url", "http://127.0.0.1:45331"],
+            ["--lifecycle-token-file", token_path.to_str().unwrap()],
+        ] {
+            assert!(
+                explicit_admin_args.windows(2).any(|actual| actual == pair),
+                "missing {pair:?} in {explicit_admin_args:?}"
+            );
+        }
     }
 }

@@ -16,7 +16,10 @@ import {
   configureTerminalKeybindings,
   terminalKeybindings,
 } from "../src/keybindings.ts";
-import { SettingsSelectorComponent } from "@earendil-works/pi-coding-agent";
+import {
+  SessionManager,
+  SettingsSelectorComponent,
+} from "@earendil-works/pi-coding-agent";
 import {
   ProcessTerminal,
   stripTerminalSequences,
@@ -506,41 +509,60 @@ test("/export writes the selected Durable transcript as local Markdown", async (
 test("/import reads native Pi JSONL and selects the Pod-imported Durable conversation", async () => {
   const directory = await mkdtemp(join(tmpdir(), "adm-pi-import-"));
   const transcript = join(directory, "session with spaces.jsonl");
-  await writeFileFs(
-    transcript,
-    [
-      JSON.stringify({
-        type: "session",
-        version: 3,
-        id: "native-42",
-        cwd: "/tmp/source",
-      }),
-      JSON.stringify({
-        type: "message",
-        id: "1",
-        parentId: null,
-        timestamp: "2026-10-18T00:00:00.000Z",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "Imported request" }],
-          timestamp: 1,
-        },
-      }),
-      JSON.stringify({
-        type: "message",
-        id: "2",
-        parentId: "1",
-        timestamp: "2026-10-18T00:00:01.000Z",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "Imported response" }],
-          stopReason: "stop",
-          timestamp: 2,
-        },
-      }),
-      "",
-    ].join("\n"),
-  );
+  const native = SessionManager.create("/tmp/source", directory, {
+    id: "native-42",
+  });
+  const rootMessage = native.appendMessage({
+    role: "user",
+    content: "Source request",
+    timestamp: 1,
+  });
+  native.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "Source answer" }],
+    api: "openai-responses",
+    provider: "faux",
+    model: "faux-1",
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 2,
+  });
+  native.appendMessage({
+    role: "user",
+    content: "Alternate branch request",
+    timestamp: 3,
+  });
+  native.branch(rootMessage);
+  native.appendMessage({
+    role: "user",
+    content: "Imported request",
+    timestamp: 4,
+  });
+  native.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "Imported response" }],
+    api: "openai-responses",
+    provider: "faux",
+    model: "faux-1",
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 5,
+  });
+  await writeFileFs(transcript, await readFile(native.getSessionFile()!));
   let activeConversationId = 1;
   let imported: any;
   let stream: import("node:http").ServerResponse | undefined;
@@ -600,7 +622,8 @@ test("/import reads native Pi JSONL and selects the Pod-imported Durable convers
       response.end(
         JSON.stringify({
           activeConversationId,
-          importedMessages: imported.messages.length,
+          importedMessages: imported.entries.length,
+          importedBranches: 2,
         }),
       );
     } else if (request.method === "GET")
@@ -627,16 +650,27 @@ test("/import reads native Pi JSONL and selects the Pod-imported Durable convers
     await terminal.submit(`/import "${transcript}"`);
     assert.equal(imported.session.id, "native-42");
     assert.deepEqual(
-      imported.messages.map((message: any) => message.content[0].text),
-      ["Imported request", "Imported response"],
+      imported.entries.map((entry: any) =>
+        typeof entry.message.content === "string"
+          ? entry.message.content
+          : entry.message.content[0].text,
+      ),
+      [
+        "Source request",
+        "Source answer",
+        "Alternate branch request",
+        "Imported request",
+        "Imported response",
+      ],
     );
+    assert.equal(imported.selectedLeafId, imported.entries.at(-1).id);
     assert.equal((terminal as any).conversationId, 2);
     assert.match(
       stripTerminalSequences(terminal.render(120).join("\n")).replace(
         /\s+/g,
         " ",
       ),
-      /Imported 2 messages from session with spaces\.jsonl/,
+      /Imported 5 messages across 2 branches from session with spaces\.jsonl/,
     );
   } finally {
     terminal.close();

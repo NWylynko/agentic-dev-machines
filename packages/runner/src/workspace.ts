@@ -26,6 +26,7 @@ import { workspaceModels } from "./models.ts";
 import {
   activeWorkspaceConversation,
   createWorkspaceConversation,
+  createWorkspaceImportedTree,
   forkWorkspaceBranch,
   initializeNavigation,
   selectWorkspaceBranch,
@@ -819,7 +820,15 @@ export class Workspace {
   }
 
   async importMessages(
-    messages: readonly Message[],
+    branches: readonly {
+      leafId: string;
+      entries: readonly {
+        id: string;
+        parentId: string | null;
+        message: Message;
+      }[];
+    }[],
+    selectedLeafId: string,
     sourceSession?: { id?: string; cwd?: string },
   ) {
     if (this.config.role !== "coding")
@@ -832,7 +841,7 @@ export class Workspace {
       await this.assertIdleForNavigation();
       const active = this.conversation;
       const agent = await active.agent(context);
-      const result = await createWorkspaceConversation(
+      const result = await createWorkspaceImportedTree(
         this.harness,
         Number(active.id),
         {
@@ -846,22 +855,9 @@ export class Workspace {
             : {}),
           thinkingLevel: agent.thinkingLevel,
         },
-        async (tx, conversationId) => {
-          for (const [index, message] of messages.entries()) {
-            await tx.appendEntry(conversationId, {
-              kind: "adm.imported-message",
-              model: [message],
-              data: {
-                imported: true,
-                timestamp:
-                  typeof message.timestamp === "number"
-                    ? message.timestamp
-                    : Date.now(),
-                ...(index === 0 && sourceSession ? { sourceSession } : {}),
-              },
-            });
-          }
-        },
+        selectedLeafId,
+        branches,
+        sourceSession,
       );
       this.conversation = await activeWorkspaceConversation(this.harness);
       const selected = (await this.conversation.agent(context)).model;
@@ -875,7 +871,9 @@ export class Workspace {
       return {
         ...result,
         model: this.config.model,
-        importedMessages: messages.length,
+        importedMessages:
+          branches.find((branch) => branch.leafId === selectedLeafId)?.entries
+            .length ?? 0,
       };
     });
   }

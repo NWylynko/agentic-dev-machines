@@ -849,6 +849,7 @@ function importedPiMessages(value: unknown): Message[] {
       "Pi transcript import requires one to 1000 messages",
     );
   let totalBytes = 0;
+  const availableToolCalls = new Set<string>();
   const messages = value.map((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item))
       throw new ApiError(
@@ -857,19 +858,66 @@ function importedPiMessages(value: unknown): Message[] {
         "Imported message must be an object",
       );
     const message = item as Record<string, any>;
-    if (
-      !["user", "assistant", "toolResult"].includes(message.role) ||
-      !Array.isArray(message.content) ||
-      (message.role === "toolResult" &&
-        (typeof message.toolCallId !== "string" ||
-          typeof message.toolName !== "string" ||
-          typeof message.isError !== "boolean"))
-    )
+    if (!["user", "assistant", "toolResult"].includes(message.role))
       throw new ApiError(
         400,
         "INVALID_IMPORT",
         "Imported messages must be Pi user, assistant, or tool-result messages",
       );
+    if (
+      message.role === "user" &&
+      typeof message.content !== "string" &&
+      (!Array.isArray(message.content) ||
+        message.content.some(
+          (part: any) =>
+            !part ||
+            typeof part !== "object" ||
+            Array.isArray(part) ||
+            (part.type === "text" && typeof part.text !== "string") ||
+            !["text", "image"].includes(part.type),
+        ))
+    )
+      throw new ApiError(
+        400,
+        "INVALID_IMPORT",
+        "Imported user content is invalid",
+      );
+    if (
+      message.role !== "user" &&
+      (!Array.isArray(message.content) ||
+        (message.role === "assistant" &&
+          (typeof message.api !== "string" ||
+            typeof message.provider !== "string" ||
+            typeof message.model !== "string" ||
+            ![
+              "pending",
+              "stop",
+              "length",
+              "toolUse",
+              "error",
+              "aborted",
+              "deferred",
+            ].includes(message.stopReason) ||
+            !message.usage ||
+            typeof message.usage !== "object" ||
+            ["input", "output", "cacheRead", "cacheWrite"].some(
+              (field) =>
+                !Number.isFinite(message.usage[field]) ||
+                message.usage[field] < 0,
+            ))) ||
+        (message.role === "toolResult" &&
+          (typeof message.toolCallId !== "string" ||
+            !availableToolCalls.has(message.toolCallId) ||
+            typeof message.toolName !== "string" ||
+            typeof message.isError !== "boolean")))
+    )
+      throw new ApiError(
+        400,
+        "INVALID_IMPORT",
+        "Imported message metadata or content is invalid",
+      );
+    if (message.role === "toolResult")
+      availableToolCalls.delete(message.toolCallId);
     if (
       message.timestamp !== undefined &&
       (!Number.isFinite(message.timestamp) ||
@@ -881,12 +929,40 @@ function importedPiMessages(value: unknown): Message[] {
         "Message timestamp must be numeric",
       );
     for (const part of message.content) {
+      if (typeof message.content === "string") break;
       if (!part || typeof part !== "object" || Array.isArray(part))
         throw new ApiError(
           400,
           "INVALID_IMPORT",
           "Message content part must be an object",
         );
+      if (
+        (part.type === "text" && typeof part.text !== "string") ||
+        (part.type === "thinking" &&
+          (message.role !== "assistant" ||
+            typeof part.thinking !== "string")) ||
+        (part.type === "toolCall" &&
+          (message.role !== "assistant" ||
+            typeof part.id !== "string" ||
+            !part.id ||
+            typeof part.name !== "string" ||
+            !part.name ||
+            !part.arguments ||
+            typeof part.arguments !== "object" ||
+            Array.isArray(part.arguments) ||
+            availableToolCalls.has(part.id))) ||
+        (part.type === "image" &&
+          !["user", "assistant", "toolResult"].includes(message.role)) ||
+        (message.role === "toolResult" &&
+          !["text", "image"].includes(part.type)) ||
+        !["text", "thinking", "toolCall", "image"].includes(part.type)
+      )
+        throw new ApiError(
+          400,
+          "INVALID_IMPORT",
+          "Message content part is invalid for its role",
+        );
+      if (part.type === "toolCall") availableToolCalls.add(part.id);
       if (part.type === "image") {
         if (
           !["image/png", "image/jpeg", "image/webp"].includes(part.mimeType) ||
@@ -935,6 +1011,67 @@ function importedPiMessages(value: unknown): Message[] {
     return message as Message;
   });
   return messages;
+}
+
+function importedPiTree(value: unknown, selectedLeafId: unknown) {
+  if (
+    !Array.isArray(value) ||
+    value.length < 1 ||
+    value.length > 1000 ||
+    typeof selectedLeafId !== "string"
+  )
+    throw new ApiError(
+      400,
+      "INVALID_IMPORT",
+      "Pi tree import requires one to 1000 entries and a selected leaf",
+    );
+  const byId = new Map<string, { id: string; parentId: string | null; message: unknown }>();
+  const roots = new Set<string>();
+  const children = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      throw new ApiError(400, "INVALID_IMPORT", "Imported entry must be an object");
+    const entry = item as Record<string, unknown>;
+    if (
+      typeof entry.id !== "string" ||
+      !entry.id ||
+      entry.id.length > 128 ||
+      (entry.parentId !== null && typeof entry.parentId !== "string") ||
+      byId.has(entry.id)
+    )
+      throw new ApiError(400, "INVALID_IMPORT", "Imported entry identity is invalid");
+    const parentId = entry.parentId as string | null;
+    if (parentId === null) roots.add(entry.id);
+    else {
+      if (!byId.has(parentId))
+        throw new ApiError(400, "INVALID_IMPORT", "Imported entry parent is missing or out of order");
+      children.add(parentId);
+    }
+    byId.set(entry.id, { id: entry.id, parentId, message: entry.message });
+  }
+  if (roots.size !== 1)
+    throw new ApiError(400, "INVALID_IMPORT", "Imported branches must share one history root");
+  const leaves = [...byId.keys()].filter((id) => !children.has(id));
+  if (!leaves.includes(selectedLeafId))
+    throw new ApiError(400, "INVALID_IMPORT", "Selected imported leaf does not exist");
+  const branches = leaves.map((leafId) => {
+    const path: { id: string; parentId: string | null; message: unknown }[] = [];
+    let current: { id: string; parentId: string | null; message: unknown } | undefined = byId.get(leafId);
+    while (current) {
+      path.push(current);
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+    path.reverse();
+    const messages = importedPiMessages(path.map((entry) => entry.message));
+    return {
+      leafId,
+      entries: path.map((entry, index) => ({
+        ...entry,
+        message: messages[index],
+      })),
+    };
+  });
+  return { branches, selectedLeafId };
 }
 function json(response: ServerResponse, status: number, value: unknown) {
   response.writeHead(status, {
@@ -1185,7 +1322,7 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "POST" && action === "import") {
       const data = await body(request, 9 * 1024 * 1024);
-      const messages = importedPiMessages(data.messages);
+      const imported = importedPiTree(data.entries, data.selectedLeafId);
       let sourceSession: { id?: string; cwd?: string } | undefined;
       if (data.session !== undefined) {
         if (
@@ -1220,7 +1357,11 @@ const server = createServer(async (request, response) => {
         return json(
           response,
           201,
-          await workspace.importMessages(messages, sourceSession),
+          await workspace.importMessages(
+            imported.branches,
+            imported.selectedLeafId,
+            sourceSession,
+          ),
         );
       });
     }

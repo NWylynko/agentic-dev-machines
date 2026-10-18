@@ -6,8 +6,81 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { createWorkspaceImportedTree } from "../src/navigation.ts";
 
 const main = new URL("../src/main.ts", import.meta.url);
+
+test("failed imported branch publication keeps the old conversation active and reports the staged root", async () => {
+  const navigation = {
+    activeConversationId: 1,
+    branches: [{ conversationId: 1, createdAt: 1 }],
+  };
+  const history = new Map([[1, ["Existing conversation"]]]);
+  let nextId = 2;
+  const harness = {
+    snapshot: async () => structuredClone(navigation),
+    createConversation: async (options) => {
+      const id = nextId++;
+      const staged = [];
+      await options.init(
+        {
+          appendEntry: async (conversationId, entry) => {
+            assert.equal(conversationId, id);
+            staged.push(entry.model[0]);
+            return { id: staged.length };
+          },
+        },
+        id,
+      );
+      history.set(id, staged);
+      return { id };
+    },
+    commit: async (callback) => {
+      const draft = structuredClone(navigation);
+      const tx = {
+        forkConversation: async () => {
+          throw new Error("injected Durable fork failure");
+        },
+        doc: async () => draft,
+      };
+      const result = await callback(tx);
+      Object.assign(navigation, draft);
+      return result;
+    },
+  };
+  await assert.rejects(
+    createWorkspaceImportedTree(
+      harness,
+      1,
+      {},
+      "selected-leaf",
+      [
+        {
+          leafId: "selected-leaf",
+          entries: [
+            { id: "root", parentId: null, message: { role: "user" } },
+            { id: "selected-leaf", parentId: "root", message: { role: "assistant" } },
+          ],
+        },
+        {
+          leafId: "alternate-leaf",
+          entries: [
+            { id: "root", parentId: null, message: { role: "user" } },
+            { id: "alternate-leaf", parentId: "root", message: { role: "user" } },
+          ],
+        },
+      ],
+    ),
+    /previous selection is unchanged by this import; staged conversation 2 is recorded as incomplete/,
+  );
+  assert.equal(navigation.activeConversationId, 1);
+  assert.deepEqual(navigation.branches, [{ conversationId: 1, createdAt: 1 }]);
+  assert.deepEqual(navigation.incompleteImports, [
+    { conversationId: 2, createdAt: navigation.incompleteImports[0].createdAt },
+  ]);
+  assert.equal(history.get(1)[0], "Existing conversation");
+  assert.equal(history.get(2).length, 2);
+});
 
 async function runnerFor(directory, { defaultModel = true } = {}) {
   const args = [
@@ -531,34 +604,114 @@ test(
     const originalId = registered.body.conversationId;
     const imported = await runner.request(path + "/import", "POST", {
       session: { id: "native-session-1", cwd: "/tmp/original" },
-      messages: [
+      selectedLeafId: "selected-answer",
+      entries: [
         {
-          role: "user",
-          content: [{ type: "text", text: "Imported question" }],
-          timestamp: 10,
+          id: "source-question",
+          parentId: null,
+          message: {
+            role: "user",
+            content: "Imported question",
+            timestamp: 10,
+          },
         },
         {
-          role: "assistant",
-          content: [{ type: "text", text: "Imported answer" }],
-          stopReason: "stop",
-          timestamp: 11,
+          id: "source-answer",
+          parentId: "source-question",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Source answer" }],
+            api: "openai-responses",
+            provider: "faux",
+            model: "faux-1",
+            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+            timestamp: 11,
+          },
+        },
+        {
+          id: "alternate-question",
+          parentId: "source-question",
+          message: {
+            role: "user",
+            content: "Alternate question",
+            timestamp: 12,
+          },
+        },
+        {
+          id: "selected-question",
+          parentId: "source-answer",
+          message: {
+            role: "user",
+            content: "Selected follow-up",
+            timestamp: 13,
+          },
+        },
+        {
+          id: "selected-answer",
+          parentId: "selected-question",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Selected answer" }],
+            api: "openai-responses",
+            provider: "faux",
+            model: "faux-1",
+            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "stop",
+            timestamp: 14,
+          },
         },
       ],
     });
     assert.equal(imported.status, 201, JSON.stringify(imported.body));
     assert.notEqual(imported.body.activeConversationId, originalId);
-    assert.equal(imported.body.importedMessages, 2);
+    assert.equal(imported.body.importedMessages, 4);
+    assert.equal(imported.body.importedBranches, 2);
+    const invalidContent = await runner.request(path + "/import", "POST", {
+      messages: [{ role: "user", content: [{ type: "toolCall", id: "fake" }] }],
+    });
+    assert.equal(invalidContent.status, 400);
+    const danglingTool = await runner.request(path + "/import", "POST", {
+      messages: [
+        {
+          role: "toolResult",
+          toolCallId: "missing",
+          toolName: "bash",
+          isError: false,
+          content: [{ type: "text", text: "no" }],
+          timestamp: 12,
+        },
+      ],
+    });
+    assert.equal(danglingTool.status, 400);
+    assert.equal(
+      (await runner.request(path)).body.conversationId,
+      imported.body.activeConversationId,
+    );
     const navigation = await runner.request(path + "/branches");
     assert.equal(
       navigation.body.activeConversationId,
       imported.body.activeConversationId,
     );
-    assert.equal(navigation.body.branches.length, 2);
+    assert.equal(navigation.body.branches.length, 3);
     const history = await runner.request(path + "/history?limit=100");
     assert.deepEqual(
       history.body.events.map((event) => event.data.text),
-      ["Imported question", "Imported answer"],
+      ["Imported question", "Source answer", "Selected follow-up", "Selected answer"],
     );
+    const alternate = navigation.body.branches.at(-1).conversationId;
+    const selectedAlternate = await runner.request(path + "/branch", "PUT", {
+      conversationId: alternate,
+    });
+    assert.equal(selectedAlternate.status, 200);
+    const alternateHistory = await runner.request(path + "/history?limit=100");
+    assert.deepEqual(
+      alternateHistory.body.events.map((event) => event.data.text),
+      ["Imported question", "Alternate question"],
+    );
+    await runner.request(path + "/branch", "PUT", {
+      conversationId: imported.body.activeConversationId,
+    });
     await runner.stop();
     runner = await runnerFor(directory);
     const restored = await runner.request(path);
@@ -569,8 +722,47 @@ test(
     const restoredHistory = await runner.request(path + "/history?limit=100");
     assert.deepEqual(
       restoredHistory.body.events.map((event) => event.data.text),
-      ["Imported question", "Imported answer"],
+      ["Imported question", "Source answer", "Selected follow-up", "Selected answer"],
     );
+    const toolImport = await runner.request(path + "/import", "POST", {
+      selectedLeafId: "tool-result",
+      entries: [
+        {
+          id: "tool-call",
+          parentId: null,
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "imported-call-1",
+                name: "read",
+                arguments: { path: "README.md" },
+              },
+            ],
+            api: "openai-responses",
+            provider: "faux",
+            model: "faux-1",
+            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+            stopReason: "toolUse",
+            timestamp: 13,
+          },
+        },
+        {
+          id: "tool-result",
+          parentId: "tool-call",
+          message: {
+            role: "toolResult",
+            toolCallId: "imported-call-1",
+            toolName: "read",
+            isError: false,
+            content: [{ type: "text", text: "Imported file output" }],
+            timestamp: 14,
+          },
+        },
+      ],
+    });
+    assert.equal(toolImport.status, 201, JSON.stringify(toolImport.body));
   },
 );
 
