@@ -860,9 +860,7 @@ fn remove_close_receipt(cli: &Cli, workspace_id: &str) -> Result<()> {
 }
 
 fn replay_close_journal(cli: &Cli) -> Result<()> {
-    if !cli.state_path().exists() {
-        return Ok(());
-    }
+    let _lock = binding_lock(cli)?;
     let mut receipts = Vec::new();
     for entry in fs::read_dir(cli.state_path())? {
         let path = entry?.path();
