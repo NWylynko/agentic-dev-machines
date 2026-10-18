@@ -390,6 +390,13 @@ elif args[:2] == ['delete','namespace']:
     wait_for_release('delete')
     state.pop(args[2],None);path.write_text(json.dumps(state)); print('deleted')
 elif args[0] == 'wait':
+    if '--for=jsonpath=' in ' '.join(args) and pathlib.Path(__file__).parent.joinpath('real-kubectl-parser').exists():
+        parser = pathlib.Path(__file__).parent.joinpath('real-kubectl-parser').read_text().strip()
+        result = subprocess.run([parser, '--server=http://127.0.0.1:9', '--request-timeout=1s', *args], text=True, capture_output=True)
+        pathlib.Path(__file__).parent.joinpath('real-kubectl-result').write_text(repr(args) + '\n' + result.stderr)
+        if 'unexpected path string' in result.stderr.lower() or 'connection refused' not in result.stderr.lower():
+            print(result.stderr, file=sys.stderr)
+            sys.exit(result.returncode or 1)
     wait_for_release('readiness')
     failure = pathlib.Path(__file__).parent / 'fail-wait-once'
     if failure.exists():
@@ -885,6 +892,16 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
 #[test]
 fn create_prepares_a_private_public_repository_inside_each_workspace_pod() {
     let root = fixture();
+    let kubectl_parser = Command::new("which")
+        .arg("kubectl")
+        .output()
+        .expect("find real kubectl parser");
+    assert!(kubectl_parser.status.success(), "kubectl must be installed");
+    fs::write(
+        root.path().join("real-kubectl-parser"),
+        String::from_utf8(kubectl_parser.stdout).unwrap(),
+    )
+    .unwrap();
     let upstreams = root.path().join("upstreams");
     let upstream = upstreams.join("owner/project.git");
     let rewrite = format!("url.file://{}/.insteadOf", upstreams.display());
@@ -966,6 +983,13 @@ fn create_prepares_a_private_public_repository_inside_each_workspace_pod() {
             "owner/project",
         ],
     ));
+    let parser_result = fs::read_to_string(root.path().join("real-kubectl-result"))
+        .expect("the public create command must pass its Pod wait through real kubectl");
+    assert!(
+        parser_result.contains("connection refused")
+            && !parser_result.contains("unexpected path string"),
+        "kubectl must parse the wait expression before reaching the unreachable API: {parser_result}"
+    );
     assert_eq!(created["repository"], "owner/project");
     assert_eq!(created["cwd"], "/repos/owner/project");
     assert_eq!(created["phase"], "ready");

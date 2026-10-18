@@ -1282,7 +1282,7 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
                     cli,
                     &[
                         "wait",
-                        "--for=jsonpath='{.status.phase}'=Running",
+                        "--for=jsonpath={.status.phase}=Running",
                         "pod",
                         "-l",
                         &format!("adm.dev/workspace-id={}", w.id),
