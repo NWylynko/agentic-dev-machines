@@ -18,38 +18,41 @@ adm terminal --url URL --workspace ID --admin-executable /path/to/adm --admin-ar
 
 The terminal loads persisted history, subscribes to server-sent events, and resumes from its last event cursor after `/reconnect` or Ctrl+R. A lost connection leaves the agent running. Reconnection is explicit; the client does not poll or silently restart the runner.
 
-| Input                                | Effect                                                           |
-| ------------------------------------ | ---------------------------------------------------------------- |
-| Enter                                | Send input, steering a busy agent after its current tools        |
-| `/followup TEXT`                     | Queue input after the current run                                |
-| `/resume`                            | Retry the latest provider failure when no tool ran before it     |
-| `/model`                             | Open the Pi model selector backed by the selected workspace      |
-| `/thinking`                          | Open the Pi thinking-level selector                              |
-| `/settings`                          | Open workspace-backed Pi settings; unsupported settings fail     |
-| `/session`, `/tree`, `/fork`, `/new` | Inspect and navigate Durable conversations in this workspace     |
-| `/compact`, `/reset`                 | Compact or reset the selected Durable conversation               |
-| `/login`, `/logout`                  | Run the host CLI's shared provider-auth flow                     |
-| Ctrl+G                               | Open `$VISUAL`/`$EDITOR` and return text to the prompt           |
-| Ctrl+V / Alt+V                       | Attach a clipboard PNG/JPEG/WebP image to the next prompt        |
-| `/newgoal TEXT`                      | Save a durable goal (`/goal` also works)                         |
-| `/loop SECONDS TEXT`                 | Save recurring work                                              |
-| `/goals`                             | List durable goal IDs, descriptions, and statuses                |
-| `/loops`                             | List recurring loop IDs, prompts, and statuses                   |
-| `/complete-goal ID`                  | Mark a goal completed                                            |
-| `/cancel-goal ID`                    | Cancel a goal                                                    |
-| `/cancel-loop ID`                    | Stop a recurring loop                                            |
-| Esc or `/abort`                      | Abort current foreground work                                    |
-| `/abort all`                         | Request cancellation including background agent work             |
-| `/status`                            | Show current state, provider error details, and goal/loop counts |
-| `/help`                              | Show available commands                                          |
-| Ctrl+R or `/reconnect`               | Reattach from the last received cursor                           |
-| Ctrl+C or `/detach`                  | Close this terminal attachment                                   |
-| Ctrl+J or Shift+Enter                | Insert a newline in the prompt editor                            |
-| Up / Down                            | Browse submitted prompt history                                  |
+| Input                                | Effect                                                              |
+| ------------------------------------ | ------------------------------------------------------------------- |
+| Enter                                | Send input, steering a busy agent after its current tools           |
+| `/followup TEXT`                     | Queue input after the current run                                   |
+| `/resume`                            | Retry the latest provider failure when no tool ran before it        |
+| `/model`                             | Open the Pi model selector backed by the selected workspace         |
+| `/thinking`                          | Open the Pi thinking-level selector                                 |
+| `/settings`                          | Open workspace-backed Pi settings; unsupported settings fail        |
+| `/session`, `/tree`, `/fork`, `/new` | Inspect and navigate Durable conversations in this workspace        |
+| `/compact`, `/reset`                 | Compact or reset the selected Durable conversation                  |
+| `/import PATH.jsonl`                 | Import supported native Pi messages into a new Durable conversation |
+| `/share PATH`                        | Save a local Markdown copy of the selected transcript               |
+| `/bash`                              | Open bash inside this coding workspace's Pod                        |
+| `/login`, `/logout`                  | Run the host CLI's shared provider-auth flow                        |
+| Ctrl+G                               | Open `$VISUAL`/`$EDITOR` and return text to the prompt              |
+| Ctrl+V / Alt+V                       | Attach a clipboard PNG/JPEG/WebP image to the next prompt           |
+| `/newgoal TEXT`                      | Save a durable goal (`/goal` also works)                            |
+| `/loop SECONDS TEXT`                 | Save recurring work                                                 |
+| `/goals`                             | List durable goal IDs, descriptions, and statuses                   |
+| `/loops`                             | List recurring loop IDs, prompts, and statuses                      |
+| `/complete-goal ID`                  | Mark a goal completed                                               |
+| `/cancel-goal ID`                    | Cancel a goal                                                       |
+| `/cancel-loop ID`                    | Stop a recurring loop                                               |
+| Esc or `/abort`                      | Abort current foreground work                                       |
+| `/abort all`                         | Request cancellation including background agent work                |
+| `/status`                            | Show current state, provider error details, and goal/loop counts    |
+| `/help`                              | Show available commands                                             |
+| Ctrl+R or `/reconnect`               | Reattach from the last received cursor                              |
+| Ctrl+C or `/detach`                  | Close this terminal attachment                                      |
+| Ctrl+J or Shift+Enter                | Insert a newline in the prompt editor                               |
+| Up / Down                            | Browse submitted prompt history                                     |
 
 Bot chat shows user input, explicit `sendMessage` deliveries, and system status. Ordinary model responses and tool output remain hidden even if the server accidentally includes them. Start with `--diagnostics` to inspect raw diagnostic events explicitly. Model-supplied terminal control sequences are stripped before display.
 
-Assistant, user, thinking, and tool records render through Pi TUI components. `/resume` retries a safe failed provider turn; it does not select a native Pi JSONL session. Import/share, project trust, extension management, reload, and native bash mode are not yet available because the workspace runtime APIs do not expose those operations. The client does not run local coding tools or create a second Pi session.
+Assistant, user, thinking, and tool records render through Pi TUI components. `/resume` retries a safe failed provider turn; `/import` imports supported user/assistant/tool-result messages into and selects a new Durable conversation. Unsupported message shapes fail visibly instead of being dropped. `/share PATH` writes a user-requested local Markdown copy and does not publish a link. `/bash` uses the host CLI to open an interactive shell inside the owning coding Pod; bots cannot use it. Project trust, extension management, reload, and extension UI still need Pod-owned contracts. The client does not run local coding tools or create a second Pi session.
 
 An input whose HTTP response is lost retains its request ID when retried unchanged in the same attachment. The runner can deduplicate the admission. If input fails, its text returns to the editor and the error is shown.
 

@@ -187,6 +187,24 @@ fn forward(cli: &Cli, workspace: &Workspace, pod: &str) -> Result<(Forward, Stri
     }
 }
 
+fn terminal_admin_args(cli: &Cli) -> Result<Vec<String>> {
+    let mut args = vec![
+        "--kubectl".into(),
+        cli.kubectl.clone(),
+        "--kubeconfig".into(),
+        cli.kubeconfig_reference()?,
+        "--lifecycle-url".into(),
+        cli.lifecycle_url.clone(),
+        "--lifecycle-namespace".into(),
+        cli.lifecycle_namespace.clone(),
+    ];
+    if let Some(path) = &cli.lifecycle_token_file {
+        args.push("--lifecycle-token-file".into());
+        args.push(path.to_string_lossy().into_owned());
+    }
+    Ok(args)
+}
+
 pub fn request(
     cli: &Cli,
     workspace: &Workspace,
@@ -246,6 +264,11 @@ pub fn attach(cli: &Cli, workspace: &Workspace, diagnostics: bool) -> Result<()>
             "--identity-file",
         ])
         .arg(path);
+    command
+        .arg("--admin-executable")
+        .arg(std::env::current_exe().context("locate adm executable for terminal auth")?)
+        .arg("--admin-args-json")
+        .arg(serde_json::to_string(&terminal_admin_args(cli)?)?);
     if diagnostics {
         command.arg("--diagnostics");
     }
@@ -383,5 +406,113 @@ mod forward_pipe_tests {
         assert!(forward.0.try_wait().unwrap().is_none());
         forward.0.kill().unwrap();
         forward.0.wait().unwrap();
+    }
+
+    #[test]
+    fn attach_passes_host_auth_connection_selectors_without_bearer_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        fs::create_dir_all(project.join("runtime")).unwrap();
+        let output = directory.path().join("terminal-argv.json");
+        fs::write(
+            project.join("runtime/terminal.mjs"),
+            format!(
+                "import {{ writeFileSync }} from 'node:fs'; writeFileSync({}, JSON.stringify(process.argv.slice(2)));",
+                serde_json::to_string(&output.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        let kubeconfig = directory.path().join("client.kubeconfig");
+        fs::write(&kubeconfig, "synthetic kubeconfig path only").unwrap();
+        let token_path = directory.path().join("lifecycle-token");
+        fs::write(&token_path, "synthetic-bearer-that-must-not-be-forwarded").unwrap();
+        let pod_fixture = directory.path().join("pod.json");
+        fs::write(
+            &pod_fixture,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {
+                    "uid": "pod-uid",
+                    "namespace": "adm-demo",
+                    "name": "workspace-pod",
+                    "labels": {
+                        "adm.dev/workspace-id": "a1a1a1a1a1a14a1a8a1a1a1a1a1a1a1a",
+                        "app.kubernetes.io/managed-by": "adm"
+                    }
+                },
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "phase": "Running"
+                },
+                "spec": {"serviceAccountName": "adm-runtime"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let kubectl = directory.path().join("kubectl");
+        fs::write(
+            &kubectl,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = get ]; then cat '{}'; exit 0; fi\nif [ \"$1\" = port-forward ]; then echo 'Forwarding from 127.0.0.1:39423 -> 7432'; sleep 30; fi\nexit 1\n",
+                pod_fixture.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = Cli {
+            state_dir: Some(directory.path().join("state")),
+            kubectl: kubectl.to_string_lossy().into_owned(),
+            kubeconfig: Some(kubeconfig.to_string_lossy().into_owned()),
+            runner_url: String::new(),
+            lifecycle_url: "http://127.0.0.1:45331".into(),
+            lifecycle_url_explicit: true,
+            lifecycle_forward: false,
+            lifecycle_namespace: "adm-system-fixture".into(),
+            lifecycle_token_file: Some(token_path.clone()),
+            lifecycle_token_secret: false,
+            runtime_status_port: 7432,
+            lifecycle_fence: None,
+            lifecycle_operation_id: None,
+            project_dir: project,
+            command: crate::Action::Attach {
+                name: "demo".into(),
+                diagnostics: false,
+            },
+        };
+        let workspace: Workspace = serde_json::from_value(serde_json::json!({
+            "id":"a1a1a1a1a1a14a1a8a1a1a1a1a1a1a1a",
+            "name":"demo", "role":"coding", "namespace":"adm-demo",
+            "phase":"ready", "runtime_status":{"podName":"workspace-pod"},
+            "image":"adm-dev:test", "storage_class":"test",
+            "storage_size":"1Gi", "cpu":"1", "memory":"1Gi", "agent_enabled":true,
+            "repositories":false, "catalog":{}, "model":null,
+            "created_at":1
+        }))
+        .unwrap();
+        attach(&cli, &workspace, false).unwrap();
+        let argv: Vec<String> = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert!(argv.windows(2).any(|pair| pair
+            == [
+                "--admin-executable",
+                std::env::current_exe().unwrap().to_str().unwrap()
+            ]));
+        let json = argv
+            .iter()
+            .position(|arg| arg == "--admin-args-json")
+            .unwrap();
+        let admin_args: Vec<String> = serde_json::from_str(&argv[json + 1]).unwrap();
+        for pair in [
+            ["--kubectl", kubectl.to_str().unwrap()],
+            ["--kubeconfig", kubeconfig.to_str().unwrap()],
+            ["--lifecycle-url", "http://127.0.0.1:45331"],
+            ["--lifecycle-namespace", "adm-system-fixture"],
+            ["--lifecycle-token-file", token_path.to_str().unwrap()],
+        ] {
+            assert!(
+                admin_args.windows(2).any(|actual| actual == pair),
+                "missing {pair:?} in {admin_args:?}"
+            );
+        }
+        assert!(!argv.join(" ").contains("synthetic-bearer"));
+        assert!(!admin_args.join(" ").contains("synthetic-bearer"));
     }
 }

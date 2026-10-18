@@ -509,6 +509,10 @@ test(
     );
     try {
       await terminal.connect();
+      assert.match(
+        terminalText(terminal),
+        /DIAGNOSTICS · PRIVATE MODEL\/TOOL OUTPUT/,
+      );
       assert.match(terminalText(terminal), /PRIVATE DIAGNOSTICS/);
       await terminal.submit("Check the status");
       assert.match(terminalText(terminal), /Error:/);

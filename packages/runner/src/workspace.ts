@@ -31,6 +31,7 @@ import {
   selectWorkspaceBranch,
   workspaceBranches,
 } from "./navigation.ts";
+import type { Message } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { BotProfileDocument, botExtension } from "./bot.ts";
 import type { BotAgentManagement } from "./bot-management.ts";
@@ -814,6 +815,68 @@ export class Workspace {
       };
       this.events.emit("branch");
       return { ...result, model: this.config.model };
+    });
+  }
+
+  async importMessages(
+    messages: readonly Message[],
+    sourceSession?: { id?: string; cwd?: string },
+  ) {
+    if (this.config.role !== "coding")
+      throw new ApiError(
+        403,
+        "BOT_IMPORT_FORBIDDEN",
+        "Bots cannot import coding-agent transcripts",
+      );
+    return this.withAdmission(async () => {
+      await this.assertIdleForNavigation();
+      const active = this.conversation;
+      const agent = await active.agent(context);
+      const result = await createWorkspaceConversation(
+        this.harness,
+        Number(active.id),
+        {
+          ...(agent.model
+            ? {
+                model: {
+                  provider: agent.model.provider,
+                  modelId: agent.model.modelId,
+                },
+              }
+            : {}),
+          thinkingLevel: agent.thinkingLevel,
+        },
+        async (tx, conversationId) => {
+          for (const [index, message] of messages.entries()) {
+            await tx.appendEntry(conversationId, {
+              kind: "adm.imported-message",
+              model: [message],
+              data: {
+                imported: true,
+                timestamp:
+                  typeof message.timestamp === "number"
+                    ? message.timestamp
+                    : Date.now(),
+                ...(index === 0 && sourceSession ? { sourceSession } : {}),
+              },
+            });
+          }
+        },
+      );
+      this.conversation = await activeWorkspaceConversation(this.harness);
+      const selected = (await this.conversation.agent(context)).model;
+      this.config = {
+        ...this.config,
+        model: selected
+          ? { provider: selected.provider, id: selected.modelId }
+          : undefined,
+      };
+      this.events.emit("branch");
+      return {
+        ...result,
+        model: this.config.model,
+        importedMessages: messages.length,
+      };
     });
   }
 

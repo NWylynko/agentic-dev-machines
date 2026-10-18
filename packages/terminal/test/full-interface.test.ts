@@ -400,10 +400,19 @@ test("provider login and logout delegate to the host CLI and reconnect the Durab
     assert.match(await readFile(output, "utf8"), /login openai/);
     await terminal.submit("/logout openai");
     assert.match(await readFile(output, "utf8"), /logout openai/);
+    await terminal.submit("/bash");
+    assert.match(await readFile(output, "utf8"), /shell work -- bash/);
     const connectionsBeforeFailedAuth = eventConnections;
     await terminal.submit("/login fail");
-    assert.match(stripTerminalSequences(terminal.render(120).join("\n")), /adm login exited 7/);
-    assert.equal(eventConnections, connectionsBeforeFailedAuth + 1, "failed auth must restore the workspace event stream");
+    assert.match(
+      stripTerminalSequences(terminal.render(120).join("\n")),
+      /adm login exited 7/,
+    );
+    assert.equal(
+      eventConnections,
+      connectionsBeforeFailedAuth + 1,
+      "failed auth must restore the workspace event stream",
+    );
   } finally {
     terminal.close();
     stream?.end();
@@ -485,6 +494,150 @@ test("/export writes the selected Durable transcript as local Markdown", async (
     await terminal.submit(`/export "${path}"`);
     assert.match((terminal as any).status, /EEXIST/);
     assert.equal(await readFile(path, "utf8"), contents);
+  } finally {
+    terminal.close();
+    stream?.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("/import reads native Pi JSONL and selects the Pod-imported Durable conversation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-pi-import-"));
+  const transcript = join(directory, "session with spaces.jsonl");
+  await writeFileFs(
+    transcript,
+    [
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "native-42",
+        cwd: "/tmp/source",
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "1",
+        parentId: null,
+        timestamp: "2026-10-18T00:00:00.000Z",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Imported request" }],
+          timestamp: 1,
+        },
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "2",
+        parentId: "1",
+        timestamp: "2026-10-18T00:00:01.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Imported response" }],
+          stopReason: "stop",
+          timestamp: 2,
+        },
+      }),
+      "",
+    ].join("\n"),
+  );
+  let activeConversationId = 1;
+  let imported: any;
+  let stream: import("node:http").ServerResponse | undefined;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history"))
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          events:
+            activeConversationId === 2
+              ? [
+                  {
+                    seq: 1,
+                    workspaceId: "work",
+                    kind: "user",
+                    data: { text: "Imported request" },
+                    timestamp: 1,
+                  },
+                  {
+                    seq: 2,
+                    workspaceId: "work",
+                    kind: "assistant",
+                    data: { text: "Imported response" },
+                    timestamp: 2,
+                  },
+                ]
+              : [],
+          nextAfter: activeConversationId === 2 ? 2 : 0,
+          hasMore: false,
+        }),
+      );
+    else if (url.pathname.endsWith("/models"))
+      response.end(
+        JSON.stringify({ providers: [], models: [], selected: null }),
+      );
+    else if (url.pathname.endsWith("/settings"))
+      response.end(JSON.stringify({ thinkingLevel: "off" }));
+    else if (url.pathname.endsWith("/branches"))
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          branches: [{ conversationId: 1 }, { conversationId: 2 }],
+        }),
+      );
+    else if (url.pathname.endsWith("/events")) {
+      stream = response;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else if (url.pathname.endsWith("/import")) {
+      let text = "";
+      for await (const chunk of request) text += chunk;
+      imported = JSON.parse(text);
+      activeConversationId = 2;
+      response.statusCode = 201;
+      response.end(
+        JSON.stringify({
+          activeConversationId,
+          importedMessages: imported.messages.length,
+        }),
+      );
+    } else if (request.method === "GET")
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          role: "coding",
+          status: "idle",
+          conversationId: activeConversationId,
+        }),
+      );
+    else response.end(JSON.stringify({ status: "accepted" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit(`/import "${transcript}"`);
+    assert.equal(imported.session.id, "native-42");
+    assert.deepEqual(
+      imported.messages.map((message: any) => message.content[0].text),
+      ["Imported request", "Imported response"],
+    );
+    assert.equal((terminal as any).conversationId, 2);
+    assert.match(
+      stripTerminalSequences(terminal.render(120).join("\n")).replace(
+        /\s+/g,
+        " ",
+      ),
+      /Imported 2 messages from session with spaces\.jsonl/,
+    );
   } finally {
     terminal.close();
     stream?.end();

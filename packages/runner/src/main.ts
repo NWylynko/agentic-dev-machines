@@ -30,6 +30,7 @@ import {
 import { botAgentManagementFromEnvironment } from "./bot-management.ts";
 import { ApiError, workspaceIdPattern, type WorkspaceConfig } from "./types.ts";
 import { watchEvents } from "@earendil-works/pi-durable";
+import type { Message } from "@earendil-works/pi-ai";
 import {
   BACKGROUND_CONTEXT,
   withAbortSignal,
@@ -839,6 +840,102 @@ async function body(request: IncomingMessage, maxBytes = 1024 * 1024) {
     );
   return value as Record<string, unknown>;
 }
+
+function importedPiMessages(value: unknown): Message[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 1000)
+    throw new ApiError(
+      400,
+      "INVALID_IMPORT",
+      "Pi transcript import requires one to 1000 messages",
+    );
+  let totalBytes = 0;
+  const messages = value.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      throw new ApiError(
+        400,
+        "INVALID_IMPORT",
+        "Imported message must be an object",
+      );
+    const message = item as Record<string, any>;
+    if (
+      !["user", "assistant", "toolResult"].includes(message.role) ||
+      !Array.isArray(message.content) ||
+      (message.role === "toolResult" &&
+        (typeof message.toolCallId !== "string" ||
+          typeof message.toolName !== "string" ||
+          typeof message.isError !== "boolean"))
+    )
+      throw new ApiError(
+        400,
+        "INVALID_IMPORT",
+        "Imported messages must be Pi user, assistant, or tool-result messages",
+      );
+    if (
+      message.timestamp !== undefined &&
+      (!Number.isFinite(message.timestamp) ||
+        typeof message.timestamp !== "number")
+    )
+      throw new ApiError(
+        400,
+        "INVALID_IMPORT",
+        "Message timestamp must be numeric",
+      );
+    for (const part of message.content) {
+      if (!part || typeof part !== "object" || Array.isArray(part))
+        throw new ApiError(
+          400,
+          "INVALID_IMPORT",
+          "Message content part must be an object",
+        );
+      if (part.type === "image") {
+        if (
+          !["image/png", "image/jpeg", "image/webp"].includes(part.mimeType) ||
+          typeof part.data !== "string" ||
+          !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+            part.data,
+          )
+        )
+          throw new ApiError(
+            400,
+            "INVALID_IMPORT_IMAGE",
+            "Imported image must use base64 PNG, JPEG, or WebP content",
+          );
+        const image = Buffer.from(part.data, "base64");
+        const signatureMatches =
+          (part.mimeType === "image/png" &&
+            image
+              .subarray(0, 8)
+              .equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) ||
+          (part.mimeType === "image/jpeg" &&
+            image[0] === 255 &&
+            image[1] === 216 &&
+            image[2] === 255) ||
+          (part.mimeType === "image/webp" &&
+            image.toString("ascii", 0, 4) === "RIFF" &&
+            image.toString("ascii", 8, 12) === "WEBP");
+        if (
+          !image.length ||
+          image.length > 4 * 1024 * 1024 ||
+          !signatureMatches
+        )
+          throw new ApiError(
+            400,
+            "INVALID_IMPORT_IMAGE",
+            "Imported image is invalid or exceeds 4 MiB",
+          );
+      }
+    }
+    totalBytes += Buffer.byteLength(JSON.stringify(message));
+    if (totalBytes > 8 * 1024 * 1024)
+      throw new ApiError(
+        413,
+        "IMPORT_TOO_LARGE",
+        "Imported message history exceeds 8 MiB",
+      );
+    return message as Message;
+  });
+  return messages;
+}
 function json(response: ServerResponse, status: number, value: unknown) {
   response.writeHead(status, {
     "content-type": "application/json",
@@ -898,7 +995,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|compact|reset|settings))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1084,6 +1181,47 @@ const server = createServer(async (request, response) => {
       return await serialized(async () => {
         await assertActive(id, requestSignal);
         return json(response, 200, await workspace.newSession());
+      });
+    }
+    if (request.method === "POST" && action === "import") {
+      const data = await body(request, 9 * 1024 * 1024);
+      const messages = importedPiMessages(data.messages);
+      let sourceSession: { id?: string; cwd?: string } | undefined;
+      if (data.session !== undefined) {
+        if (
+          !data.session ||
+          typeof data.session !== "object" ||
+          Array.isArray(data.session)
+        )
+          throw new ApiError(
+            400,
+            "INVALID_IMPORT",
+            "Pi session header must be an object",
+          );
+        const session = data.session as Record<string, unknown>;
+        if (
+          (session.id !== undefined &&
+            (typeof session.id !== "string" || session.id.length > 128)) ||
+          (session.cwd !== undefined &&
+            (typeof session.cwd !== "string" || session.cwd.length > 4096))
+        )
+          throw new ApiError(
+            400,
+            "INVALID_IMPORT",
+            "Pi session header fields are invalid",
+          );
+        sourceSession = {
+          ...(typeof session.id === "string" ? { id: session.id } : {}),
+          ...(typeof session.cwd === "string" ? { cwd: session.cwd } : {}),
+        };
+      }
+      return await serialized(async () => {
+        await assertActive(id);
+        return json(
+          response,
+          201,
+          await workspace.importMessages(messages, sourceSession),
+        );
       });
     }
     if (request.method === "PUT" && action === "branch") {
@@ -1294,6 +1432,7 @@ const server = createServer(async (request, response) => {
           "INVALID_IMAGES",
           "Input images must contain one to four images",
         );
+      let imageBytes = 0;
       const content =
         images === undefined
           ? message
@@ -1325,11 +1464,44 @@ const server = createServer(async (request, response) => {
                     "Image must use base64 PNG, JPEG, or WebP content",
                   );
                 const bytes = Buffer.from(candidate.data, "base64");
-                if (!bytes.length || bytes.length > 4 * 1024 * 1024)
+                if (
+                  !bytes.length ||
+                  bytes.toString("base64") !== candidate.data
+                )
+                  throw new ApiError(
+                    400,
+                    "INVALID_IMAGE",
+                    "Image data must be canonical base64",
+                  );
+                const signatureMatches =
+                  (candidate.mimeType === "image/png" &&
+                    bytes.length >= 8 &&
+                    bytes
+                      .subarray(0, 8)
+                      .equals(
+                        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+                      )) ||
+                  (candidate.mimeType === "image/jpeg" &&
+                    bytes.length >= 3 &&
+                    bytes[0] === 255 &&
+                    bytes[1] === 216 &&
+                    bytes[2] === 255) ||
+                  (candidate.mimeType === "image/webp" &&
+                    bytes.length >= 12 &&
+                    bytes.toString("ascii", 0, 4) === "RIFF" &&
+                    bytes.toString("ascii", 8, 12) === "WEBP");
+                if (!signatureMatches)
+                  throw new ApiError(
+                    400,
+                    "IMAGE_MIME_MISMATCH",
+                    "Image bytes do not match their declared PNG, JPEG, or WebP MIME type",
+                  );
+                imageBytes += bytes.length;
+                if (imageBytes > 4 * 1024 * 1024)
                   throw new ApiError(
                     413,
-                    "IMAGE_TOO_LARGE",
-                    "Each prompt image must be at most 4 MiB",
+                    "IMAGES_TOO_LARGE",
+                    "Prompt images must total at most 4 MiB",
                   );
                 return {
                   type: "image" as const,

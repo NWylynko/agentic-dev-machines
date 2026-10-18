@@ -491,6 +491,86 @@ test(
       { type: "text", text: "What is in this picture?" },
       image,
     ]);
+    const mislabeled = await runner.request(path + "/input", "POST", {
+      message: "mislabelled image",
+      images: [{ ...image, mimeType: "image/webp" }],
+    });
+    assert.equal(mislabeled.status, 400);
+    const largeImage = Buffer.concat([
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      Buffer.alloc(2_100_000),
+    ]).toString("base64");
+    const tooMuch = await runner.request(path + "/input", "POST", {
+      message: "two images exceed the aggregate limit",
+      images: [
+        { type: "image", mimeType: "image/png", data: largeImage },
+        { type: "image", mimeType: "image/png", data: largeImage },
+      ],
+    });
+    assert.equal(tooMuch.status, 413);
+  },
+);
+
+test(
+  "native Pi messages import as a selected Durable conversation and survive runner restart",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-terminal-import-"));
+    let runner = await runnerFor(directory);
+    t.after(() => runner.stop());
+    const path = "/v1/workspaces/import-demo";
+    const registered = await runner.request(path, "PUT", {
+      id: "import-demo",
+      name: "import demo",
+      role: "coding",
+      environment: "local",
+      localRoot: directory,
+      model: { provider: "faux", id: "faux-1" },
+    });
+    assert.equal(registered.status, 200);
+    const originalId = registered.body.conversationId;
+    const imported = await runner.request(path + "/import", "POST", {
+      session: { id: "native-session-1", cwd: "/tmp/original" },
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Imported question" }],
+          timestamp: 10,
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Imported answer" }],
+          stopReason: "stop",
+          timestamp: 11,
+        },
+      ],
+    });
+    assert.equal(imported.status, 201, JSON.stringify(imported.body));
+    assert.notEqual(imported.body.activeConversationId, originalId);
+    assert.equal(imported.body.importedMessages, 2);
+    const navigation = await runner.request(path + "/branches");
+    assert.equal(
+      navigation.body.activeConversationId,
+      imported.body.activeConversationId,
+    );
+    assert.equal(navigation.body.branches.length, 2);
+    const history = await runner.request(path + "/history?limit=100");
+    assert.deepEqual(
+      history.body.events.map((event) => event.data.text),
+      ["Imported question", "Imported answer"],
+    );
+    await runner.stop();
+    runner = await runnerFor(directory);
+    const restored = await runner.request(path);
+    assert.equal(
+      restored.body.conversationId,
+      imported.body.activeConversationId,
+    );
+    const restoredHistory = await runner.request(path + "/history?limit=100");
+    assert.deepEqual(
+      restoredHistory.body.events.map((event) => event.data.text),
+      ["Imported question", "Imported answer"],
+    );
   },
 );
 

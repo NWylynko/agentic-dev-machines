@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  stat as statFile,
+  writeFile,
+} from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { terminalKeybindings } from "./keybindings.ts";
@@ -214,10 +220,11 @@ export class WorkspaceTerminal extends Container {
   private refresh() {
     this.toolViews = [];
     this.assistantViews = [];
+    const startup = this.startupExpanded
+      ? `▛▀▜  Pi v1.2.0\n▌ ▌  Esc interrupt · Ctrl+C detach · / commands · Ctrl+O more\nCtrl+T thinking · Shift+Tab cycle thinking · /model select model · Shift+Enter new line\nCtrl+R reconnect · Ctrl+C detach · /help commands\n\nPi can explain its own features and look up its docs. Ask it how to use Pi.`
+      : `▛▀▜  Pi v1.2.0\n▌ ▌  Esc interrupt · Ctrl+C detach · / commands · Ctrl+O more\nPress Ctrl+O to show full startup help.\n\nPi can explain its own features and look up its docs. Ask it how to use Pi.`;
     this.heading.setText(
-      this.startupExpanded
-        ? `▛▀▜  Pi v1.2.0\n▌ ▌  Esc interrupt · Ctrl+C detach · / commands · Ctrl+O more\nCtrl+T thinking · Shift+Tab cycle thinking · /model select model · Shift+Enter new line\nCtrl+R reconnect · Ctrl+C detach · /help commands\n\nPi can explain its own features and look up its docs. Ask it how to use Pi.`
-        : `▛▀▜  Pi v1.2.0\n▌ ▌  Esc interrupt · Ctrl+C detach · / commands · Ctrl+O more\nPress Ctrl+O to show full startup help.\n\nPi can explain its own features and look up its docs. Ask it how to use Pi.`,
+      `${this.options.diagnostics ? "⚠ DIAGNOSTICS · PRIVATE MODEL/TOOL OUTPUT\n" : ""}${startup}`,
     );
     this.transcript.clear();
     for (const item of this.records) {
@@ -804,6 +811,8 @@ export class WorkspaceTerminal extends Container {
       if (message === "/help") {
         this.status =
           "/model · /settings · /thinking · /session · /copy · /export [PATH] · /resume · /new · /fork · /tree · /hotkeys · /compact [INSTRUCTIONS] · /reset [HANDOFF] · /retry · /followup TEXT · /abort [all] · /newgoal TEXT · /loop SECONDS TEXT · /goals · /loops · /complete-goal ID · /cancel-goal ID · /cancel-loop ID · /status · /reconnect · /detach\n/model opens Pi's model selector; /thinking changes the durable thinking level; /session shows the selected workspace conversation; /copy copies the latest assistant reply or explicit bot message; /export writes this Durable transcript to a local Markdown file; /resume selects a durable branch; /new creates an empty durable conversation in this workspace; /fork opens the durable tree; /retry retries a safe failed provider turn.";
+        this.status +=
+          "\n/import PATH.jsonl imports native Pi messages; /share PATH saves a local transcript copy; /bash opens an interactive shell in this coding workspace.";
         clearInput();
         return;
       }
@@ -839,6 +848,19 @@ export class WorkspaceTerminal extends Container {
           /^\/logout(?:\s+(\S+))?(?:\s+(\S+))?$/.exec(message) ?? [];
         if (!provider || extra) throw new Error("Usage: /logout PROVIDER");
         await this.runAdminCommand("logout", [provider]);
+        clearInput();
+        return;
+      }
+      if (message === "/bash") {
+        if (this.role !== "coding")
+          throw new Error(
+            "Bots have no development shell or repository access",
+          );
+        await this.runAdminCommand("shell", [
+          this.options.workspaceId,
+          "--",
+          "bash",
+        ]);
         clearInput();
         return;
       }
@@ -943,7 +965,11 @@ export class WorkspaceTerminal extends Container {
         clearInput();
         return;
       }
-      if (message === "/export" || message.startsWith("/export ")) {
+      if (
+        message === "/export" ||
+        message.startsWith("/export ") ||
+        message.startsWith("/share ")
+      ) {
         if (!this.connected)
           throw new Error("Reconnect before exporting the selected transcript");
         const suppliedPath = message
@@ -990,7 +1016,63 @@ export class WorkspaceTerminal extends Container {
           `# Workspace session ${this.conversationId ?? "unknown"}\n\n${exported.join("\n")}`,
           { encoding: "utf8", flag: "wx", mode: 0o600 },
         );
-        this.status = `Exported transcript to ${path}`;
+        this.status = `${message.startsWith("/share ") ? "Shared transcript saved" : "Exported transcript"} to ${path}`;
+        clearInput();
+        return;
+      }
+      if (message.startsWith("/import ")) {
+        if (!this.connected)
+          throw new Error("Reconnect before importing a Pi transcript");
+        if (this.role !== "coding")
+          throw new Error("Bots cannot import coding-agent transcripts");
+        const suppliedPath = message
+          .slice(8)
+          .trim()
+          .replace(/^(?:"(.*)"|'(.*)')$/, "$1$2");
+        if (!suppliedPath) throw new Error("Usage: /import PATH.jsonl");
+        const path = resolve(suppliedPath);
+        const file = await statFile(path);
+        if (!file.isFile() || file.size > 8 * 1024 * 1024)
+          throw new Error(
+            "Pi transcript must be a regular file no larger than 8 MiB",
+          );
+        const lines = (await readFile(path, "utf8"))
+          .split(/\r?\n/)
+          .filter(Boolean);
+        const header = JSON.parse(lines.shift() ?? "null");
+        if (!header || header.type !== "session")
+          throw new Error("File is not a native Pi JSONL session");
+        const messages = lines.flatMap((line, index) => {
+          let entry: any;
+          try {
+            entry = JSON.parse(line);
+          } catch {
+            throw new Error(`Invalid Pi transcript JSON on line ${index + 2}`);
+          }
+          if (entry?.type !== "message") return [];
+          if (
+            !entry.message ||
+            !["user", "assistant", "toolResult"].includes(entry.message.role)
+          )
+            throw new Error(`Unsupported Pi message on line ${index + 2}`);
+          return [entry.message];
+        });
+        if (!messages.length || messages.length > 1000)
+          throw new Error(
+            "Pi transcript must contain one to 1000 supported messages",
+          );
+        const result = await this.request("/import", {
+          session: {
+            ...(typeof header.id === "string" ? { id: header.id } : {}),
+            ...(typeof header.cwd === "string" ? { cwd: header.cwd } : {}),
+          },
+          messages,
+        });
+        this.records = [];
+        this.cursor = 0;
+        await this.connect();
+        this.status = `Imported ${result.importedMessages} messages from ${clean(basename(path))}`;
+        this.refresh();
         clearInput();
         return;
       }
@@ -1499,7 +1581,7 @@ export class WorkspaceTerminal extends Container {
       this.closeModelSelector();
     }
   }
-  private async runAdminCommand(command: "login" | "logout", args: string[]) {
+  private async runAdminCommand(command: string, args: string[]) {
     const adminCommand = this.options.adminCommand;
     if (!adminCommand)
       throw new Error(
