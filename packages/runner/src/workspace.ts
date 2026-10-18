@@ -34,6 +34,7 @@ import {
   forkWorkspaceBranch,
   initializeNavigation,
   selectWorkspaceBranch,
+  workspaceBranchList,
   workspaceBranches,
 } from "./navigation.ts";
 import type { Message } from "@earendil-works/pi-ai";
@@ -779,7 +780,11 @@ export class Workspace {
   }
 
   async branches() {
-    return workspaceBranches(this.harness);
+    return workspaceBranchList(this.harness, {
+      id: this.config.id,
+      cwd: this.config.cwd ?? this.config.localRoot ?? "/workspace",
+      role: this.config.role,
+    });
   }
 
   async newSession() {

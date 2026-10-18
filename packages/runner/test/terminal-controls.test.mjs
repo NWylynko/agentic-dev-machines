@@ -482,6 +482,23 @@ test(
       (await runner.request(path + "/history?limit=100")).body.events,
       [],
     );
+    const persistedSessionInfo = persistedNewSession.body.branches.find(
+      (branch) => branch.conversationId === newSession.body.activeConversationId,
+    ).sessionInfo;
+    assert.equal(persistedSessionInfo.id, `branch-demo:${newSession.body.activeConversationId}`);
+    assert.equal(persistedSessionInfo.path, persistedSessionInfo.id);
+    assert.equal(persistedSessionInfo.cwd, directory);
+    assert.equal(persistedSessionInfo.messageCount, 0);
+    assert.equal(persistedSessionInfo.firstMessage, "");
+    assert.ok(Number.isFinite(Date.parse(persistedSessionInfo.created)));
+    assert.ok(Number.isFinite(Date.parse(persistedSessionInfo.modified)));
+    const persistedRootInfo = persistedNewSession.body.branches.find(
+      (branch) => branch.conversationId === initial.body.activeConversationId,
+    ).sessionInfo;
+    assert.ok(persistedRootInfo.messageCount >= 2);
+    assert.equal(persistedRootInfo.firstMessage, "Write one concise greeting");
+    assert.match(persistedRootInfo.allMessagesText, /Write one concise greeting/);
+    assert.match(persistedRootInfo.allMessagesText, /Echo: Write one concise greeting/);
     const newSessionStatus = await runner.request(path);
     assert.deepEqual(newSessionStatus.body.model, previousSession.body.model);
     assert.deepEqual(newSessionStatus.body.tools, previousSession.body.tools);
@@ -943,6 +960,9 @@ test(
           ["user", "message", "status"].includes(frame.data.kind),
       ),
     );
+    const publicBranch = (await runner.request(path + "/branches")).body.branches[0];
+    assert.match(publicBranch.sessionInfo.allMessagesText, /What identity and purpose would you like me to have/);
+    assert.doesNotMatch(publicBranch.sessionInfo.allMessagesText, /I am ready for setup details\./);
     const diagnosticFrames = JSON.stringify(diagnosticEvents.frames);
     assert.match(diagnosticFrames, /I am ready for setup details\./);
     await diagnosticEvents.waitFor(

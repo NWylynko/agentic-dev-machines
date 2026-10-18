@@ -55,6 +55,95 @@ export async function workspaceBranches(harness: Harness) {
   );
 }
 
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part?.type === "text")
+    .map((part) => part.text)
+    .join(" ");
+}
+
+async function branchSessionInfo(
+  harness: Harness,
+  branch: Branch,
+  workspace: { id: string; cwd: string; role: "coding" | "bot" },
+) {
+  const conversation = await harness.conversation(
+    branch.conversationId as unknown as ConversationId,
+    context,
+  );
+  if (!conversation) return undefined;
+
+  let cursor:
+    | Awaited<ReturnType<typeof conversation.entries>>["next"]
+    | undefined;
+  let messageCount = 0;
+  let firstMessage = "";
+  let modified = branch.createdAt;
+  const allMessages: string[] = [];
+  do {
+    const page = await conversation.entries(
+      { order: "ascending" },
+      1000,
+      cursor,
+      context,
+    );
+    for (const entry of page.items) {
+      if (workspace.role === "bot" && entry.kind === "adm.message") {
+        const data = entry.data as
+          | { text?: unknown; timestamp?: unknown }
+          | undefined;
+        if (typeof data?.timestamp === "number")
+          modified = Math.max(modified, data.timestamp);
+        if (typeof data?.text === "string" && data.text) {
+          messageCount++;
+          allMessages.push(data.text);
+        }
+        continue;
+      }
+      for (const message of entry.model ?? []) {
+        if (workspace.role === "bot" && message.role !== "user") continue;
+        messageCount++;
+        if (message.role !== "user" && message.role !== "assistant") continue;
+        if (typeof message.timestamp === "number")
+          modified = Math.max(modified, message.timestamp);
+        const text = messageText(message.content);
+        if (!text) continue;
+        allMessages.push(text);
+        if (!firstMessage && message.role === "user") firstMessage = text;
+      }
+    }
+    cursor = page.next;
+  } while (cursor);
+
+  const id = `${workspace.id}:${branch.conversationId}`;
+  return {
+    path: id,
+    id,
+    cwd: workspace.cwd,
+    created: new Date(branch.createdAt).toISOString(),
+    modified: new Date(modified).toISOString(),
+    messageCount,
+    firstMessage,
+    allMessagesText: allMessages.join(" "),
+  };
+}
+
+export async function workspaceBranchList(
+  harness: Harness,
+  workspace: { id: string; cwd: string; role: "coding" | "bot" },
+) {
+  const state = await workspaceBranches(harness);
+  const branches = await Promise.all(
+    state.branches.map(async (branch) => ({
+      ...branch,
+      sessionInfo: await branchSessionInfo(harness, branch, workspace),
+    })),
+  );
+  return { ...state, branches };
+}
+
 export async function activeWorkspaceConversation(
   harness: Harness,
 ): Promise<Conversation> {
