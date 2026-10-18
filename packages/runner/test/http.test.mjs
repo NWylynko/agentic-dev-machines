@@ -522,8 +522,13 @@ test("workspace requests are authorized by lifecycle against the caller's projec
       }),
     },
   );
-  assert.equal(fenced.status, 503);
-  assert.equal((await fenced.json()).error.code, "RUNTIME_OWNERSHIP_LOST");
+  const rejection = await fenced.json();
+  // An in-flight commit may observe deletion before this request reaches its own fence check.
+  assert.ok(
+    (fenced.status === 503 && rejection.error.code === "RUNTIME_OWNERSHIP_LOST") ||
+      (fenced.status === 410 && rejection.error.code === "WORKSPACE_DELETED"),
+    JSON.stringify({ status: fenced.status, rejection }),
+  );
   const readiness = await fetch(`${runner.url}/health`);
   assert.equal(readiness.status, 503);
   assert.equal((await readiness.json()).status, "error");
