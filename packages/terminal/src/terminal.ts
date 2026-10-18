@@ -832,7 +832,6 @@ export class WorkspaceTerminal extends Container {
         const provider = message.slice(6).trim();
         await this.runAdminCommand("login", provider ? [provider] : []);
         clearInput();
-        await this.refreshProviderCatalog();
         return;
       }
       if (message.startsWith("/logout")) {
@@ -841,7 +840,6 @@ export class WorkspaceTerminal extends Container {
         if (!provider || extra) throw new Error("Usage: /logout PROVIDER");
         await this.runAdminCommand("logout", [provider]);
         clearInput();
-        await this.refreshProviderCatalog();
         return;
       }
       if (message === "/model") {
@@ -1510,6 +1508,7 @@ export class WorkspaceTerminal extends Container {
     if (this.controller) this.controller.abort();
     this.connected = false;
     this.options.tui?.stop();
+    let commandError: unknown;
     try {
       await new Promise<void>((resolve, reject) => {
         const child = spawn(
@@ -1523,16 +1522,13 @@ export class WorkspaceTerminal extends Container {
           else reject(new Error(`adm ${command} exited ${signal ?? code}`));
         });
       });
+    } catch (error) {
+      commandError = error;
     } finally {
       this.options.tui?.start();
+      await this.connect();
     }
-  }
-  private async refreshProviderCatalog() {
-    await this.connect();
-    this.status = this.connected
-      ? "Provider authentication updated"
-      : this.status;
-    this.refresh();
+    if (commandError) throw commandError;
   }
   private closeModelSelector() {
     this.modelSelector?.dispose();

@@ -351,6 +351,7 @@ test("provider login and logout delegate to the host CLI and reconnect the Durab
   const directory = await mkdtemp(join(tmpdir(), "adm-provider-cli-"));
   const output = join(directory, "commands.json");
   let stream: import("node:http").ServerResponse | undefined;
+  let eventConnections = 0;
   const server = createServer(async (request, response) => {
     const url = new URL(request.url!, "http://localhost");
     response.setHeader("content-type", "application/json");
@@ -365,6 +366,7 @@ test("provider login and logout delegate to the host CLI and reconnect the Durab
     else if (url.pathname.endsWith("/settings"))
       response.end(JSON.stringify({ thinkingLevel: "off" }));
     else if (url.pathname.endsWith("/events")) {
+      eventConnections++;
       stream = response;
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.write(": attached\n\n");
@@ -388,7 +390,7 @@ test("provider login and logout delegate to the host CLI and reconnect the Durab
       executable: process.execPath,
       args: [
         "-e",
-        `require('node:fs').appendFileSync(${JSON.stringify(output)}, process.argv.slice(1).join(' ') + '\\n')`,
+        `if (process.argv.includes('fail')) process.exit(7); require('node:fs').appendFileSync(${JSON.stringify(output)}, process.argv.slice(1).join(' ') + '\\n')`,
       ],
     },
   });
@@ -398,6 +400,10 @@ test("provider login and logout delegate to the host CLI and reconnect the Durab
     assert.match(await readFile(output, "utf8"), /login openai/);
     await terminal.submit("/logout openai");
     assert.match(await readFile(output, "utf8"), /logout openai/);
+    const connectionsBeforeFailedAuth = eventConnections;
+    await terminal.submit("/login fail");
+    assert.match(stripTerminalSequences(terminal.render(120).join("\n")), /adm login exited 7/);
+    assert.equal(eventConnections, connectionsBeforeFailedAuth + 1, "failed auth must restore the workspace event stream");
   } finally {
     terminal.close();
     stream?.end();
