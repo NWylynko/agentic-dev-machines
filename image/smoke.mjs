@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { verifyGitHubPushAuthentication } from "./github-auth-smoke.mjs";
+import { verifyLifecycleKubeconfigProjection } from "./lifecycle-kubeconfig-smoke.mjs";
 
 const exec = promisify(execFile);
 const image = process.argv[2] ?? "ghcr.io/nwylynko/agentic-dev-machines:latest";
@@ -601,6 +602,7 @@ try {
 `;
 
 try {
+  await verifyLifecycleKubeconfigProjection(image);
   await docker(
     "create",
     "--name",
