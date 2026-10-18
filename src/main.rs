@@ -970,6 +970,31 @@ fn run(cli: &Cli) -> Result<()> {
                 "create",
                 &workspace.name,
             )?;
+            if options.herdr {
+                eprintln!(
+                    "adm: workspace {} is ready; opening a Herdr space and attaching there",
+                    workspace.name
+                );
+                let opened = herdr::open_created_space(
+                    cli,
+                    &workspace.name,
+                    &std::env::current_dir().context("read local client working directory")?,
+                )
+                .with_context(|| herdr_partial_success(&workspace, None))?;
+                herdr::configure_bound_space(cli, &workspace, &opened.workspace_id).with_context(
+                    || herdr_partial_success(&workspace, Some(&opened.workspace_id)),
+                )?;
+                herdr::queue_attach_in_created_pane(cli, &workspace, &opened).with_context(
+                    || herdr_partial_success(&workspace, Some(&opened.workspace_id)),
+                )?;
+                let delivery = herdr::event_delivery_status(cli)
+                    .unwrap_or_else(|error| format!("unavailable ({error:#})"));
+                println!(
+                    "Opened Herdr space {} (tab {}, pane {}). Close-event delivery: {}.",
+                    opened.workspace_id, opened.tab_id, opened.pane_id, delivery
+                );
+                return Ok(());
+            }
             let attach = !options.no_attach
                 && std::io::stdin().is_terminal()
                 && std::io::stdout().is_terminal();
@@ -983,7 +1008,7 @@ fn run(cli: &Cli) -> Result<()> {
             runtime_access::attach(cli, &workspace, false).with_context(|| {
                 format!(
                     "workspace {} was created with ID {}, but attach failed; recover with `adm attach {}`",
-                    workspace.name, workspace.id, workspace.name
+                    workspace.name, workspace.id, workspace.id
                 )
             })
         }
@@ -1309,6 +1334,19 @@ fn run(cli: &Cli) -> Result<()> {
             anyhow::ensure!(status.success(), "browser automation failed");
             Ok(())
         }
+    }
+}
+
+fn herdr_partial_success(workspace: &workspaces::Workspace, herdr_space: Option<&str>) -> String {
+    match herdr_space {
+        Some(space_id) => format!(
+            "workspace {} was created with ID {} and Herdr space {}; handoff failed; recover with `adm attach {}`",
+            workspace.name, workspace.id, space_id, workspace.id
+        ),
+        None => format!(
+            "workspace {} was created with ID {}, but Herdr space creation failed; recover with `adm attach {}`",
+            workspace.name, workspace.id, workspace.id
+        ),
     }
 }
 

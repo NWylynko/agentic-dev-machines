@@ -427,7 +427,7 @@ fn fixture_with_runner(runner_override: Option<&str>) -> TestFixture {
     let herdr = herdr_bin.join("herdr");
     fs::write(
         &herdr,
-        "#!/bin/sh\nprintf '{\"result\":{\"workspace\":{\"workspace_id\":\"%s\"}}}\\n' \"$3\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\nif [ \"$2\" = rename ] && [ -f \"$(dirname \"$0\")/fail-rename\" ]; then exit 1; fi\nprintf '{\"result\":{\"workspace\":{\"workspace_id\":\"%s\"}}}\\n' \"$3\"\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&herdr).unwrap().permissions();
@@ -1399,6 +1399,215 @@ fn interactive_create_attaches_once_to_the_created_workspace() {
 }
 
 #[test]
+fn create_herdr_opens_and_attaches_by_explicit_ids_without_focusing_other_spaces() {
+    use std::io::BufRead;
+
+    let root = fixture();
+    let socket = root.path().join("herdr-create-attach.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let root_path = root.path().to_owned();
+    let local_cwd = std::env::current_dir().unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let create: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(create["method"], "workspace.create");
+        assert_eq!(create["params"]["focus"], false);
+        assert_eq!(create["params"]["env"]["ADM_HERDR_INITIAL_PANE"], "local");
+        assert_eq!(
+            create["params"]["cwd"],
+            local_cwd.to_string_lossy().as_ref()
+        );
+        // The Herdr space must only be created after the durable workspace is ready.
+        let created = assert_ok(adm(&root_path, &["list", "--json"]));
+        let workspace = created
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "herdr-project")
+            .unwrap();
+        let workspace_id = workspace["id"].as_str().unwrap().to_owned();
+        writeln!(
+            reader.get_mut(),
+            "{}",
+            serde_json::json!({
+                "id":create["id"],
+                "result":{"type":"workspace_created",
+                    "workspace":{"workspace_id":"explicit-space-8","number":8,"label":"herdr-project","focused":false,"pane_count":1,"tab_count":1,"active_tab_id":"tab-8","agent_status":"idle"},
+                    "tab":{"tab_id":"tab-8","workspace_id":"explicit-space-8","number":1,"label":"herdr-project","focused":false,"pane_count":1,"agent_status":"idle"},
+                    "root_pane":{"pane_id":"pane-8","terminal_id":"terminal-8","workspace_id":"explicit-space-8","tab_id":"tab-8","focused":false,"agent_status":"idle","revision":1}}
+            })
+        )
+        .unwrap();
+
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let send: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(send["method"], "pane.send_input");
+        assert_eq!(send["params"]["pane_id"], "pane-8");
+        let text = send["params"]["text"].as_str().unwrap();
+        assert_eq!(text.matches("'attach'").count(), 1, "{text}");
+        assert!(
+            text.contains(&workspace_id),
+            "must attach by immutable ID: {text}"
+        );
+        assert!(!text.contains("attach herdr-project"), "{text}");
+        assert!(
+            text.contains("--kubectl"),
+            "preserve connection selectors: {text}"
+        );
+        assert!(
+            text.contains("--lifecycle-token-file"),
+            "preserve token-file selection by path: {text}"
+        );
+        assert!(
+            !text.contains("fixture-token"),
+            "never serialize bearer values: {text}"
+        );
+        writeln!(
+            reader.get_mut(),
+            "{}",
+            serde_json::json!({"id":send["id"],"result":{"sent":true}})
+        )
+        .unwrap();
+        workspace_id
+    });
+
+    let output = adm_in_herdr(
+        root.path(),
+        &["create", "herdr-project", "--no-repositories", "--herdr"],
+        &socket,
+    );
+    let workspace_id = server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output_text.contains("Close-event delivery: unavailable"),
+        "must show actual optional bridge health: {output_text}"
+    );
+    assert!(
+        !output_text.contains("adm herdr watch"),
+        "creation must not start or prescribe an unverified watcher: {output_text}"
+    );
+    let stored: Value =
+        serde_json::from_slice(&fs::read(root.path().join("state/herdr-bindings.json")).unwrap())
+            .unwrap();
+    assert_eq!(stored[0]["workspace_id"], workspace_id);
+    assert_eq!(stored[0]["space_id"], "explicit-space-8");
+    let herdr_calls = fs::read_to_string(root.path().join("herdr-bin/calls")).unwrap();
+    assert!(
+        herdr_calls
+            .lines()
+            .any(|call| call == "workspace get explicit-space-8"),
+        "{herdr_calls}"
+    );
+    assert!(
+        herdr_calls
+            .lines()
+            .any(|call| call == "workspace rename explicit-space-8 herdr-project"),
+        "{herdr_calls}"
+    );
+}
+
+#[test]
+fn create_herdr_rejects_no_attach_and_explicit_space_selection() {
+    let root = fixture();
+    let output = adm(
+        root.path(),
+        &["create", "invalid-herdr", "--herdr", "--no-attach"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+
+    let output = adm(
+        root.path(),
+        &[
+            "create",
+            "invalid-herdr",
+            "--herdr",
+            "--herdr-space",
+            "existing",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+}
+
+#[test]
+fn create_herdr_rename_failure_reports_both_immutable_ids_and_workspace_recovery() {
+    use std::io::BufRead;
+
+    let root = fixture();
+    fs::write(root.path().join("herdr-bin/fail-rename"), "fail").unwrap();
+    let socket = root.path().join("herdr-rename-failure.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let root_path = root.path().to_owned();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "workspace.create");
+        let created = assert_ok(adm(&root_path, &["list", "--json"]));
+        assert!(
+            created
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"] == "rename-fails")
+        );
+        writeln!(
+            reader.get_mut(),
+            "{}",
+            serde_json::json!({
+                "id":request["id"],"result":{"type":"workspace_created",
+                    "workspace":{"workspace_id":"explicit-space-fail","label":"rename-fails"},
+                    "tab":{"tab_id":"tab-fail"},"root_pane":{"pane_id":"pane-fail"}}
+            })
+        )
+        .unwrap();
+    });
+    let output = adm_in_herdr(
+        root.path(),
+        &["create", "rename-fails", "--no-repositories", "--herdr"],
+        &socket,
+    );
+    server.join().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let workspaces = assert_ok(adm(root.path(), &["list", "--json"]));
+    let workspace_id = workspaces[0]["id"].as_str().unwrap();
+    assert!(stderr.contains(workspace_id), "{stderr}");
+    assert!(stderr.contains("explicit-space-fail"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("recover with `adm attach {workspace_id}`")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("attach rename-fails"), "{stderr}");
+    let calls = fs::read_to_string(root.path().join("herdr-bin/calls")).unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|call| call == "workspace rename explicit-space-fail rename-fails"),
+        "{calls}"
+    );
+}
+
+#[test]
 fn attach_failure_reports_partial_success_and_direct_recovery_command() {
     let root = fixture();
     let project = install_terminal_fixture(root.path());
@@ -1422,7 +1631,7 @@ fn attach_failure_reports_partial_success_and_direct_recovery_command() {
         "partial success must identify the created workspace: {stderr}"
     );
     assert!(
-        stderr.contains("recover with `adm attach attach-fails`"),
+        stderr.contains(&format!("recover with `adm attach {workspace_id}`")),
         "partial success must give the precise recovery command: {stderr}"
     );
     let cluster: Value =
@@ -1443,7 +1652,7 @@ fn interactive_create_failure_does_not_launch_the_terminal() {
     let (status, stderr) = interactive_cli(
         root.path(),
         &project,
-        &["create", "create-fails", "--no-repositories"],
+        &["create", "create-fails", "--no-repositories", "--herdr"],
     );
 
     assert!(!status.success(), "storage validation must fail creation");
@@ -1454,6 +1663,10 @@ fn interactive_create_failure_does_not_launch_the_terminal() {
     assert!(
         !root.path().join("attach-invocations.jsonl").exists(),
         "failed creation must not launch a terminal"
+    );
+    assert!(
+        !root.path().join("herdr-bin/calls").exists(),
+        "failed creation must not query or create a Herdr space"
     );
 }
 

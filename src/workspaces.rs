@@ -112,8 +112,11 @@ pub struct CredentialEnvRef {
 pub struct CreateOptions {
     pub name: String,
     /// Return the created workspace without opening an attached terminal.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["herdr", "herdr_space"])]
     pub no_attach: bool,
+    /// Open a new stock Herdr space and run `adm attach` in its initial pane.
+    #[arg(long, conflicts_with_all = ["no_attach", "herdr_space"])]
+    pub herdr: bool,
     /// Stable lifecycle operation UUID used to replay this create request.
     #[arg(long)]
     pub operation_id: Option<String>,
@@ -151,7 +154,7 @@ pub struct CreateOptions {
     pub credential_env: Vec<String>,
     #[arg(long)]
     pub allow_node_local_storage: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "herdr")]
     pub herdr_space: Option<String>,
     /// JSON file containing host-configured stdio MCP servers and exact tool grants.
     #[arg(long)]

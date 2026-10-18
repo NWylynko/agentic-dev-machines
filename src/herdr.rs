@@ -215,6 +215,67 @@ pub fn open_created_space(cli: &Cli, label: &str, client_cwd: &Path) -> Result<O
     Ok(opened)
 }
 
+/// Queue one immutable-ID attach command in the newly returned root pane.
+pub fn queue_attach_in_created_pane(
+    cli: &Cli,
+    workspace: &Workspace,
+    opened: &OpenedHerdrSpace,
+) -> Result<()> {
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let mut arguments = vec![
+        executable.to_string_lossy().into_owned(),
+        "--state-dir".into(),
+        cli.state_path().to_string_lossy().into_owned(),
+        "--kubectl".into(),
+        cli.kubectl.clone(),
+        "--kubeconfig".into(),
+        cli.kubeconfig_reference()?,
+        "--runner-url".into(),
+        cli.runner_url.clone(),
+        "--lifecycle-namespace".into(),
+        cli.lifecycle_namespace.clone(),
+        "--project-dir".into(),
+        cli.project_dir.to_string_lossy().into_owned(),
+    ];
+    if cli.lifecycle_url_explicit {
+        arguments.extend(["--lifecycle-url".into(), cli.lifecycle_url.clone()]);
+    }
+    if let Some(token_file) = &cli.lifecycle_token_file {
+        arguments.extend([
+            "--lifecycle-token-file".into(),
+            token_file.to_string_lossy().into_owned(),
+        ]);
+    }
+    if cli.runtime_status_port != 7432 {
+        arguments.extend([
+            "--runtime-status-port".into(),
+            cli.runtime_status_port.to_string(),
+        ]);
+    }
+    arguments.extend(["attach".into(), workspace.id.clone()]);
+    let command = arguments
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut api = HerdrApi::connect(&session_socket()?)?;
+    api.request(
+        "pane.send_input",
+        json!({"pane_id":opened.pane_id,"text":command,"keys":["Enter"]}),
+    )?;
+    Ok(())
+}
+
+/// Report the live optional watcher state without starting or changing it.
+pub fn event_delivery_status(cli: &Cli) -> Result<String> {
+    let socket = session_socket()?;
+    match live_watcher(cli, &socket) {
+        Ok(true) => Ok("active".to_owned()),
+        Ok(false) => Ok("unavailable".to_owned()),
+        Err(error) => Ok(format!("unavailable ({error:#})")),
+    }
+}
+
 fn session_socket() -> Result<PathBuf> {
     std::env::var_os("HERDR_SOCKET_PATH")
         .map(PathBuf::from)

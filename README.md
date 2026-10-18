@@ -35,7 +35,7 @@ Every workspace starts with its durable agent. Choose a default model during set
 
 Work inside `/repos`. A plain workspace starts empty; clone there, or use `adm create my-project --repo OWNER/REPO` to prepare a checkout and start the shell and agent in it. See [repository navigation](docs/operations.md#find-your-repositories) for plain and lazy-catalog examples.
 
-In an interactive terminal, `adm create` attaches to the new workspace's durable agent when it is ready. Noninteractive use returns workspace JSON; pass `--no-attach` to force creation-only behavior.
+In an interactive terminal, `adm create` attaches to the new workspace's durable agent when it is ready. Noninteractive use returns workspace JSON; pass `--no-attach` to force creation-only behavior. Use `adm create my-project --herdr` inside a Herdr session to create and bind a new Herdr space, then start one attach in its initial pane. This option works in scripts too and reports the current close-event delivery health without starting a watcher.
 
 See [operations](docs/operations.md) for commands, Herdr integration, bots, and verification; [the implementation contract](docs/implementation-contract.md) for APIs; and [product requirements](docs/product-requirements.md) for the design and open decisions.
 

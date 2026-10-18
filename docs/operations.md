@@ -79,7 +79,7 @@ adm inspect my-project
 
 `adm create` writes lifecycle stage starts and elapsed stage/total durations to stderr and returns its workspace record on stdout. It reports the StorageClass lookup, resource apply, deployment readiness, optional repository preparation, and runner startup/registration separately. For `--repo`, creation waits until the owned Pod container is running, prepares the private checkout, then waits for Deployment readiness so a missing repository path cannot block startup. `adm destroy` returns its durable lifecycle operation receipt after deletion is admitted; use `adm destroy NAME --wait` to wait for completion and receive the deleted workspace record. A repeated destroy resumes the same operation, including after service restart. The lifecycle service records a tombstone before namespace cleanup, and stores cleanup stages, timings, and failures in the operation receipt and workspace status. These timings cover ADM's synchronous calls; for example, deployment readiness includes whatever Kubernetes waits on before the Deployment becomes Available, such as storage binding, scheduling, and initialization. Use the slowest stage to guide further measurements; the CLI does not infer a cause or split Kubernetes internals into separate durations.
 
-When both stdin and stdout are terminals, a successful `adm create NAME` attaches once to that workspace's durable agent. Without a default model, the normal `/model` selector remains available in the terminal. Pipes and redirected output stay creation-only and return the ready workspace JSON; use `--no-attach` to request that behavior explicitly from an interactive shell. If attachment fails after creation, the error includes the immutable workspace ID and the recovery command `adm attach NAME`. Closing or detaching the terminal leaves the workspace and agent running.
+When both stdin and stdout are terminals, a successful `adm create NAME` attaches once to that workspace's durable agent. Without a default model, the normal `/model` selector remains available in the terminal. Pipes and redirected output stay creation-only and return the ready workspace JSON; use `--no-attach` to request that behavior explicitly from an interactive shell. If attachment fails after creation, the error includes the immutable workspace ID and the recovery command `adm attach IMMUTABLE_ID`. Closing or detaching the terminal leaves the workspace and agent running.
 
 If coding tools cannot use Kubernetes, verify that the selected host kubeconfig reaches the intended cluster and run `adm reconnect NAME --kubeconfig PATHS`. The command checks the namespace's immutable workspace ownership, then updates the Pod runtime's host-side tool connection while retaining the namespace, workspace ID, files, history, goals, and loops. If active work blocks the rebind, stop it deliberately with `adm abort NAME`, then retry. A workspace Pod replacement retains the registered connection. The `--kubeconfig` argument accepts the ordinary colon-separated merge list; CLI-relative entries are resolved from the current directory.
 
@@ -213,13 +213,15 @@ The port is available on the client device running `adm port`; open `http://127.
 
 ## Herdr ownership and deletion
 
-Herdr integration is configured independently on each client device. `adm herdr bind` must run inside the Herdr space to own the selected ADM workspace. It verifies and renames that explicit space through stock Herdr commands, then installs a device-local default-shell wrapper. New panes in a bound space open `adm shell` at that workspace's saved repository cwd; other spaces keep Herdr's previous shell and its pane arguments. The initial pane returned by ADM space creation stays local so a host-side `adm attach` can run once.
+Herdr integration is configured independently on each client device. Use `adm create NAME --herdr` inside a Herdr session to create a ready ADM workspace, create a new stock-Herdr space labeled with its name, bind them by immutable IDs, and queue exactly one `adm attach IMMUTABLE_ID` in the returned initial pane. The command uses the client's current local directory as Herdr's cwd and does not change the invoking space's focus. It preserves the selected ADM connection paths without passing a bearer value. `--herdr` works in noninteractive commands; it cannot be combined with `--no-attach` or `--herdr-space`. If any handoff step fails after ADM creation, the error identifies the workspace ID and any created Herdr space ID and gives `adm attach IMMUTABLE_ID` as recovery. The initial pane is marked local so the device shell router does not replace this host-side attach with a remote shell. Other panes in the bound space use the workspace's saved cwd.
 
 ```sh
-# In an existing local pane of the Herdr space
-adm create my-project
-adm herdr bind my-project "$HERDR_WORKSPACE_ID"
-adm attach my-project
+# In an existing local pane of the Herdr session
+adm create my-project --herdr
+# Or bind a workspace to the current space separately
+adm create another-project
+adm herdr bind another-project "$HERDR_WORKSPACE_ID"
+adm attach IMMUTABLE_ID
 
 # Optional: start close-event cleanup inside this Herdr session under a
 # supervisor of your choice. This is independent of shell routing and binding.
