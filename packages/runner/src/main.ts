@@ -20,6 +20,13 @@ import { timingSafeEqual } from "node:crypto";
 import { parseArgs } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Workspace } from "./workspace.ts";
+import {
+  failLifecycleAvailability,
+  lifecycleAvailabilityError,
+  restoreLifecycleAvailability,
+  suspendLifecycleAvailability,
+  waitForLifecycleAvailability,
+} from "./lifecycle-availability.ts";
 import { botAgentManagementFromEnvironment } from "./bot-management.ts";
 import { ApiError, workspaceIdPattern, type WorkspaceConfig } from "./types.ts";
 import { watchEvents } from "@earendil-works/pi-durable";
@@ -92,10 +99,16 @@ const ownerPath = join(stateDirectory, "owner.json");
 const ownerDatabasePath = join(stateDirectory, "owner.sqlite");
 let ownerDatabase: DatabaseSync | undefined;
 let runtimeLease:
-  | { workspaceId: string; holder: string; fencingToken: number }
+  | {
+      workspaceId: string;
+      holder: string;
+      fencingToken: number;
+      expiresAt: number;
+    }
   | undefined;
 let runtimeLeaseError: Error | undefined;
 let fenceShutdown: Promise<void> | undefined;
+let leaseExpiryTimer: NodeJS.Timeout | undefined;
 async function processStart(pid: number): Promise<string | undefined> {
   try {
     const record = await readFile(`/proc/${pid}/stat`, "utf8");
@@ -242,21 +255,50 @@ async function assertActive(id: string) {
         "RUNTIME_LEASE_MISSING",
         "Workspace runtime does not hold its lifecycle fence",
       );
-    try {
-      await lifecycleRuntimeCall(id, "check", {
-        holder: runtimeLease.holder,
-        fencingToken: runtimeLease.fencingToken,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await fenceLost(error);
-      throw new ApiError(503, "RUNTIME_OWNERSHIP_LOST", message);
+    for (;;) {
+      await waitForLifecycleAvailability();
+      try {
+        await lifecycleRuntimeCall(id, "check", {
+          holder: runtimeLease.holder,
+          fencingToken: runtimeLease.fencingToken,
+        });
+        restoreLifecycleAvailability();
+        return;
+      } catch (error) {
+        if (isLifecycleUnavailable(error)) {
+          suspendLifecycleAvailability(error);
+          continue;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        await fenceLost(error);
+        throw new ApiError(503, "RUNTIME_OWNERSHIP_LOST", message);
+      }
     }
   }
+}
+function isLifecycleUnavailable(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (!(error instanceof ApiError) || error.status >= 500)
+  );
+}
+function scheduleLeaseExpiry(expiresAt: number) {
+  if (leaseExpiryTimer) clearTimeout(leaseExpiryTimer);
+  const remaining = expiresAt * 1000 - Date.now();
+  if (remaining <= 0) {
+    void fenceLost(new Error("Workspace runtime lease expired"));
+    return;
+  }
+  leaseExpiryTimer = setTimeout(() => {
+    void fenceLost(new Error("Workspace runtime lease expired"));
+  }, remaining);
+  leaseExpiryTimer.unref();
 }
 function fenceLost(error: unknown) {
   if (fenceShutdown) return fenceShutdown;
   runtimeLeaseError = error instanceof Error ? error : new Error(String(error));
+  if (leaseExpiryTimer) clearTimeout(leaseExpiryTimer);
+  failLifecycleAvailability(runtimeLeaseError);
   process.stderr.write(
     `FATAL workspace runtime lost its lifecycle fence: ${runtimeLeaseError.message}\n`,
   );
@@ -305,6 +347,7 @@ async function lifecycleRuntimeCall(
     error?: { code?: string; message?: string };
     fencingToken?: number;
     holder?: string;
+    expiresAt?: number;
   };
   if (!response.ok)
     throw new ApiError(
@@ -343,40 +386,45 @@ async function authorizeRuntimeRequest(
         "UNAUTHORIZED",
         "Workspace runtime identity is unavailable",
       );
-    let response: Response;
-    try {
-      response = await fetch(
-        `${lifecycleUrl.replace(/\/$/, "")}/v1/workspaces/${encodeURIComponent(id)}/runtime/authorize`,
-        {
-          method: "POST",
-          headers: {
-            authorization,
-            "content-type": "application/json",
+    for (;;) {
+      await waitForLifecycleAvailability();
+      let response: Response;
+      try {
+        response = await fetch(
+          `${lifecycleUrl.replace(/\/$/, "")}/v1/workspaces/${encodeURIComponent(id)}/runtime/authorize`,
+          {
+            method: "POST",
+            headers: {
+              authorization,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              action: runtimeAction(request.method ?? "GET", pathname),
+            }),
+            signal: AbortSignal.timeout(5_000),
           },
-          body: JSON.stringify({
-            action: runtimeAction(request.method ?? "GET", pathname),
-          }),
-          signal: AbortSignal.timeout(5_000),
-        },
-      );
-    } catch (error) {
-      throw new ApiError(
-        503,
-        "AUTHORIZATION_UNAVAILABLE",
-        `Lifecycle authorization is unavailable: ${(error as Error).message}`,
-      );
+        );
+      } catch (error) {
+        suspendLifecycleAvailability(error);
+        continue;
+      }
+      if (!response.ok) {
+        const value = (await response.json().catch(() => ({}))) as {
+          error?: { code?: string; message?: string };
+        };
+        const failure = new ApiError(
+          response.status,
+          value.error?.code ?? "UNAUTHORIZED",
+          value.error?.message ?? "Lifecycle rejected the workspace request",
+        );
+        if (response.status >= 500) {
+          suspendLifecycleAvailability(failure);
+          continue;
+        }
+        throw failure;
+      }
+      return;
     }
-    if (!response.ok) {
-      const value = (await response.json().catch(() => ({}))) as {
-        error?: { code?: string; message?: string };
-      };
-      throw new ApiError(
-        response.status,
-        value.error?.code ?? "UNAUTHORIZED",
-        value.error?.message ?? "Lifecycle rejected the workspace request",
-      );
-    }
-    return;
   }
   if (!tokenFile) return;
   let expected: Buffer;
@@ -460,14 +508,18 @@ if (lifecycleUrl) {
   if (
     acquired.holder !== holder ||
     !Number.isSafeInteger(acquired.fencingToken) ||
-    acquired.fencingToken! < 1
+    acquired.fencingToken! < 1 ||
+    !Number.isSafeInteger(acquired.expiresAt) ||
+    acquired.expiresAt! <= Math.floor(Date.now() / 1000)
   )
-    throw new Error("Lifecycle returned an invalid workspace runtime fence");
+    throw new Error("Lifecycle returned an invalid workspace runtime lease");
   runtimeLease = {
     workspaceId: config.id,
     holder,
     fencingToken: acquired.fencingToken!,
+    expiresAt: acquired.expiresAt!,
   };
+  scheduleLeaseExpiry(runtimeLease.expiresAt);
 }
 for (const config of configs.values())
   await openWorkspace(config, await isDeleted(config.id));
@@ -485,8 +537,20 @@ if (lifecycleUrl) {
       });
       if (renewed.fencingToken !== runtimeLease.fencingToken)
         throw new Error("Lifecycle changed the active workspace fence");
+      if (
+        renewed.holder !== holder ||
+        !Number.isSafeInteger(renewed.expiresAt) ||
+        renewed.expiresAt! <= Math.floor(Date.now() / 1000)
+      )
+        throw new Error(
+          "Lifecycle returned an invalid renewed workspace lease",
+        );
+      runtimeLease.expiresAt = renewed.expiresAt!;
+      scheduleLeaseExpiry(runtimeLease.expiresAt);
+      restoreLifecycleAvailability();
     } catch (error) {
-      await fenceLost(error);
+      if (isLifecycleUnavailable(error)) suspendLifecycleAvailability(error);
+      else await fenceLost(error);
     } finally {
       renewing = false;
     }
@@ -784,6 +848,13 @@ const server = createServer(async (request, response) => {
         return json(response, 503, {
           status: "error",
           error: runtimeLeaseError.message,
+        });
+      if (lifecycleAvailabilityError() && !runtimeLeaseError)
+        return json(response, 200, {
+          status: "degraded",
+          version: "0.1.0",
+          reason: "lifecycle-unavailable",
+          leaseExpiresAt: runtimeLease?.expiresAt,
         });
       return json(response, 200, { status: "ok", version: "0.1.0" });
     }

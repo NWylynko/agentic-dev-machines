@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import {
+  access,
   chmod,
   mkdir,
   mkdtemp,
@@ -525,6 +526,114 @@ test("workspace requests are authorized by lifecycle against the caller's projec
   assert.equal(closed.status, 503);
   assert.equal((await closed.json()).error.code, "RUNTIME_OWNERSHIP_LOST");
 });
+
+test(
+  "a controller transport outage pauses new work while an active turn survives until the same lease is renewed",
+  { timeout: 35_000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-lifecycle-outage-"));
+    const tokenFile = join(directory, "service-account-token");
+    const workspaceConfigFile = join(directory, "workspace.json");
+    const repository = join(directory, "repository");
+    const marker = join(directory, "tool-started");
+    await writeFile(tokenFile, "temporary-outage-identity\n", { mode: 0o600 });
+    await writeFile(workspaceConfigFile, JSON.stringify({
+      id: "workspace-lifecycle-outage",
+      name: "lifecycle-outage",
+      role: "coding",
+      environment: "pod",
+      localRoot: repository,
+      model: { provider: "faux", id: "faux-1" },
+    }));
+    let unavailable = false;
+    let renewedDuringOutage;
+    const renewalDuringOutage = new Promise((resolve) => {
+      renewedDuringOutage = resolve;
+    });
+    const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+    const control = createServer(async (request, response) => {
+      let text = "";
+      for await (const chunk of request) text += chunk;
+      const body = JSON.parse(text);
+      const headers = { "content-type": "application/json" };
+      if (request.headers.authorization !== "Bearer temporary-outage-identity") {
+        response.writeHead(401, headers).end(JSON.stringify({ error: { code: "UNAUTHORIZED" } }));
+        return;
+      }
+      if (unavailable) {
+        if (request.url?.endsWith("/runtime/lease/renew")) renewedDuringOutage();
+        response.writeHead(503, headers).end(JSON.stringify({ error: { code: "SERVICE_UNAVAILABLE" } }));
+        return;
+      }
+      response.writeHead(200, headers).end(JSON.stringify({
+        workspaceId: "workspace-lifecycle-outage",
+        holder: body.holder ?? holder,
+        fencingToken: 1,
+        expiresAt: Math.floor(Date.now() / 1000) + 30,
+        valid: true,
+      }));
+    });
+    await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+    const runner = await startRunner(
+      join(directory, "state"),
+      {},
+      {
+        tokenFile,
+        workspaceConfigFile,
+        lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+        podUid: holder,
+      },
+    );
+    t.after(async () => {
+      await runner.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+
+    const id = "workspace-lifecycle-outage";
+    const active = await runner.request(`/v1/workspaces/${id}/input`, "POST", {
+      requestId: "held-across-controller-update",
+      message: "/faux " + JSON.stringify({
+        calls: [{ tool: "bash", args: { command: `touch ${marker}; sleep 12; printf held > ${join(repository, "tool-finished")}` } }],
+        answer: "The in-flight turn completed after the controller returned.",
+      }),
+    }, undefined, "temporary-outage-identity");
+    assert.equal(active.status, 202);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        await access(marker);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    await access(marker);
+    unavailable = true;
+    await renewalDuringOutage;
+
+    const waiting = runner.request(`/v1/workspaces/${id}/input`, "POST", {
+      requestId: "admission-waits-for-authority",
+      message: "Continue after the controller has the same runtime lease again.",
+    }, undefined, "temporary-outage-identity");
+    const early = await Promise.race([
+      waiting.then((result) => ({ result })),
+      new Promise((resolve) => setTimeout(() => resolve({ held: true }), 100)),
+    ]);
+    assert.deepEqual(early, { held: true });
+    assert.equal((await fetch(`${runner.url}/health`)).status, 200);
+
+    unavailable = false;
+    const resumed = await waiting;
+    assert.equal(resumed.status, 202);
+    await nextEvent(runner, id, (event) =>
+      event.kind === "assistant" && event.data.text.includes("controller returned"),
+      0,
+      false,
+      25_000,
+      "temporary-outage-identity",
+    );
+    assert.equal(await readFile(join(repository, "tool-finished"), "utf8"), "held");
+  },
+);
 
 async function nextEvent(
   runner,
