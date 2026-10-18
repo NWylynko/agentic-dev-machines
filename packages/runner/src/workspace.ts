@@ -22,6 +22,7 @@ import { defaultRemoteEnv, KubernetesExecutionEnv } from "./kubernetes-env.ts";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
+import { WorkspaceResources } from "./resources.ts";
 import {
   workspaceModels,
   type LifecycleAuthorityAvailability,
@@ -127,6 +128,7 @@ function agentIsBusy(task: TaskInspection) {
 
 export class Workspace {
   config: WorkspaceConfig;
+  resources?: WorkspaceResources;
   harness: Awaited<ReturnType<typeof Harness.open>>;
   conversation: Awaited<
     ReturnType<Awaited<ReturnType<typeof Harness.open>>["root"]>
@@ -254,6 +256,9 @@ export class Workspace {
         registry.install(botExtension(config, assertActive, botAgents));
         registry.install(createCodemodeExtension({ sandbox, models: false }));
       }
+      const resources = config.role === "coding" && config.environment !== "kubernetes"
+        ? new WorkspaceResources(config, directory)
+        : undefined;
       registry.install(
         defineExtension({
           name: "workspace-lifecycle",
@@ -265,9 +270,9 @@ export class Workspace {
               },
             }),
             hook(GenerationTask, {
-              beforeRequest: async (_request, _api, context) => {
+              beforeRequest: async (request, _api, context) => {
                 await assertActive(context.abortSignal);
-                return undefined;
+                return resources ? { messages: await resources.requestMessages(request.messages) } : undefined;
               },
               afterResponse: async (message) => {
                 reportedError =
@@ -361,6 +366,7 @@ export class Workspace {
         mcp?.close,
       );
       openedWorkspace = workspace;
+      workspace.resources = resources;
       workspace.lastError = reportedError;
       workspace.mcpError = mcpError;
       workspace.localEnv = localEnv;

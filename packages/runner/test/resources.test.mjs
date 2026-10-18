@@ -50,6 +50,44 @@ async function startRunner(directory) {
     });
   });
   return {
+    async inspectPrompt(path) {
+      const controller = new AbortController();
+      const stream = await fetch(url + path + "/events", {
+        signal: AbortSignal.any([
+          controller.signal,
+          AbortSignal.timeout(10000),
+        ]),
+      });
+      const reader = stream.body.getReader();
+      try {
+        const admitted = await this.request(path + "/input", "POST", {
+          message: "/faux-inspect-system-prompt",
+          requestId: "resource-prompt-inspection",
+        });
+        assert.equal(admitted.status, 202);
+        let buffer = "";
+        const decoder = new TextDecoder();
+        for (;;) {
+          const part = await reader.read();
+          if (part.done)
+            throw new Error("Runner events closed before prompt inspection");
+          buffer += decoder.decode(part.value, { stream: true });
+          let newline;
+          while ((newline = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, newline).trimEnd();
+            buffer = buffer.slice(newline + 1);
+            if (line.startsWith("data: ")) {
+              const event = JSON.parse(line.slice(6));
+              if (event.kind === "assistant")
+                return JSON.parse(event.data.text);
+            }
+          }
+        }
+      } finally {
+        controller.abort();
+        await reader.cancel().catch(() => {});
+      }
+    },
     async request(path, method = "GET", data) {
       const response = await fetch(url + path, {
         method,
@@ -122,6 +160,7 @@ test(
           role: "coding",
           environment: "local",
           localRoot: project,
+          model: { provider: "faux", id: "faux-1" },
         })
       ).status,
       200,
@@ -167,6 +206,14 @@ test(
     assert.equal(trusted.body.themes[0].json.name, "workspace-theme");
     assert.deepEqual(trusted.body.themes[0].json.colors, theme.colors);
     assert.equal(trusted.body.systemPrompt, "Workspace system prompt.");
+    const providerMessages = await runner.inspectPrompt(path);
+    const providerSystem = providerMessages
+      .filter((message) => message.role === "system")
+      .map((message) => message.content)
+      .join("\n");
+    assert.match(providerSystem, /Workspace system prompt\./);
+    assert.match(providerSystem, /Use the workspace conventions\./);
+    assert.match(providerSystem, /Review a change/);
     assert.ok(
       trusted.body.extensions.some(
         (extension) =>

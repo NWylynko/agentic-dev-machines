@@ -55,7 +55,6 @@ const host = values.host!,
   port = Number(values.port),
   stateDirectory = values["state-dir"]!;
 const tokenFile = values["token-file"];
-const workspaceResources = new Map<string, WorkspaceResources>();
 const lifecycleUrl = values["lifecycle-url"] ?? process.env.ADM_LIFECYCLE_URL;
 if (!["127.0.0.1", "::1", "localhost"].includes(host) && !lifecycleUrl)
   throw new Error(
@@ -1476,14 +1475,10 @@ const server = createServer(async (request, response) => {
       action === "resources/reload" ||
       action === "trust"
     ) {
-      let resources = workspaceResources.get(id);
-      if (!resources) {
-        resources = new WorkspaceResources(
+      const resources = workspace.resources ?? new WorkspaceResources(
           workspace.config,
           join(stateDirectory, "sessions", id),
         );
-        workspaceResources.set(id, resources);
-      }
       if (request.method === "GET" && action === "resources")
         return json(response, 200, await resources.get());
       if (request.method === "GET" && action === "trust")

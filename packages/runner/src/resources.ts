@@ -3,6 +3,7 @@ import { basename, isAbsolute, join, resolve, sep } from "node:path";
 import {
   DefaultPackageManager,
   DefaultResourceLoader,
+  formatSkillsForPrompt,
   hasTrustRequiringProjectResources,
   ProjectTrustStore,
   SettingsManager,
@@ -11,6 +12,7 @@ import {
   type SourceInfo,
 } from "@earendil-works/pi-coding-agent";
 import { ApiError, type WorkspaceConfig } from "./types.ts";
+import type { Message } from "@earendil-works/pi-ai";
 
 export type WorkspaceResourceSnapshot = {
   cwd: string;
@@ -67,6 +69,40 @@ export class WorkspaceResources {
 
   async get() {
     return this.snapshot ?? this.reload();
+  }
+
+  async requestMessages(
+    input: readonly Message[],
+  ): Promise<readonly Message[]> {
+    const resources = await this.get();
+    const extra = [
+      ...resources.agentsFiles.map(
+        (file) => `# ${file.path}\n\n${file.content}`,
+      ),
+      ...resources.appendSystemPrompt,
+      formatSkillsForPrompt(resources.skills),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    if (resources.systemPrompt === undefined && !extra) return input;
+    const messages = [...input];
+    const leading = messages[0]?.role === "system" ? messages[0] : undefined;
+    const base =
+      resources.systemPrompt ??
+      (leading
+        ? typeof leading.content === "string"
+          ? leading.content
+          : leading.content.map((part) => part.text).join("\n")
+        : "");
+    const system: Message = {
+      ...leading,
+      role: "system",
+      content: [base, extra].filter(Boolean).join("\n\n"),
+      timestamp: leading?.timestamp ?? 0,
+    };
+    if (leading) messages[0] = system;
+    else messages.unshift(system);
+    return messages;
   }
 
   async setTrust(trusted: boolean) {
