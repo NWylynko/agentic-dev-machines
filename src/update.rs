@@ -184,12 +184,13 @@ pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str
             "durationSeconds":MAINTENANCE_SECONDS,
         })),
     )?;
+    let maintenance_expires_at = extension["expiresAt"]
+        .as_u64()
+        .context("maintenance extension omitted its authoritative expiry")?;
     eprintln!(
         "adm: update: extended {} active workspace leases through {}",
         extension["workspaceIds"].as_array().map_or(0, Vec::len),
-        extension["expiresAt"]
-            .as_u64()
-            .context("maintenance extension omitted its authoritative expiry")?,
+        maintenance_expires_at,
     );
     connected.request_lifecycle(
         "POST",
@@ -222,6 +223,17 @@ pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str
     connected
         .request_lifecycle("GET", "/v1/workspaces", None)
         .context("verify authenticated lifecycle API after controller update")?;
+    connected
+        .request_lifecycle(
+            "POST",
+            "/v1/runtime/maintenance/complete",
+            Some(&json!({"maintenanceId":maintenance_id})),
+        )
+        .with_context(|| {
+            format!(
+                "controller is healthy, but planned workspace lease window {maintenance_id} could not be released (expires at {maintenance_expires_at})"
+            )
+        })?;
     if !selected.is_empty() {
         upgrade_selected(
             &connected,

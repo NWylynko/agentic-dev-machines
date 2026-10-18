@@ -838,6 +838,16 @@ fn route(
             serde_json::json!({"maintenanceId":request.maintenance_id,"ready":true}),
         ));
     }
+    if method == "POST" && path == "/v1/runtime/maintenance/complete" {
+        cli.check_lifecycle_fence()?;
+        let request: RuntimeMaintenanceRequest = serde_json::from_slice(body)?;
+        let expires_at = store.complete_runtime_maintenance(&request.maintenance_id)?;
+        notify_runtime_maintenance_changed();
+        return Ok((
+            200,
+            serde_json::json!({"maintenanceId":request.maintenance_id,"completed":true,"expiresAt":expires_at}),
+        ));
+    }
     if path.starts_with("/v1/provider-auth/") {
         cli.check_lifecycle_fence()?;
     }

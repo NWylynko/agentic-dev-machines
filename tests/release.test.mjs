@@ -240,6 +240,7 @@ esac
       { mode: 0o755 },
     );
     const failedWorkspaceOperations = new Set();
+    const maintenanceCalls = [];
     let failSelectedWorkspace = false;
     const lifecycleServer = createHttpServer(async (request, response) => {
       const chunks = [];
@@ -248,6 +249,17 @@ esac
       if (request.headers.authorization !== "Bearer synthetic-lifecycle-token") {
         response.writeHead(401, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: { message: "selected token file was not forwarded" } }));
+        return;
+      }
+      if (request.url.startsWith("/v1/runtime/maintenance/")) {
+        maintenanceCalls.push(request.url);
+        const value = request.url.endsWith("/extend")
+          ? { workspaceIds: [], expiresAt: Math.floor(Date.now() / 1000) + 300 }
+          : request.url.endsWith("/await")
+            ? { ready: true }
+            : { completed: true };
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(value));
         return;
       }
       const selectedId = "55f9ea63-5506-4b39-bab8-49c2fadd0e73";
@@ -359,6 +371,11 @@ esac
       { cwd: unrelated, env: updateEnvironment, maxBuffer: 1024 * 1024 },
     );
     assert.match(update.stderr, /controller release v9\.8\.7 observed/);
+    assert.deepEqual(maintenanceCalls, [
+      "/v1/runtime/maintenance/extend",
+      "/v1/runtime/maintenance/await",
+      "/v1/runtime/maintenance/complete",
+    ]);
     assert.equal(await readFile(applied, "utf8"), `image=${targetImage}\n`);
     const appliedCalls = (await readFile(kubectlLog, "utf8"))
       .split("\n")

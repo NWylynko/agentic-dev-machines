@@ -229,7 +229,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     fs::write(
         root.path().join("kubectl"),
         r##"#!/usr/bin/env python3
-import datetime, fcntl, json, pathlib, re, sys, time
+import datetime, fcntl, json, pathlib, re, sys, time, urllib.request, uuid
 root=pathlib.Path(__file__).parent
 args=sys.argv[1:]
 args=[arg for arg in args if not arg.startswith('--request-timeout=')]
@@ -297,13 +297,20 @@ elif args[:2] == ['get','pods']:
     count=int(count_path.read_text()) if count_path.exists() else 0
     count_path.write_text(str(count+1))
     items=[]
+    selected_workspace=None
+    if '-l' in args:
+        selector=args[args.index('-l')+1]
+        if selector.startswith('adm.dev/workspace-id='): selected_workspace=selector.split('=',1)[1]
     runtime_ip=(root/'runtime-ip').read_text() if (root/'runtime-ip').exists() else None
     for namespace, resource in state.items():
         workspace_id=resource['metadata']['labels'].get('adm.dev/workspace-id')
+        if selected_workspace and workspace_id != selected_workspace: continue
         pod_uid=(root/'expected-pod-uid').read_text() if (root/'expected-pod-uid').exists() else '4b53eaa6-4e4d-42dd-9a02-4702a842155a'
         if (root/'expected-bot-namespace').exists() and namespace == (root/'expected-bot-namespace').read_text():
             pod_uid=(root/'expected-bot-pod-uid').read_text()
-        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'test-node'},'status':{'phase':'Running','podIP':runtime_ip,'containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
+        image='ghcr.io/example/adm-dev:fixture'
+        if (root/'pod-image').exists(): image=(root/'pod-image').read_text()
+        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'test-node','containers':[{'name':'dev','image':image}]},'status':{'phase':'Running','podIP':runtime_ip,'conditions':[{'type':'Ready','status':'True'}],'containerStatuses':[{'name':'dev','ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:3] == ['get','deployment','workspace']:
     namespace=args[args.index('-n')+1]
@@ -329,8 +336,12 @@ elif args[0] == 'apply':
             print('injected deployment admission failure',file=sys.stderr); sys.exit(1)
     doc=json.load(sys.stdin)
     (root/'applied').write_text(json.dumps(doc))
+    if doc.get('kind') == 'Deployment' and doc['metadata'].get('name') == 'workspace':
+        (root/'current-deployment.json').write_text(json.dumps(doc))
     for item in doc.get('items',[]):
         if item['kind']=='Namespace': state[item['metadata']['name']]=item
+        if item['kind']=='Deployment' and item['metadata'].get('name') == 'workspace':
+            (root/'current-deployment.json').write_text(json.dumps(item))
     state_path.write_text(json.dumps(state))
 elif args[:2] == ['create','-f']:
     doc=json.load(sys.stdin)
@@ -350,6 +361,24 @@ elif args[:2] == ['replace','-f']:
     if doc['spec']['holderIdentity']==current['spec']['holderIdentity']:
         (root/'lease-renewed').write_text('yes')
     print(json.dumps(doc))
+elif args[:3] == ['rollout','status','deployment/workspace']:
+    if (root/'fail-wait').exists() and 'deployment/workspace' in args:
+        print('injected workspace rollout readiness failure',file=sys.stderr); sys.exit(1)
+    deployment=json.loads((root/'current-deployment.json').read_text())
+    namespace=args[args.index('-n')+1]
+    workspace_id=deployment['metadata']['labels']['adm.dev/workspace-id']
+    (root/'pod-image').write_text(next(container['image'] for container in deployment['spec']['template']['spec']['containers'] if container['name']=='dev'))
+    pod_uid=str(uuid.uuid4())
+    (root/'expected-pod-uid').write_text(pod_uid)
+    payload=json.dumps({'holder':pod_uid}).encode()
+    target_token='target-token:'+namespace+':'+pod_uid
+    request=urllib.request.Request((root/'lifecycle-url').read_text().strip()+'/v1/workspaces/'+workspace_id+'/runtime/lease',data=payload,headers={'Authorization':'Bearer '+target_token,'Content-Type':'application/json'},method='POST')
+    with urllib.request.urlopen(request) as response:
+        lease=json.loads(response.read())
+    if lease.get('maintenanceId'):
+        payload=json.dumps({'holder':pod_uid,'fencingToken':lease['fencingToken'],'maintenanceId':lease['maintenanceId'],'expiresAt':lease['expiresAt']}).encode()
+        request=urllib.request.Request((root/'lifecycle-url').read_text().strip()+'/v1/workspaces/'+workspace_id+'/runtime/lease/ack',data=payload,headers={'Authorization':'Bearer '+target_token,'Content-Type':'application/json'},method='POST')
+        with urllib.request.urlopen(request) as response: response.read()
 elif args[0] == 'wait':
     if (root/'fail-wait').exists() and 'deployment/workspace' in args:
         print('injected workspace rollout readiness failure',file=sys.stderr); sys.exit(1)
@@ -378,6 +407,7 @@ else:
     )
     .unwrap();
     let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
     let mut service = start_service(root.path(), port);
     let initial_health = wait_for(|| request(&url, "GET", "/health", None).ok());
     assert_eq!(initial_health.status(), 200);
@@ -1297,6 +1327,19 @@ else:
         400,
         "a concurrent update must not replace the first update's required acknowledgement set"
     );
+    assert_ne!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/maintenance/await",
+            Some(&json!({"maintenanceId":"62e0d7b1-54b6-4fbb-8fa7-96aa4fe4ecb0"})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .status(),
+        200,
+        "a stale maintenance ID must not succeed with an empty acknowledgement set"
+    );
     let extended_renewal: Value = request_with_token(
         &url,
         "POST",
@@ -1318,6 +1361,19 @@ else:
         "maintenanceId": maintenance_id,
         "expiresAt": extended_renewal["expiresAt"],
     });
+    assert_ne!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/maintenance/complete",
+            Some(&json!({"maintenanceId":maintenance_id})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .status(),
+        200,
+        "the controller cannot close a maintenance window before all runtime ACKs"
+    );
     assert_eq!(
         request_with_token(
             &url,
@@ -1336,6 +1392,100 @@ else:
             "POST",
             "/v1/runtime/maintenance/await",
             Some(&json!({"maintenanceId":maintenance_id})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    let wrong_maintenance_await = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/maintenance/await",
+        Some(&json!({"maintenanceId":"62e0d7b1-54b6-4fbb-8fa7-96aa4fe4ecb0"})),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap();
+    assert_ne!(wrong_maintenance_await.status(), 200);
+    let completed_maintenance: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/maintenance/complete",
+        Some(&json!({"maintenanceId":maintenance_id})),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(completed_maintenance["completed"], true);
+    let next_maintenance_id = "62e0d7b1-54b6-4fbb-8fa7-96aa4fe4ecb0";
+    let next_maintenance = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/maintenance/extend",
+        Some(&json!({"maintenanceId":next_maintenance_id,"durationSeconds":300})),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json::<Value>()
+    .unwrap();
+    assert!(
+        next_maintenance["workspaceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(runtime_id))
+    );
+    let renewed_for_next_maintenance: Value = request_with_token(
+        &url,
+        "POST",
+        &format!("/v1/workspaces/{runtime_id}/runtime/lease/renew"),
+        Some(&json!({"holder":runtime_pod_uid,"fencingToken":runtime_lease["fencingToken"]})),
+        Some("runtime-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(
+        renewed_for_next_maintenance["maintenanceId"],
+        next_maintenance_id
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &format!("/v1/workspaces/{runtime_id}/runtime/lease/ack"),
+            Some(&json!({
+                "holder":runtime_pod_uid,
+                "fencingToken":runtime_lease["fencingToken"],
+                "maintenanceId":next_maintenance_id,
+                "expiresAt":renewed_for_next_maintenance["expiresAt"],
+            })),
+            Some("runtime-token"),
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/maintenance/await",
+            Some(&json!({"maintenanceId":next_maintenance_id})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/maintenance/complete",
+            Some(&json!({"maintenanceId":next_maintenance_id})),
             Some("synthetic-lifecycle-token"),
         )
         .unwrap()
@@ -1413,7 +1563,10 @@ else:
         runtime_workspace["namespace"]
     );
     assert_eq!(updated_workspace["cwd"], runtime_workspace["cwd"]);
-    let replacement_pod_uid = "d524ee78-6fc3-4b5e-9bd0-6e6f2ee37fd3";
+    let replacement_pod_uid = fs::read_to_string(root.path().join("expected-pod-uid"))
+        .unwrap()
+        .trim()
+        .to_owned();
     let replacement_token = format!(
         "target-token:{}:{replacement_pod_uid}",
         updated_workspace["namespace"].as_str().unwrap()
@@ -1435,7 +1588,7 @@ else:
     assert_eq!(replacement_status, 200, "{replacement_body}");
     let replacement_lease: Value = serde_json::from_str(&replacement_body).unwrap();
     assert_eq!(replacement_lease["fencingToken"], 2);
-    fs::write(root.path().join("expected-pod-uid"), replacement_pod_uid).unwrap();
+    fs::write(root.path().join("expected-pod-uid"), &replacement_pod_uid).unwrap();
     assert_ne!(
         request_with_token(
             &url,
@@ -1633,8 +1786,10 @@ else:
         fs::read_to_string(root.path().join("history.marker")).unwrap(),
         "kept durable history\n"
     );
-    let final_pod_uid = "ae7e7885-3037-4ad4-91e1-1190d2086c64";
-    fs::write(root.path().join("expected-pod-uid"), final_pod_uid).unwrap();
+    let final_pod_uid = fs::read_to_string(root.path().join("expected-pod-uid"))
+        .unwrap()
+        .trim()
+        .to_owned();
     let final_pod_token = format!(
         "target-token:{}:{final_pod_uid}",
         final_workspace["namespace"].as_str().unwrap()
@@ -1651,7 +1806,7 @@ else:
     .unwrap()
     .json()
     .unwrap();
-    assert_eq!(final_lease["fencingToken"], 3);
+    assert!(final_lease["fencingToken"].as_u64().unwrap() >= 3);
     let final_lease_body =
         json!({"holder":final_pod_uid,"fencingToken":final_lease["fencingToken"]});
     let other_pod_lease = json!({"holder":"f8a58e8d-91e7-4a5e-9da8-2591dfbb9fde"});
@@ -1713,7 +1868,10 @@ else:
     .unwrap()
     .json()
     .unwrap();
-    assert_eq!(resumed_after_expiry["fencingToken"], 4);
+    assert_eq!(
+        resumed_after_expiry["fencingToken"].as_u64().unwrap(),
+        final_lease["fencingToken"].as_u64().unwrap() + 1
+    );
     assert_ne!(
         request_with_token(
             &url,

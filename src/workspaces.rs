@@ -742,7 +742,7 @@ impl WorkspaceStore {
         &mut self,
         workspace_id: &str,
         operation_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -754,6 +754,7 @@ impl WorkspaceStore {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
             )
             .optional()?;
+        let revoked_holder = lease.as_ref().map(|(holder, _)| holder.clone());
         if let Some((holder, fencing_token)) = lease {
             transaction.execute(
                 "INSERT INTO runtime_lease_revocations(workspace_id,holder,fencing_token,operation_id) VALUES(?1,?2,?3,?4) ON CONFLICT(workspace_id,holder) DO UPDATE SET fencing_token=excluded.fencing_token,operation_id=excluded.operation_id",
@@ -765,7 +766,7 @@ impl WorkspaceStore {
             )?;
         }
         transaction.commit()?;
-        Ok(())
+        Ok(revoked_holder)
     }
     pub fn extend_runtime_leases(
         &mut self,
@@ -897,11 +898,63 @@ impl WorkspaceStore {
         Ok(())
     }
     pub fn unacknowledged_runtime_maintenance(&self, maintenance_id: &str) -> Result<Vec<String>> {
+        let active: Option<(String, u64)> = self
+            .connection
+            .query_row(
+                "SELECT maintenance_id,expires_at FROM runtime_maintenance WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?;
+        ensure!(
+            active.as_ref().is_some_and(
+                |(active_id, expires_at)| active_id == maintenance_id && *expires_at > now()
+            ),
+            "controller maintenance window is missing, expired, or belongs to another update"
+        );
         let mut statement = self.connection.prepare(
             "SELECT workspace_id FROM runtime_maintenance_leases WHERE maintenance_id=?1 AND acknowledged=0 ORDER BY workspace_id",
         )?;
         let rows = statement.query_map([maintenance_id], |row| row.get(0))?;
         rows.map(|row| Ok(row?)).collect()
+    }
+    pub fn complete_runtime_maintenance(&mut self, maintenance_id: &str) -> Result<u64> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        let (active_id, expires_at): (String, u64) = transaction.query_row(
+            "SELECT maintenance_id,expires_at FROM runtime_maintenance WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+        )?;
+        ensure!(
+            active_id == maintenance_id && expires_at > now(),
+            "controller maintenance window is missing, expired, or belongs to another update"
+        );
+        let unacknowledged: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM runtime_maintenance_leases WHERE maintenance_id=?1 AND acknowledged=0",
+            [maintenance_id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            unacknowledged == 0,
+            "workspace runtimes have not all acknowledged the planned maintenance window"
+        );
+        transaction.execute(
+            "DELETE FROM runtime_maintenance_leases WHERE maintenance_id=?1",
+            [maintenance_id],
+        )?;
+        let removed = transaction.execute(
+            "DELETE FROM runtime_maintenance WHERE singleton=1 AND maintenance_id=?1",
+            [maintenance_id],
+        )?;
+        ensure!(
+            removed == 1,
+            "controller maintenance window changed before completion"
+        );
+        transaction.commit()?;
+        Ok(expires_at)
     }
     pub fn runtime_maintenance_for_lease(
         &self,
@@ -950,6 +1003,21 @@ impl WorkspaceStore {
         ensure!(row.2 > now(), "runtime lease expired");
         tx.commit()?;
         Ok(())
+    }
+    pub fn current_runtime_lease(&self, workspace_id: &str) -> Result<(String, u64, u64)> {
+        self.connection
+            .query_row(
+                "SELECT holder,fencing_token,expires_at FROM runtime_leases WHERE workspace_id=?1",
+                [workspace_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .with_context(|| "workspace runtime lease is not held")
     }
     pub fn check_runtime_owner(&self, workspace_id: &str, holder: &str) -> Result<()> {
         let (active_holder, expires_at): (String, i64) = self
@@ -1618,7 +1686,8 @@ pub fn upgrade_persisted(cli: &Cli, workspace_id: &str) -> Result<Workspace> {
         .lifecycle_operation_id
         .as_deref()
         .context("workspace image update needs a durable operation ID")?;
-    cli.store()?
+    let previous_holder = cli
+        .store()?
         .revoke_runtime_lease_for_update(workspace_id, operation_id)?;
     let resources = manifest(&workspace)?;
     let deployment = resources["items"]
@@ -1651,8 +1720,8 @@ pub fn upgrade_persisted(cli: &Cli, workspace_id: &str) -> Result<Workspace> {
     kubectl(
         cli,
         &[
-            "wait",
-            "--for=condition=available",
+            "rollout",
+            "status",
             "deployment/workspace",
             "-n",
             &workspace.namespace,
@@ -1660,9 +1729,11 @@ pub fn upgrade_persisted(cli: &Cli, workspace_id: &str) -> Result<Workspace> {
         ],
         None,
     )
-    .context("wait for selected workspace runtime and lease readiness")?;
+    .context("wait for selected workspace Deployment rollout")?;
     verify_ownership(cli, &workspace)
         .context("verify selected workspace ownership after image update")?;
+    verify_updated_workspace_runtime(cli, &workspace, previous_holder.as_deref())
+        .context("verify selected workspace replacement Pod and runtime lease")?;
     let current = cli.store()?.find(workspace_id)?;
     ensure!(
         current.id == workspace.id && current.image == workspace.image,
@@ -1670,6 +1741,95 @@ pub fn upgrade_persisted(cli: &Cli, workspace_id: &str) -> Result<Workspace> {
     );
     workspace.runtime_status = None;
     Ok(workspace)
+}
+
+fn verify_updated_workspace_runtime(
+    cli: &Cli,
+    workspace: &Workspace,
+    previous_holder: Option<&str>,
+) -> Result<()> {
+    let pods: Value = serde_json::from_slice(&kubectl(
+        cli,
+        &[
+            "get",
+            "pods",
+            "-n",
+            &workspace.namespace,
+            "-l",
+            &format!("adm.dev/workspace-id={}", workspace.id),
+            "-o",
+            "json",
+        ],
+        None,
+    )?)
+    .context("decode selected workspace replacement Pod list")?;
+    let ready = pods["items"]
+        .as_array()
+        .context("selected workspace Pod list has no items")?
+        .iter()
+        .filter(|pod| {
+            pod["metadata"]["deletionTimestamp"].is_null()
+                && pod["status"]["phase"] == "Running"
+                && pod["status"]["conditions"]
+                    .as_array()
+                    .is_some_and(|conditions| {
+                        conditions.iter().any(|condition| {
+                            condition["type"] == "Ready" && condition["status"] == "True"
+                        })
+                    })
+                && pod["status"]["containerStatuses"]
+                    .as_array()
+                    .is_some_and(|containers| {
+                        containers.iter().any(|container| {
+                            container["name"] == "dev" && container["ready"] == true
+                        })
+                    })
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        ready.len() == 1,
+        "selected workspace update expected one ready replacement Pod, found {}",
+        ready.len()
+    );
+    let pod = ready[0];
+    ensure!(
+        pod["metadata"]["namespace"] == workspace.namespace
+            && pod["metadata"]["labels"]["app.kubernetes.io/managed-by"] == MANAGED_BY
+            && pod["metadata"]["labels"]["adm.dev/workspace-id"] == workspace.id,
+        "selected workspace replacement Pod ownership metadata does not match the selected workspace"
+    );
+    let holder = pod["metadata"]["uid"]
+        .as_str()
+        .context("selected workspace replacement Pod has no UID")?;
+    ensure!(
+        uuid::Uuid::parse_str(holder).is_ok() && Some(holder) != previous_holder,
+        "selected workspace update did not replace the previous Pod identity"
+    );
+    ensure!(
+        pod["spec"]["containers"]
+            .as_array()
+            .is_some_and(|containers| {
+                containers.iter().any(|container| {
+                    container["name"] == "dev" && container["image"] == workspace.image
+                })
+            }),
+        "selected workspace replacement Pod is not running image {}",
+        workspace.image
+    );
+    let (lease_holder, fencing_token, expires_at) =
+        cli.store()?.current_runtime_lease(&workspace.id)?;
+    ensure!(
+        lease_holder == holder,
+        "selected workspace replacement Pod has not acquired its lifecycle runtime lease"
+    );
+    ensure!(
+        expires_at > now(),
+        "selected workspace replacement runtime lease expired"
+    );
+    cli.store()?
+        .check_runtime_lease(&workspace.id, &lease_holder, fencing_token)
+        .context("selected workspace replacement runtime lease is not authoritative")?;
+    Ok(())
 }
 
 fn verify_workspace_update_target(cli: &Cli, workspace: &Workspace) -> Result<()> {
