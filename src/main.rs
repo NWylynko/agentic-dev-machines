@@ -633,12 +633,14 @@ fn workspace_summary(workspace: &Value, activity: &Value) -> [String; 8] {
     let runtime = workspace.get("runtime_status").unwrap_or(&Value::Null);
     let (runtime_readiness, node) = if phase == "deleted" {
         ("deleted".to_owned(), "—".to_owned())
-    } else if runtime["error"].is_string() {
+    } else if runtime["error"].is_string() && runtime["podPhase"] != "Failed" {
         ("unavailable".to_owned(), "—".to_owned())
     } else {
         let pod_phase = runtime["podPhase"].as_str().unwrap_or("Unknown");
         let readiness = if runtime["podPhase"] == "Missing" {
             "missing".to_owned()
+        } else if runtime["podPhase"] == "Failed" {
+            "NotReady (Failed)".to_owned()
         } else if runtime["ready"] == true {
             "Ready".to_owned()
         } else if pod_phase == "Pending" {
@@ -815,26 +817,35 @@ fn print_status(status: &Value) {
 fn print_summary_errors(status: &Value) {
     let workspace = status.get("workspace").unwrap_or(status);
     let activity = status.get("activity").unwrap_or(&status["activity"]);
+    let identity = format!(
+        "{} ({})",
+        workspace["name"].as_str().unwrap_or("unknown"),
+        workspace["id"].as_str().unwrap_or("unknown")
+    );
     if workspace["phase"] != "deleted" {
         if let Some(error) = workspace["runtime_status"]["error"].as_str() {
-            println!("Runtime unavailable: {error}");
+            if workspace["runtime_status"]["podPhase"] == "Failed" {
+                println!("Runtime failure for {identity}: {error}");
+            } else {
+                println!("Runtime unavailable for {identity}: {error}");
+            }
         } else if workspace["runtime_status"].is_null() {
-            println!("Runtime unavailable: runtime observation is missing");
+            println!("Runtime unavailable for {identity}: runtime observation is missing");
         } else if workspace["runtime_status"]["podPhase"] == "Missing" {
-            println!("Runtime unavailable: workspace Pod is missing");
+            println!("Runtime unavailable for {identity}: workspace Pod is missing");
         }
     }
     if let Some(error) = activity["error"].as_str() {
         match activity["status"].as_str() {
-            Some("unavailable") => println!("Agent unavailable: {error}"),
-            Some("error") => println!("Agent failure: {error}"),
-            _ => println!("Agent error: {error}"),
+            Some("unavailable") => println!("Agent unavailable for {identity}: {error}"),
+            Some("error") => println!("Agent failure for {identity}: {error}"),
+            _ => println!("Agent error for {identity}: {error}"),
         }
     } else if activity["status"] == "unavailable" {
-        println!("Agent unavailable: workspace runtime did not report a cause");
+        println!("Agent unavailable for {identity}: workspace runtime did not report a cause");
     }
     if let Some(error) = workspace["last_error"].as_str() {
-        println!("Workspace failure: {error}");
+        println!("Workspace failure for {identity}: {error}");
     }
 }
 

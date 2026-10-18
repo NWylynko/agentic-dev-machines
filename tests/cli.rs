@@ -371,7 +371,9 @@ elif args[:2] == ['get','pods']:
     items=[]
     for namespace, resource in state.items():
         workspace_id=resource['metadata'].get('labels',{}).get('adm.dev/workspace-id')
-        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':{'phase':'Running','containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
+        failed = (pathlib.Path(__file__).parent / 'failed-pod').exists()
+        pod_status = {'phase':'Failed' if failed else 'Running','message':'workspace process exited unexpectedly' if failed else None,'containerStatuses':[{'ready':not failed,'state':{'terminated':{'reason':'Error'}} if failed else {'running':{}}}]}
+        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':pod_status})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:2] == ['get', 'storageclass']:
     if (pathlib.Path(__file__).parent / 'missing-storage').exists():
@@ -1372,6 +1374,51 @@ fn list_and_status_render_the_same_core_workspace_observation() {
         "the shared summary must use the lifecycle directory observation"
     );
     assert_eq!(details["agent"]["status"], "unavailable");
+}
+
+#[test]
+fn failed_pod_summary_keeps_observed_node_and_failure_cause() {
+    let root = fixture();
+    assert_ok(adm(
+        root.path(),
+        &["create", "crashed", "--no-repositories"],
+    ));
+    fs::write(root.path().join("failed-pod"), "failed").unwrap();
+
+    let output = adm(root.path(), &["status", "crashed"]);
+    assert!(output.status.success(), "{output:?}");
+    let output = String::from_utf8_lossy(&output.stdout);
+    let row = output.lines().nth(1).unwrap();
+    assert!(row.contains("NotReady (Failed)"), "{output}");
+    assert!(row.contains("node-a"), "{output}");
+    assert!(
+        output.contains("workspace process exited unexpectedly"),
+        "the observed Pod failure cause must remain visible: {output}"
+    );
+    assert!(
+        !output.contains("Runtime unavailable:"),
+        "a reported Failed Pod is an observed runtime state: {output}"
+    );
+}
+
+#[test]
+fn list_runtime_diagnostics_identify_the_workspace_row() {
+    let root = fixture();
+    let coding = assert_ok(adm(root.path(), &["create", "editor", "--no-repositories"]));
+    let bot = assert_ok(adm(root.path(), &["create", "supervisor", "--role", "bot"]));
+
+    let output = adm(root.path(), &["list"]);
+    assert!(output.status.success(), "{output:?}");
+    let output = String::from_utf8_lossy(&output.stdout);
+    for (name, workspace) in [("editor", &coding), ("supervisor", &bot)] {
+        let identity = format!("{name} ({})", workspace["id"].as_str().unwrap());
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("Agent unavailable") && line.contains(&identity)),
+            "missing diagnostic for {identity}: {output}"
+        );
+    }
 }
 
 #[test]
