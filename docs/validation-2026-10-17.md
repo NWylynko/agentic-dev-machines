@@ -1,5 +1,10 @@
 # Validation — 2026-10-17
 
+This is the earlier 2026-10-17 snapshot. Later automatic setup and a limited
+live workspace lifecycle are recorded in
+[setup validation](setup-validation-2026-10-17.md). The publication blockers
+and installation gaps below describe the state at this earlier snapshot.
+
 This run resumed the existing Linear worktrees with GPT-6 Luna agents. The
 completed commits are integrated on local `main`; publication is separate.
 

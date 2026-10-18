@@ -45,7 +45,7 @@ Keeping this connection available after logout requires operator-configured user
 
 Automatic setup uses namespace `adm-system` and a loopback URL, normally `http://127.0.0.1:7433`. Select another local port with `adm --lifecycle-url http://127.0.0.1:PORT setup`. A custom namespace or a separately managed connection uses the advanced manual installation below. Declining controller installation changes workspace defaults without installing cluster resources or a connection service. The [lifecycle API guide](lifecycle-api.md) describes the API and authentication boundary.
 
-Process tests cover automatic installation, credential reuse, connection verification, and visible rollout failures against Kubernetes/systemd fixtures. This is not a claim of a completed live control-plane installation or full runtime-image validation; see [current validation](validation-2026-10-17.md).
+Process tests cover automatic installation, credential reuse, connection verification, and visible rollout failures against Kubernetes/systemd fixtures. Automatic setup, authenticated listing, and one disposable workspace create/exec/destroy cycle have also passed live on one node. See [setup validation](setup-validation-2026-10-17.md) for the exact image/manifest combination and remaining limits; this does not establish provider sessions or cross-node recovery.
 
 ### Advanced manual installation
 

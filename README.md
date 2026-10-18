@@ -2,7 +2,7 @@
 
 On-demand development workspaces for a homelab Kubernetes cluster, controlled through `adm` and opened in Herdr. Coding agents keep working after you disconnect. Removing a Herdr space destroys its workspace and stops its owned activity.
 
-**Status:** workspace runtime and lifecycle tests pass. The lifecycle Kubernetes permission boundary has been checked live; full workspace-image startup, cross-node recovery, the node-failure loss window, and live provider sessions still need validation.
+**Status:** automatic setup, authenticated listing, and workspace creation, command execution, and deletion have passed live on one cluster node with the [recorded image and manifest](docs/setup-validation-2026-10-17.md). Cross-node recovery, the node-failure loss window, live Herdr delivery, and provider sessions still need validation.
 
 ## Install
 
