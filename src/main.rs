@@ -43,6 +43,10 @@ pub struct Cli {
         default_value = "http://127.0.0.1:7433"
     )]
     pub lifecycle_url: String,
+    #[arg(skip)]
+    pub lifecycle_url_explicit: bool,
+    #[arg(skip)]
+    pub lifecycle_forward: bool,
     #[arg(
         long,
         global = true,
@@ -111,7 +115,7 @@ pub enum Action {
         #[arg(long)]
         wait: bool,
     },
-    /// Rebind a Kubernetes coding workspace to the selected host connection without replacing it.
+    /// Rebind a Kubernetes coding workspace to the selected client kubeconfig without replacing it.
     Reconnect { name: String },
     /// Open the reconnectable Pi-style terminal client.
     Attach {
@@ -173,7 +177,7 @@ pub enum Action {
         #[arg(long, default_value_t = 7433)]
         port: u16,
     },
-    /// Maintain the supervised management-host connection to the lifecycle service.
+    /// Keep a foreground loopback connection to the lifecycle service.
     LifecycleForward,
     /// Explain workspace runtime shutdown (no host runner).
     Stop,
@@ -186,8 +190,10 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Configure workspace defaults and install/connect the cluster controller.
+    /// Configure workspace defaults and optionally install the cluster controller.
     Setup,
+    /// Connect this client to an already-installed cluster without changing it.
+    Connect,
     /// Generate shell completion scripts.
     Completions { shell: CompletionShell },
     /// Log a provider into this workspace's private durable auth store.
@@ -244,6 +250,8 @@ impl Cli {
             kubeconfig: self.kubeconfig.clone(),
             runner_url: self.runner_url.clone(),
             lifecycle_url: self.lifecycle_url.clone(),
+            lifecycle_url_explicit: self.lifecycle_url_explicit,
+            lifecycle_forward: self.lifecycle_forward,
             lifecycle_namespace: self.lifecycle_namespace.clone(),
             lifecycle_token_file: self.lifecycle_token_file.clone(),
             lifecycle_token_secret: self.lifecycle_token_secret,
@@ -277,6 +285,7 @@ impl Cli {
         const MANAGEMENT: &[&str] = &[
             "manifest",
             "setup",
+            "connect",
             "login",
             "start",
             "serve",
@@ -1011,7 +1020,7 @@ fn run(cli: &Cli) -> Result<()> {
             let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(
                 workspace.role == "coding",
-                "only Kubernetes coding workspaces have a host connection to reconnect"
+                "only Kubernetes coding workspaces have a kubeconfig binding to reconnect"
             );
             workspaces::verify_ownership(cli, &workspace)
                 .context("verify workspace namespace ownership using the selected kubeconfig")?;
@@ -1111,14 +1120,14 @@ fn run(cli: &Cli) -> Result<()> {
         } => {
             anyhow::ensure!(
                 bind == "127.0.0.1" || bind == "::1",
-                "port forwarding must bind to loopback; use SSH forwarding from your MacBook"
+                "port forwarding must bind to loopback on this client device"
             );
             let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(workspace.role == "coding", "bots have no development ports");
             workspaces::verify_ownership(cli, &workspace)?;
             let local = local_port.unwrap_or(*port);
             eprintln!(
-                "Preview: http://{bind}:{local}  (forward this management-host port over SSH from your MacBook)"
+                "Preview: http://{bind}:{local} (available on this client while the port forward is running)"
             );
             let status = cli
                 .kubectl_command()?
@@ -1191,6 +1200,7 @@ fn run(cli: &Cli) -> Result<()> {
             json,
         } => diagnostics::doctor(cli, storage_class, *json),
         Action::Setup => setup::run(cli),
+        Action::Connect => setup::connect(cli),
         Action::Completions { shell } => {
             let mut command = Cli::command();
             match shell {
@@ -1253,13 +1263,27 @@ fn main() {
     }
     let matches = Cli::help_command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).expect("validated CLI arguments");
-    if let Err(error) = configure_defaults(&mut cli, &matches).and_then(|()| run(&cli)) {
+    if let Err(error) = configure_defaults(&mut cli, &matches).and_then(|()| {
+        if let Action::Create(options) = &cli.command {
+            workspaces::validate_name(&options.name)?;
+        }
+        let _connection = if cli.lifecycle_forward && !matches!(cli.command, Action::Connect) {
+            let connection = setup_connection::connect(&cli)?;
+            cli.lifecycle_url = connection.url.clone();
+            Some(connection)
+        } else {
+            None
+        };
+        run(&cli)
+    }) {
         eprintln!("adm: {error:#}");
         std::process::exit(1);
     }
 }
 
 fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
+    cli.lifecycle_url_explicit =
+        matches.value_source("lifecycle_url") != Some(ValueSource::DefaultValue);
     let workspace_defaults = matches!(
         cli.command,
         Action::Create(_) | Action::Manifest(_) | Action::Doctor { .. }
@@ -1267,17 +1291,31 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
     let connection_defaults = !matches!(
         cli.command,
         Action::Completions { .. }
+            | Action::Setup
             | Action::LifecycleServe { .. }
             | Action::LifecycleForward
             | Action::Manifest(_)
+            | Action::Start
+            | Action::Serve
+            | Action::Stop
+            | Action::Herdr {
+                command: None | Some(herdr::HerdrAction::Hook)
+            }
     );
+    if connection_defaults && !cli.lifecycle_url_explicit {
+        cli.lifecycle_forward = true;
+        cli.lifecycle_token_secret = cli.lifecycle_token_file.is_none();
+    }
     if !workspace_defaults && !connection_defaults {
         return Ok(());
     }
     let config = setup::read_config()?;
     if connection_defaults && let Some(connection) = &config.lifecycle {
-        if matches.value_source("lifecycle_url") == Some(ValueSource::DefaultValue) {
-            cli.lifecycle_url = connection.url.clone();
+        if !cli.lifecycle_url_explicit {
+            cli.lifecycle_forward = connection.forward;
+            if let Some(url) = &connection.url {
+                cli.lifecycle_url = url.clone();
+            }
         }
         if matches.value_source("lifecycle_namespace") == Some(ValueSource::DefaultValue) {
             cli.lifecycle_namespace = connection.namespace.clone();

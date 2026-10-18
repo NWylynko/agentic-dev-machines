@@ -33,10 +33,10 @@ Bot runtime authorization is broad across coding workspaces, including calls mad
 
 ## Client setup
 
-Run `adm setup` for the default installation. It installs the controller, creates or reuses its Kubernetes credential, enables a supervised loopback connection, and saves nonsecret settings only after authenticated access succeeds. No token file or manual port-forward is required. See [installation](installation.md#in-cluster-lifecycle-owner) for prerequisites.
+Run `adm setup` for the default installation. It installs the controller, creates or reuses its Kubernetes credential, verifies access through a temporary client port-forward, and saves nonsecret settings only after authenticated access succeeds. No token file or background service is required. See [installation](installation.md#in-cluster-lifecycle-owner) for prerequisites.
 
 For an independently managed installation:
 
 The control-plane Deployment uses the ADM image containing the `adm` and pinned `kubectl` binaries. Create `adm-system`, a protected client-token file, and the Kubernetes Secret `adm-lifecycle-token` with key `token`; do not put the value in a manifest, shell history, normal ADM config, workspace spec, receipt, or log. Apply `deploy/lifecycle/control-plane.yaml`. The cluster must already provide the configured StorageClass.
 
-For host CLI access, forward the private Service with `kubectl -n adm-system port-forward service/adm-lifecycle 7433:7433`, supervise the tunnel, set `ADM_LIFECYCLE_URL=http://127.0.0.1:7433`, and point `ADM_LIFECYCLE_TOKEN_FILE` to the protected client copy. Workspace Pods use the in-cluster Service address and projected Pod tokens instead. This installation recipe is not a live-cluster validation claim; see [validation](validation-2026-10-17.md) for current evidence and limits.
+For an explicitly managed endpoint, forward the private Service and set `ADM_LIFECYCLE_URL` plus `ADM_LIFECYCLE_TOKEN_FILE` to the protected client copy. This explicit mode has no automatic fallback. Ordinary client commands instead fetch the Kubernetes Secret in memory and open a command-scoped local forward. Workspace Pods use the in-cluster Service address and projected Pod tokens. This installation recipe is not a live-cluster validation claim; see [validation](validation-2026-10-17.md) for current evidence and limits.

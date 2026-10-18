@@ -144,7 +144,19 @@ jobs:
 
   binaries:
     needs: verify
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-amd64
+            runner: macos-15-intel
+          - platform: darwin-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
@@ -165,6 +177,7 @@ jobs:
       - run: npm ci --ignore-scripts
 
       - name: Install release test dependencies
+        if: runner.os == 'Linux'
         run: |
           set -eu
           sudo apt-get update
@@ -175,21 +188,26 @@ jobs:
         run: |
           set -eu
           cargo build --release --locked
-          CGO_ENABLED=0 go build -C packages/repositories -trimpath -ldflags='-s -w' -o /tmp/adm-repositories .
+          if [ "${{ runner.os }}" = Linux ]; then
+            CGO_ENABLED=0 go build -C packages/repositories -trimpath -ldflags='-s -w' -o /tmp/adm-repositories .
+          fi
 
-      - name: Package standalone management-host release
+      - name: Package native client release
         run: |
           set -eu
           version="sha-${GITHUB_SHA::12}"
           image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]'):sha-${GITHUB_SHA::12}"
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; fi
+          args=""
+          if [ "${{ runner.os }}" = Linux ]; then args="--repositories /tmp/adm-repositories"; fi
           node scripts/build-release.mjs \
             --version "$version" --image "$image" \
-            --adm target/release/adm --repositories /tmp/adm-repositories \
-            --output dist
-          cp install.sh dist/install.sh
+            --adm target/release/adm $args \
+            --output "dist/${{ matrix.platform }}"
+          cp install.sh "dist/${{ matrix.platform }}/install.sh"
 
       - name: Verify standalone runtime and Code Mode assets
+        if: runner.os == 'Linux'
         env:
           ADM_RELEASE_TEST_ADM: ${{ github.workspace }}/target/release/adm
         run: npm run test:release
@@ -197,8 +215,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: github.event_name != 'pull_request'
         with:
-          name: adm-linux-amd64
-          path: dist
+          name: adm-${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}
           if-no-files-found: error
 
   release:
@@ -208,10 +226,20 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+
       - uses: actions/download-artifact@v8
         with:
-          name: adm-linux-amd64
+          pattern: adm-*
           path: dist
+          merge-multiple: false
+
+      - name: Assemble all platform assets and checksums
+        run: node scripts/assemble-release.mjs --dist dist
 
       - name: Publish GitHub release
         env:
@@ -278,13 +306,13 @@ jobs:
           cat > release-notes.md <<EOF
           ## Install or update
 
-          Complete linux/amd64 distribution for the Debian management host, including the runner, terminal, and pinned Node dependencies. Requires Node.js 24 or newer. No checkout, Rust, Go, or npm install is needed.
+          Native client distributions for macOS x86_64/arm64 and Linux amd64/arm64, including the runner, terminal, and platform-specific Node dependencies. Requires Node.js 24 or newer. No checkout or build toolchain is needed.
 
           \`\`\`sh
           curl -fsSL https://github.com/${repo}/releases/download/${tag}/install.sh | sh -s -- --version ${tag}
           \`\`\`
 
-          Omit \`--version\` to install or update to the latest successful main release while preserving settings and workspace state. First installation offers \`adm setup\`. The archive's default workspace image is pinned to this build.
+          Omit \`--version\` to install or update to the latest successful main release while preserving settings and workspace state. First installation offers \`adm setup\`. The workspace image is linux/amd64.
 
           ## Workspace image
 
@@ -306,9 +334,16 @@ jobs:
             --title "$tag" \
             --notes-file release-notes.md \
             --latest="$latest" \
-            dist/adm-linux-amd64.tar.gz \
-            dist/install.sh \
-            dist/LICENSE \
-            dist/adm-linux-amd64 \
-            dist/adm-repositories-linux-amd64 \
-            dist/SHA256SUMS
+            dist/release/adm-linux-amd64.tar.gz \
+            dist/release/adm-linux-arm64.tar.gz \
+            dist/release/adm-darwin-amd64.tar.gz \
+            dist/release/adm-darwin-arm64.tar.gz \
+            dist/release/install.sh \
+            dist/release/LICENSE \
+            dist/release/adm-linux-amd64 \
+            dist/release/adm-linux-arm64 \
+            dist/release/adm-darwin-amd64 \
+            dist/release/adm-darwin-arm64 \
+            dist/release/adm-repositories-linux-amd64 \
+            dist/release/adm-repositories-linux-arm64 \
+            dist/release/SHA256SUMS

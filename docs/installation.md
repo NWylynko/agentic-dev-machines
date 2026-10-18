@@ -1,8 +1,8 @@
 # Installation and updates
 
-ADM installs on the Debian Linux x86_64 management host. Client laptops connect through Herdr/SSH; the installer runs on the management host.
+ADM installs on macOS x86_64/arm64 and Linux amd64/arm64 clients. Each client uses its existing Kubernetes access, including access over Tailscale, to connect to the same cluster workspaces.
 
-The host needs Node.js 24+, `curl`, GNU `tar`, `sha256sum`, and `flock`. Guided setup also needs `kubectl` configured with permission to install the controller's namespace and RBAC, a replicated [StorageClass](../deploy/storage.md), and a running systemd user manager with `systemctl` and `systemd-notify` available. The installer does not install system packages or a storage backend. Repository discovery needs Git and authenticated `gh`.
+The client needs Node.js 24+, `curl`, `tar`, a SHA-256 utility, and `kubectl` configured for the cluster. Installing or updating the cluster controller also needs permission to manage its namespace and RBAC plus a replicated [StorageClass](../deploy/storage.md). No systemd or launchd service is required. The installer does not install system packages or a storage backend. Repository discovery needs Git and authenticated `gh`.
 
 ## Install and configure
 
@@ -10,18 +10,20 @@ The host needs Node.js 24+, `curl`, GNU `tar`, `sha256sum`, and `flock`. Guided 
 curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/install.sh | sh
 ```
 
-The script downloads `adm-linux-amd64.tar.gz` and verifies its checksum from the release's `SHA256SUMS`. Successful `main` builds automatically publish a release containing the CLI, repository helper, compiled runner and terminal, and pinned production Node dependencies. No checkout or build toolchain is needed.
+The script selects a native release archive (`adm-linux-amd64.tar.gz`, `adm-linux-arm64.tar.gz`, `adm-darwin-amd64.tar.gz`, or `adm-darwin-arm64.tar.gz`) and verifies it against the release's `SHA256SUMS`. Successful `main` builds publish all supported client archives together. Each contains the native CLI and Node production dependencies for that platform. No checkout or build toolchain is needed.
 
 The commands are installed in `$HOME/.local/bin`. Add that directory to your PATH if needed. The installation lives under `$XDG_DATA_HOME/adm/install`, or `$HOME/.local/share/adm/install` when XDG_DATA_HOME is unset. Versioned runtime files are separate from workspace and lifecycle-service state.
 
-First interactive installation opens `adm setup`. With no terminal, or with `--no-setup`, installation prints the command to run later. Setup asks for the workspace image, storage class, and optional default model, then offers to install or update the cluster controller and enable its connection; the default answer is yes.
+First interactive installation opens `adm setup`. With no terminal, or with `--no-setup`, installation prints the command to run later. Setup asks for the workspace image, storage class, and optional default model, then offers to install or update the cluster controller; the default answer is yes.
 
-Settings are nonsecret JSON at `$XDG_CONFIG_HOME/adm/config.json`, normally `$HOME/.config/adm/config.json`. They include image/storage/model defaults and, after successful controller setup, the lifecycle URL, namespace, kubectl command, and selected kubeconfig paths. Explicit flags and environment settings override the corresponding connection defaults. When installing the controller, setup saves settings only after rollout and an authenticated API check succeed. It keeps your selected Kubernetes context and saves an explicit image reference, so updates preserve your image choice.
+Settings are nonsecret JSON at `$XDG_CONFIG_HOME/adm/config.json`, normally `$HOME/.config/adm/config.json`. They include image/storage/model defaults and, after setup, whether the client should use its command-scoped Kubernetes forward, plus namespace, kubectl command, and selected kubeconfig paths. Explicit lifecycle URLs remain available for advanced connections and override saved settings. Setup saves settings only after rollout and an authenticated API check succeed. It keeps your selected Kubernetes context and saves an explicit image reference, so updates preserve your image choice.
 
 ```sh
 adm setup
 adm list
 ```
+
+Run `adm connect` on another client that should use an existing installation. It checks authenticated access and saves this client's kubeconfig, namespace, and kubectl selection. It does not install or modify cluster resources.
 
 Provider login is performed inside a selected workspace and is kept on its private volume. Workspaces always create their durable agent; a model can be selected later in `adm attach` with `/model`.
 
@@ -33,19 +35,11 @@ The CLI uses the in-cluster lifecycle API for workspace creation, deletion, and 
 
 Setup generates the internal lifecycle credential only when the `adm-system/adm-lifecycle-token` Secret is missing, and reuses an existing Secret. The CLI reads that credential into memory through the selected host kubeconfig. The default flow creates no local token file and stores no token value in ADM config or a service unit. This credential is separate from provider credentials; workspace Pods receive their own projected identities.
 
-Setup installs and enables `adm-lifecycle-forward.service` in your systemd user manager. Its `Type=notify` startup completes when the loopback port-forward is ready; setup then checks the authenticated lifecycle API before saving connection settings. Check or restart the connection with:
+Ordinary commands open an ephemeral loopback forward to the private lifecycle Service, fetch its bearer credential from the Kubernetes Secret into memory, and close only their own `kubectl` process on exit. The lifecycle operation, agent turn, workspace files, and history remain in Kubernetes when the client disconnects.
 
-```sh
-systemctl --user status adm-lifecycle-forward.service
-journalctl --user -u adm-lifecycle-forward.service
-systemctl --user restart adm-lifecycle-forward.service
-```
+Automatic setup uses namespace `adm-system`; the local port is selected by kubectl for each command. An explicit `--lifecycle-url` or `ADM_LIFECYCLE_URL` selects a separately managed connection with no automatic fallback. A custom namespace uses `--lifecycle-namespace`. Declining controller installation changes workspace defaults without installing cluster resources. The [lifecycle API guide](lifecycle-api.md) describes the API and authentication boundary.
 
-Keeping this connection available after logout requires operator-configured user lingering. Agents run inside their workspace Pods and continue independently of the management-host connection.
-
-Automatic setup uses namespace `adm-system` and a loopback URL, normally `http://127.0.0.1:7433`. Select another local port with `adm --lifecycle-url http://127.0.0.1:PORT setup`. A custom namespace or a separately managed connection uses the advanced manual installation below. Declining controller installation changes workspace defaults without installing cluster resources or a connection service. The [lifecycle API guide](lifecycle-api.md) describes the API and authentication boundary.
-
-Process tests cover automatic installation, credential reuse, connection verification, and visible rollout failures against Kubernetes/systemd fixtures. Automatic setup, authenticated listing, and one disposable workspace create/exec/destroy cycle have also passed live on one node. See [setup validation](setup-validation-2026-10-17.md) for the exact image/manifest combination and remaining limits; this does not establish provider sessions or cross-node recovery.
+Process tests cover automatic installation, credential reuse, command-scoped forwarding, connection verification, and visible rollout failures against Kubernetes/HTTP fixtures. The existing live setup record predates portable clients and does not validate this forwarding change across macOS or Linux architectures. See [setup validation](setup-validation-2026-10-17.md) for the older exact image/manifest combination and remaining limits.
 
 ### Advanced manual installation
 
@@ -72,13 +66,13 @@ adm list
 
 An explicit `--lifecycle-token-file` or `ADM_LIFECYCLE_TOKEN_FILE` overrides the Kubernetes credential source. Passing it to `adm setup` also uses that credential when creating a missing Secret; setup rejects a mismatch with an existing Secret rather than rotating it. The service token grants full lifecycle API access; keep it on trusted management clients and out of workspace Pods. `/health` is public, so use `adm list` to verify authentication too.
 
-If `adm list` reports `Connection refused`, run `adm setup` or inspect the connection service above and `kubectl -n adm-system get deployment,pods,service,pvc`. For Pods that are not ready, inspect `kubectl -n adm-system describe pod` and `kubectl -n adm-system logs deployment/adm-lifecycle`. A 401 response means the selected client credential does not match the running controller.
+If `adm list` reports `Connection refused`, run `adm setup` or inspect `kubectl -n adm-system get deployment,pods,service,pvc`. For Pods that are not ready, inspect `kubectl -n adm-system describe pod` and `kubectl -n adm-system logs deployment/adm-lifecycle`. A 401 response means the selected client credential does not match the running controller.
 
 ## Update or pin a version
 
 Rerun the install command to get the latest successful `main` release. Each build has its own `sha-<commit>` release and matching workspace image; updating does not require a manual version tag. Markdown-only pushes skip the build. Optional `v*` tags publish pinned versions without changing the installer's default release.
 
-Updates validate the download before changing the active installation, retain previous runtime directories, and preserve configuration. The installer itself does not restart services or change cluster resources on updates. Run `adm setup` afterward and select the desired image to update the controller and its supervised connection; the existing credential and persistent state claim are retained. A claim's StorageClass cannot be changed in place. Existing workspaces retain their image and storage settings and continue independently of the installer.
+Updates validate the download before changing the active installation, retain previous runtime directories, and preserve configuration. The installer itself does not change cluster resources on updates. Run `adm setup` afterward and select the desired image to update the controller; the existing credential and persistent state claim are retained. A claim's StorageClass cannot be changed in place. Existing workspaces retain their image and storage settings and continue independently of the installer.
 
 Closing terminal attachments detaches; it does not delete workspaces. Use `adm destroy NAME` to delete a workspace and stop its owned work.
 

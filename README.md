@@ -2,11 +2,11 @@
 
 On-demand development workspaces for a homelab Kubernetes cluster, controlled through `adm` and opened in Herdr. Coding agents keep working after you disconnect. Removing a Herdr space destroys its workspace and stops its owned activity.
 
-**Status:** automatic setup, authenticated listing, and workspace creation, command execution, and deletion have passed live on one cluster node with the [recorded image and manifest](docs/setup-validation-2026-10-17.md). Cross-node recovery, the node-failure loss window, live Herdr delivery, and provider sessions still need validation.
+**Status:** command-scoped lifecycle forwarding and native installer selection are covered by fixtures. The earlier [live setup record](docs/setup-validation-2026-10-17.md) predates portable-client changes. Cross-platform native runs, cross-node recovery, the node-failure loss window, live Herdr delivery, and provider sessions still need validation.
 
 ## Install
 
-Run on your Debian Linux x86_64 management host with Node.js 24+ installed:
+Run on a macOS or Linux client with Node.js 24+ installed. Supported clients are macOS x86_64/arm64 and Linux amd64/arm64:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/install.sh | sh
@@ -18,7 +18,7 @@ Successful `main` builds publish a release automatically. See [installation deta
 
 ## Setup
 
-Your Kubernetes access, replicated [StorageClass](deploy/storage.md), and systemd user session must already be configured. First interactive installation opens `adm setup`; otherwise run it yourself:
+Your Kubernetes access and a cluster [StorageClass](deploy/storage.md) must already be configured. First interactive installation opens `adm setup`; otherwise run it yourself:
 
 ```sh
 adm setup
@@ -28,7 +28,9 @@ adm create my-project
 adm attach my-project
 ```
 
-Setup asks for the image, storage class, and optional default model, then installs the cluster controller and enables its supervised management-host connection by default. It creates an internal credential in Kubernetes when needed and reuses it on later runs. No local token file or manual port-forward is needed for this setup. See [installation details](docs/installation.md#in-cluster-lifecycle-owner) for prerequisites and advanced manual installation.
+On another client that only needs access to an already-installed cluster, run `adm connect`; it verifies access and saves that device's kubeconfig selection without installing cluster resources.
+
+Setup asks for the image, storage class, and optional default model, then offers to install or update the cluster controller. Client commands use the selected kubeconfig to open a temporary authenticated port-forward and close it when the command exits. No system service or permanent management host is required. See [installation details](docs/installation.md#in-cluster-lifecycle-owner) for prerequisites and advanced manual installation.
 
 Every workspace starts with its durable agent. Choose a default model during setup or pass `--model PROVIDER/MODEL_ID` when creating a workspace; otherwise select one in `adm attach` with `/model`. Provider credentials belong to each workspace and are not copied from the management host.
 

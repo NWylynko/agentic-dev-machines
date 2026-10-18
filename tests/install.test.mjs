@@ -24,13 +24,20 @@ const execute = promisify(execFile),
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), "adm-install-test-")),
     home = join(directory, "home"),
-    assets = new Map();
+    assets = new Map(),
+    requests = [];
   await mkdir(home);
   const commands = join(directory, "commands");
   await mkdir(commands);
   await writeFile(join(commands, "systemctl"), "#!/bin/sh\nexit 1\n");
   await chmod(join(commands, "systemctl"), 0o755);
+  await writeFile(
+    join(commands, "uname"),
+    '#!/bin/sh\nif [ "$1" = -s ]; then echo "${ADM_TEST_OS:-Linux}"; else echo "${ADM_TEST_ARCH:-x86_64}"; fi\n',
+  );
+  await chmod(join(commands, "uname"), 0o755);
   const server = createServer((request, response) => {
+    requests.push(request.url);
     const value = assets.get(request.url);
     if (typeof value === "function") return value(response);
     response.writeHead(value ? 200 : 404);
@@ -77,8 +84,14 @@ async function fixture(t) {
     await execute("tar", ["-czf", archive, "-C", bundle, "."]);
     const bytes = await readFile(archive),
       checksum = createHash("sha256").update(bytes).digest("hex");
-    assets.set(`/${name}/adm-linux-amd64.tar.gz`, bytes);
-    assets.set(`/${name}/SHA256SUMS`, `${checksum}  adm-linux-amd64.tar.gz\n`);
+    for (const platform of ["linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64"])
+      assets.set(`/${name}/adm-${platform}.tar.gz`, bytes);
+    assets.set(
+      `/${name}/SHA256SUMS`,
+      ["linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64"]
+        .map((platform) => `${checksum}  adm-${platform}.tar.gz`)
+        .join("\n") + "\n",
+    );
     return { checksum, bytes };
   }
   async function install(name, args = []) {
@@ -96,6 +109,7 @@ async function fixture(t) {
     directory,
     home,
     assets,
+    requests,
     env,
     base,
     release,
@@ -138,6 +152,31 @@ test("a release installs without a checkout and updates preserve existing state 
     (await execute(f.command, ["--version"], { env: f.env })).stdout,
     "v1\n",
   );
+});
+
+test("native installer selects each supported Linux and macOS client archive", async (t) => {
+  for (const [os, arch, platform] of [
+    ["Linux", "x86_64", "linux-amd64"],
+    ["Linux", "aarch64", "linux-arm64"],
+    ["Darwin", "x86_64", "darwin-amd64"],
+    ["Darwin", "arm64", "darwin-arm64"],
+  ]) {
+    await t.test(platform, async (t) => {
+      const f = await fixture(t);
+      await f.release("native");
+      f.env.ADM_TEST_OS = os;
+      f.env.ADM_TEST_ARCH = arch;
+      const result = await f.install("native");
+      assert.equal(result.code, undefined, result.stderr);
+      assert.ok(f.requests.includes(`/native/adm-${platform}.tar.gz`));
+      assert.equal(
+        (await execute(f.command, ["--version"], { env: f.env })).stdout,
+        "native\n",
+      );
+      if (os === "Darwin")
+        await assert.rejects(access(join(f.home, ".local/bin/adm-repositories")), { code: "ENOENT" });
+    });
+  }
 });
 
 test("a bad download keeps the current release usable and rerunning an unchanged release is idempotent", async (t) => {
@@ -272,12 +311,12 @@ test("prerequisite failures and unmanaged commands are rejected before creating 
   await rm(join(boundary, "node"));
   await writeFile(
     join(boundary, "uname"),
-    '#!/bin/sh\nif [ "$1" = -s ]; then echo Linux; else echo aarch64; fi\n',
+    '#!/bin/sh\nif [ "$1" = -s ]; then echo Plan9; else echo x86_64; fi\n',
   );
   await chmod(join(boundary, "uname"), 0o755);
   result = await f.install("unused");
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /architecture/);
+  assert.match(result.stderr, /unsupported platform/);
   await rm(join(boundary, "uname"));
   await mkdir(dirname(f.command), { recursive: true });
   await writeFile(f.command, "my existing command\n");

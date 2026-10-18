@@ -1,165 +1,255 @@
+use serde_json::{Value, json};
 use std::{
-    ffi::CString,
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{Read, Write},
+    net::TcpListener,
     os::unix::fs::PermissionsExt,
-    path::Path,
-    process::{Command, Stdio},
+    process::Command,
 };
 
-fn executable(path: &Path, script: &str) {
+fn executable(path: &std::path::Path, script: &str) {
     fs::write(path, script).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn forwarding_command(root: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
-    command
-        .env("HOME", root)
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("PATH", root.join("bin"))
-        .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
-        .env_remove("ADM_PROJECT_DIR")
-        .env_remove("ADM_STATE_DIR")
-        .args(["--kubectl"])
-        .arg(root.join("bin/kubectl"))
-        .args(["--kubeconfig"])
-        .arg(root.join("selected kubeconfig"))
-        .args([
-            "--lifecycle-namespace",
-            "adm-testing",
-            "--lifecycle-url",
-            "http://127.0.0.1:17433",
-            "lifecycle-forward",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command
-}
-
 #[test]
-fn lifecycle_forward_notifies_after_kubectl_binds_and_reports_connection_exit() {
+fn port_forward_is_killed_if_stdout_closes_before_readiness() {
     let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("bin")).unwrap();
-    let gate = root.path().join("forward-ready");
-    let gate_name = CString::new(gate.to_str().unwrap()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(gate_name.as_ptr(), 0o600) }, 0);
+    let kubectl = root.path().join("kubectl");
     executable(
-        &root.path().join("bin/kubectl"),
+        &kubectl,
         r#"#!/usr/bin/python3
-import json,os,pathlib,sys
-root=pathlib.Path(os.environ['HOME'])
-(root/'kubectl-arguments').write_text(json.dumps(sys.argv[1:]))
-(root/'kubectl-kubeconfig').write_text(os.environ['KUBECONFIG'])
-print('Preparing port forward',flush=True)
-with (root/'forward-ready').open() as gate: gate.read()
-print('Forwarding from 127.0.0.1:17433 -> 7433',flush=True)
-print('after readiness '*20000,flush=True)
-sys.exit(23)
-"#,
-    );
-    executable(
-        &root.path().join("bin/systemd-notify"),
-        r#"#!/usr/bin/python3
-import os,pathlib,sys
-pathlib.Path(os.environ['HOME'],'notified').write_text(' '.join(sys.argv[1:]))
-"#,
-    );
-    let mut child = forwarding_command(root.path()).spawn().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut first = String::new();
-    stdout.read_line(&mut first).unwrap();
-    let notified_early = root.path().join("notified").exists();
-    let mut remaining = String::new();
-    if !first.is_empty() {
-        fs::write(&gate, "ready").unwrap();
-        stdout.read_to_string(&mut remaining).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(first, "Preparing port forward\n", "{error}");
-    assert!(
-        !notified_early,
-        "forwarding must bind before notifying systemd"
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("notified")).unwrap(),
-        "--ready"
-    );
-    assert!(remaining.contains("after readiness"));
-    assert!(!output.status.success());
-    assert!(error.contains("23"), "{error}");
-    let arguments: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.path().join("kubectl-arguments")).unwrap()).unwrap();
-    assert_eq!(
-        arguments,
-        serde_json::json!([
-            "-n",
-            "adm-testing",
-            "port-forward",
-            "service/adm-lifecycle",
-            "17433:7433",
-            "--address",
-            "127.0.0.1"
-        ])
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("kubectl-kubeconfig")).unwrap(),
-        root.path().join("selected kubeconfig").to_str().unwrap()
-    );
-}
-
-#[test]
-fn lifecycle_forward_reports_a_failure_before_readiness_without_notifying_systemd() {
-    let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("bin")).unwrap();
-    executable(
-        &root.path().join("bin/kubectl"),
-        "#!/bin/sh\nprintf 'fixture forbidden to forward\\n' >&2\nexit 17\n",
-    );
-    executable(
-        &root.path().join("bin/systemd-notify"),
-        "#!/bin/sh\n: > \"$HOME/notified\"\n",
-    );
-    let output = forwarding_command(root.path()).output().unwrap();
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success());
-    assert!(error.contains("fixture forbidden to forward"), "{error}");
-    assert!(error.contains("before readiness"), "{error}");
-    assert!(error.contains("17"), "{error}");
-    assert!(!root.path().join("notified").exists());
-}
-
-#[test]
-fn lifecycle_forward_reaps_kubectl_when_readiness_notification_fails() {
-    let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("bin")).unwrap();
-    executable(
-        &root.path().join("bin/kubectl"),
-        r#"#!/usr/bin/python3
-import os,pathlib,signal
-pathlib.Path(os.environ['HOME'],'kubectl.pid').write_text(str(os.getpid()))
-print('Forwarding from 127.0.0.1:17433 -> 7433',flush=True)
+import os, pathlib, signal
+pathlib.Path(os.environ['HOME'], 'forward.pid').write_text(str(os.getpid()))
+os.close(1)
 signal.pause()
 "#,
     );
-    executable(
-        &root.path().join("bin/systemd-notify"),
-        "#!/bin/sh\nprintf 'fixture manager rejected readiness\\n' >&2\nexit 19\n",
-    );
-    let output = forwarding_command(root.path()).output().unwrap();
-    let error = String::from_utf8_lossy(&output.stderr);
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("ADM_LIFECYCLE_URL")
+        .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
+        .args(["--kubectl"])
+        .arg(&kubectl)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
     assert!(!output.status.success());
-    assert!(error.contains("systemd-notify --ready failed"), "{error}");
-    assert!(error.contains("19"), "{error}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stdout closed before readiness"));
+    let pid = fs::read_to_string(root.path().join("forward.pid")).unwrap();
+    #[cfg(target_os = "linux")]
     assert!(
-        error.contains("fixture manager rejected readiness"),
-        "{error}"
+        !std::path::Path::new("/proc").join(pid).exists(),
+        "kubectl with a closed stdout must be killed and reaped"
     );
-    let pid = fs::read_to_string(root.path().join("kubectl.pid")).unwrap();
+}
+
+#[test]
+fn port_forward_reports_kubectl_startup_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let kubectl = root.path().join("kubectl");
+    executable(
+        &kubectl,
+        r#"#!/usr/bin/python3
+import sys
+sys.stderr.write('service/adm-lifecycle was not found\n')
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("ADM_LIFECYCLE_URL")
+        .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
+        .args(["--kubectl"])
+        .arg(&kubectl)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !Path::new("/proc").join(pid).exists(),
-        "kubectl must be killed and reaped before the forward supervisor exits"
+        stderr.contains("service/adm-lifecycle was not found"),
+        "{stderr}"
     );
+    assert!(stderr.contains("failed before readiness"), "{stderr}");
+}
+
+#[test]
+fn doctor_uses_one_ephemeral_authenticated_forward_and_reaps_it_on_exit() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("config/adm")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 8192];
+        let count = stream.read(&mut request).unwrap();
+        let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+        assert!(request.starts_with("get /health "));
+        assert!(request.contains("authorization: bearer cluster-token"));
+        let body = r#"{"status":"ok"}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let pid_path = root.path().join("forward.pid");
+    let args_path = root.path().join("forward.args");
+    let kubectl = root.path().join("kubectl");
+    executable(
+        &kubectl,
+        &format!(
+            r#"#!/usr/bin/python3
+import json,os,pathlib,signal,sys
+root=pathlib.Path(os.environ['ADM_FIXTURE_HOME'])
+args=sys.argv[1:]
+if args[:2]==['get','nodes']:
+ print(json.dumps({{'items':[]}}))
+elif args[:2]==['get','storageclass']:
+ print(json.dumps({{'metadata':{{'name':'adm-replicated'}},'provisioner':'example'}}))
+elif args[2:5]==['get','secret','adm-lifecycle-token']:
+ sys.stdout.write('cluster-token')
+elif args[2:4]==['port-forward','service/adm-lifecycle']:
+ pathlib.Path(root/'forward.pid').write_text(str(os.getpid()))
+ pathlib.Path(root/'forward.args').write_text(json.dumps(args))
+ sys.stdout.write('Forwarding from 127.0.0.1:{port} -> 7433\n');sys.stdout.flush()
+ signal.pause()
+else:
+ print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
+"#
+        ),
+    );
+    let kubeconfig = root.path().join("kubeconfig");
+    fs::write(&kubeconfig, "fixture").unwrap();
+    fs::write(
+        root.path().join("config/adm/config.json"),
+        serde_json::to_vec(&json!({
+            "lifecycle": {
+                "url":"http://127.0.0.1:7433",
+                "forward":true,
+                "namespace":"adm-system",
+                "kubectl":kubectl,
+                "kubeconfig":kubeconfig,
+                "tokenFile":null
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("ADM_FIXTURE_HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("ADM_LIFECYCLE_URL")
+        .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["lifecycle"]["status"], "ok");
+    assert_eq!(
+        report["lifecycle"]["url"],
+        format!("http://127.0.0.1:{port}")
+    );
+    let args: Value = serde_json::from_slice(&fs::read(args_path).unwrap()).unwrap();
+    assert_eq!(args[4], format!(":7433"));
+    assert!(
+        args.as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--address")
+    );
+    let pid = fs::read_to_string(pid_path).unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::path::Path::new("/proc").join(pid).exists(),
+        "owned kubectl must be reaped at command exit"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn connect_saves_only_client_selectors_without_installing_cluster_resources() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("bin")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 8192];
+        let count = stream.read(&mut request).unwrap();
+        let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+        assert!(request.starts_with("get /v1/workspaces "));
+        assert!(request.contains("authorization: bearer cluster-token"));
+        let body = "[]";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let pid_path = root.path().join("forward.pid");
+    let kubectl = root.path().join("bin/kubectl");
+    executable(
+        &kubectl,
+        &format!(
+            r#"#!/usr/bin/python3
+import json,os,pathlib,signal,sys
+root=pathlib.Path(os.environ['HOME'])
+args=sys.argv[1:]
+with (root/'kubectl.log').open('a') as log: log.write(json.dumps(args)+'\n')
+if args[2:5]==['get','secret','adm-lifecycle-token']:
+ sys.stdout.write('cluster-token')
+elif args[2:4]==['port-forward','service/adm-lifecycle']:
+ pathlib.Path(root/'forward.pid').write_text(str(os.getpid()))
+ sys.stdout.write('Forwarding from 127.0.0.1:{port} -> 7433\n');sys.stdout.flush()
+ signal.pause()
+else:
+ print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
+"#
+        ),
+    );
+    let kubeconfig = root.path().join("kubeconfig");
+    fs::write(&kubeconfig, "fixture").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("PATH", root.path().join("bin"))
+        .env_remove("ADM_LIFECYCLE_URL")
+        .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
+        .args(["--kubectl"])
+        .arg(&kubectl)
+        .args(["--kubeconfig"])
+        .arg(&kubeconfig)
+        .arg("connect")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: Value =
+        serde_json::from_slice(&fs::read(root.path().join("config/adm/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["lifecycle"]["forward"], true);
+    assert!(
+        config["lifecycle"]["url"].is_null(),
+        "ephemeral port must not be saved"
+    );
+    assert_eq!(config["lifecycle"]["namespace"], "adm-system");
+    assert_eq!(
+        config["lifecycle"]["kubeconfig"],
+        kubeconfig.to_str().unwrap()
+    );
+    let calls = fs::read_to_string(root.path().join("kubectl.log")).unwrap();
+    assert!(calls.contains("port-forward"));
+    assert!(!calls.contains("apply"));
+    assert!(!calls.contains("create"));
+    let pid = fs::read_to_string(pid_path).unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(!std::path::Path::new("/proc").join(pid).exists());
+    server.join().unwrap();
 }

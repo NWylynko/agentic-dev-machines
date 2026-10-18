@@ -2,14 +2,18 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import YAML from "yaml";
 
 const workflow = YAML.parse(await readFile(new URL("../.github/workflows/build.yml", import.meta.url), "utf8"));
 const execute = promisify(execFile);
-const assetNames = ["adm-linux-amd64.tar.gz", "install.sh", "LICENSE", "adm-linux-amd64", "adm-repositories-linux-amd64", "SHA256SUMS"];
+const assetNames = [
+  "adm-linux-amd64.tar.gz", "adm-linux-arm64.tar.gz", "adm-darwin-amd64.tar.gz", "adm-darwin-arm64.tar.gz",
+  "install.sh", "LICENSE", "adm-linux-amd64", "adm-linux-arm64", "adm-darwin-amd64", "adm-darwin-arm64",
+  "adm-repositories-linux-amd64", "adm-repositories-linux-arm64", "SHA256SUMS",
+];
 // History is oldest first. newerCommit is the later main commit, but its prefix
 // sorts before olderCommit, so hexadecimal order cannot choose the default download.
 const newerCommit = "0123456789ab" + "1".repeat(28);
@@ -147,7 +151,17 @@ else:
   const step = workflow.jobs.release.steps.find((entry) => entry.name === "Publish GitHub release");
   return {
     async artifacts(label) {
-      for (const name of assetNames) await writeFile(join(directory, "dist", name), `${label}: ${name}\n`);
+      for (const platform of ["linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64"]) {
+        const platformDir = join(directory, "dist", `adm-${platform}`);
+        await mkdir(platformDir, { recursive: true });
+        for (const name of [`adm-${platform}.tar.gz`, `adm-${platform}`])
+          await writeFile(join(platformDir, name), `${label}: ${name}\n`);
+        if (platform.startsWith("linux-"))
+          await writeFile(join(platformDir, `adm-repositories-${platform}`), `${label}: adm-repositories-${platform}\n`);
+      }
+      await writeFile(join(directory, "dist/adm-linux-amd64/install.sh"), `${label}: install.sh\n`);
+      await writeFile(join(directory, "dist/adm-linux-amd64/LICENSE"), `${label}: LICENSE\n`);
+      await execute(process.execPath, [resolve("scripts/assemble-release.mjs"), "--dist", join(directory, "dist")]);
     },
     async state(update) {
       const value = JSON.parse(await readFile(statePath, "utf8"));
@@ -177,6 +191,9 @@ test("main and version builds publish only after the image and binaries succeed"
   const eligible = new Function("github", "startsWith", `return (${release.if});`);
   const startsWith = (value, prefix) => value.startsWith(prefix);
   assert.deepEqual(release.needs, ["image", "binaries"]);
+  const platforms = workflow.jobs.binaries.strategy.matrix.include.map((entry) => entry.platform).sort();
+  assert.deepEqual(platforms, ["darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64"]);
+  assert.ok(release.steps.some((entry) => entry.name === "Assemble all platform assets and checksums"));
   for (const event_name of ["push", "workflow_dispatch"]) {
     assert.equal(eligible({ ref: "refs/heads/main", event_name }, startsWith), true);
   }
@@ -233,8 +250,12 @@ test("an older main build keeps its own release without moving the newer default
   assert.equal(state.creations, 2);
   assert.equal(state.releases["sha-fedcba987654"].latestFlag, "false");
   assert.equal(state.releases["sha-fedcba987654"].target, olderCommit);
-  assert.equal(state.releases["sha-fedcba987654"].assets.SHA256SUMS, "older: SHA256SUMS\n");
-  assert.equal(state.releases["sha-0123456789ab"].assets.SHA256SUMS, "newer: SHA256SUMS\n");
+  assert.match(state.releases["sha-fedcba987654"].assets.SHA256SUMS, /adm-darwin-arm64\.tar\.gz/);
+  assert.match(state.releases["sha-0123456789ab"].assets.SHA256SUMS, /adm-darwin-arm64\.tar\.gz/);
+  assert.notEqual(
+    state.releases["sha-fedcba987654"].assets.SHA256SUMS,
+    state.releases["sha-0123456789ab"].assets.SHA256SUMS,
+  );
 });
 
 test("a main build unrelated to the current default publishes without replacing it", async (t) => {

@@ -23,7 +23,10 @@ pub struct Config {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LifecycleConfig {
-    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub forward: bool,
     pub namespace: String,
     pub kubectl: String,
     pub kubeconfig: String,
@@ -164,7 +167,7 @@ pub fn run(cli: &Cli) -> Result<()> {
     };
     config.validate()?;
     let install = prompt(
-        "Install/update the cluster controller and enable its connection? (yes/no)",
+        "Install/update the cluster controller and verify client access? (yes/no)",
         "yes",
     )?;
     let connected = match install.to_ascii_lowercase().as_str() {
@@ -192,13 +195,23 @@ pub fn run(cli: &Cli) -> Result<()> {
                     .as_deref()
                     .expect("configured storage class"),
             )?;
-            crate::setup_connection::install(&connection)?;
-            connection.lifecycle_token_secret = connection.lifecycle_token_file.is_none();
-            connection
-                .request_lifecycle("GET", "/v1/workspaces", None)
-                .context("verify authenticated lifecycle connection after setup")?;
+            if !connection.lifecycle_url_explicit {
+                let connected = crate::setup_connection::connect(&connection)?;
+                connection.lifecycle_url = connected.url;
+                connection.lifecycle_forward = true;
+                connection.lifecycle_token_secret = connection.lifecycle_token_file.is_none();
+                connection
+                    .request_lifecycle("GET", "/v1/workspaces", None)
+                    .context("verify authenticated lifecycle connection after setup")?;
+            } else {
+                connection.lifecycle_token_secret = connection.lifecycle_token_file.is_none();
+                connection
+                    .request_lifecycle("GET", "/v1/workspaces", None)
+                    .context("verify authenticated lifecycle connection after setup")?;
+            }
             config.lifecycle = Some(LifecycleConfig {
-                url: connection.lifecycle_url,
+                url: (!connection.lifecycle_forward).then_some(connection.lifecycle_url),
+                forward: connection.lifecycle_forward,
                 namespace: connection.lifecycle_namespace,
                 kubectl: connection.kubectl,
                 kubeconfig: connection.kubeconfig.expect("selected kubeconfig"),
@@ -226,5 +239,52 @@ pub fn run(cli: &Cli) -> Result<()> {
     println!(
         "Run `adm doctor` to check cluster and lifecycle access, then create a workspace. Use `adm login NAME` to authenticate its private provider store."
     );
+    Ok(())
+}
+
+pub fn connect(cli: &Cli) -> Result<()> {
+    let mut config = read_config()?;
+    cli.kubeconfig_reference()?;
+    let mut connection = cli.clone_for_lifecycle();
+    connection.lifecycle_forward = !connection.lifecycle_url_explicit;
+    connection.lifecycle_token_secret = connection.lifecycle_token_file.is_none();
+    let kubeconfig = connection.kubeconfig_reference()?;
+    if connection.lifecycle_forward {
+        let forward = crate::setup_connection::connect(&connection)?;
+        connection.lifecycle_url = forward.url.clone();
+        connection
+            .request_lifecycle("GET", "/v1/workspaces", None)
+            .context("verify authenticated client connection")?;
+        config.lifecycle = Some(LifecycleConfig {
+            url: None,
+            forward: true,
+            namespace: connection.lifecycle_namespace,
+            kubectl: connection.kubectl,
+            kubeconfig,
+            token_file: connection.lifecycle_token_file,
+        });
+        let path = save_config(&config)?;
+        println!(
+            "Connected to the cluster through a command-scoped lifecycle forward. Saved {}",
+            path.display()
+        );
+    } else {
+        connection
+            .request_lifecycle("GET", "/v1/workspaces", None)
+            .context("verify explicit lifecycle connection")?;
+        config.lifecycle = Some(LifecycleConfig {
+            url: Some(connection.lifecycle_url),
+            forward: false,
+            namespace: connection.lifecycle_namespace,
+            kubectl: connection.kubectl,
+            kubeconfig,
+            token_file: connection.lifecycle_token_file,
+        });
+        let path = save_config(&config)?;
+        println!(
+            "Connected through the explicit lifecycle URL. Saved {}",
+            path.display()
+        );
+    }
     Ok(())
 }

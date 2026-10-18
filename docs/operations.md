@@ -1,20 +1,20 @@
 # Running ADM
 
-ADM has a Rust CLI and an in-cluster lifecycle service. The management host is an access plane: coding and bot agents, their model requests, tools, MCP servers, goals, and schedules run in their own workspace Pods. Terminal and shell attachments are clients; closing one does not stop an agent.
+ADM has a Rust CLI and an in-cluster lifecycle service. Every supported client uses its Kubernetes access to reach the cluster; coding and bot agents, their model requests, tools, MCP servers, goals, and schedules run in their own workspace Pods. Terminal and shell attachments are clients; closing one does not stop an agent.
 
-## Management host
+## Client connection
 
-Install the standalone release with the command in the [README](../README.md), then run `adm setup` if first installation did not open it. Setup installs or updates the cluster controller and enables its supervised connection by default. It needs configured `kubectl` access, replicated storage, and a running systemd user manager. Git and `gh` are needed for repository discovery. Rust, Go, npm, and the checkout are only needed for source development. See [installation and updates](installation.md) for prerequisites and version selection.
+Install ADM on any supported macOS or Linux client with configured Kubernetes access, then run `adm setup` if first installation did not open it. Setup offers to install or update the cluster controller. Client lifecycle commands create a temporary authenticated port-forward that ends with the command. Git and `gh` are needed for repository discovery. Rust, Go, npm, and the checkout are only needed for source development. See [installation and updates](installation.md) for supported platforms and prerequisites.
 
 ```sh
 adm setup
 adm list
-systemctl --user status adm-lifecycle-forward.service
+adm doctor
 ```
 
-Setup creates the internal lifecycle credential in Kubernetes only when its Secret is missing and reuses it on later runs. The CLI reads it through the selected host kubeconfig; no local token file is created by default. Nonsecret connection settings are saved after rollout and an authenticated API check succeed. Explicit `--lifecycle-token-file` or `ADM_LIFECYCLE_TOKEN_FILE` selects a protected client file instead. Automatic setup uses `adm-system` and a loopback URL; see [advanced manual installation](installation.md#advanced-manual-installation) for separately managed connections.
+Setup creates the internal lifecycle credential in Kubernetes only when its Secret is missing and reuses it on later runs. Each client reads it through its selected kubeconfig into memory; no local token file is created by default. Nonsecret connection settings are saved after rollout and an authenticated API check succeed. Explicit `--lifecycle-token-file` or `ADM_LIFECYCLE_TOKEN_FILE` selects a protected client file instead. Automatic setup uses `adm-system`; see [advanced manual installation](installation.md#advanced-manual-installation) for separately managed connections.
 
-The `adm-lifecycle-forward.service` user unit reports ready after forwarding is established. Inspect it with `journalctl --user -u adm-lifecycle-forward.service` or restart it with `systemctl --user restart adm-lifecycle-forward.service`. Operator-configured user lingering keeps the connection available after logout; workspace agents continue in their Pods even when the management connection stops.
+`adm doctor` shows whether lifecycle access used the selected explicit URL or a command-scoped port-forward, and reports the actual loopback endpoint for the current invocation. The lifecycle controller continues admitted operations and workspace agents after the client exits.
 
 Make sure `$HOME/.local/bin` is on your shell's PATH. `adm doctor` reports local tools, cluster readiness, the default StorageClass, and the selected CLI state directory. Use `adm doctor --storage-class NAME` to inspect another class; node-local storage is labeled explicitly. Diagnostics do not allocate a workspace or install missing prerequisites.
 
@@ -29,7 +29,7 @@ adm attach my-project
 
 `adm start`, `adm serve`, and `adm stop` do not start a host-side agent runtime. Workspace Pods start and supervise their own agents independently of the management host, CLI, SSH, and terminal connections.
 
-Kubernetes credentials stay on the management host. `adm create` records the host-side `KUBECONFIG` path list for each coding workspace so coding tools keep using the selected cluster after Pod replacement. Use `--kubeconfig PATHS` or `KUBECONFIG` to select a file or the normal colon-separated merge list; relative entries are made absolute. If neither is set, ADM uses `$HOME/.kube/config`. Kubeconfig contents never enter a workspace Pod. `adm reconnect NAME --kubeconfig PATHS` verifies namespace ownership and updates the host-side coding-tool connection while preserving the workspace ID, files, and history.
+Kubernetes credentials stay on each client. `adm create` records the selected `KUBECONFIG` path list for each coding workspace so coding tools keep using the selected cluster after Pod replacement. Use `--kubeconfig PATHS` or `KUBECONFIG` to select a file or the normal colon-separated merge list; relative entries are made absolute. If neither is set, ADM uses `$HOME/.kube/config`. Kubeconfig contents never enter a workspace Pod. `adm reconnect NAME --kubeconfig PATHS` verifies namespace ownership and updates the coding-tool connection while preserving the workspace ID, files, and history.
 
 The default CLI state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/adm` when XDG_DATA_HOME is unset. Lifecycle state and deletion work are owned by the in-cluster service on its persistent volume. See [controller installation](installation.md#in-cluster-lifecycle-owner) and [the lifecycle API](lifecycle-api.md) for the management connection and authentication boundary.
 
@@ -42,7 +42,7 @@ The default CLI state directory is `$XDG_DATA_HOME/adm`, or `$HOME/.local/share/
 | `main`   | `latest`, `sha-<commit>`                    |
 | `v0.1.0` | `0.1.0`, `v0.1.0`, `latest`, `sha-<commit>` |
 
-After verification, image publishing, and runtime packaging pass, a `main` build automatically creates a GitHub release under `sha-<commit>` and marks it latest. Each release has its own assets, so a newer build does not overwrite files being downloaded. The release includes `install.sh`, `LICENSE`, `adm-linux-amd64.tar.gz`, compatibility binaries, and `SHA256SUMS`. The archive contains the CLI, repository helper, compiled runner/terminal, their pinned production Node dependencies, and the lifecycle deployment manifests. Both controller images in the bundled manifests match the release image. The same files remain available as a workflow artifact. Installation needs no checkout. The bundle records its matching `sha-<commit>` workspace image reference; setup can select a different image.
+After verification and image publishing pass on all native client runners, a `main` build automatically creates a GitHub release under `sha-<commit>` and marks it latest. The release includes native archives for Linux amd64/arm64 and macOS x86_64/arm64, plus checksums. Each archive contains the CLI, compiled runner/terminal, native production Node dependencies, and lifecycle deployment manifests; Linux archives also include the repository helper. Both controller images in the bundled manifests match the release image. Installation needs no checkout. The bundle records its matching `sha-<commit>` workspace image reference; setup can select a different image.
 
 The installer consumes the latest successful `main` release automatically. Optional `v*` tags also publish pinned releases; they do not change the installer's latest release. Rerunning the same build preserves published assets. An older or unrelated main build is published under its own tag and is not promoted over a newer published build. A draft left by a failed publish is not reused; delete that draft before rerunning the build. Markdown-only pushes skip publication; a manual Build run on `main` can publish that commit when needed.
 
@@ -207,7 +207,7 @@ adm port my-project 3000 --local-port 3000
 adm browser my-project http://127.0.0.1:3000 --screenshot /workspace/preview.png
 ```
 
-From your laptop, forward that management-host port over your normal SSH connection: `ssh -L 3000:127.0.0.1:3000 MANAGEMENT_HOST`. Open `http://127.0.0.1:3000` in your laptop's browser. Port forwarding binds to loopback. A failed forward reports interruption; rerunning it resolves the current runtime.
+The port is available on the client device running `adm port`; open `http://127.0.0.1:3000` there or use that device's own network forwarding tools to expose it. ADM binds to loopback by default. A failed forward reports interruption; rerunning it resolves the current runtime.
 
 ## Herdr ownership and deletion
 

@@ -28,10 +28,19 @@ pub fn doctor(cli: &Cli, storage_class: &str, json_output: bool) -> Result<()> {
         }),
     };
     let lifecycle = match cli.request_lifecycle("GET", "/health", None) {
-        Ok(health) => health,
+        Ok(mut health) => {
+            health["url"] = json!(cli.lifecycle_url);
+            health["connection"] = json!(if cli.lifecycle_forward {
+                "command-scoped-port-forward"
+            } else {
+                "explicit-url"
+            });
+            health
+        }
         Err(error) => json!({
             "status":"unavailable",
             "url":cli.lifecycle_url,
+            "connection": if cli.lifecycle_forward {"command-scoped-port-forward"} else {"explicit-url"},
             "error":format!("{error:#}"),
             "action":crate::lifecycle::setup_guidance(cli),
         }),

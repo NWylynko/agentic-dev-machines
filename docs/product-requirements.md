@@ -4,7 +4,7 @@ These notes distinguish confirmed requirements, implemented local behavior, and 
 
 The implementation target changed on 2026-10-16: all agent execution and durable state belong in workspace Pods; the management host is an access plane. Placement proposals in the earlier investigation below are historical.
 
-Decisions confirmed on 2026-10-18 further define the target: clients already have Tailscale and Kubernetes access; ordinary ADM use needs no permanent management host or mandatory client daemon. A stock-Herdr bridge is optional per device, provider login is shared across the installation, and default updates leave active workspace images and agents running. These are requirements, not claims of implemented behavior; current setup still uses a systemd connection service and workspace-local provider login.
+Decisions confirmed on 2026-10-18 further define the target: clients already have Tailscale and Kubernetes access; ordinary ADM use needs no permanent management host or mandatory client daemon. A stock-Herdr bridge is optional per device, provider login is shared across the installation, and default updates leave active workspace images and agents running. Command-scoped client forwarding and separate operator setup/client connect flows are now implemented. Shared provider login, optional Herdr bridging, and the update behavior remain requirements whose implementation and live acceptance are tracked separately.
 
 ## Confirmed requirements
 

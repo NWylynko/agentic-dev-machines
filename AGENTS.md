@@ -2,6 +2,8 @@ keep this file up to date
 
 # Project notes
 
+- Implemented client connection boundary (2026-10-18): ordinary lifecycle commands can use a command-scoped `kubectl port-forward` to the in-cluster service, fetch the lifecycle Secret in memory, and close only their own forward on exit. Setup installs the cluster controller separately and does not install a device service. Native client installers target Linux amd64/arm64 and macOS x86_64/arm64; this release matrix still needs CI/live acceptance on each native platform. An explicit lifecycle URL remains an explicit connection choice.
+
 - Confirmed target decisions (2026-10-18; not yet implemented): client devices already have Tailscale and Kubernetes access. Ordinary ADM use must work without a permanent management host or mandatory client daemon; lifecycle, durable execution, and shared provider authentication belong in the cluster. Transport remains an implementation choice.
 - Herdr target (2026-10-18): support stock Herdr through an optional per-device bridge/tunnel/service that the user chooses independently on each device. Other ADM commands must work without it. Show bridge unavailability; do not promise replay of missed close events or infer deletion from missing spaces/disconnection.
 - Provider target (2026-10-18): one account per provider per ADM installation, available to every existing and new coding and bot agent. Shared billing/rate limits are accepted; credential delivery and refresh ownership remain to be designed. No provider/billing fallback. The current workspace-local login described below is superseded as a target, not yet replaced in code.

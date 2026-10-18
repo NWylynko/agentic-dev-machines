@@ -20,8 +20,10 @@ import YAML from "yaml";
 
 const execute = promisify(execFile);
 const project = fileURLToPath(new URL("../", import.meta.url));
-if (process.platform !== "linux" || process.arch !== "x64")
-  throw new Error("Release packaging requires Linux x86_64");
+const platformName = process.platform === "darwin" ? "darwin" : process.platform;
+if (!["linux", "darwin"].includes(platformName) || !["x64", "arm64"].includes(process.arch))
+  throw new Error(`Unsupported release platform: ${process.platform}/${process.arch}`);
+const platform = `${platformName}-${process.arch === "x64" ? "amd64" : "arm64"}`;
 const { values } = parseArgs({
   options: Object.fromEntries(
     ["version", "image", "adm", "repositories", "output"].map((name) => [
@@ -30,7 +32,7 @@ const { values } = parseArgs({
     ]),
   ),
 });
-for (const name of ["version", "image", "adm", "repositories", "output"]) {
+for (const name of ["version", "image", "adm", "output"]) {
   if (!values[name]) throw new Error(`--${name} is required`);
 }
 if (!/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(values.version))
@@ -41,10 +43,11 @@ const output = resolve(values.output);
 const staging = await mkdtemp(join(tmpdir(), "adm-release-"));
 try {
   await mkdir(join(staging, "bin"));
-  for (const [source, name] of [
-    [values.adm, "adm"],
-    [values.repositories, "adm-repositories"],
-  ]) {
+  const binaries = [[values.adm, "adm"]];
+  if (values.repositories) binaries.push([values.repositories, "adm-repositories"]);
+  else if (platform.startsWith("linux-"))
+    throw new Error("Linux release packages require --repositories");
+  for (const [source, name] of binaries) {
     const destination = join(staging, "bin", name);
     await copyFile(resolve(source), destination);
     await chmod(destination, 0o755);
@@ -116,20 +119,17 @@ try {
   await writeFile(join(staging, "VERSION"), values.version + "\n");
   await writeFile(join(staging, "IMAGE"), values.image + "\n");
   await mkdir(output, { recursive: true });
-  const archive = "adm-linux-amd64.tar.gz";
+  const archive = `adm-${platform}.tar.gz`;
   await execute("tar", ["-czf", join(output, archive), "-C", staging, "."]);
-  const binaries = [
-    ["adm", "adm-linux-amd64"],
-    ["adm-repositories", "adm-repositories-linux-amd64"],
-  ];
-  for (const [name, artifact] of binaries)
+  const binaryAssets = binaries.map(([source, name]) => [name, `${name}-${platform}`]);
+  for (const [name, artifact] of binaryAssets)
     await copyFile(join(staging, "bin", name), join(output, artifact));
   await copyFile(join(staging, "LICENSE"), join(output, "LICENSE"));
   const sums = [];
   for (const name of [
     archive,
     "LICENSE",
-    ...binaries.map(([, artifact]) => artifact),
+    ...binaryAssets.map(([, artifact]) => artifact),
   ]) {
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(join(output, name)))

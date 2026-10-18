@@ -98,23 +98,6 @@ elif args[:5]==['-n','adm-system','rollout','status','deployment/adm-lifecycle']
 else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
 "#).unwrap();
     fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
-    let systemctl = root.path().join("bin/systemctl");
-    fs::write(
-        &systemctl,
-        r#"#!/usr/bin/python3
-import json,pathlib,sys
-root=pathlib.Path(__file__).parent.parent
-with (root/'systemctl.log').open('a') as log: log.write(json.dumps(sys.argv[1:])+'\n')
-if 'show-environment' in sys.argv and (root/'fail-manager').exists(): print('user manager unavailable',file=sys.stderr);sys.exit(1)
-if 'is-active' in sys.argv: sys.exit(0 if (root/'active').exists() else 3)
-if 'enable' in sys.argv or 'restart' in sys.argv:
- unit=root/'config/systemd/user/adm-lifecycle-forward.service'
- if not unit.exists(): print('missing forward unit',file=sys.stderr);sys.exit(1)
- (root/'active').touch()
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token_path = root.path().join("controller-token");
@@ -163,20 +146,10 @@ if 'enable' in sys.argv or 'restart' in sys.argv:
             .unwrap()
             .contains(token.trim())
     );
-    let unit = fs::read_to_string(
-        root.path()
-            .join("config/systemd/user/adm-lifecycle-forward.service"),
-    )
-    .unwrap();
-    assert!(unit.contains("Type=notify"), "{unit}");
-    assert!(unit.contains("RestartSec=3s"), "{unit}");
-    assert!(unit.contains("lifecycle-forward"), "{unit}");
-    assert!(!unit.contains(token.trim()));
-    assert!(!unit.contains("--project-dir"));
-    assert!(unit.contains("$$VALUE"), "{unit}");
-    assert!(unit.contains("%%q"), "{unit}");
-    assert!(unit.contains("\\\"quoted\\\""), "{unit}");
-    assert!(unit.contains("\\\\slash"), "{unit}");
+    assert!(
+        !root.path().join("config/systemd/user").exists(),
+        "ordinary setup must not install a per-device service"
+    );
     let applied: Value =
         serde_json::from_slice(&fs::read(root.path().join("applied.json")).unwrap()).unwrap();
     let items = applied["items"].as_array().unwrap();
@@ -233,17 +206,7 @@ if 'enable' in sys.argv or 'restart' in sys.argv:
         fs::read_to_string(root.path().join("controller-token")).unwrap(),
         token
     );
-    let calls = fs::read(root.path().join("kubectl.log")).unwrap();
-    fs::write(root.path().join("fail-manager"), "").unwrap();
-    let output = invoke(root.path(), &arguments, "\n\n\n\n");
-    assert!(!output.status.success());
-    assert_eq!(
-        fs::read(root.path().join("kubectl.log")).unwrap(),
-        calls,
-        "unavailable user manager must fail before cluster mutation"
-    );
-    assert_eq!(fs::read(&config_path).unwrap(), saved);
-    fs::remove_file(root.path().join("fail-manager")).unwrap();
+    assert!(!root.path().join("systemctl.log").exists());
     fs::write(
         root.path().join("client-token"),
         "synthetic-mismatched-token",

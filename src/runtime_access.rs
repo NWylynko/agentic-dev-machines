@@ -398,6 +398,8 @@ mod forward_pipe_tests {
             kubeconfig: Some(kubeconfig.to_string_lossy().into_owned()),
             runner_url: String::new(),
             lifecycle_url: String::new(),
+            lifecycle_url_explicit: false,
+            lifecycle_forward: false,
             lifecycle_namespace: String::new(),
             lifecycle_token_file: None,
             lifecycle_token_secret: false,

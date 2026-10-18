@@ -8,7 +8,7 @@ fail() {
 
 usage() {
   cat <<'USAGE'
-Install or update ADM on a Debian Linux x86_64 management host.
+Install or update ADM on Linux amd64/arm64 or macOS x86_64/arm64.
 
 Usage: sh install.sh [--version TAG] [--yes | --no-setup]
   --version TAG  Install a release tag (default: latest).
@@ -17,7 +17,7 @@ Usage: sh install.sh [--version TAG] [--yes | --no-setup]
   --base-url URL Download release assets from this directory.
   --help         Show this help.
 
-Requires Node.js 24+, curl, tar, sha256sum, and flock. No sudo or checkout needed.
+Requires Node.js 24+, curl, tar, and a SHA-256 tool. No sudo or checkout needed.
 Rerun the same command to update. Existing state and settings are preserved.
 USAGE
 }
@@ -46,11 +46,21 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 case "$version" in ''|*[!A-Za-z0-9._-]*) fail 'release tags may contain letters, numbers, dots, underscores, and hyphens' ;; esac
-[ "$(uname -s)" = Linux ] || fail 'supported platform is Debian Linux x86_64'
-case "$(uname -m)" in x86_64|amd64) ;; *) fail 'supported architecture is x86_64' ;; esac
-for dependency in node curl tar sha256sum mktemp readlink flock; do
+os=$(uname -s)
+arch=$(uname -m)
+case "$os:$arch" in
+  Linux:x86_64|Linux:amd64) platform=linux-amd64 ;;
+  Linux:aarch64|Linux:arm64) platform=linux-arm64 ;;
+  Darwin:x86_64|Darwin:amd64) platform=darwin-amd64 ;;
+  Darwin:arm64|Darwin:aarch64) platform=darwin-arm64 ;;
+  *) fail "unsupported platform: $os/$arch" ;;
+esac
+for dependency in node curl tar mktemp readlink; do
   command -v "$dependency" >/dev/null 2>&1 || fail "missing prerequisite: $dependency"
 done
+if command -v sha256sum >/dev/null 2>&1; then checksum_tool=sha256sum
+elif command -v shasum >/dev/null 2>&1; then checksum_tool=shasum
+else fail 'missing prerequisite: sha256sum or shasum'; fi
 node -e 'if(Number(process.versions.node.split(".")[0])<24)process.exit(1)' || fail 'Node.js 24 or newer is required'
 case "${HOME-}" in /*) ;; *) fail 'HOME must be an absolute path' ;; esac
 data_home=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -61,7 +71,8 @@ for directory in "$prefix" "$prefix/releases" "$bin_dir"; do
   [ ! -L "$directory" ] || fail "refusing symlink directory: $directory"
   [ ! -e "$directory" ] || [ -d "$directory" ] || fail "not a directory: $directory"
 done
-for binary in adm adm-repositories; do
+case "$platform" in linux-*) binaries="adm adm-repositories" ;; *) binaries=adm ;; esac
+for binary in $binaries; do
   command_path=$bin_dir/$binary
   if [ -e "$command_path" ] || [ -L "$command_path" ]; then
     [ -L "$command_path" ] && [ "$(readlink "$command_path")" = "$prefix/current/bin/$binary" ] || fail "refusing to overwrite unmanaged command: $command_path"
@@ -83,13 +94,14 @@ if [ -z "$base_url" ]; then
 fi
 case "$base_url" in http://*|https://*) ;; *) fail '--base-url must be an HTTP or HTTPS release asset directory' ;; esac
 base_url=${base_url%/}
-archive_name=adm-linux-amd64.tar.gz
+archive_name=adm-$platform.tar.gz
 mkdir -p "$prefix/releases" "$bin_dir"
-exec 9>"$prefix/install.lock"
-flock -n 9 || fail 'another ADM installation is in progress'
+lock_dir=$prefix/install.lock
+mkdir "$lock_dir" 2>/dev/null || fail 'another ADM installation is in progress'
 temporary=$(mktemp -d "$prefix/.install.XXXXXXXX")
 cleanup() {
   if [ -n "${temporary-}" ] && [ -d "$temporary" ]; then rm -r "$temporary"; fi
+  rmdir "$lock_dir" 2>/dev/null || :
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -99,13 +111,18 @@ curl --fail --silent --show-error --location "$base_url/$archive_name" -o "$temp
 curl --fail --silent --show-error --location "$base_url/SHA256SUMS" -o "$temporary/SHA256SUMS" || fail 'release checksum download failed'
 checksum=$(awk -v archive="$archive_name" '$2 == archive || $2 == "*" archive {print $1; count++} END {if(count != 1) exit 1}' "$temporary/SHA256SUMS") || fail 'expected exactly one archive checksum in SHA256SUMS'
 printf '%s\n' "$checksum" | LC_ALL=C awk '/^[a-f0-9]{64}$/ {valid=1} END {exit !valid}' || fail 'invalid archive checksum'
-printf '%s  %s\n' "$checksum" "$temporary/$archive_name" | sha256sum -c - >/dev/null || fail 'archive checksum mismatch; existing installation was not changed'
+if [ "$checksum_tool" = sha256sum ]; then
+  printf '%s  %s\n' "$checksum" "$temporary/$archive_name" | sha256sum -c - >/dev/null || fail 'archive checksum mismatch; existing installation was not changed'
+else
+  actual=$(shasum -a 256 "$temporary/$archive_name" | awk '{print $1}')
+  [ "$actual" = "$checksum" ] || fail 'archive checksum mismatch; existing installation was not changed'
+fi
 tar -tzf "$temporary/$archive_name" > "$temporary/entries" || fail 'invalid release archive'
 awk '/^\// || /(^|\/)\.\.(\/|$)/ {exit 1}' "$temporary/entries" || fail 'archive contains an unsafe path'
 mkdir "$temporary/bundle"
-tar --no-same-owner --no-same-permissions -xzf "$temporary/$archive_name" -C "$temporary/bundle" || fail 'release extraction failed'
+tar -xzf "$temporary/$archive_name" -C "$temporary/bundle" || fail 'release extraction failed'
 bundle=$temporary/bundle
-for binary in adm adm-repositories; do
+for binary in $binaries; do
   [ -f "$bundle/bin/$binary" ] && [ -x "$bundle/bin/$binary" ] || fail "release is missing executable bin/$binary"
 done
 for path in runtime/runner.mjs runtime/terminal.mjs package.json VERSION IMAGE; do
@@ -141,7 +158,7 @@ release=$prefix/releases/$checksum
 first_install=true
 if [ -L "$prefix/current" ]; then first_install=false; fi
 if [ "$(readlink "$prefix/current" 2>/dev/null || :)" = "releases/$checksum" ]; then
-  for binary in adm adm-repositories; do
+  for binary in $binaries; do
     if [ ! -L "$bin_dir/$binary" ]; then ln -s "$prefix/current/bin/$binary" "$bin_dir/$binary"; fi
   done
   printf 'ADM is already up to date.\n'
@@ -156,8 +173,8 @@ if [ ! -e "$release" ]; then
   mv "$bundle" "$release"
 fi
 ln -s "releases/$checksum" "$temporary/current"
-mv -T "$temporary/current" "$prefix/current"
-for binary in adm adm-repositories; do
+node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$temporary/current" "$prefix/current"
+for binary in $binaries; do
   if [ ! -L "$bin_dir/$binary" ]; then ln -s "$prefix/current/bin/$binary" "$bin_dir/$binary"; fi
 done
 printf 'Installed ADM %s.\n' "$(cat "$release/VERSION")"
@@ -166,6 +183,6 @@ if [ "$first_install" = true ]; then
   if [ "$setup" = true ] && [ -t 1 ] && ( : </dev/tty ) 2>/dev/null; then
     "$bin_dir/adm" setup </dev/tty
   else
-    printf 'Run adm setup to configure the management host.\n'
+    printf 'Run adm setup to connect this client and optionally install the cluster controller.\n'
   fi
 fi
