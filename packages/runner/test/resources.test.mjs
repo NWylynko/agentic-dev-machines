@@ -278,6 +278,22 @@ test(
       ).status,
       400,
     );
+    await writeFile(
+      join(project, ".pi/settings.json"),
+      JSON.stringify({ packages: ["npm:adm-missing-resource-fixture@0.0.0"] }),
+    );
+    const failedReload = await runner.request(
+      path + "/resources/reload",
+      "POST",
+      {},
+    );
+    assert.equal(failedReload.status, 500);
+    assert.match(failedReload.body.error.message, /Missing source/);
+    assert.equal(
+      (await runner.request(path + "/resources")).status,
+      500,
+      "failed reload cannot silently serve stale trusted resources",
+    );
     await assert.rejects(access(sentinel), { code: "ENOENT" });
   },
 );

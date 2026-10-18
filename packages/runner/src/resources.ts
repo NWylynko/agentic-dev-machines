@@ -145,6 +145,7 @@ export class WorkspaceResources {
   }
 
   async reload(): Promise<WorkspaceResourceSnapshot> {
+    this.snapshot = undefined;
     await this.prepare();
     const trust = this.trust();
     const settingsManager = SettingsManager.create(this.cwd, this.agentDir, {
