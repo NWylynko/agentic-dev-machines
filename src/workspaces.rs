@@ -398,7 +398,7 @@ impl WorkspaceStore {
         fs::create_dir_all(path)?;
         let connection = Connection::open(path.join("workspaces.sqlite"))?;
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,phase TEXT NOT NULL,spec TEXT NOT NULL,fencing_token INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS active_workspace_names ON workspaces(name) WHERE phase!='deleted'; CREATE TABLE IF NOT EXISTS lifecycle_operations(operation_id TEXT PRIMARY KEY,kind TEXT NOT NULL,request TEXT NOT NULL,workspace_id TEXT NOT NULL,status TEXT NOT NULL,accepted_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,stage TEXT,last_error TEXT,timings TEXT NOT NULL DEFAULT '{}',fencing_token INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS runtime_leases(workspace_id TEXT PRIMARY KEY,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS runtime_maintenance(singleton INTEGER PRIMARY KEY CHECK(singleton=1),maintenance_id TEXT NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS runtime_maintenance_leases(maintenance_id TEXT NOT NULL,workspace_id TEXT NOT NULL,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(maintenance_id,workspace_id)); CREATE TABLE IF NOT EXISTS lifecycle_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),fencing_token INTEGER NOT NULL);")?;
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,phase TEXT NOT NULL,spec TEXT NOT NULL,fencing_token INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS active_workspace_names ON workspaces(name) WHERE phase!='deleted'; CREATE TABLE IF NOT EXISTS lifecycle_operations(operation_id TEXT PRIMARY KEY,kind TEXT NOT NULL,request TEXT NOT NULL,workspace_id TEXT NOT NULL,status TEXT NOT NULL,accepted_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,stage TEXT,last_error TEXT,timings TEXT NOT NULL DEFAULT '{}',fencing_token INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS runtime_leases(workspace_id TEXT PRIMARY KEY,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS runtime_lease_revocations(workspace_id TEXT NOT NULL,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,operation_id TEXT NOT NULL,PRIMARY KEY(workspace_id,holder)); CREATE TABLE IF NOT EXISTS runtime_maintenance(singleton INTEGER PRIMARY KEY CHECK(singleton=1),maintenance_id TEXT NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS runtime_maintenance_leases(maintenance_id TEXT NOT NULL,workspace_id TEXT NOT NULL,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(maintenance_id,workspace_id)); CREATE TABLE IF NOT EXISTS lifecycle_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),fencing_token INTEGER NOT NULL);")?;
         connection.execute(
             "INSERT INTO lifecycle_owner(singleton,fencing_token) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET fencing_token=MAX(lifecycle_owner.fencing_token,excluded.fencing_token)",
             [fencing_token as i64],
@@ -485,6 +485,7 @@ impl WorkspaceStore {
                 }
             }
             OperationRequest::Delete { .. } => None,
+            OperationRequest::Update { .. } => None,
         };
         let workspace_id = created_workspace
             .as_ref()
@@ -530,6 +531,40 @@ impl WorkspaceStore {
                     params![workspace.id, serde_json::to_string(&workspace)?, self.fencing_token as i64],
                 )?;
                 ensure!(changed == 1, "workspace lifecycle fencing token is stale");
+            }
+            OperationRequest::Update {
+                workspace_id,
+                image,
+                ..
+            } => {
+                let raw: String = transaction
+                    .query_row(
+                        "SELECT spec FROM workspaces WHERE id=?1",
+                        [workspace_id],
+                        |row| row.get(0),
+                    )
+                    .with_context(|| format!("workspace not found: {workspace_id}"))?;
+                let mut workspace: Workspace = serde_json::from_str(&raw)?;
+                ensure!(
+                    workspace.phase == "ready",
+                    "workspace {} is not ready for an image update",
+                    workspace.name
+                );
+                ensure!(
+                    workspace.phase != "deleting" && workspace.phase != "deleted",
+                    "workspace {} is being deleted",
+                    workspace.name
+                );
+                workspace.image = image.clone();
+                workspace.last_error = None;
+                let changed = transaction.execute(
+                    "UPDATE workspaces SET spec=?2,fencing_token=?3 WHERE id=?1 AND phase='ready' AND fencing_token<=?3",
+                    params![workspace.id, serde_json::to_string(&workspace)?, self.fencing_token as i64],
+                )?;
+                ensure!(
+                    changed == 1,
+                    "workspace changed before its image update was admitted"
+                );
             }
         }
         transaction.execute(
@@ -605,6 +640,18 @@ impl WorkspaceStore {
         let expires_at = maintenance
             .as_ref()
             .map_or(normal_expiry, |(_, until)| normal_expiry.max(*until));
+        let revoked = tx
+            .query_row(
+                "SELECT 1 FROM runtime_lease_revocations WHERE workspace_id=?1 AND holder=?2",
+                params![workspace_id, holder],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        ensure!(
+            !revoked,
+            "runtime Pod lease was explicitly revoked for image update"
+        );
         tx.execute(
             "INSERT INTO runtime_leases(workspace_id,holder,fencing_token,expires_at,lifecycle_fencing_token) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workspace_id) DO UPDATE SET holder=excluded.holder,fencing_token=excluded.fencing_token,expires_at=excluded.expires_at,lifecycle_fencing_token=excluded.lifecycle_fencing_token WHERE runtime_leases.lifecycle_fencing_token<=excluded.lifecycle_fencing_token",
             params![workspace_id, holder, fencing_token as i64, expires_at as i64, self.fencing_token as i64],
@@ -691,6 +738,35 @@ impl WorkspaceStore {
         tx.commit()?;
         Ok(expires_at)
     }
+    pub fn revoke_runtime_lease_for_update(
+        &mut self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        let lease = transaction
+            .query_row(
+                "SELECT holder,fencing_token FROM runtime_leases WHERE workspace_id=?1",
+                [workspace_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?;
+        if let Some((holder, fencing_token)) = lease {
+            transaction.execute(
+                "INSERT INTO runtime_lease_revocations(workspace_id,holder,fencing_token,operation_id) VALUES(?1,?2,?3,?4) ON CONFLICT(workspace_id,holder) DO UPDATE SET fencing_token=excluded.fencing_token,operation_id=excluded.operation_id",
+                params![workspace_id, holder, fencing_token as i64, operation_id],
+            )?;
+            transaction.execute(
+                "UPDATE runtime_leases SET expires_at=?2,lifecycle_fencing_token=?3 WHERE workspace_id=?1 AND lifecycle_fencing_token<=?3",
+                params![workspace_id, now().saturating_sub(1) as i64, self.fencing_token as i64],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn extend_runtime_leases(
         &mut self,
         maintenance_id: &str,
@@ -709,6 +785,30 @@ impl WorkspaceStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure_store_fence(&tx, self.fencing_token)?;
         let current_time = now();
+        let active_maintenance = tx
+            .query_row(
+                "SELECT maintenance_id,expires_at FROM runtime_maintenance WHERE singleton=1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?;
+        if let Some((active_id, active_expiry)) = active_maintenance
+            && active_expiry > current_time
+        {
+            ensure!(
+                active_id == maintenance_id,
+                "another controller maintenance window is active; refusing to replace its runtime acknowledgement set"
+            );
+            let mut statement = tx.prepare(
+                "SELECT workspace_id FROM runtime_maintenance_leases WHERE maintenance_id=?1 ORDER BY workspace_id",
+            )?;
+            let workspace_ids = statement
+                .query_map([maintenance_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            tx.commit()?;
+            return Ok((active_expiry, workspace_ids));
+        }
         let expires_at = current_time + duration;
         tx.execute("DELETE FROM runtime_maintenance_leases", [])?;
         tx.execute(
@@ -1506,6 +1606,133 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
     Ok(w)
 }
 
+pub fn upgrade_persisted(cli: &Cli, workspace_id: &str) -> Result<Workspace> {
+    let mut workspace = cli.store()?.find(workspace_id)?;
+    ensure!(
+        workspace.phase == "ready",
+        "workspace is not ready for an image update"
+    );
+    verify_workspace_update_target(cli, &workspace)
+        .context("verify selected workspace deployment and private volume before image update")?;
+    let operation_id = cli
+        .lifecycle_operation_id
+        .as_deref()
+        .context("workspace image update needs a durable operation ID")?;
+    cli.store()?
+        .revoke_runtime_lease_for_update(workspace_id, operation_id)?;
+    let resources = manifest(&workspace)?;
+    let deployment = resources["items"]
+        .as_array()
+        .context("workspace manifest is not a Kubernetes List")?
+        .iter()
+        .find(|resource| {
+            resource["kind"] == "Deployment" && resource["metadata"]["name"] == "workspace"
+        })
+        .context("workspace manifest has no workspace Deployment")?;
+    let mut deployment = deployment.clone();
+    let annotations = deployment
+        .pointer_mut("/spec/template/metadata/annotations")
+        .and_then(Value::as_object_mut);
+    if annotations.is_none() {
+        deployment["spec"]["template"]["metadata"]["annotations"] = json!({});
+    }
+    deployment["spec"]["template"]["metadata"]["annotations"]["adm.dev/update-attempt"] =
+        json!(uuid::Uuid::new_v4().to_string());
+    eprintln!(
+        "adm: update workspace {} ({}) image {}",
+        workspace.name, workspace.id, workspace.image
+    );
+    kubectl(
+        cli,
+        &["apply", "-f", "-"],
+        Some(&serde_json::to_vec(&deployment)?),
+    )
+    .context("apply selected workspace Deployment image update")?;
+    kubectl(
+        cli,
+        &[
+            "wait",
+            "--for=condition=available",
+            "deployment/workspace",
+            "-n",
+            &workspace.namespace,
+            "--timeout=180s",
+        ],
+        None,
+    )
+    .context("wait for selected workspace runtime and lease readiness")?;
+    verify_ownership(cli, &workspace)
+        .context("verify selected workspace ownership after image update")?;
+    let current = cli.store()?.find(workspace_id)?;
+    ensure!(
+        current.id == workspace.id && current.image == workspace.image,
+        "workspace identity or selected image changed during update"
+    );
+    workspace.runtime_status = None;
+    Ok(workspace)
+}
+
+fn verify_workspace_update_target(cli: &Cli, workspace: &Workspace) -> Result<()> {
+    verify_ownership(cli, workspace)?;
+    let deployment: Value = serde_json::from_slice(&kubectl(
+        cli,
+        &[
+            "get",
+            "deployment",
+            "workspace",
+            "-n",
+            &workspace.namespace,
+            "-o",
+            "json",
+        ],
+        None,
+    )?)
+    .context("decode selected workspace Deployment")?;
+    let owned_labels = &deployment["metadata"]["labels"];
+    let selector = &deployment["spec"]["selector"]["matchLabels"];
+    let pod_labels = &deployment["spec"]["template"]["metadata"]["labels"];
+    ensure!(
+        deployment["metadata"]["name"] == "workspace"
+            && deployment["metadata"]["namespace"] == workspace.namespace
+            && owned_labels["app.kubernetes.io/managed-by"] == MANAGED_BY
+            && owned_labels["adm.dev/workspace-id"] == workspace.id
+            && selector["adm.dev/workspace-id"] == workspace.id
+            && pod_labels["adm.dev/workspace-id"] == workspace.id
+            && deployment["spec"]["template"]["spec"]["serviceAccountName"] == "adm-runtime"
+            && deployment["spec"]["template"]["spec"]["volumes"]
+                .as_array()
+                .is_some_and(|volumes| {
+                    volumes.iter().any(|volume| {
+                        volume["name"] == "work"
+                            && volume["persistentVolumeClaim"]["claimName"] == "work"
+                    })
+                }),
+        "workspace Deployment does not match the selected ADM workspace identity and volume"
+    );
+    let claim: Value = serde_json::from_slice(&kubectl(
+        cli,
+        &[
+            "get",
+            "pvc",
+            "work",
+            "-n",
+            &workspace.namespace,
+            "-o",
+            "json",
+        ],
+        None,
+    )?)
+    .context("decode selected workspace private PVC")?;
+    ensure!(
+        claim["metadata"]["name"] == "work"
+            && claim["metadata"]["namespace"] == workspace.namespace
+            && claim["metadata"]["labels"]["app.kubernetes.io/managed-by"] == MANAGED_BY
+            && claim["metadata"]["labels"]["adm.dev/workspace-id"] == workspace.id,
+        "workspace PVC does not match the selected ADM workspace identity"
+    );
+    Ok(())
+}
+
 fn prepare_repository(cli: &Cli, workspace: &Workspace, repository: &str) -> Result<()> {
     let (owner, name) = validate_repository_ref(repository)?;
     let script = r#"set -eu
@@ -1660,6 +1887,37 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
 #[cfg(test)]
 mod lifecycle_fence_tests {
     use super::*;
+
+    #[test]
+    fn admitted_workspace_image_update_preserves_identity_and_private_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = WorkspaceStore::open_fenced(directory.path(), 3).unwrap();
+        let workspace: Workspace = serde_json::from_value(json!({
+            "id":"e39f7d2667d64ca8a75c9c926611991d", "name":"upgrade-me",
+            "role":"coding", "namespace":"adm-e39f7d2667d64ca8",
+            "phase":"ready", "image":"adm-dev:old", "storage_class":"adm-replicated",
+            "storage_size":"1Gi", "cpu":"1", "memory":"1Gi", "agent_enabled":true,
+            "repositories":false, "catalog":{}, "repository":"nick/repo", "cwd":"/repos/nick/repo",
+            "model":{"provider":"test","id":"model"}, "created_at":1,
+            "last_error":null
+        }))
+        .unwrap();
+        store.insert(&workspace).unwrap();
+        let request: crate::lifecycle::OperationRequest = serde_json::from_value(json!({
+            "kind":"update", "operationId":"c0a0ad14-a514-4c27-9e4c-acb1a05b272c",
+            "workspaceId":workspace.id, "image":"adm-dev:new"
+        }))
+        .unwrap();
+        store.admit_lifecycle_operation(&request).unwrap();
+        let updated = store.find(&workspace.id).unwrap();
+        assert_eq!(updated.image, "adm-dev:new");
+        assert_eq!(updated.id, workspace.id);
+        assert_eq!(updated.namespace, workspace.namespace);
+        assert_eq!(updated.repository, workspace.repository);
+        assert_eq!(updated.cwd, workspace.cwd);
+        assert_eq!(updated.model, workspace.model);
+        assert_eq!(updated.phase, "ready");
+    }
 
     #[test]
     fn stale_lifecycle_fence_cannot_insert_a_new_operation() {

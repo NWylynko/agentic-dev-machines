@@ -47,6 +47,13 @@ pub enum OperationRequest {
         #[serde(rename = "workspaceId")]
         workspace_id: String,
     },
+    Update {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        image: String,
+    },
 }
 
 /// Caller-owned creation choices only. Identity, namespace, phase, timestamps,
@@ -239,14 +246,18 @@ impl CreateIntent {
 impl OperationRequest {
     pub fn operation_id(&self) -> &str {
         match self {
-            Self::Create { operation_id, .. } | Self::Delete { operation_id, .. } => operation_id,
+            Self::Create { operation_id, .. }
+            | Self::Delete { operation_id, .. }
+            | Self::Update { operation_id, .. } => operation_id,
         }
     }
 
     pub fn workspace_id(&self) -> Option<&str> {
         match self {
             Self::Create { .. } => None,
-            Self::Delete { workspace_id, .. } => Some(workspace_id),
+            Self::Delete { workspace_id, .. } | Self::Update { workspace_id, .. } => {
+                Some(workspace_id)
+            }
         }
     }
 
@@ -254,6 +265,7 @@ impl OperationRequest {
         match self {
             Self::Create { .. } => "create",
             Self::Delete { .. } => "delete",
+            Self::Update { .. } => "update",
         }
     }
 }
@@ -377,6 +389,17 @@ pub fn admit(store: &mut WorkspaceStore, request: &OperationRequest) -> Result<O
                 "workspaceId must be an immutable workspace UUID"
             );
         }
+        OperationRequest::Update {
+            workspace_id,
+            image,
+            ..
+        } => {
+            ensure!(
+                uuid::Uuid::parse_str(workspace_id).is_ok(),
+                "workspaceId must be an immutable workspace UUID"
+            );
+            ensure!(!image.trim().is_empty(), "update request needs an image");
+        }
     }
     store.admit_lifecycle_operation(request)
 }
@@ -479,6 +502,9 @@ fn lifecycle_worker(
                     } else {
                         crate::workspaces::destroy(&cli, &workspace_id)?
                     }
+                }
+                OperationRequest::Update { workspace_id, .. } => {
+                    crate::workspaces::upgrade_persisted(&cli, &workspace_id)?
                 }
             };
             ensure!(
@@ -884,6 +910,9 @@ fn route(
                     "runtime caller is not authorized to delete this workspace role"
                 );
             }
+            OperationRequest::Update { .. } => anyhow::bail!(
+                "runtime callers cannot update workspace images; use `adm update --workspace`"
+            ),
         }
         let operation_id = request.operation_id().to_owned();
         let receipt = admit(&mut store, &request)?;

@@ -187,6 +187,235 @@ test(
       deployment.spec.template.spec.containers[0].image,
       "ghcr.io/example/adm:9.8.7",
     );
+    await assert.rejects(
+      execute(
+        adm,
+        ["update", "--workspace", "same", "--workspace", "same"],
+        { cwd: unrelated, env: environment },
+      ),
+      /a workspace was selected more than once/,
+    );
+    assert.equal(await readFile(join(installed, "VERSION"), "utf8"), "v9.8.7\n");
+
+    const lifecycleTokenFile = join(directory, "lifecycle-token");
+    await writeFile(lifecycleTokenFile, "synthetic-lifecycle-token\n", { mode: 0o600 });
+    const applied = join(directory, "controller-applied");
+    const kubectlLog = join(directory, "kubectl.log");
+    const targetImage = "ghcr.io/example/adm:9.8.7";
+    const fixtureResources = YAML.parseAllDocuments(
+      await readFile(join(installed, "deploy/lifecycle/control-plane.yaml"), "utf8"),
+    ).map((document) => document.toJSON());
+    const deploymentResource = fixtureResources.find(
+      (resource) => resource.kind === "Deployment" && resource.metadata.name === "adm-lifecycle",
+    );
+    for (const container of [
+      ...deploymentResource.spec.template.spec.initContainers,
+      ...deploymentResource.spec.template.spec.containers,
+    ]) container.image = targetImage;
+    const resourcesFile = join(directory, "lifecycle-resources.json");
+    await writeFile(resourcesFile, fixtureResources.map(JSON.stringify).join("\n"));
+    const fakeKubectl = join(hostTools, "kubectl");
+    await writeFile(
+      fakeKubectl,
+      `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> ${JSON.stringify(kubectlLog)}
+case "$*" in
+  *"get namespace adm-system"*) printf '{"metadata":{"name":"adm-system","labels":{"app.kubernetes.io/part-of":"adm"}}}\\n' ;;
+  *"get pvc adm-lifecycle-state"*) printf '{"metadata":{"name":"adm-lifecycle-state","namespace":"adm-system"},"spec":{"storageClassName":"installed-lifecycle-class"}}\\n' ;;
+  *"get deployment adm-lifecycle"*)
+    image=${JSON.stringify(targetImage)}
+    [ ! -f ${JSON.stringify(applied)} ] || image=$(cut -d= -f2 ${JSON.stringify(applied)})
+    printf '{"metadata":{"name":"adm-lifecycle","namespace":"adm-system"},"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"adm-lifecycle"}},"template":{"spec":{"serviceAccountName":"adm-lifecycle","volumes":[{"name":"state","persistentVolumeClaim":{"claimName":"adm-lifecycle-state"}}],"initContainers":[{"image":"%s"}],"containers":[{"image":"%s"}]}}}}\\n' "$image" "$image"
+    ;;
+  *"get storageclass"*) printf '{"provisioner":"rook-ceph.rbd.csi.ceph.com"}\\n' ;;
+  *"create --dry-run=client"*) cat ${JSON.stringify(resourcesFile)} ;;
+  *"get secret adm-lifecycle-token"*) exit 0 ;;
+  *"apply -f -"*) manifest=$(cat); printf '%s' "$manifest" > ${JSON.stringify(applied)}.manifest; printf 'image=${targetImage}\\n' > ${JSON.stringify(applied)} ;;
+  *"rollout status deployment/adm-lifecycle"*) exit 0 ;;
+  *"create secret generic adm-lifecycle-token"*) cat >/dev/null ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    const failedWorkspaceOperations = new Set();
+    let failSelectedWorkspace = false;
+    const lifecycleServer = createHttpServer(async (request, response) => {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : {};
+      if (request.headers.authorization !== "Bearer synthetic-lifecycle-token") {
+        response.writeHead(401, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "selected token file was not forwarded" } }));
+        return;
+      }
+      const selectedId = "55f9ea63-5506-4b39-bab8-49c2fadd0e73";
+      const selectedWorkspace = {
+        id: selectedId,
+        name: "selected-workspace",
+        role: "coding",
+        namespace: "adm-55f9ea6355064b39",
+        phase: "ready",
+        image: "ghcr.io/example/adm-dev:stale-workspace-image",
+        storage_class: "adm-replicated",
+        storage_size: "1Gi",
+        cpu: "1",
+        memory: "1Gi",
+        agent_enabled: true,
+        allow_node_local_storage: false,
+        repositories: false,
+        catalog: {},
+        repository: null,
+        cwd: "/repos",
+        model: null,
+        credential_env: [],
+        mcp_servers: null,
+        herdr_space: null,
+        created_at: 1,
+        last_error: null,
+      };
+      if (request.method === "GET" && request.url === "/v1/workspaces") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify([selectedWorkspace]));
+        return;
+      }
+      if (request.method === "POST" && request.url === "/v1/operations") {
+        assert.equal(body.kind, "update");
+        assert.equal(body.workspaceId, selectedId);
+        if (failSelectedWorkspace) failedWorkspaceOperations.add(body.operationId);
+        response.writeHead(202, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          operationId: body.operationId,
+          workspaceId: body.workspaceId,
+          kind: "update",
+          status: failSelectedWorkspace ? "accepted" : "completed",
+          stage: failSelectedWorkspace ? "accepted" : "completed",
+        }));
+        return;
+      }
+      if (request.method === "GET" && request.url?.startsWith("/v1/operations/")) {
+        const operationId = request.url.split("/").at(-1);
+        const failed = failedWorkspaceOperations.has(operationId);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          status: failed ? "failed" : "completed",
+          stage: failed ? "failed" : "completed",
+          lastError: failed ? "injected selected workspace update failure" : null,
+        }));
+        return;
+      }
+      if (request.method === "GET" && request.url === `/v1/workspaces/${selectedId}`) {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          ...selectedWorkspace,
+          image: targetImage,
+        }));
+        return;
+      }
+      const maintenanceResponse = request.url.endsWith("/extend")
+        ? { workspaceIds: [], expiresAt: Math.floor(Date.now() / 1000) + 300 }
+        : {};
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(maintenanceResponse));
+    });
+    lifecycleServer.listen(0, "127.0.0.1");
+    await once(lifecycleServer, "listening");
+    t.after(
+      () =>
+        new Promise((resolve, reject) =>
+          lifecycleServer.close((error) => (error ? reject(error) : resolve())),
+        ),
+    );
+    await mkdir(join(environment.XDG_CONFIG_HOME, "adm"), { recursive: true });
+    await writeFile(
+      join(environment.XDG_CONFIG_HOME, "adm", "config.json"),
+      JSON.stringify({
+        image: "ghcr.io/example/adm-dev:stale-workspace-image",
+        storageClass: "stale-workspace-storage",
+        lifecycle: {
+          url: `http://127.0.0.1:${lifecycleServer.address().port}`,
+          forward: false,
+          namespace: "adm-system",
+          kubectl: fakeKubectl,
+          kubeconfig: "/fixture/kubeconfig",
+        },
+      }),
+    );
+    const updateEnvironment = { ...environment, ADM_PROJECT_DIR: unrelated };
+    const update = await execute(
+      adm,
+      [
+        "update",
+        "--version",
+        "v9.8.7",
+        "--base-url",
+        `http://127.0.0.1:${releaseServer.address().port}`,
+        "--lifecycle-token-file",
+        lifecycleTokenFile,
+        "--kubectl",
+        fakeKubectl,
+      ],
+      { cwd: unrelated, env: updateEnvironment, maxBuffer: 1024 * 1024 },
+    );
+    assert.match(update.stderr, /controller release v9\.8\.7 observed/);
+    assert.equal(await readFile(applied, "utf8"), `image=${targetImage}\n`);
+    const appliedCalls = (await readFile(kubectlLog, "utf8"))
+      .split("\n")
+      .filter((call) => call.startsWith("apply "));
+    assert.equal(appliedCalls.length, 2, "default update applies only the controller namespace and resources");
+    const appliedManifest = await readFile(`${applied}.manifest`, "utf8");
+    assert.match(appliedManifest, /installed-lifecycle-class/);
+    assert.doesNotMatch(appliedManifest, /stale-workspace-storage/);
+    assert.doesNotMatch(appliedManifest, /stale-workspace-image/);
+    assert.equal(
+      (await execute(adm, ["--version"], { cwd: unrelated, env: environment })).stdout,
+      "adm 0.1.0\n",
+    );
+    const selectedUpdate = await execute(
+      adm,
+      [
+        "update",
+        "--version",
+        "v9.8.7",
+        "--base-url",
+        `http://127.0.0.1:${releaseServer.address().port}`,
+        "--lifecycle-token-file",
+        lifecycleTokenFile,
+        "--kubectl",
+        fakeKubectl,
+        "--workspace",
+        "selected-workspace",
+      ],
+      { cwd: unrelated, env: updateEnvironment, maxBuffer: 1024 * 1024 },
+    );
+    assert.match(selectedUpdate.stderr, /selected workspace selected-workspace/);
+    assert.match(selectedUpdate.stderr, /targets immutable ID 55f9ea63-5506-4b39-bab8-49c2fadd0e73/);
+    failSelectedWorkspace = true;
+    await assert.rejects(
+      execute(
+        adm,
+        [
+          "update",
+          "--version",
+          "v9.8.7",
+          "--base-url",
+          `http://127.0.0.1:${releaseServer.address().port}`,
+          "--lifecycle-token-file",
+          lifecycleTokenFile,
+          "--kubectl",
+          fakeKubectl,
+          "--workspace",
+          "selected-workspace",
+        ],
+        { cwd: unrelated, env: updateEnvironment, maxBuffer: 1024 * 1024 },
+      ),
+      (error) =>
+        /adm update --version v9\.8\.7 .*--workspace 55f9ea63-5506-4b39-bab8-49c2fadd0e73 --operation-id [0-9a-f-]{36}/.test(
+          error.stderr,
+        ),
+    );
+
     const terminal = await execute(
       process.execPath,
       [join(installed, "runtime/terminal.mjs"), "--help"],
@@ -255,7 +484,13 @@ test(
       response.end(
         JSON.stringify(
           valid
-            ? { holder, fencingToken: 1 }
+            ? {
+                holder,
+                fencingToken: 1,
+                expiresAt: Math.floor(Date.now() / 1000) + 60,
+                valid: true,
+                check: { valid: true },
+              }
             : { error: { message: "invalid fixture identity or fence" } },
         ),
       );

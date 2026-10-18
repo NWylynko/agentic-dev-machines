@@ -305,6 +305,16 @@ elif args[:2] == ['get','pods']:
             pod_uid=(root/'expected-bot-pod-uid').read_text()
         items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'test-node'},'status':{'phase':'Running','podIP':runtime_ip,'containerStatuses':[{'ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
+elif args[:3] == ['get','deployment','workspace']:
+    namespace=args[args.index('-n')+1]
+    workspace_id=(root/'expected-workspace-id').read_text()
+    labels={'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id,'adm.dev/role':'coding'}
+    print(json.dumps({'kind':'Deployment','metadata':{'name':'workspace','namespace':namespace,'labels':labels},'spec':{'selector':{'matchLabels':labels},'template':{'metadata':{'labels':labels},'spec':{'serviceAccountName':'adm-runtime','volumes':[{'name':'work','persistentVolumeClaim':{'claimName':'work'}}]}}}}))
+elif args[:2] == ['get','pvc'] and args[2] == 'work':
+    namespace=args[args.index('-n')+1]
+    workspace_id=(root/'expected-workspace-id').read_text()
+    labels={'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id,'adm.dev/role':'coding'}
+    print(json.dumps({'kind':'PersistentVolumeClaim','metadata':{'name':'work','namespace':namespace,'labels':labels}}))
 elif args[:2] == ['get','namespace']:
     if args[2] not in state:
         print('Error from server (NotFound): namespaces not found',file=sys.stderr); sys.exit(1)
@@ -340,7 +350,9 @@ elif args[:2] == ['replace','-f']:
     if doc['spec']['holderIdentity']==current['spec']['holderIdentity']:
         (root/'lease-renewed').write_text('yes')
     print(json.dumps(doc))
-elif args[0] == 'wait': pass
+elif args[0] == 'wait':
+    if (root/'fail-wait').exists() and 'deployment/workspace' in args:
+        print('injected workspace rollout readiness failure',file=sys.stderr); sys.exit(1)
 elif args[:2] == ['delete','namespace']:
     if (root/'hold-delete').exists():
         (root/'deleting-entered').write_text('yes')
@@ -1132,6 +1144,7 @@ else:
     .unwrap()
     .json()
     .unwrap();
+    fs::write(root.path().join("expected-workspace-id"), runtime_id).unwrap();
     let runtime_pod_uid = "9d297900-1295-44ed-8fb8-9f3c210cf9fd";
     fs::write(
         root.path().join("expected-namespace"),
@@ -1268,6 +1281,22 @@ else:
             .unwrap()
             .contains(&json!(runtime_id))
     );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/maintenance/extend",
+            Some(&json!({
+                "maintenanceId":"62e0d7b1-54b6-4fbb-8fa7-96aa4fe4ecb0",
+                "durationSeconds":300
+            })),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .status(),
+        400,
+        "a concurrent update must not replace the first update's required acknowledgement set"
+    );
     let extended_renewal: Value = request_with_token(
         &url,
         "POST",
@@ -1327,6 +1356,304 @@ else:
         .status(),
         200
     );
+    let update_operation = "35a7bb46-d770-4cb1-b1cc-5ebdb5fdf734";
+    fs::write(
+        root.path().join("private-file.marker"),
+        "kept workspace files\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("history.marker"), "kept durable history\n").unwrap();
+    let update_request = json!({
+        "operationId":update_operation,
+        "kind":"update",
+        "workspaceId":runtime_id,
+        "image":"ghcr.io/example/adm-dev:explicit-update"
+    });
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&update_request),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let update_receipt: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{update_operation}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "completed")
+    });
+    assert_eq!(update_receipt["kind"], "update");
+    assert_eq!(update_receipt["workspaceId"], runtime_id);
+    let updated_workspace: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/workspaces/{runtime_id}"),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(
+        updated_workspace["image"],
+        "ghcr.io/example/adm-dev:explicit-update"
+    );
+    assert_eq!(updated_workspace["id"], runtime_workspace["id"]);
+    assert_eq!(
+        updated_workspace["namespace"],
+        runtime_workspace["namespace"]
+    );
+    assert_eq!(updated_workspace["cwd"], runtime_workspace["cwd"]);
+    let replacement_pod_uid = "d524ee78-6fc3-4b5e-9bd0-6e6f2ee37fd3";
+    let replacement_token = format!(
+        "target-token:{}:{replacement_pod_uid}",
+        updated_workspace["namespace"].as_str().unwrap()
+    );
+    let original_pod_token = format!(
+        "target-token:{}:{runtime_pod_uid}",
+        updated_workspace["namespace"].as_str().unwrap()
+    );
+    let replacement_response = request_with_token(
+        &url,
+        "POST",
+        &lease_path,
+        Some(&json!({"holder":replacement_pod_uid})),
+        Some(&replacement_token),
+    )
+    .unwrap();
+    let replacement_status = replacement_response.status();
+    let replacement_body = replacement_response.text().unwrap();
+    assert_eq!(replacement_status, 200, "{replacement_body}");
+    let replacement_lease: Value = serde_json::from_str(&replacement_body).unwrap();
+    assert_eq!(replacement_lease["fencingToken"], 2);
+    fs::write(root.path().join("expected-pod-uid"), replacement_pod_uid).unwrap();
+    assert_ne!(
+        request_with_token(
+            &url,
+            "POST",
+            &check_path,
+            Some(&check_body),
+            Some(&original_pod_token),
+        )
+        .unwrap()
+        .status(),
+        200,
+        "the old Pod lease must stay fenced after its planned extension"
+    );
+    let applied_update: Value =
+        serde_json::from_slice(&fs::read(root.path().join("applied")).unwrap()).unwrap();
+    assert_eq!(applied_update["kind"], "Deployment");
+    assert_eq!(
+        applied_update["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "work")
+            .unwrap()["persistentVolumeClaim"]["claimName"],
+        "work"
+    );
+    assert_eq!(
+        applied_update["spec"]["template"]["spec"]["containers"][0]["image"],
+        "ghcr.io/example/adm-dev:explicit-update"
+    );
+    let first_update_attempt =
+        applied_update["spec"]["template"]["metadata"]["annotations"]["adm.dev/update-attempt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    fs::write(root.path().join("hold-apply"), "yes").unwrap();
+    fs::write(root.path().join("apply-release"), "yes").unwrap();
+    fs::write(root.path().join("fail-apply"), "yes").unwrap();
+    let retry_operation = "5f81b5e2-1db5-4f77-91e7-2c1fbeebf429";
+    let retry_request = json!({
+        "operationId":retry_operation,
+        "kind":"update",
+        "workspaceId":runtime_id,
+        "image":"ghcr.io/example/adm-dev:retry-update"
+    });
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&retry_request),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let failed_retry: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{retry_operation}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "failed")
+    });
+    assert!(
+        failed_retry["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("injected deployment admission failure")
+    );
+    fs::remove_file(root.path().join("fail-apply")).unwrap();
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&retry_request),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let retried: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{retry_operation}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "completed")
+    });
+    assert_eq!(retried["workspaceId"], runtime_id);
+    let final_workspace: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/workspaces/{runtime_id}"),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(
+        final_workspace["image"],
+        "ghcr.io/example/adm-dev:retry-update"
+    );
+    assert_eq!(final_workspace["id"], runtime_workspace["id"]);
+    assert_eq!(final_workspace["cwd"], runtime_workspace["cwd"]);
+    let replay_operation = "0149f752-b4b1-4d4d-a37e-83ee93ed29ac";
+    let replay_request = json!({
+        "operationId":replay_operation,
+        "kind":"update",
+        "workspaceId":runtime_id,
+        "image":"ghcr.io/example/adm-dev:retry-update"
+    });
+    fs::write(root.path().join("fail-wait"), "yes").unwrap();
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&replay_request),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let failed_after_apply: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{replay_operation}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "failed")
+    });
+    assert!(
+        failed_after_apply["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("injected workspace rollout readiness failure")
+    );
+    let first_attempt_after_apply: Value =
+        serde_json::from_slice(&fs::read(root.path().join("applied")).unwrap()).unwrap();
+    let first_attempt_after_apply = first_attempt_after_apply["spec"]["template"]["metadata"]
+        ["annotations"]["adm.dev/update-attempt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::remove_file(root.path().join("fail-wait")).unwrap();
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&replay_request),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let replayed_after_apply: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{replay_operation}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "completed")
+    });
+    assert_eq!(replayed_after_apply["workspaceId"], runtime_id);
+    let second_attempt_after_apply: Value =
+        serde_json::from_slice(&fs::read(root.path().join("applied")).unwrap()).unwrap();
+    assert_ne!(
+        first_attempt_after_apply,
+        second_attempt_after_apply["spec"]["template"]["metadata"]["annotations"]["adm.dev/update-attempt"]
+    );
+    assert_ne!(
+        first_update_attempt,
+        second_attempt_after_apply["spec"]["template"]["metadata"]["annotations"]["adm.dev/update-attempt"]
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("private-file.marker")).unwrap(),
+        "kept workspace files\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("history.marker")).unwrap(),
+        "kept durable history\n"
+    );
+    let final_pod_uid = "ae7e7885-3037-4ad4-91e1-1190d2086c64";
+    fs::write(root.path().join("expected-pod-uid"), final_pod_uid).unwrap();
+    let final_pod_token = format!(
+        "target-token:{}:{final_pod_uid}",
+        final_workspace["namespace"].as_str().unwrap()
+    );
+    let final_lease: Value = request_with_token(
+        &url,
+        "POST",
+        &lease_path,
+        Some(&json!({"holder":final_pod_uid})),
+        Some(&final_pod_token),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(final_lease["fencingToken"], 3);
+    let final_lease_body =
+        json!({"holder":final_pod_uid,"fencingToken":final_lease["fencingToken"]});
     let other_pod_lease = json!({"holder":"f8a58e8d-91e7-4a5e-9da8-2591dfbb9fde"});
     assert_eq!(
         request_with_token(
@@ -1358,19 +1685,54 @@ else:
         &url,
         "POST",
         &renew_path,
-        Some(&check_body),
-        Some("runtime-token"),
+        Some(&final_lease_body),
+        Some(&final_pod_token),
     )
     .unwrap()
     .json()
     .unwrap();
-    assert!(renewed["expiresAt"].as_u64().unwrap() >= runtime_lease["expiresAt"].as_u64().unwrap());
+    assert!(renewed["expiresAt"].as_u64().unwrap() >= final_lease["expiresAt"].as_u64().unwrap());
+    let state =
+        rusqlite::Connection::open(root.path().join("state").join("workspaces.sqlite")).unwrap();
+    state
+        .execute(
+            "UPDATE runtime_leases SET expires_at=0 WHERE workspace_id=?1",
+            [runtime_id],
+        )
+        .unwrap();
+    drop(state);
+    let resumed_after_expiry: Value = request_with_token(
+        &url,
+        "POST",
+        &lease_path,
+        Some(&json!({"holder":final_pod_uid})),
+        Some(&final_pod_token),
+    )
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(resumed_after_expiry["fencingToken"], 4);
+    assert_ne!(
+        request_with_token(
+            &url,
+            "POST",
+            &check_path,
+            Some(&final_lease_body),
+            Some(&final_pod_token),
+        )
+        .unwrap()
+        .status(),
+        200,
+        "natural expiry lets the same Pod reacquire with a new token while rejecting stale work"
+    );
     assert_eq!(
         request_with_token(
             &url,
             "POST",
             &check_path,
-            Some(&check_body),
+            Some(&final_lease_body),
             Some("other-workspace-token")
         )
         .unwrap()
@@ -1398,7 +1760,7 @@ else:
             "POST",
             &authorize_path,
             Some(&json!({"action":"status"})),
-            Some("runtime-token")
+            Some(&final_pod_token)
         )
         .unwrap()
         .status(),
@@ -1411,12 +1773,13 @@ else:
             "POST",
             &authorize_path,
             Some(&prompt_action),
-            Some("runtime-token")
+            Some(&final_pod_token)
         )
         .unwrap()
         .status(),
         200
     );
+    fs::write(root.path().join("expected-pod-uid"), runtime_pod_uid).unwrap();
     let bot_operation = "e915a262-bae8-44f7-9da7-fad40d671f52";
     let mut bot_spec = workspace_spec("lifecycle-bot");
     bot_spec["role"] = "bot".into();

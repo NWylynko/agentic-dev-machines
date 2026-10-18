@@ -26,6 +26,7 @@ FROM rust:1.89-bookworm AS adm-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY install.sh ./install.sh
 RUN cargo build --release --bin adm
 
 FROM debian:bookworm-slim AS kubectl-build

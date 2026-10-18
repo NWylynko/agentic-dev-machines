@@ -8,6 +8,7 @@ mod runtime_access;
 mod setup;
 mod setup_connection;
 mod setup_control_plane;
+mod update;
 mod workspaces;
 
 use anyhow::{Context, Result};
@@ -196,6 +197,28 @@ pub enum Action {
     Setup,
     /// Connect this client to an already-installed cluster without changing it.
     Connect,
+    /// Update the managed CLI and controller, optionally upgrading selected workspaces.
+    Update {
+        /// Install a specific published release tag.
+        #[arg(long)]
+        version: Option<String>,
+        /// Use an explicit release asset directory.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Also upgrade this workspace runtime; repeat to select multiple workspaces.
+        #[arg(long = "workspace")]
+        workspaces: Vec<String>,
+        /// Resume the same durable workspace update operation.
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
+    #[command(name = "__update-services", hide = true)]
+    UpdateServices {
+        #[arg(long = "workspace")]
+        workspaces: Vec<String>,
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
     /// Generate shell completion scripts.
     Completions { shell: CompletionShell },
     /// Authenticate a provider for every workspace in this ADM installation.
@@ -289,6 +312,7 @@ impl Cli {
         const MANAGEMENT: &[&str] = &[
             "manifest",
             "setup",
+            "update",
             "connect",
             "login",
             "logout",
@@ -1285,6 +1309,22 @@ fn run(cli: &Cli) -> Result<()> {
         } => diagnostics::doctor(cli, storage_class, *json),
         Action::Setup => setup::run(cli),
         Action::Connect => setup::connect(cli),
+        Action::Update {
+            version,
+            base_url,
+            workspaces,
+            operation_id,
+        } => update::run(
+            cli,
+            version.as_deref(),
+            base_url.as_deref(),
+            workspaces,
+            operation_id.as_deref(),
+        ),
+        Action::UpdateServices {
+            workspaces,
+            operation_id,
+        } => update::update_services(cli, workspaces, operation_id.as_deref()),
         Action::Completions { shell } => {
             let mut command = Cli::command();
             match shell {
@@ -1366,6 +1406,8 @@ fn main() {
             && !matches!(
                 cli.command,
                 Action::Connect
+                    | Action::Update { .. }
+                    | Action::UpdateServices { .. }
                     | Action::Herdr {
                         command: Some(herdr::HerdrAction::RouteShell { .. }),
                     }
@@ -1396,11 +1438,17 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
         cli.command,
         Action::Create(_) | Action::Manifest(_) | Action::Doctor { .. }
     );
+    let update_connection_defaults = matches!(
+        cli.command,
+        Action::Update { .. } | Action::UpdateServices { .. }
+    );
     let connection_defaults = route_shell
         || !matches!(
             cli.command,
             Action::Completions { .. }
                 | Action::Setup
+                | Action::Update { .. }
+                | Action::UpdateServices { .. }
                 | Action::LifecycleServe { .. }
                 | Action::LifecycleForward
                 | Action::Manifest(_)
@@ -1416,15 +1464,20 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
                         | Some(herdr::HerdrAction::CreateSpace { .. })
                 }
         );
-    if connection_defaults && !route_shell && !cli.lifecycle_url_explicit {
+    if (connection_defaults || update_connection_defaults)
+        && !route_shell
+        && !cli.lifecycle_url_explicit
+    {
         cli.lifecycle_forward = true;
         cli.lifecycle_token_secret = cli.lifecycle_token_file.is_none();
     }
-    if !workspace_defaults && !connection_defaults {
+    if !workspace_defaults && !connection_defaults && !update_connection_defaults {
         return Ok(());
     }
     let config = setup::read_config()?;
-    if connection_defaults && let Some(connection) = &config.lifecycle {
+    if (connection_defaults || update_connection_defaults)
+        && let Some(connection) = &config.lifecycle
+    {
         if !cli.lifecycle_url_explicit {
             cli.lifecycle_forward = connection.forward;
             if let Some(url) = &connection.url {
