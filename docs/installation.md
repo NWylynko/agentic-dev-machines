@@ -39,7 +39,7 @@ Ordinary commands open an ephemeral loopback forward to the private lifecycle Se
 
 Automatic setup uses namespace `adm-system`; the local port is selected by kubectl for each command. An explicit `--lifecycle-url` or `ADM_LIFECYCLE_URL` selects a separately managed connection with no automatic fallback. A custom namespace uses `--lifecycle-namespace`. Declining controller installation changes workspace defaults without installing cluster resources. The [lifecycle API guide](lifecycle-api.md) describes the API and authentication boundary.
 
-Process tests cover automatic installation, credential reuse, command-scoped forwarding, connection verification, and visible rollout failures against Kubernetes/HTTP fixtures. The existing live setup record predates portable clients and does not validate this forwarding change across macOS or Linux architectures. See [setup validation](setup-validation-2026-10-17.md) for the older exact image/manifest combination and remaining limits.
+Process tests cover automatic installation, credential reuse, command-scoped forwarding, connection verification, and visible rollout failures against Kubernetes/HTTP fixtures. [Portable Linux client checks](client-validation-2026-10-18.md) verify independent connections and continued Pod work against the existing controller. Native macOS/arm64 execution remains unverified. See [setup validation](setup-validation-2026-10-17.md) for the older exact image/manifest combination and remaining limits.
 
 ### Advanced manual installation
 

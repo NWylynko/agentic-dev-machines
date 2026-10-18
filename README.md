@@ -12,7 +12,7 @@ Run on a macOS or Linux client with Node.js 24+ installed. Supported clients are
 curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/install.sh | sh
 ```
 
-This downloads the release CLI, workspace runtime, terminal, and their dependencies. No clone, Rust, Go, or npm install is needed. Add `~/.local/bin` to your PATH. Rerun the same command to update; settings are preserved.
+This downloads the release CLI, workspace runtime, terminal, and their dependencies. No clone, Rust, Go, or npm install is needed. Add `~/.local/bin` to your PATH. Use `adm update` to update the CLI and owned cluster services; settings are preserved and existing workspace images stay running. Select `adm update --workspace NAME` explicitly to update a workspace image and interrupt its agent.
 
 Successful `main` builds publish a release automatically. See [installation details](docs/installation.md) for pinned versions, prerequisites, and updates.
 
