@@ -96,6 +96,10 @@ try {
   await build({
     entryPoints: {
       runner: join(project, "packages/runner/src/main.ts"),
+      "provider-auth": join(
+        project,
+        "packages/runner/src/provider-auth-main.ts",
+      ),
       terminal: join(project, "packages/terminal/src/main.ts"),
       "shell-management": join(
         project,

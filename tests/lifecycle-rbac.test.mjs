@@ -59,3 +59,47 @@ test("lifecycle may request tokens only for workspace runtime service accounts",
     "the lifecycle controller must not mint additional RBAC grants",
   );
 });
+
+test("provider auth authority shares the lifecycle image and persistent state without a public port", async () => {
+  const documents = YAML.parseAllDocuments(
+    await readFile(
+      new URL("../deploy/lifecycle/control-plane.yaml", import.meta.url),
+      "utf8",
+    ),
+  ).map((document) => document.toJSON());
+  const deployment = documents.find(
+    (document) =>
+      document.kind === "Deployment" &&
+      document.metadata.name === "adm-lifecycle",
+  );
+  assert.ok(deployment);
+  const controller = deployment.spec.template.spec.containers.find(
+    (container) => container.name === "lifecycle",
+  );
+  const authority = deployment.spec.template.spec.containers.find(
+    (container) => container.name === "provider-auth",
+  );
+  assert.ok(controller);
+  assert.ok(authority);
+  assert.deepEqual(authority.command, ["node", "/opt/adm/provider-auth.mjs"]);
+  assert.equal(authority.image, controller.image);
+  assert.ok(
+    authority.volumeMounts.some(
+      (mount) => mount.name === "state" && mount.mountPath === "/var/lib/adm",
+    ),
+    "shared credentials must use the lifecycle persistent volume",
+  );
+  assert.ok(
+    authority.readinessProbe.exec,
+    "a loopback-bound sidecar needs an in-container readiness probe",
+  );
+  const service = documents.find(
+    (document) =>
+      document.kind === "Service" && document.metadata.name === "adm-lifecycle",
+  );
+  assert.ok(service);
+  assert.ok(
+    service.spec.ports.every((port) => port.port !== 7434),
+    "the provider authority must not be exposed as a Service port",
+  );
+});

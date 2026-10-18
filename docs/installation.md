@@ -27,7 +27,7 @@ Run `adm connect` on another client that should use an existing installation. It
 
 Provider login is performed inside a selected workspace and is kept on its private volume. Workspaces always create their durable agent; a model can be selected later in `adm attach` with `/model`.
 
-Configure each workspace's credentials with `adm login NAME` or references to keys in a Secret in that workspace's namespace. For API keys, pass references such as `--credential-env OPENAI_API_KEY=provider-auth:openai`; ADM stores only the environment name and Secret/key reference and maps the value into that workspace's container. No particular secret manager is required. Do not put values in ADM config, service files, or project `.env` files.
+Authenticate once for the ADM installation with `adm login [PROVIDER]`; omitting the provider opens Pi's provider and authentication-method selectors. Use `adm logout PROVIDER` to revoke that shared login. The lifecycle deployment stores provider credentials on its persistent state volume and resolves request auth only after validating the workspace's projected lifecycle identity. Workspace-scoped `--credential-env` Secret references remain available for explicit workspace environment configuration, but are separate from shared provider authentication. Do not put values in ADM config, service files, or project `.env` files.
 
 ## In-cluster lifecycle owner
 

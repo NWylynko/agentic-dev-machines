@@ -177,6 +177,31 @@ spec:
             - name: identity
               mountPath: /var/run/adm-identity
               readOnly: true
+        - name: provider-auth
+          image: ghcr.io/nwylynko/agentic-dev-machines:latest
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/opt/adm/provider-auth.mjs"]
+          ports:
+            - name: provider-auth
+              containerPort: 7434
+          readinessProbe:
+            exec:
+              command: ["node", "-e", "fetch('http://127.0.0.1:7434/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+          livenessProbe:
+            exec:
+              command: ["node", "-e", "fetch('http://127.0.0.1:7434/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/adm
       volumes:
         - name: state
           persistentVolumeClaim:

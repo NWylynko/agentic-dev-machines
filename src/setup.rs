@@ -237,7 +237,7 @@ pub fn run(cli: &Cli) -> Result<()> {
         println!("{}", crate::lifecycle::setup_guidance(cli));
     }
     println!(
-        "Run `adm doctor` to check cluster and lifecycle access, then create a workspace. Use `adm login NAME` to authenticate its private provider store."
+        "Run `adm doctor` to check cluster and lifecycle access, then create a workspace. Use `adm login [PROVIDER]` to authenticate a provider for every workspace."
     );
     Ok(())
 }

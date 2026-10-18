@@ -2,6 +2,7 @@ mod diagnostics;
 mod herdr;
 mod lease;
 mod lifecycle;
+mod provider_auth;
 mod runner;
 mod runtime_access;
 mod setup;
@@ -196,8 +197,10 @@ pub enum Action {
     Connect,
     /// Generate shell completion scripts.
     Completions { shell: CompletionShell },
-    /// Log a provider into this workspace's private durable auth store.
-    Login { name: String },
+    /// Authenticate a provider for every workspace in this ADM installation.
+    Login { provider: Option<String> },
+    /// Revoke the shared provider login.
+    Logout { provider: String },
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
     Herdr {
         #[command(subcommand)]
@@ -287,6 +290,7 @@ impl Cli {
             "setup",
             "connect",
             "login",
+            "logout",
             "start",
             "serve",
             "lifecycle-serve",
@@ -476,6 +480,30 @@ impl Cli {
             );
         }
         lifecycle::request(
+            &self.lifecycle_url,
+            self.lifecycle_token_file.as_deref(),
+            method,
+            path,
+            body,
+        )
+    }
+    pub fn request_lifecycle_wait(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        if self.lifecycle_token_secret && self.lifecycle_token_file.is_none() {
+            let token = lifecycle::kubernetes_token(self)?;
+            return lifecycle::request_with_token_wait(
+                &self.lifecycle_url,
+                Some(&token),
+                method,
+                path,
+                body,
+            );
+        }
+        lifecycle::request_wait(
             &self.lifecycle_url,
             self.lifecycle_token_file.as_deref(),
             method,
@@ -1217,10 +1245,8 @@ fn run(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        Action::Login { name } => {
-            let workspace = cli.active_workspace(name)?;
-            runtime_access::login(cli, &workspace)
-        }
+        Action::Login { provider } => provider_auth::login(cli, provider.as_deref()),
+        Action::Logout { provider } => provider_auth::logout(cli, provider),
         Action::Herdr { command } => {
             herdr::run(cli, command.as_ref().unwrap_or(&herdr::HerdrAction::Hook))
         }

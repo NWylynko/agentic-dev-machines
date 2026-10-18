@@ -165,6 +165,12 @@ test(
       await readFile(join(installed, "IMAGE"), "utf8"),
       "ghcr.io/example/adm:9.8.7\n",
     );
+    assert.ok(
+      (
+        await readFile(join(installed, "runtime/provider-auth.mjs"), "utf8")
+      ).includes("createProviderAuthAuthority"),
+      "the released runtime must include the lifecycle provider-auth authority bundle",
+    );
     const version = await execute(adm, ["--version"], {
       cwd: unrelated,
       env: environment,

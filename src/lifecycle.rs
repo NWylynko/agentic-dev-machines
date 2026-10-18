@@ -488,7 +488,7 @@ fn handle_http(
     let mut bytes = vec![0; content_length];
     reader.read_exact(&mut bytes)?;
     let public_health = method == "GET" && path == "/health";
-    let runtime_route = path.contains("/runtime/") && authorization.starts_with("Bearer ");
+    let runtime_route = is_runtime_auth_route(method, path) && authorization.starts_with("Bearer ");
     let response = if public_health || authorization == format!("Bearer {token}") || runtime_route {
         route(cli, wake, method, path, &bytes, &authorization)
     } else {
@@ -549,6 +549,16 @@ fn handle_http(
     Ok(())
 }
 
+fn is_runtime_auth_route(method: &str, path: &str) -> bool {
+    (method == "GET" && path == "/v1/runtime/workspaces")
+        || (method == "POST" && path == "/v1/runtime/operations")
+        || (method == "POST" && path == "/v1/provider-auth/resolve")
+        || (method == "GET"
+            && path
+                .strip_prefix("/v1/runtime/operations/")
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()))
+}
+
 pub fn request(
     url: &str,
     token_file: Option<&std::path::Path>,
@@ -560,6 +570,19 @@ pub fn request(
         .map(|path| fs::read_to_string(path).context("read lifecycle bearer token file"))
         .transpose()?;
     request_with_token(url, token.as_deref().map(str::trim), method, path, body)
+}
+
+pub fn request_wait(
+    url: &str,
+    token_file: Option<&std::path::Path>,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Value> {
+    let token = token_file
+        .map(|path| fs::read_to_string(path).context("read lifecycle bearer token file"))
+        .transpose()?;
+    request_with_token_wait(url, token.as_deref().map(str::trim), method, path, body)
 }
 
 pub fn kubernetes_token(cli: &crate::Cli) -> Result<String> {
@@ -593,10 +616,41 @@ pub fn request_with_token(
     path: &str,
     body: Option<&Value>,
 ) -> Result<Value> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    request_with_token_timeout(
+        url,
+        token,
+        method,
+        path,
+        body,
+        Some(std::time::Duration::from_secs(30)),
+    )
+}
+
+pub fn request_with_token_wait(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Value> {
+    request_with_token_timeout(url, token, method, path, body, None)
+}
+
+fn request_with_token_timeout(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value> {
+    let client =
+        reqwest::blocking::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
+    let client = if let Some(timeout) = timeout {
+        client.timeout(timeout).build()?
+    } else {
+        client.build()?
+    };
     let method = reqwest::Method::from_bytes(method.as_bytes())?;
     let mut request = client.request(method, format!("{}{path}", url.trim_end_matches('/')));
     if let Some(token) = token {
@@ -648,6 +702,20 @@ fn route(
         ));
     }
     let mut store = cli.store()?;
+    if path.starts_with("/v1/provider-auth/") {
+        cli.check_lifecycle_fence()?;
+    }
+    if method == "POST" && path == "/v1/provider-auth/resolve" {
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
+        ensure!(
+            caller.phase == "ready",
+            "workspace lifecycle is not ready for provider requests"
+        );
+        return proxy_provider_auth(method, path, body);
+    }
+    if path.starts_with("/v1/provider-auth/") {
+        return proxy_provider_auth(method, path, body);
+    }
     if method == "GET" && path == "/v1/runtime/workspaces" {
         cli.check_lifecycle_fence()?;
         let caller = authorize_runtime_caller(cli, &store, authorization)?;
@@ -835,6 +903,50 @@ fn route(
         return Ok((200, lease));
     }
     Ok((404, serde_json::json!({"error":{"code":"NOT_FOUND"}})))
+}
+
+fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Value)> {
+    let login_route = path
+        .strip_prefix("/v1/provider-auth/login/")
+        .is_some_and(|tail| match tail.split_once('/') {
+            Some((operation, suffix)) => {
+                uuid::Uuid::parse_str(operation).is_ok() && matches!(suffix, "events" | "reply")
+            }
+            None => uuid::Uuid::parse_str(tail).is_ok(),
+        });
+    ensure!(
+        matches!(
+            path,
+            "/v1/provider-auth/providers"
+                | "/v1/provider-auth/login"
+                | "/v1/provider-auth/logout"
+                | "/v1/provider-auth/resolve"
+        ) || path.starts_with("/v1/provider-auth/login/") && login_route,
+        "unknown provider auth route"
+    );
+    ensure!(
+        matches!(method, "GET" | "POST" | "DELETE"),
+        "unsupported provider auth method"
+    );
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes())?,
+            format!("http://127.0.0.1:7434{path}"),
+        )
+        .body(body.to_vec())
+        .send()
+        .context("connect to the provider authentication authority")?;
+    let status = response.status().as_u16();
+    let bytes = response
+        .bytes()
+        .context("read provider authentication response")?;
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).context("decode provider authentication response")?
+    };
+    Ok((status, value))
 }
 
 fn enrich_runtime_status(cli: &crate::Cli, workspaces: &mut [Workspace]) -> Result<()> {
@@ -1328,4 +1440,102 @@ pub(crate) fn authorize_runtime_caller(
     );
     store.check_runtime_owner(&source.id, &pod_uid)?;
     Ok(source)
+}
+
+#[cfg(test)]
+mod provider_auth_wait_tests {
+    use super::*;
+    use clap::Parser;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+    };
+
+    #[test]
+    fn projected_identity_bypass_is_limited_to_exact_runtime_routes() {
+        assert!(is_runtime_auth_route("POST", "/v1/provider-auth/resolve"));
+        assert!(is_runtime_auth_route("GET", "/v1/runtime/workspaces"));
+        assert!(is_runtime_auth_route("POST", "/v1/runtime/operations"));
+        assert!(is_runtime_auth_route(
+            "GET",
+            "/v1/runtime/operations/00000000-0000-4000-8000-000000000001"
+        ));
+        assert!(!is_runtime_auth_route("POST", "/v1/provider-auth/logout"));
+        assert!(!is_runtime_auth_route(
+            "GET",
+            "/v1/runtime/operations/../../provider-auth/logout"
+        ));
+        assert!(!is_runtime_auth_route(
+            "POST",
+            "/v1/runtime/operations/00000000-0000-4000-8000-000000000001"
+        ));
+    }
+
+    #[test]
+    fn arbitrary_pod_bearers_cannot_reach_provider_admin_routes_over_lifecycle_http() {
+        let cli = crate::Cli::try_parse_from(["adm", "login"]).unwrap();
+        let (wake, _receiver) = mpsc::channel();
+        for path in [
+            "/v1/provider-auth/logout",
+            "/v1/runtime/operations/00000000-0000-4000-8000-000000000001/../provider-auth/logout",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = thread::spawn(move || {
+                let mut socket = TcpStream::connect(address).unwrap();
+                write!(socket, "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer arbitrary-pod-token\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+                let mut response = String::new();
+                socket.read_to_string(&mut response).unwrap();
+                response
+            });
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_http(&cli, &wake, "lifecycle-admin-secret", &mut stream).unwrap();
+            drop(stream);
+            assert!(
+                client
+                    .join()
+                    .unwrap()
+                    .starts_with("HTTP/1.1 401 Unauthorized")
+            );
+        }
+    }
+
+    #[test]
+    fn provider_login_event_waits_for_browser_completion_without_standard_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).unwrap();
+            received_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let body = br#"{"event":{"type":"complete"},"done":true}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
+        });
+        let url = format!("http://{address}");
+        let client = thread::spawn(move || {
+            request_with_token_wait(
+                &url,
+                Some("synthetic-lifecycle-token"),
+                "GET",
+                "/v1/provider-auth/login/op/events",
+                None,
+            )
+        });
+        received_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(client.join().unwrap().unwrap()["event"]["type"], "complete");
+        server.join().unwrap();
+    }
 }

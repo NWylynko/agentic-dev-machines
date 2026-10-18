@@ -4,7 +4,7 @@ These notes distinguish confirmed requirements, implemented local behavior, and 
 
 The implementation target changed on 2026-10-16: all agent execution and durable state belong in workspace Pods; the management host is an access plane. Placement proposals in the earlier investigation below are historical.
 
-Decisions confirmed on 2026-10-18 further define the target: clients already have Tailscale and Kubernetes access; ordinary ADM use needs no permanent management host or mandatory client daemon. A stock-Herdr bridge is optional per device, provider login is shared across the installation, and default updates leave active workspace images and agents running. Command-scoped client forwarding and separate operator setup/client connect flows are now implemented. Shared provider login, optional Herdr bridging, and the update behavior remain requirements whose implementation and live acceptance are tracked separately.
+Decisions confirmed on 2026-10-18 further define the target: clients already have Tailscale and Kubernetes access; ordinary ADM use needs no permanent management host or mandatory client daemon. A stock-Herdr bridge is optional per device, provider login is shared across the installation, and default updates leave active workspace images and agents running. Command-scoped client forwarding, separate operator setup/client connect flows, and the cluster-owned provider authority are implemented. Live provider login and cluster restart acceptance remain unverified. Optional Herdr bridging and the update behavior remain requirements whose implementation and live acceptance are tracked separately.
 
 ## Confirmed requirements
 
@@ -293,7 +293,7 @@ Bot activity must have an explicit owning Herdr space. Removing its owning space
 
 ### Providers and unattended limits
 
-The confirmed target is one shared account per provider per ADM installation. Login must become available to every existing and new coding and bot agent, sharing that account's billing and rate limits without repeating login in each workspace. Authentication ownership belongs in the cluster and must not depend on a connected client. Credential delivery and refresh ownership remain implementation choices; the current `adm login NAME` flow still stores provider login within the selected workspace.
+The confirmed target is one shared account per provider per ADM installation. Login is available to every existing and new coding and bot agent, sharing that account's billing and rate limits without repeating login in each workspace. The lifecycle deployment stores credentials and owns serialized refresh; it resolves request auth after lifecycle authorization validates the caller's exact projected Pod identity and current lease. Refresh tokens do not enter workspace Pods. `adm logout PROVIDER` removes central credentials, so subsequent requests fail explicitly. Live provider login and cluster restart acceptance remain unverified.
 
 Keep model/provider authentication configurable; no provider migration, API billing arrangement, or numeric spending limit has been selected. Validate the supported account/authentication path with the chosen harness instead of assuming a subscription works through every integration.
 

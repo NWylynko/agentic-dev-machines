@@ -32,7 +32,7 @@ On another client that only needs access to an already-installed cluster, run `a
 
 Setup asks for the image, storage class, and optional default model, then offers to install or update the cluster controller. Client commands use the selected kubeconfig to open a temporary authenticated port-forward and close it when the command exits. No system service or permanent management host is required. See [installation details](docs/installation.md#in-cluster-lifecycle-owner) for prerequisites and advanced manual installation.
 
-Every workspace starts with its durable agent. Choose a default model during setup or pass `--model PROVIDER/MODEL_ID` when creating a workspace; otherwise select one in `adm attach` with `/model`. Provider credentials belong to each workspace and are not copied from the management host.
+Every workspace starts with its durable agent. Choose a default model during setup or pass `--model PROVIDER/MODEL_ID` when creating a workspace; otherwise select one in `adm attach` with `/model`. Authenticate a provider once for the installation with `adm login [PROVIDER]`; use `adm logout PROVIDER` to revoke that shared login. Refresh credentials stay on the lifecycle persistent volume and are never copied into workspace Pods.
 
 Work inside `/repos`. A plain workspace starts empty; clone there, or use `adm create my-project --repo OWNER/REPO` to prepare a checkout and start the shell and agent in it. See [repository navigation](docs/operations.md#find-your-repositories) for plain and lazy-catalog examples.
 

@@ -1,5 +1,5 @@
 # Development workspace image referenced by adm manifests as adm-dev:0.1.0.
-# Provider credentials are injected into each runtime Pod; the image contains no provider keys.
+# Provider refresh credentials live in the lifecycle persistent volume; the image contains no keys.
 
 FROM golang:1.26.5-bookworm AS go-build
 WORKDIR /src/repositories
@@ -18,6 +18,7 @@ COPY packages/terminal/package.json packages/terminal/package.json
 RUN npm ci --ignore-scripts
 COPY packages/runner packages/runner
 RUN npx esbuild packages/runner/src/main.ts --bundle --platform=node --format=esm --packages=external --outfile=/out/runner.mjs \
+ && npx esbuild packages/runner/src/provider-auth-main.ts --bundle --platform=node --format=esm --packages=external --outfile=/out/provider-auth.mjs \
  && npx esbuild packages/runner/src/remote-env-server.ts --bundle --platform=node --format=esm --outfile=/out/workspace-env.mjs \
  && npm prune --omit=dev --ignore-scripts
 
@@ -65,6 +66,7 @@ COPY image/zshrc /usr/local/share/adm/zshrc
 COPY --from=go-build /out/adm-repositories /usr/local/bin/adm-repositories
 COPY --from=go-build /go/bin/artifact-fs /usr/local/bin/artifact-fs
 COPY --from=js-build /out/runner.mjs /opt/adm/runner.mjs
+COPY --from=js-build /out/provider-auth.mjs /opt/adm/provider-auth.mjs
 COPY --from=js-build /src/node_modules /opt/adm/node_modules
 COPY packages/repositories/git /usr/local/lib/adm-repositories/git
 COPY image/adm-dev-entrypoint /usr/local/bin/adm-dev-entrypoint

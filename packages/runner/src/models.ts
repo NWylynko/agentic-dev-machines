@@ -7,6 +7,7 @@ import {
   type FauxResponseFactory,
 } from "@earendil-works/pi-ai/providers/faux";
 import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 import { workspaceCredentialRuntime } from "./credentials.ts";
 
 export async function workspaceModels(
@@ -15,17 +16,21 @@ export async function workspaceModels(
   workspaceRoot = "/workspace",
 ): Promise<Models> {
   if (provider !== "faux") {
-    if (!authPath)
-      return workspaceCredentialRuntime(workspaceRoot, {
-        allowModelNetwork: true,
-      });
-    const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
-    return ModelRuntime.create({
-      authPath,
-      modelsStorePath: join(workspaceRoot, ".adm", "pi", "models-store.json"),
+    const runtime = await workspaceCredentialRuntime(workspaceRoot, {
       allowModelNetwork: true,
-      refreshOnCreate: false,
+      ...(authPath
+        ? {
+            authPath,
+            modelsStorePath: join(
+              workspaceRoot,
+              ".adm",
+              "pi",
+              "models-store.json",
+            ),
+          }
+        : {}),
     });
+    return configureSharedProviderAuth(runtime);
   }
   const models = createModels();
   const faux = fauxProvider({ tokensPerSecond: 100_000 });
@@ -105,4 +110,58 @@ export async function workspaceModels(
   faux.setResponses([answer]);
   models.setProvider(faux.provider);
   return models;
+}
+
+export async function configureSharedProviderAuth<
+  T extends {
+    getProviders(): readonly { id: string }[];
+    getProvider(id: string): any;
+    registerNativeProvider(provider: any): void;
+  },
+>(runtime: T, selectedProviders?: readonly string[]): Promise<T> {
+  const lifecycleUrl = process.env.ADM_LIFECYCLE_URL;
+  if (!lifecycleUrl) return runtime;
+  const identityFile =
+    process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE ??
+    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+  for (const id of selectedProviders ??
+    runtime.getProviders().map(({ id }) => id)) {
+    const provider = runtime.getProvider(id);
+    if (!provider) continue;
+    const name =
+      provider.auth.oauth?.name ?? provider.auth.apiKey?.name ?? provider.name;
+    runtime.registerNativeProvider({
+      ...provider,
+      auth: {
+        apiKey: {
+          name,
+          resolve: async ({ signal }: { signal: AbortSignal }) => {
+            const token = (await readFile(identityFile, "utf8")).trim();
+            if (!token)
+              throw new Error("Projected lifecycle identity token is empty");
+            const response = await fetch(
+              `${lifecycleUrl.replace(/\/$/, "")}/v1/provider-auth/resolve`,
+              {
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  "content-type": "application/json",
+                },
+                body: JSON.stringify({ provider: id }),
+                signal,
+              },
+            );
+            if (response.status === 401)
+              throw new Error("Provider is not authenticated");
+            if (!response.ok)
+              throw new Error(
+                `Shared provider authentication failed (${response.status})`,
+              );
+            return await response.json();
+          },
+        },
+      },
+    });
+  }
+  return runtime;
 }

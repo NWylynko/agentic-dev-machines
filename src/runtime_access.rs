@@ -322,58 +322,10 @@ pub fn managed_shell(
     Ok(())
 }
 
-fn provider_login_args() -> [&'static str; 5] {
-    [
-        "--no-session",
-        "--no-tools",
-        "--no-extensions",
-        "--no-skills",
-        "--no-prompt-templates",
-    ]
-}
-
-pub fn login(cli: &Cli, workspace: &Workspace) -> Result<()> {
-    let (pod, _, container) = pod_identity(cli, workspace)?;
-    let status = cli
-        .kubectl_command()?
-        .args([
-            "exec",
-            "-it",
-            "-n",
-            &workspace.namespace,
-            &pod,
-            "-c",
-            &container,
-            "--",
-            "env",
-            "PI_CODING_AGENT_DIR=/workspace/.adm/pi",
-            "node",
-            "/opt/adm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
-        ])
-        .args(provider_login_args())
-        .status()
-        .context("open provider login inside workspace Pod")?;
-    ensure!(status.success(), "provider login exited with {status}");
-    Ok(())
-}
-
 #[cfg(test)]
 mod forward_pipe_tests {
     use super::*;
 
-    #[test]
-    fn provider_login_disables_all_coding_tools_and_persistent_sessions() {
-        assert_eq!(
-            provider_login_args(),
-            [
-                "--no-session",
-                "--no-tools",
-                "--no-extensions",
-                "--no-skills",
-                "--no-prompt-templates",
-            ]
-        );
-    }
     use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Instant};
 
     #[test]
