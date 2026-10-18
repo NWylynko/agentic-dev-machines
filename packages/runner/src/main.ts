@@ -20,6 +20,7 @@ import { timingSafeEqual } from "node:crypto";
 import { parseArgs } from "node:util";
 import { DatabaseSync } from "node:sqlite";
 import { Workspace } from "./workspace.ts";
+import { WorkspaceResources } from "./resources.ts";
 import {
   failLifecycleAvailability,
   lifecycleAvailabilityError,
@@ -54,6 +55,7 @@ const host = values.host!,
   port = Number(values.port),
   stateDirectory = values["state-dir"]!;
 const tokenFile = values["token-file"];
+const workspaceResources = new Map<string, WorkspaceResources>();
 const lifecycleUrl = values["lifecycle-url"] ?? process.env.ADM_LIFECYCLE_URL;
 if (!["127.0.0.1", "::1", "localhost"].includes(host) && !lifecycleUrl)
   throw new Error(
@@ -1132,7 +1134,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|resources\/reload|resources|trust))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1459,6 +1461,50 @@ const server = createServer(async (request, response) => {
           await workspace.reset(data.handoff as string | undefined),
         );
       });
+    }
+    if (
+      action === "resources" ||
+      action === "resources/reload" ||
+      action === "trust"
+    ) {
+      let resources = workspaceResources.get(id);
+      if (!resources) {
+        resources = new WorkspaceResources(
+          workspace.config,
+          join(stateDirectory, "sessions", id),
+        );
+        workspaceResources.set(id, resources);
+      }
+      if (request.method === "GET" && action === "resources")
+        return json(response, 200, await resources.get());
+      if (request.method === "GET" && action === "trust")
+        return json(response, 200, resources.trust());
+      if (request.method === "PUT" && action === "trust") {
+        const data = await body(request);
+        if (typeof data.trusted !== "boolean" && !Array.isArray(data.updates))
+          throw new ApiError(
+            400,
+            "INVALID_TRUST",
+            "trusted must be a boolean or updates must contain project trust decisions",
+          );
+        return await serialized(async () => {
+          await assertActive(id, requestSignal);
+          return json(
+            response,
+            200,
+            Array.isArray(data.updates)
+              ? await resources.setTrustUpdates(
+                  data.updates as { path: string; decision: boolean | null }[],
+                )
+              : await resources.setTrust(data.trusted as boolean),
+          );
+        });
+      }
+      if (request.method === "POST" && action === "resources/reload")
+        return await serialized(async () => {
+          await assertActive(id, requestSignal);
+          return json(response, 200, await resources.reload());
+        });
     }
     if (request.method === "GET" && action === "settings")
       return json(response, 200, await workspace.settings());
