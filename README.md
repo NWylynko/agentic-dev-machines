@@ -25,7 +25,6 @@ adm setup
 adm list
 adm doctor
 adm create my-project
-adm attach my-project
 ```
 
 On another client that only needs access to an already-installed cluster, run `adm connect`; it verifies access and saves that device's kubeconfig selection without installing cluster resources.
@@ -35,6 +34,8 @@ Setup asks for the image, storage class, and optional default model, then offers
 Every workspace starts with its durable agent. Choose a default model during setup or pass `--model PROVIDER/MODEL_ID` when creating a workspace; otherwise select one in `adm attach` with `/model`. Authenticate a provider once for the installation with `adm login [PROVIDER]`; use `adm logout PROVIDER` to revoke that shared login. Refresh credentials stay on the lifecycle persistent volume and are never copied into workspace Pods.
 
 Work inside `/repos`. A plain workspace starts empty; clone there, or use `adm create my-project --repo OWNER/REPO` to prepare a checkout and start the shell and agent in it. See [repository navigation](docs/operations.md#find-your-repositories) for plain and lazy-catalog examples.
+
+In an interactive terminal, `adm create` attaches to the new workspace's durable agent when it is ready. Noninteractive use returns workspace JSON; pass `--no-attach` to force creation-only behavior.
 
 See [operations](docs/operations.md) for commands, Herdr integration, bots, and verification; [the implementation contract](docs/implementation-contract.md) for APIs; and [product requirements](docs/product-requirements.md) for the design and open decisions.
 

@@ -111,6 +111,9 @@ pub struct CredentialEnvRef {
 #[derive(Args)]
 pub struct CreateOptions {
     pub name: String,
+    /// Return the created workspace without opening an attached terminal.
+    #[arg(long)]
+    pub no_attach: bool,
     /// Stable lifecycle operation UUID used to replay this create request.
     #[arg(long)]
     pub operation_id: Option<String>,

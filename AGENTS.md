@@ -2,6 +2,7 @@ keep this file up to date
 
 # Project notes
 
+- Implemented interactive create handoff (2026-10-18): when stdin/stdout are terminals, successful `adm create NAME` enters the existing durable agent once. `--no-attach` forces ready-record JSON for scripts; nonterminal invocations remain creation-only. A failed attach reports the created immutable workspace ID and `adm attach NAME` recovery. Detaching leaves the workspace running. Herdr new-space creation is still pending TASK-59 integration with TASK-55.
 - Implemented workspace summary presentation (2026-10-18): human `adm list` and `adm status NAME` share `NAME ROLE PHASE AGENT CONFIG RUNTIME ACTIVITY NODE ID` fields. Their core rows use the lifecycle directory's bounded Pod/runtime observation; selected-status detail JSON remains available separately. Agent configuration and activity remain distinct, unavailable runtime/activity causes are shown with workspace name and immutable ID, and an observed Failed Pod retains its node and failure cause.
 - Implemented client connection boundary (2026-10-18): ordinary lifecycle commands can use a command-scoped `kubectl port-forward` to the in-cluster service, fetch the lifecycle Secret in memory, and close only their own forward on exit. Setup installs the cluster controller separately and does not install a device service. Native client installers target Linux amd64/arm64 and macOS x86_64/arm64; this release matrix still needs CI/live acceptance on each native platform. An explicit lifecycle URL remains an explicit connection choice.
 

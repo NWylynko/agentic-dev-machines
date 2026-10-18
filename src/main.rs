@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource};
 use serde_json::{Value, json};
 use std::{
+    io::IsTerminal,
     path::PathBuf,
     process::{Command, Stdio},
     thread,
@@ -969,7 +970,22 @@ fn run(cli: &Cli) -> Result<()> {
                 "create",
                 &workspace.name,
             )?;
-            print_json(&workspace)
+            let attach = !options.no_attach
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal();
+            if !attach {
+                return print_json(&workspace);
+            }
+            eprintln!(
+                "adm: workspace {} is ready; attaching to its durable agent",
+                workspace.name
+            );
+            runtime_access::attach(cli, &workspace, false).with_context(|| {
+                format!(
+                    "workspace {} was created with ID {}, but attach failed; recover with `adm attach {}`",
+                    workspace.name, workspace.id, workspace.name
+                )
+            })
         }
         Action::Manifest(options) => print_json(&workspaces::manifest(&options.workspace()?)?),
         Action::List { all, json } => {

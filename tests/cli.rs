@@ -5,7 +5,7 @@ use std::{
     net::TcpListener,
     os::unix::fs::{PermissionsExt, symlink},
     os::unix::net::UnixListener,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
 use tempfile::TempDir;
@@ -104,6 +104,86 @@ fn configure_lifecycle(command: &mut Command, root: &Path) {
             .arg("--lifecycle-token-file")
             .arg(root.join("lifecycle-token"));
     }
+}
+
+fn interactive_cli(
+    root: &Path,
+    project: &Path,
+    arguments: &[&str],
+) -> (std::process::ExitStatus, String) {
+    use std::os::fd::{FromRawFd, RawFd};
+
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "open a PTY for the public CLI"
+    );
+    let master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    let node_path = root.join("node-bin");
+    let path = format!(
+        "{}:{}:{}",
+        node_path.display(),
+        root.join("herdr-bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("ADM_ATTACH_TEST_ROOT", root)
+        .env("PATH", path)
+        .arg("--project-dir")
+        .arg(project)
+        .arg("--state-dir")
+        .arg(root.join("state"))
+        .arg("--kubectl")
+        .arg(root.join("kubectl"))
+        .args(["--runner-url"])
+        .arg(fs::read_to_string(root.join("runner-url")).unwrap())
+        .args(arguments)
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave))
+        .stderr(Stdio::piped());
+    configure_lifecycle(&mut command, root);
+    let mut child = command.spawn().expect("start interactive public CLI");
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    drop(master);
+    (status, stderr)
+}
+
+fn install_terminal_fixture(root: &Path) -> PathBuf {
+    fs::write(root.join("attach-fixture"), "enable runtime Pod identity").unwrap();
+    let project = root.join("installed-adm");
+    fs::create_dir_all(project.join("runtime")).unwrap();
+    fs::write(project.join("runtime/terminal.mjs"), "").unwrap();
+    let node = root.join("node-bin/node");
+    fs::create_dir_all(node.parent().unwrap()).unwrap();
+    fs::write(
+        &node,
+        "#!/usr/bin/env python3\nimport json, os, pathlib, sys\nroot=pathlib.Path(os.environ['ADM_ATTACH_TEST_ROOT'])\nwith (root/'attach-invocations.jsonl').open('a') as log: log.write(json.dumps(sys.argv[1:])+'\\n')\nidentity=pathlib.Path(sys.argv[sys.argv.index('--identity-file')+1])\n(root/'attach-identity.json').write_text(identity.read_text())\nsys.exit(7 if (root/'fail-terminal').exists() else 0)\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&node).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(node, permissions).unwrap();
+    project
 }
 
 fn start_runner_stub() -> (String, u16, std::thread::JoinHandle<()>) {
@@ -369,12 +449,23 @@ elif args[:2] == ['get','pods'] and '-n' in args:
     print(json.dumps({'items':[{'metadata':{'name':'workspace-123'},'spec':{'nodeName':'node-a'},'status':status}]}))
 elif args[:2] == ['get','pods']:
     items=[]
+    attach_fixture=pathlib.Path(__file__).parent.joinpath('attach-fixture').exists()
     for namespace, resource in state.items():
         workspace_id=resource['metadata'].get('labels',{}).get('adm.dev/workspace-id')
         failed = (pathlib.Path(__file__).parent / 'failed-pod').exists()
-        pod_status = {'phase':'Failed' if failed else 'Running','message':'workspace process exited unexpectedly' if failed else None,'containerStatuses':[{'ready':not failed,'state':{'terminated':{'reason':'Error'}} if failed else {'running':{}}}]}
-        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'node-a'},'status':pod_status})
+        metadata={'name':'workspace-pod','namespace':namespace,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}}
+        spec={'nodeName':'node-a'}
+        status={'phase':'Failed' if failed else 'Running','message':'workspace process exited unexpectedly' if failed else None,'containerStatuses':[{'ready':not failed,'state':{'terminated':{'reason':'Error'}} if failed else {'running':{}}}]}
+        if attach_fixture:
+            metadata['uid']='8b7dcaa0-fb7b-4e43-a668-23a2ae131a0a'
+            spec['serviceAccountName']='adm-runtime'
+            status.update({'podIP':'127.0.0.1','conditions':[{'type':'Ready','status':'True'}],'containerStatuses':[{'name':'dev','ready':True,'state':{'running':{}}}]})
+        items.append({'kind':'Pod','metadata':metadata,'spec':spec,'status':status})
     print(json.dumps({'kind':'PodList','items':items}))
+elif args[:2] == ['get','pod']:
+    namespace=args[args.index('-n')+1]
+    workspace_id=state[namespace]['metadata']['labels']['adm.dev/workspace-id']
+    print(json.dumps({'metadata':{'name':args[2],'namespace':namespace,'uid':'8b7dcaa0-fb7b-4e43-a668-23a2ae131a0a','labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'serviceAccountName':'adm-runtime'},'status':{'phase':'Running','conditions':[{'type':'Ready','status':'True'}]}}))
 elif args[:2] == ['get', 'storageclass']:
     if (pathlib.Path(__file__).parent / 'missing-storage').exists():
         print('Error from server (NotFound): storageclass adm-replicated not found',file=sys.stderr);sys.exit(1)
@@ -436,6 +527,9 @@ elif args and args[0] == 'exec':
         if fail_after_clone.exists(): env['ADM_TEST_FAIL_AFTER_CLONE']=str(fail_after_clone)
         result = subprocess.run(command, cwd=repos, env=env)
         sys.exit(result.returncode)
+elif args and args[0] == 'port-forward':
+    print('Forwarding from 127.0.0.1:43127 -> 7432', flush=True)
+    __import__('time').sleep(60)
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
 "##).unwrap();
     fs::set_permissions(kubectl, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1219,6 +1313,118 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
     assert_eq!(
         &actual[command_start..],
         ["printf", "%s", "argument with spaces"]
+    );
+}
+
+#[test]
+fn create_no_attach_keeps_the_ready_workspace_json_for_automation() {
+    let root = fixture();
+    let output = adm(
+        root.path(),
+        &["create", "create-only", "--no-repositories", "--no-attach"],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace: Value = serde_json::from_slice(&output.stdout)
+        .expect("creation-only output stays machine-readable JSON");
+    assert_eq!(workspace["name"], "create-only");
+    assert_eq!(workspace["phase"], "ready");
+    assert!(!root.path().join("exec-args.json").exists());
+}
+
+#[test]
+fn interactive_create_attaches_once_to_the_created_workspace() {
+    let root = fixture();
+    let project = install_terminal_fixture(root.path());
+    let (status, stderr) = interactive_cli(
+        root.path(),
+        &project,
+        &["create", "interactive-create", "--no-repositories"],
+    );
+
+    assert!(
+        status.success(),
+        "CLI failed during interactive handoff: {stderr}"
+    );
+    let calls = fs::read_to_string(root.path().join("attach-invocations.jsonl")).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "one attach terminal must be launched"
+    );
+    let identity: Value =
+        serde_json::from_slice(&fs::read(root.path().join("attach-identity.json")).unwrap())
+            .unwrap();
+    let cluster: Value =
+        serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
+    assert_eq!(
+        cluster[identity["namespace"].as_str().unwrap()]["metadata"]["labels"]["adm.dev/workspace-id"],
+        identity["workspaceId"],
+        "terminal identity must be the workspace created by this command"
+    );
+}
+
+#[test]
+fn attach_failure_reports_partial_success_and_direct_recovery_command() {
+    let root = fixture();
+    let project = install_terminal_fixture(root.path());
+    fs::write(root.path().join("fail-terminal"), "fail attach").unwrap();
+
+    let (status, stderr) = interactive_cli(
+        root.path(),
+        &project,
+        &["create", "attach-fails", "--no-repositories"],
+    );
+
+    assert!(!status.success(), "terminal failure must remain visible");
+    let identity: Value =
+        serde_json::from_slice(&fs::read(root.path().join("attach-identity.json")).unwrap())
+            .unwrap();
+    let workspace_id = identity["workspaceId"].as_str().unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "workspace attach-fails was created with ID {workspace_id}"
+        )),
+        "partial success must identify the created workspace: {stderr}"
+    );
+    assert!(
+        stderr.contains("recover with `adm attach attach-fails`"),
+        "partial success must give the precise recovery command: {stderr}"
+    );
+    let cluster: Value =
+        serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
+    assert_eq!(
+        cluster[identity["namespace"].as_str().unwrap()]["metadata"]["labels"]["adm.dev/workspace-id"],
+        identity["workspaceId"],
+        "the workspace remains registered after attach failure"
+    );
+}
+
+#[test]
+fn interactive_create_failure_does_not_launch_the_terminal() {
+    let root = fixture();
+    let project = install_terminal_fixture(root.path());
+    fs::write(root.path().join("missing-storage"), "fail provision").unwrap();
+
+    let (status, stderr) = interactive_cli(
+        root.path(),
+        &project,
+        &["create", "create-fails", "--no-repositories"],
+    );
+
+    assert!(!status.success(), "storage validation must fail creation");
+    assert!(
+        stderr.contains("storageclass adm-replicated not found"),
+        "the creation cause stays visible: {stderr}"
+    );
+    assert!(
+        !root.path().join("attach-invocations.jsonl").exists(),
+        "failed creation must not launch a terminal"
     );
 }
 
