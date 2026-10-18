@@ -335,6 +335,8 @@ path = pathlib.Path(__file__).parent / 'cluster.json'
 state = json.loads(path.read_text()) if path.exists() else {}
 args = sys.argv[1:]
 args = [arg for arg in args if not arg.startswith('--request-timeout=')]
+if args[:2] == ['get','pods']:
+    with open(pathlib.Path(__file__).parent / 'kubectl-pod-calls', 'a') as calls: calls.write(json.dumps(args)+'\n')
 def wait_for_release(stage):
     if not (pathlib.Path(__file__).parent / ('delay-'+stage)).exists(): return
     entered=pathlib.Path(__file__).parent / ('entered-'+stage)
@@ -689,6 +691,10 @@ fn list_uses_the_directory_and_keeps_full_records_with_json() {
     ));
     let bot = assert_ok(adm(root.path(), &["create", "observer", "--role", "bot"]));
 
+    let pod_calls = root.path().join("kubectl-pod-calls");
+    if pod_calls.exists() {
+        fs::remove_file(&pod_calls).unwrap();
+    }
     let table = adm(root.path(), &["list"]);
     assert!(
         table.status.success(),
@@ -696,6 +702,11 @@ fn list_uses_the_directory_and_keeps_full_records_with_json() {
         String::from_utf8_lossy(&table.stderr)
     );
     let table = String::from_utf8_lossy(&table.stdout);
+    assert_eq!(
+        fs::read_to_string(pod_calls).unwrap().lines().count(),
+        1,
+        "list should collect one bounded Pod inventory for all workspaces"
+    );
     assert!(
         table.contains("NAME")
             && table.contains("ROLE")
@@ -1290,6 +1301,80 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
 }
 
 #[test]
+fn list_and_status_render_the_same_core_workspace_observation() {
+    let root = fixture();
+    let workspace = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
+
+    let list = adm(root.path(), &["list"]);
+    assert!(list.status.success(), "{list:?}");
+    let list = String::from_utf8_lossy(&list.stdout);
+    let status = adm(root.path(), &["status", "demo"]);
+    assert!(status.status.success(), "{status:?}");
+    let status = String::from_utf8_lossy(&status.stdout);
+
+    let expected_headers = [
+        "NAME",
+        "ROLE",
+        "PHASE",
+        "AGENT CONFIG",
+        "RUNTIME",
+        "ACTIVITY",
+        "NODE",
+        "ID",
+    ];
+    let list_headers = list
+        .lines()
+        .next()
+        .unwrap()
+        .split("  ")
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .collect::<Vec<_>>();
+    let status_headers = status
+        .lines()
+        .next()
+        .unwrap()
+        .split("  ")
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(list_headers, expected_headers);
+    assert_eq!(status_headers, expected_headers);
+
+    let list_row = list
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let status_row = status
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    assert_eq!(list_row, status_row);
+    assert_eq!(list_row[0], "demo");
+    assert_eq!(list_row[1], "coding");
+    assert_eq!(list_row[2], workspace["phase"]);
+    assert_eq!(list_row[3], "enabled");
+    assert_eq!(list_row[4], "Ready");
+    assert_eq!(list_row[5], "unavailable");
+    assert_eq!(list_row[6], "node-a");
+    assert_eq!(list_row[7], workspace["id"]);
+    assert!(status.contains("workspace Pod has no valid IP address"));
+
+    let details = assert_ok(adm(root.path(), &["status", "demo", "--json"]));
+    assert_eq!(details["workspace"]["id"], workspace["id"]);
+    assert_eq!(details["cluster"]["pods"][0]["status"]["phase"], "Running");
+    assert_eq!(
+        details["cluster"]["pods"][0]["status"]["conditions"][0]["status"], "False",
+        "the shared summary must use the lifecycle directory observation"
+    );
+    assert_eq!(details["agent"]["status"], "unavailable");
+}
+
+#[test]
 fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     let root = fixture();
     let coding = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));
@@ -1306,15 +1391,17 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
         status.contains("NAME")
             && status.contains("ROLE")
             && status.contains("PHASE")
+            && status.contains("AGENT CONFIG")
             && status.contains("RUNTIME")
             && status.contains("ACTIVITY")
-            && status.contains("NODE"),
+            && status.contains("NODE")
+            && status.contains("ID"),
         "{status}"
     );
     assert!(
         status.contains("demo")
             && status.contains("coding")
-            && status.contains("NotReady (Running)")
+            && status.contains("Ready")
             && status.contains("unavailable")
             && status.contains("workspace Pod has no valid IP address")
             && status.contains("node-a")
@@ -1338,6 +1425,11 @@ fn status_is_concise_and_inspect_and_json_preserve_the_full_record() {
     assert!(
         pod_row.contains("Ready") && !pod_row.contains("NotReady"),
         "{ready}"
+    );
+    let ready_details = assert_ok(adm(root.path(), &["status", "demo", "--json"]));
+    assert_eq!(
+        ready_details["cluster"]["pods"][0]["status"]["conditions"][0]["status"],
+        "True"
     );
 
     fs::remove_file(root.path().join("ready-pod")).unwrap();
@@ -1502,6 +1594,27 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
     );
     let original_id = failed[0]["id"].as_str().unwrap();
     assert_eq!(failed[0]["phase"], "failed");
+    let failed_list = adm(root.path(), &["list"]);
+    let failed_status = adm(root.path(), &["status", "retry-me"]);
+    assert!(failed_list.status.success(), "{failed_list:?}");
+    assert!(failed_status.status.success(), "{failed_status:?}");
+    let failed_list_row = String::from_utf8_lossy(&failed_list.stdout)
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let failed_status_row = String::from_utf8_lossy(&failed_status.stdout)
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(failed_list_row, failed_status_row);
+    assert_eq!(failed_status_row[2], "failed");
+    assert_eq!(failed_status_row[4], "Ready");
 
     let retried = assert_ok(adm(
         root.path(),

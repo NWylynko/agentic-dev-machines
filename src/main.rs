@@ -569,6 +569,8 @@ pub fn print_json(value: &impl serde::Serialize) -> Result<()> {
 fn workspace_activity(workspace: &workspaces::Workspace) -> Value {
     if workspace.phase == "deleted" {
         json!({"status":"deleted"})
+    } else if !workspace.agent_enabled {
+        json!({"status":"disabled"})
     } else {
         workspace
             .runtime_status
@@ -587,62 +589,101 @@ fn workspace_list_value(workspace: &workspaces::Workspace) -> Result<Value> {
     Ok(value)
 }
 
+const WORKSPACE_SUMMARY_HEADERS: [&str; 8] = [
+    "NAME",
+    "ROLE",
+    "PHASE",
+    "AGENT CONFIG",
+    "RUNTIME",
+    "ACTIVITY",
+    "NODE",
+    "ID",
+];
+
+fn workspace_summary(workspace: &Value, activity: &Value) -> [String; 8] {
+    let phase = workspace["phase"].as_str().unwrap_or("unknown");
+    let runtime = workspace.get("runtime_status").unwrap_or(&Value::Null);
+    let (runtime_readiness, node) = if phase == "deleted" {
+        ("deleted".to_owned(), "—".to_owned())
+    } else if runtime["error"].is_string() {
+        ("unavailable".to_owned(), "—".to_owned())
+    } else {
+        let pod_phase = runtime["podPhase"].as_str().unwrap_or("Unknown");
+        let readiness = if runtime["podPhase"] == "Missing" {
+            "missing".to_owned()
+        } else if runtime["ready"] == true {
+            "Ready".to_owned()
+        } else if pod_phase == "Pending" {
+            "Pending".to_owned()
+        } else if pod_phase == "Unknown" {
+            "unavailable".to_owned()
+        } else {
+            format!("NotReady ({pod_phase})")
+        };
+        let node = runtime["nodeName"]
+            .as_str()
+            .filter(|node| !node.is_empty())
+            .unwrap_or("—");
+        (readiness, node.to_owned())
+    };
+    [
+        workspace["name"].as_str().unwrap_or("unknown").to_owned(),
+        workspace["role"].as_str().unwrap_or("unknown").to_owned(),
+        phase.to_owned(),
+        if workspace["agent_enabled"] == true {
+            "enabled".to_owned()
+        } else {
+            "disabled".to_owned()
+        },
+        runtime_readiness,
+        activity["status"]
+            .as_str()
+            .unwrap_or("unavailable")
+            .to_owned(),
+        node,
+        workspace["id"].as_str().unwrap_or("unknown").to_owned(),
+    ]
+}
+
+fn print_workspace_summaries(summaries: &[[String; 8]]) {
+    let widths = std::array::from_fn::<_, 8, _>(|column| {
+        summaries
+            .iter()
+            .map(|row| row[column].len())
+            .max()
+            .unwrap_or(0)
+            .max(WORKSPACE_SUMMARY_HEADERS[column].len())
+    });
+    for (index, header) in WORKSPACE_SUMMARY_HEADERS.iter().enumerate() {
+        if index > 0 {
+            print!("  ");
+        }
+        print!("{header:<width$}", width = widths[index]);
+    }
+    println!();
+    for row in summaries {
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                print!("  ");
+            }
+            print!("{value:<width$}", width = widths[index]);
+        }
+        println!();
+    }
+}
+
 fn print_workspace_list(items: &[Value]) {
     if items.is_empty() {
         println!("No workspaces");
         return;
     }
-    let rows = items
+    let summaries = items
         .iter()
-        .map(|workspace| {
-            [
-                workspace["name"].as_str().unwrap_or("unknown"),
-                workspace["role"].as_str().unwrap_or("unknown"),
-                workspace["phase"].as_str().unwrap_or("unknown"),
-                if workspace["agent_enabled"] == true {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                workspace["activity"]["status"]
-                    .as_str()
-                    .unwrap_or("unavailable"),
-                workspace["id"].as_str().unwrap_or("unknown"),
-            ]
-        })
+        .map(|workspace| workspace_summary(workspace, &workspace["activity"]))
         .collect::<Vec<_>>();
-    let headers = ["NAME", "ROLE", "PHASE", "AGENT CONFIG", "ACTIVITY", "ID"];
-    let widths = std::array::from_fn::<_, 6, _>(|column| {
-        rows.iter()
-            .map(|row| row[column].len())
-            .max()
-            .unwrap_or(0)
-            .max(headers[column].len())
-    });
-    for row in std::iter::once(headers.as_slice()).chain(rows.iter().map(|row| row.as_slice())) {
-        println!(
-            "{:<name$}  {:<role$}  {:<phase$}  {:<config$}  {:<activity$}  {:<id$}",
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            row[4],
-            row[5],
-            name = widths[0],
-            role = widths[1],
-            phase = widths[2],
-            config = widths[3],
-            activity = widths[4],
-            id = widths[5],
-        );
-    }
+    print_workspace_summaries(&summaries);
     for workspace in items {
-        if let Some(error) = workspace["activity"]["error"].as_str() {
-            println!(
-                "Agent {}: {error}",
-                workspace["name"].as_str().unwrap_or("unknown")
-            );
-        }
+        print_summary_errors(workspace);
     }
 }
 
@@ -731,78 +772,41 @@ fn pod_summary(status: &Value) -> (String, String) {
     (readiness, node.to_owned())
 }
 
-fn status_row(status: &Value) -> [String; 6] {
-    let workspace = &status["workspace"];
-    let role = workspace["role"].as_str().unwrap_or("unknown");
-    let phase = workspace["phase"].as_str().unwrap_or("unknown");
-    let (pod, node) = if phase == "deleted" {
-        ("deleted".into(), "—".into())
-    } else if status["cluster"]["status"] == "unavailable" {
-        ("unavailable".into(), "—".into())
-    } else if status["cluster"].is_null() {
-        ("n/a".into(), "—".into())
-    } else {
-        pod_summary(status)
-    };
-    let agent = status["agent"]["status"].as_str().unwrap_or("unknown");
-    [
-        workspace["name"].as_str().unwrap_or("unknown").into(),
-        role.into(),
-        phase.into(),
-        pod,
-        agent.into(),
-        node,
-    ]
+fn print_status(status: &Value) {
+    let row = workspace_summary(&status["workspace"], &status["activity"]);
+    print_workspace_summaries(&[row]);
+    print_summary_errors(status);
+    if let Some(error) = status["cluster"]["error"].as_str() {
+        println!("Cluster details unavailable: {error}");
+    }
+    if let Some(reason) = status["cluster"]["containerReason"].as_str() {
+        println!("Pod runtime: {reason}");
+    }
 }
 
-fn print_status(status: &Value) {
-    let headers = ["NAME", "ROLE", "PHASE", "RUNTIME", "ACTIVITY", "NODE"];
-    let row = status_row(status);
-    let widths =
-        std::array::from_fn::<_, 6, _>(|column| row[column].len().max(headers[column].len()));
-    println!(
-        "{:<name$}  {:<role$}  {:<phase$}  {:<pod$}  {:<agent$}  {}",
-        headers[0],
-        headers[1],
-        headers[2],
-        headers[3],
-        headers[4],
-        headers[5],
-        name = widths[0],
-        role = widths[1],
-        phase = widths[2],
-        pod = widths[3],
-        agent = widths[4]
-    );
-    println!(
-        "{:<name$}  {:<role$}  {:<phase$}  {:<pod$}  {:<agent$}  {}",
-        row[0],
-        row[1],
-        row[2],
-        row[3],
-        row[4],
-        row[5],
-        name = widths[0],
-        role = widths[1],
-        phase = widths[2],
-        pod = widths[3],
-        agent = widths[4]
-    );
-    if let Some(error) = status["cluster"]["error"].as_str() {
-        println!("Runtime unavailable: {error}");
+fn print_summary_errors(status: &Value) {
+    let workspace = status.get("workspace").unwrap_or(status);
+    let activity = status.get("activity").unwrap_or(&status["activity"]);
+    if workspace["phase"] != "deleted" {
+        if let Some(error) = workspace["runtime_status"]["error"].as_str() {
+            println!("Runtime unavailable: {error}");
+        } else if workspace["runtime_status"].is_null() {
+            println!("Runtime unavailable: runtime observation is missing");
+        } else if workspace["runtime_status"]["podPhase"] == "Missing" {
+            println!("Runtime unavailable: workspace Pod is missing");
+        }
     }
-    if let Some(error) = status["agent"]["error"].as_str() {
-        match status["agent"]["status"].as_str() {
+    if let Some(error) = activity["error"].as_str() {
+        match activity["status"].as_str() {
             Some("unavailable") => println!("Agent unavailable: {error}"),
             Some("error") => println!("Agent failure: {error}"),
             _ => println!("Agent error: {error}"),
         }
+    } else if activity["status"] == "unavailable" {
+        println!("Agent unavailable: workspace runtime did not report a cause");
     }
-    if let Some(error) = status["workspace"]["last_error"].as_str() {
+    if let Some(error) = workspace["last_error"].as_str() {
         println!("Workspace failure: {error}");
-    }
-    if let Some(reason) = status["cluster"]["containerReason"].as_str() {
-        println!("Pod runtime: {reason}");
     }
 }
 
