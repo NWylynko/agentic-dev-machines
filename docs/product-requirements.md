@@ -4,22 +4,29 @@ These notes distinguish confirmed requirements, implemented local behavior, and 
 
 The implementation target changed on 2026-10-16: all agent execution and durable state belong in workspace Pods; the management host is an access plane. Placement proposals in the earlier investigation below are historical.
 
-## Confirmed behavior
+Decisions confirmed on 2026-10-18 further define the target: clients already have Tailscale and Kubernetes access; ordinary ADM use needs no permanent management host or mandatory client daemon. A stock-Herdr bridge is optional per device, provider login is shared across the installation, and default updates leave active workspace images and agents running. These are requirements, not claims of implemented behavior; current setup still uses a systemd connection service and workspace-local provider login.
+
+## Confirmed requirements
 
 - Preserve repository work and agent history across runtime replacement. Installed tools are temporary or supplied by the base image.
 - Isolate each workspace's files and Git state, even when two workspaces use the same repository and branch name.
 - Accept some recent work loss during a rare, unexpected node failure. No exact loss window has been selected.
-- Keep agents running autonomously while their Herdr space exists, including when nobody is connected.
-- Treat manual Herdr space removal as workspace destruction: stop execution and remove the dev container and its private files.
+- Keep agents running autonomously while their workspace exists, including when nobody is connected.
+- Treat explicit manual Herdr space removal delivered by the optional bridge as workspace destruction: stop execution and remove the dev container and its private files. Never infer deletion when the bridge is unavailable.
 - Use Pi-style terminal interaction inside Herdr for development work and bot conversations.
 - Bots have no repository access or coding tools. They can monitor and prompt coding agents, use Code Mode to compose permitted tools, and manage their own goals and recurring work.
 - Bot model output stays private unless it calls `sendMessage` to publish a message in the terminal conversation.
 - Support browser automation and a way to access development sites and ports from client laptops.
+- Support ordinary CLI use from any device with existing Tailscale and Kubernetes access, independently of Herdr integration.
+- Share one account per provider per installation across all existing and new coding and bot agents.
+- Update the CLI and owned cluster services by default; update existing workspace images and agents only at the user's explicit request.
 - Leave conversation retention after removal undecided; configurability is an acceptable proposal rather than a blocker.
 
 ## The experience
 
-Herdr runs on a long-running Debian management host. Client laptops connect to that host over SSH. Disconnecting a laptop leaves Herdr, its spaces, and the agents running. The management host may have its own custom image and resource allocation; it has a separate lifetime from individual development workspaces.
+Users run ADM from devices that already belong to their Tailscale network and can access the Kubernetes cluster. Lifecycle management, durable execution, and shared provider authentication belong in the cluster. Ordinary commands do not require a permanent management host or client daemon. The transport mechanics remain an implementation choice; a separate public sign-in service is not required.
+
+Users can independently enable a Herdr-to-ADM/cluster bridge, tunnel, or service on each device. It must work with stock Herdr. Disconnecting a device or stopping its bridge leaves workspaces and agents running; bridge availability affects Herdr event delivery rather than ordinary CLI access.
 
 Creating a new Herdr space should give you a ready-to-use shell somewhere in the cluster without choosing a node, finding a Pod, or managing Kubernetes resources by hand.
 
@@ -30,9 +37,9 @@ A typical session should look like this:
 3. Open a repository under `/repos/example-owner/<repo>` or clone one normally.
 4. Make changes yourself or run a coding agent through the Pi-style terminal interface. Optionally use a bot to monitor and prompt the agent.
 5. Disconnect while agents continue working, then return to the same named workspace later.
-6. Remove the Herdr space when finished; its owned activity stops and its development runtime and private files are destroyed.
+6. Destroy the workspace when finished, directly through ADM or through an explicit Herdr removal event delivered by the enabled bridge; its owned activity stops and its development runtime and private files are destroyed.
 
-Workspaces are quick to allocate and disposable when finished, but may run unattended for as long as their spaces exist. The development image is built from `image/Dockerfile`. The published linux/amd64 copy is `ghcr.io/nwylynko/agentic-dev-machines:latest`.
+Workspaces are quick to allocate and disposable when finished, but may run unattended until explicitly destroyed. The development image is built from `image/Dockerfile`. The published linux/amd64 copy is `ghcr.io/nwylynko/agentic-dev-machines:latest`.
 
 Nodes may have constrained storage, so creating more workspaces should avoid multiplying complete repository checkouts, Git history, and machine images.
 
@@ -44,9 +51,9 @@ Creating a new space with a previously used label gives it a new identity. Old g
 
 A **runtime** is the current container or machine executing its commands. It can be replaced without creating a new workspace.
 
-A **Herdr space** owns the workspace's lifetime. Multiple panes attach to the same workspace rather than each allocating another runtime. Manual removal of the space is an explicit destruction event; a terminal disconnection is not.
+A **Herdr space**, when associated through the optional integration, owns the workspace's lifetime. Multiple panes attach to the same workspace rather than each allocating another runtime. A delivered manual removal event triggers destruction; terminal disconnection or bridge unavailability does not.
 
-A **coding agent** executes development work inside that workspace. A **bot** is a separate agent role with monitoring, prompting, messaging, and goal/loop tools. It has no development filesystem or coding tools and does not receive a `/repos` mount. Whether a bot has its own space, shares the interface of a coding workspace, or needs a container at all remains open; ownership must be explicit in either case.
+A **coding agent** executes development work inside that workspace. A **bot** is a separate agent role with monitoring, prompting, messaging, and goal/loop tools, running in its own workspace Pod. It has no development filesystem or coding tools and does not receive a `/repos` mount. Whether a bot has its own Herdr space or shares the interface of a coding workspace remains open; ownership must be explicit in either case.
 
 There are several separate recovery goals:
 
@@ -89,47 +96,57 @@ Commands should show provisioning and recovery progress and fail clearly when th
 
 Forking a workspace could be useful later: reuse its Git baseline and create an independent writable view for another experiment or agent. Suspend, reset, snapshots, and sharing are also later possibilities rather than part of the first command set.
 
+### Updates
+
+The confirmed target for `adm update` is to update the CLI, controller, and other owned cluster services while leaving active workspace images and agents running. Existing workspaces must have an explicit upgrade operation at the user's discretion. It must show the expected interruption and preserve workspace identity, private files, and agent history. Exact command syntax for workspace upgrades remains open. This target is separate from the current installer update followed by `adm setup`.
+
 ## CLI, service, and Kubernetes
 
-The workspace manager owns lifecycle operations and resolves a workspace to its current runtime. The CLI exposes those operations; Herdr integrates through the same interface.
+The cluster-owned workspace manager owns lifecycle operations and resolves a workspace to its current runtime. The CLI exposes those operations; the optional Herdr bridge integrates through the same interface.
 
-The proposed first version uses the Kubernetes API through `kubectl` for workspace lifecycle operations. Kubernetes resources hold the desired workspace configuration. A supervised agent runner operates independently of CLI processes, terminal attachments, and SSH connections.
+The CLI uses the client's existing Kubernetes access to reach cluster services and scoped workspace runtimes. Kubernetes resources hold the desired workspace configuration. A supervised agent runner operates inside its owning workspace Pod, independently of CLI processes, terminal attachments, and SSH connections.
 
-Autonomous execution and durable scheduling are core requirements. They need an always-running execution path, but do not require a separate custom management daemon if the selected agent backend and Kubernetes already provide it. Where the agent runner and scheduler live remains an implementation choice.
+Autonomous execution and durable scheduling are core requirements and remain cluster-owned. No client process must stay running to own an agent, its durable state, or its provider login. Connection transport and the internal implementation of shared authentication remain design work.
 
 ```mermaid
 flowchart TD
-    M[Client laptops over SSH] --> H[Herdr on long-running Debian host]
-    H --> C[CLI / workspace manager]
+    M[Client device with Tailscale and Kubernetes access] --> C[ADM CLI]
+    H[Stock Herdr] --> O[Optional per-device bridge]
+    O --> L[Cluster lifecycle service]
+    C --> L
     C --> K[Kubernetes API]
+    L --> K
     K --> D[Deployment per workspace]
     D --> P[Replaceable Debian Pod]
     C -->|attach to current runtime| P
     P --> R[Repository filesystem]
     R --> G[Shared immutable Git data]
     R --> W[Durable workspace changes]
-    A[Supervised coding agent runner] -->|execute development tools| P
+    P --> A[Pod-owned coding agent runner]
     A --> S[Agent history, goals, and schedules]
-    B[Bot with restricted tools and Code Mode] -->|monitor and prompt| A
+    B[Bot in its own Pod] -->|monitor and prompt| A
     B --> S
     B -->|explicit sendMessage| T[Pi-style conversation in Herdr]
+    F[Cluster-owned shared provider authentication] --> A
+    F --> B
     P --> V[Development sites and ports]
     M -->|preview access| V
 ```
 
-This diagram shows the proposed container implementation. Persisting the whole operating system is outside the current requirements.
+This diagram shows the target ownership and connection paths, not settled transport details. Persisting the whole operating system is outside the current requirements.
 
-| Component                    | Responsibility                                                                                                                  |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| CLI / workspace manager      | Create, inspect, attach, destroy, and resolve stable workspace identities                                                       |
-| Herdr / terminal integration | Present Pi-style coding and bot conversations, map ownership, launch attachments, and propagate manual space removal            |
-| Kubernetes                   | Schedule runtimes and reconcile their desired existence                                                                         |
-| Repository filesystem        | Discover repositories, fetch contents on demand, and enforce private writable views and Git state                               |
-| Persistent storage           | Make selected workspace state recoverable on another node                                                                       |
-| Agent runner / backend       | Execute unattended with role-specific tools, persist history and goals, schedule work, and recover independently of attachments |
-| Bot control interface        | Expose authenticated discovery and lifecycle/runtime controls without development filesystem or shell access                    |
-| Terminal message adapter     | Deliver explicit bot messages to its Pi-style conversation in Herdr                                                             |
-| Preview access               | Route client connections to development sites and selected ports in the current runtime                                         |
+| Component                      | Responsibility                                                                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| CLI / workspace manager        | Expose cluster-owned lifecycle operations and resolve stable workspace identities from any authorized client                    |
+| Herdr / terminal integration   | Present Pi-style conversations and optionally propagate explicit space removal through a user-enabled per-device bridge         |
+| Kubernetes                     | Schedule runtimes and reconcile their desired existence                                                                         |
+| Repository filesystem          | Discover repositories, fetch contents on demand, and enforce private writable views and Git state                               |
+| Persistent storage             | Make selected workspace state recoverable on another node                                                                       |
+| Agent runner / backend         | Execute unattended with role-specific tools, persist history and goals, schedule work, and recover independently of attachments |
+| Shared provider authentication | Make one account per provider per installation available to all coding and bot agents without a client remaining connected      |
+| Bot control interface          | Expose authenticated discovery and lifecycle/runtime controls without development filesystem or shell access                    |
+| Terminal message adapter       | Deliver explicit bot messages to its Pi-style conversation in Herdr                                                             |
+| Preview access                 | Route client connections to development sites and selected ports in the current runtime                                         |
 
 An initial implementation could use one single-replica Deployment per workspace, identified by labels and annotations, plus storage resources where needed. There is no initial requirement for a custom cluster scheduler, database, Kubernetes operator, or Workspace CRD. Reuse the chosen agent backend's durable execution and scheduling where suitable.
 
@@ -137,15 +154,17 @@ An initial implementation could use one single-replica Deployment per workspace,
 
 The desired mapping is one Herdr space to one workspace, with several panes allowed to attach to it. Creating or reopening a space should create or resolve that association and launch the shell connection.
 
+The user chooses whether to set up a bridge/tunnel/service on each device. It must support stock Herdr without a custom build, and other ADM commands must work without it. Bridge unavailability must be visible. The current Herdr API offers no replay cursor for missed events, so eventual delivery of close events during an outage is not guaranteed; a missing space or lost connection must never be interpreted as deletion.
+
 The exact Herdr commands and lifecycle hooks need testing against the installed version. In particular, test how remote agents appear to Herdr's process detection and session restoration.
 
 The user-facing conversation surface is the terminal in Herdr, using Pi or a Pi-style client. Integrating a durable runner with that interface still needs proving; a working remote harness must not be assumed to have a ready-made Pi terminal attachment. A separate web chat or external messaging service is not required.
 
-Closing a pane or disconnecting a terminal leaves the workspace and agents running. Manually removing the entire Herdr space destroys its workspace. A Herdr process restart or temporary loss of its control connection must not be mistaken for deliberate space removal.
+Closing a pane or disconnecting a terminal leaves the workspace and agents running. An explicit manual removal event delivered by the bridge destroys the associated workspace. A Herdr process restart or temporary loss of its control connection must not be mistaken for deliberate space removal.
 
 Destruction marks the workspace as deleted before stopping its agents and cancelling its pending work, recurring loops, and tool access. It then removes the runtime and private workspace files. Recovery and scheduling must respect that deletion so delayed work cannot recreate the workspace. If cleanup is interrupted, finish it on recovery. Shared upstream caches and changes already pushed to GitHub are not workspace-local files.
 
-Repository work and agent history are durable for the lifetime of the space; durability does not imply keeping a deleted workspace alive. Configurable conversation retention after removal is an acceptable proposal. A retained archive is read-only history, not an active agent, goal, or schedule; the default retention policy remains open.
+Repository work and agent history are durable for the lifetime of the workspace; durability does not imply keeping a deleted workspace alive. Configurable conversation retention after removal is an acceptable proposal. A retained archive is read-only history, not an active agent, goal, or schedule; the default retention policy remains open.
 
 ### Runtime replacement
 
@@ -228,7 +247,7 @@ Ordinary Pi automatically saves resumable sessions under `~/.pi/agent/sessions/`
 
 The initial implementation uses the experimental [Pi Durable framework](https://earendil.com/posts/pi-durable/) version 1.2.0. Local end-to-end tests reopen its SQLite store after a process kill, resume pending work independently of terminal attachments, and execute coding tools through a Kubernetes transport adapter. The Kubernetes adapter is tested against a process boundary fixture; it still needs the opt-in real-cluster experiment. Ordinary Pi session resumption alone does not provide this unattended execution model.
 
-The [Pi Durable investigation](pi-durable-research.md) examines published version 1.2.0 and a pinned source revision. The recommended direction to validate is a supervised Durable owner for each Herdr-owned store, with reconnectable terminal clients and separate coding/bot tool profiles. For the smallest proof, the coding runner can live beside its runtime; a central runner with remote execution is a later placement option rather than an initial requirement.
+The [Pi Durable investigation](pi-durable-research.md) examines published version 1.2.0 and a pinned source revision. Its placement proposals are historical: the selected boundary is a supervised Durable owner inside each workspace Pod, with reconnectable terminal clients and separate coding/bot tool profiles.
 
 Important integration findings:
 
@@ -249,9 +268,9 @@ An agent continues processing its work and goals while the workspace exists. Wai
 
 Coding agents and bots can reuse durable execution infrastructure, but have different capabilities:
 
-| Role         | User interaction                                                                           | Tools and access                                                                                                       |
-| ------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| Coding agent | Normal visible Pi-style terminal interaction in Herdr                                      | Its own repositories and development tools; works unattended                                                           |
+| Role         | User interaction                                                                           | Tools and access                                                                                                                         |
+| ------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Coding agent | Normal visible Pi-style terminal interaction in Herdr                                      | Its own repositories and development tools; works unattended                                                                             |
 | Bot          | Pi-style terminal conversation in Herdr; only `sendMessage` publishes AI-authored messages | No repository access or coding tools; can discover and control all live coding-agent lifecycles, use Code Mode, and maintain goals/loops |
 
 The bot acts as a supervisor and general assistant with broad monitoring, prompting, lifecycle, messaging, and goal/loop tools. Runtime APIs enforce bot identity and coding-agent role while denying repository, shell, and general cross-workspace access. This role does not select a particular model provider.
@@ -273,6 +292,8 @@ A supervised runner wakes work when its trigger occurs and restores pending work
 Bot activity must have an explicit owning Herdr space. Removing its owning space stops the bot and cancels its goals and loops. The exact mapping of bot and coding-agent spaces remains open. Removing a monitored coding workspace makes that target unavailable and revokes its control link; a supervisor must not silently recreate it. Recovery after a crash and destruction by the user are distinct lifecycle events.
 
 ### Providers and unattended limits
+
+The confirmed target is one shared account per provider per ADM installation. Login must become available to every existing and new coding and bot agent, sharing that account's billing and rate limits without repeating login in each workspace. Authentication ownership belongs in the cluster and must not depend on a connected client. Credential delivery and refresh ownership remain implementation choices; the current `adm login NAME` flow still stores provider login within the selected workspace.
 
 Keep model/provider authentication configurable; no provider migration, API billing arrangement, or numeric spending limit has been selected. Validate the supported account/authentication path with the chosen harness instead of assuming a subscription works through every integration.
 
@@ -300,30 +321,33 @@ These are investigation targets, not selected dependencies:
 Build in small stages, proving each through real CLI, shell, and cluster behavior:
 
 1. **Workspace lifecycle:** create, list, inspect, attach, and destroy a Debian workspace. Disconnect and reattach; delete its Pod and resolve the replacement under the same name.
-2. **Herdr lifecycle:** create a space and attach several panes. Disconnect the laptop and verify that the workspace stays running. Remove the space and verify that its runtime and private files are destroyed. Restart Herdr without treating that interruption as deliberate removal.
+2. **Herdr lifecycle:** enable the optional bridge with stock Herdr, create a space, and attach several panes. Disconnect the laptop and verify that the workspace stays running. Deliver an explicit space removal event and verify that its runtime and private files are destroyed. Stop the bridge and restart Herdr without treating either interruption as deliberate removal; show the unavailable integration while ordinary CLI commands continue working.
 3. **Filesystem recovery:** edit files and create local commits, then drain the hosting node. Recover repository and Git state on another node. Separately simulate an unexpected failure and measure the interruption and loss window.
 4. **Lazy repositories and isolation:** expose a catalog and verify that unused repositories do not hydrate. Open the same repository on `main` in two spaces; edits, branch changes, and local commits must stay private, and attempts to access the other space's files must fail. Measure actual disk use.
 5. **Unattended agent recovery:** disconnect every client while a real agent works, replace its runtime, and demonstrate automatic recovery of its conversation and pending work without blindly repeating a partially completed action.
 6. **Bot role:** verify that normal model output produces no terminal chat delivery, `sendMessage` delivers an explicit message, and goals/loops survive replacement. Verify broad lifecycle/runtime controls and durable operation receipts work through direct tools and Code Mode, while coding tools and repository/shell access remain unavailable. Remove the owning space and verify queued work cannot recreate it or a deliberately removed target.
 7. **Browser and preview access:** automate a real browser against a workspace's development site and open its exposed site/port from a client laptop. Verify routing after replacement and cleanup on removal.
-8. **Custom image:** bake in the tools that the proven workflows need. Allow image and resource configuration for the management box and development workspaces independently.
+8. **Custom image:** bake in the tools that the proven workflows need. Allow image and resource configuration for cluster services and development workspaces independently.
+9. **Portable clients and shared login:** operate the same workspace from two devices with existing Tailscale/Kubernetes access and no mandatory local service. Log in once per provider, verify access from existing and new coding and bot agents, and verify execution continues with every client disconnected.
+10. **Updates:** update the CLI and cluster services while active workspaces keep running their current images and agents. Explicitly upgrade a workspace and verify the reported interruption, stable identity, private files, and agent history.
 
 Use end-to-end tests first for implementation changes. Provisioning, scheduling, storage, hydration, and recovery failures should be visible through CLI status and logs with the workspace identity and failure cause. Check cleanup for leaked Pods, volumes, overlays, and backend state.
 
 ## Decisions still open
 
-| Decision                                                    | Effect on the user                                                                                                                                                              |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Exact recovery time and recent-work loss window             | Determines how long a failure interrupts work and how much recent progress may be lost                                                                                          |
-| Storage and lazy-filesystem implementation                  | Determines startup time, disk use, Git compatibility, and recovery behavior                                                                                                     |
-| Agent backend and location of the supervised runner         | Pi Durable 1.2.0 owns each coding or bot workspace inside its private Pod; the host is an access plane. Cross-node durable storage and the node-failure loss window remain open |
-| Attach transport and exact Herdr integration                | `adm herdr` consumes explicit removal events. A live Herdr plugin install is not part of the tests                                                                              |
-| Pi-style terminal adapter and inbound message transport     | The terminal client speaks the runner HTTP API. Herdr pane wiring beyond `adm attach` is still local to the management box                                                      |
-| Bot ownership, permitted agents, and control-tool interface | A bot supervises only the agent ids it was given. Whether it has its own Herdr space is still open                                                                              |
-| Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop                                                 |
-| Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                                                         |
-| Browser automation and development-port transport           | Determines how browsers run and how client laptops reach development sites and ports                                                                                            |
-| Provider authentication and allowance handling              | Determines supported account connections and how unattended work waits when capacity or authentication is unavailable                                                           |
-| Image, resource, and cache configuration                    | Determines available tools, concurrent workloads, and capacity use                                                                                                              |
+| Decision                                                    | Effect on the user                                                                                                                                        |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact recovery time and recent-work loss window             | Determines how long a failure interrupts work and how much recent progress may be lost                                                                    |
+| Storage and lazy-filesystem implementation                  | Determines startup time, disk use, Git compatibility, and recovery behavior                                                                               |
+| Cross-node agent storage and recovery                       | Pi Durable 1.2.0 owns each coding or bot workspace inside its private Pod; durable storage and the node-failure loss window remain open                   |
+| Attach transport and exact Herdr integration                | Clients already have Tailscale/Kubernetes access. Stock Herdr uses an optional per-device bridge; transport and live event delivery still need validation |
+| Pi-style terminal adapter and inbound message transport     | The terminal client speaks the runner HTTP API; portable pane wiring and the full terminal experience still need validation                               |
+| Bot ownership, permitted agents, and control-tool interface | A bot supervises only the agent ids it was given. Whether it has its own Herdr space is still open                                                        |
+| Goal/loop tool interface and missed-trigger policy          | Goals and loops persist in the runner and survive a process kill. A missed beat runs once; it does not catch up in a tight loop                           |
+| Default and configurable conversation archive retention     | Determines whether old conversations remain inspectable after execution and workspace files are removed                                                   |
+| Browser automation and development-port transport           | Determines how browsers run and how client laptops reach development sites and ports                                                                      |
+| Shared provider credential delivery and refresh             | One account per provider per installation is settled; safe delivery, refresh ownership, and live account compatibility remain to be demonstrated          |
+| Explicit workspace upgrade interface                        | Determines how users select an upgrade and see its interruption; default CLI/service updates must leave active workspaces running                         |
+| Image, resource, and cache configuration                    | Determines available tools, concurrent workloads, and capacity use                                                                                        |
 
-The first useful milestone is an isolated workspace whose agents keep working unattended, recover after replacement, and stop permanently when its Herdr space is removed.
+The first useful milestone is an isolated workspace whose agents keep working unattended, recover after replacement, and stop permanently when destroyed through ADM or an explicit Herdr removal event delivered by the optional bridge.
