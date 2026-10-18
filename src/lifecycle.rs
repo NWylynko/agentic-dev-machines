@@ -557,6 +557,16 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
                 path,
                 "/v1/provider-auth/resolve" | "/v1/provider-auth/catalog"
             ))
+        || (method == "POST"
+            && path
+                .strip_prefix("/v1/workspaces/")
+                .and_then(|path| path.split_once("/runtime/"))
+                .is_some_and(|(_, endpoint)| {
+                    matches!(
+                        endpoint,
+                        "authorize" | "lease" | "lease/renew" | "lease/ack" | "check"
+                    )
+                }))
         || (method == "GET"
             && path
                 .strip_prefix("/v1/runtime/operations/")
@@ -717,8 +727,8 @@ fn route(
     {
         let caller = authorize_runtime_caller(cli, &store, authorization)?;
         ensure!(
-            caller.phase == "ready",
-            "workspace lifecycle is not ready for provider requests"
+            matches!(caller.phase.as_str(), "provisioning" | "ready"),
+            "workspace lifecycle is not active for provider requests"
         );
         return proxy_provider_auth(method, path, body);
     }

@@ -1150,6 +1150,91 @@ else:
     .json()
     .unwrap();
     assert_eq!(runtime_lease["fencingToken"], 1);
+    // A newly booting Pod can start a bot's initial provider turn before its
+    // Deployment becomes Ready. Its current Pod-bound lease is authoritative.
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let authority = TcpListener::bind("127.0.0.1:7434").unwrap();
+        let authority_thread = thread::spawn(move || {
+            let mut received = Vec::new();
+            for mut stream in authority.incoming().flatten() {
+                let mut bytes = [0; 4096];
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut bytes).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let headers = String::from_utf8_lossy(&request).into_owned();
+                if headers.starts_with("GET /stop ") {
+                    break;
+                }
+                let body = if headers.starts_with("POST /v1/provider-auth/catalog ") {
+                    r#"{"synthetic":{"auth":{"source":"OAuth","type":"oauth"},"models":["allowed"],"allModels":["allowed"]}}"#
+                } else {
+                    r#"{"auth":{"apiKey":"synthetic-shared-access"},"source":"OAuth"}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                received.push(headers);
+            }
+            received
+        });
+        let database =
+            rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
+        database.execute("UPDATE workspaces SET phase='provisioning',spec=json_set(spec,'$.phase','provisioning') WHERE id=?1", [runtime_id]).unwrap();
+        let responses: Vec<_> = ["catalog", "resolve"]
+            .into_iter()
+            .map(|endpoint| {
+                request_with_token(
+                    &url,
+                    "POST",
+                    &format!("/v1/provider-auth/{endpoint}"),
+                    Some(&json!({"provider":"synthetic"})),
+                    Some("runtime-token"),
+                )
+                .unwrap()
+            })
+            .collect();
+        let foreign_responses: Vec<_> = ["catalog", "resolve"]
+            .into_iter()
+            .map(|endpoint| {
+                request_with_token(
+                    &url,
+                    "POST",
+                    &format!("/v1/provider-auth/{endpoint}"),
+                    Some(&json!({"provider":"synthetic"})),
+                    Some("other-pod-token"),
+                )
+                .unwrap()
+            })
+            .collect();
+        database.execute("UPDATE workspaces SET phase='ready',spec=json_set(spec,'$.phase','ready') WHERE id=?1", [runtime_id]).unwrap();
+        let mut stop = TcpStream::connect("127.0.0.1:7434").unwrap();
+        stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let received = authority_thread.join().unwrap();
+        for response in responses {
+            assert_eq!(
+                response.status(),
+                200,
+                "a current provisioning Pod must use shared provider auth: {}",
+                response.text().unwrap()
+            );
+        }
+        for response in foreign_responses {
+            assert_eq!(
+                response.status(),
+                403,
+                "a foreign Pod cannot reach the shared authority"
+            );
+        }
+        assert_eq!(received.len(), 2);
+        for request in received {
+            assert!(!request.contains("runtime-token"));
+            assert!(!request.contains("synthetic-lifecycle-token"));
+        }
+    }
     let check_path = format!("/v1/workspaces/{runtime_id}/runtime/check");
     let check_body = json!({"holder":runtime_pod_uid,"fencingToken":runtime_lease["fencingToken"]});
     assert_eq!(
