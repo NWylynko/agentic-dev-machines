@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
-import { createProviderAuthAuthority } from "../src/provider-auth-authority.ts";
+import {
+  createOwnerEpochGuard,
+  createProviderAuthAuthority,
+} from "../src/provider-auth-authority.ts";
 
 test("shared model selection preserves missing-login state and OAuth account model restrictions", async () => {
   const directory = await mkdtemp(join(tmpdir(), "adm-provider-catalog-"));
@@ -648,6 +651,213 @@ test("two existing and a new agent stream use shared auth without local or ambie
     if (savedAmbient === undefined) delete process.env.ADM_SYNTHETIC_API_KEY;
     else process.env.ADM_SYNTHETIC_API_KEY = savedAmbient;
     if (authority) await authority.close();
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("a pending login cannot persist after its lifecycle owner epoch changes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-provider-auth-fence-login-"));
+  const authPath = join(directory, "auth.json");
+  const owner = { epoch: 41 };
+  let beginLogin;
+  let finishLogin;
+  let loginCount = 0;
+  const loginStarted = new Promise((resolve) => (beginLogin = resolve));
+  const provider = {
+    id: "adm-fenced-login",
+    name: "Fenced login fixture",
+    auth: {
+      apiKey: {
+        name: "Fenced key",
+        login: async () => {
+          loginCount += 1;
+          if (loginCount > 1)
+            return {
+              type: "api_key",
+              key: "new-owner-login-secret",
+            };
+          beginLogin();
+          return new Promise((resolve) => (finishLogin = resolve));
+        },
+        resolve: async ({ credential }) =>
+          credential?.key ? { auth: { apiKey: credential.key } } : undefined,
+      },
+    },
+    getModels: () => [],
+    stream: () => {
+      throw new Error("not used");
+    },
+    streamSimple: () => {
+      throw new Error("not used");
+    },
+  };
+  const createAuthority = async () => {
+    const authority = await createProviderAuthAuthority({
+      authPath,
+      ownerGuard: createOwnerEpochGuard(async () => owner.epoch),
+      configure: (runtime) => runtime.registerNativeProvider(provider),
+    });
+    await new Promise((resolve) => authority.server.listen(0, "127.0.0.1", resolve));
+    return {
+      authority,
+      url: `http://127.0.0.1:${authority.server.address().port}`,
+    };
+  };
+  const post = (url, path, value) =>
+    fetch(`${url}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(value),
+    });
+  let active = await createAuthority();
+  try {
+    assert.equal((await fetch(`${active.url}/health`)).status, 200);
+    const start = await post(active.url, "/v1/provider-auth/login", {
+      provider: provider.id,
+      type: "api_key",
+    });
+    const { operationId } = await start.json();
+    await loginStarted;
+
+    const pollAccepted = new Promise((resolve) => {
+      active.authority.server.once("request", (request) => {
+        if (request.url === `/v1/provider-auth/login/${operationId}/events`)
+          resolve();
+      });
+    });
+    const pendingEvent = fetch(
+      `${active.url}/v1/provider-auth/login/${operationId}/events`,
+    );
+    await pollAccepted;
+    owner.epoch = 42;
+    finishLogin({ type: "api_key", key: "must-not-persist-after-fence-loss" });
+    const eventResponse = await pendingEvent;
+    assert.equal(eventResponse.status, 200);
+    assert.deepEqual((await eventResponse.json()).event, {
+      type: "error",
+      message: "Provider authentication failed",
+    });
+    assert.equal((await fetch(`${active.url}/health`)).status, 503);
+    assert.doesNotMatch(await readFile(authPath, "utf8"), /must-not-persist/);
+
+    await active.authority.close();
+    active = await createAuthority();
+    assert.equal((await fetch(`${active.url}/health`)).status, 200);
+    const accepted = await post(active.url, "/v1/provider-auth/login", {
+      provider: provider.id,
+      type: "api_key",
+    });
+    const restartedOperation = (await accepted.json()).operationId;
+    const completion = await fetch(
+      `${active.url}/v1/provider-auth/login/${restartedOperation}/events`,
+    );
+    assert.equal((await completion.json()).event.type, "complete");
+    assert.match(await readFile(authPath, "utf8"), /new-owner-login-secret/);
+  } finally {
+    await active.authority.close();
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("OAuth refresh and logout recheck the owner epoch while the credential lock is held", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-provider-auth-fence-mutation-"));
+  const authPath = join(directory, "auth.json");
+  const providerId = "adm-fenced-oauth";
+  await writeFile(
+    authPath,
+    JSON.stringify({
+      [providerId]: {
+        type: "oauth",
+        access: "old-access-secret",
+        refresh: "old-refresh-secret",
+        expires: Date.now() - 1000,
+      },
+    }),
+  );
+  const owner = { epoch: 73, advanceOnNextRead: false };
+  let beginRefresh;
+  let finishRefresh;
+  const refreshStarted = new Promise((resolve) => (beginRefresh = resolve));
+  const provider = {
+    id: providerId,
+    name: "Fenced OAuth fixture",
+    auth: {
+      oauth: {
+        name: "Fenced OAuth",
+        isSubscription: true,
+        login: async () => {
+          throw new Error("login not used");
+        },
+        refresh: async () => {
+          beginRefresh();
+          return new Promise((resolve) => (finishRefresh = resolve));
+        },
+        toAuth: async (credential) => ({ apiKey: credential.access }),
+      },
+    },
+    getModels: () => [],
+    stream: () => {
+      throw new Error("not used");
+    },
+    streamSimple: () => {
+      throw new Error("not used");
+    },
+  };
+  const createAuthority = async () => {
+    const authority = await createProviderAuthAuthority({
+      authPath,
+      ownerGuard: createOwnerEpochGuard(async () => {
+        const epoch = owner.epoch;
+        if (owner.advanceOnNextRead) {
+          owner.advanceOnNextRead = false;
+          owner.epoch += 1;
+        }
+        return epoch;
+      }),
+      configure: (runtime) => runtime.registerNativeProvider(provider),
+    });
+    await new Promise((resolve) => authority.server.listen(0, "127.0.0.1", resolve));
+    return {
+      authority,
+      url: `http://127.0.0.1:${authority.server.address().port}`,
+    };
+  };
+  let active = await createAuthority();
+  try {
+    assert.equal((await fetch(`${active.url}/health`)).status, 200);
+    const refreshRequest = fetch(
+      `${active.url}/v1/provider-auth/resolve/${providerId}`,
+    );
+    await refreshStarted;
+    owner.epoch = 74;
+    finishRefresh({
+      type: "oauth",
+      access: "rotated-access-secret",
+      refresh: "rotated-refresh-secret",
+      expires: Date.now() + 60 * 60 * 1000,
+    });
+    const refreshResponse = await refreshRequest;
+    assert.equal(refreshResponse.status, 400);
+    const afterRefresh = JSON.parse(await readFile(authPath, "utf8"));
+    assert.equal(afterRefresh[providerId].access, "old-access-secret");
+    assert.equal(afterRefresh[providerId].refresh, "old-refresh-secret");
+    assert.equal((await fetch(`${active.url}/health`)).status, 503);
+
+    await active.authority.close();
+    owner.epoch = 75;
+    active = await createAuthority();
+    assert.equal((await fetch(`${active.url}/health`)).status, 200);
+    owner.advanceOnNextRead = true;
+    const logoutResponse = await fetch(`${active.url}/v1/provider-auth/logout`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: providerId }),
+    });
+    assert.equal(logoutResponse.status, 400);
+    const afterLogout = JSON.parse(await readFile(authPath, "utf8"));
+    assert.equal(afterLogout[providerId].refresh, "old-refresh-secret");
+  } finally {
+    await active.authority.close();
     await rm(directory, { recursive: true });
   }
 });

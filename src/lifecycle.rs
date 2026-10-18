@@ -565,7 +565,9 @@ fn handle_http(
         Ok((status, body)) => (status, body),
         Err(error) => {
             let message = format!("{error:#}");
-            let (status, code) = if message.contains("operationId was already used") {
+            let (status, code) = if error.is::<ProviderAuthUnavailable>() {
+                (503, "PROVIDER_AUTH_UNAVAILABLE")
+            } else if message.contains("operationId was already used") {
                 (409, "OPERATION_CONFLICT")
             } else if message.contains("not authorized for workspace")
                 || message.contains("not authorized for lifecycle operations")
@@ -602,6 +604,7 @@ fn handle_http(
         409 => "Conflict",
         410 => "Gone",
         403 => "Forbidden",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     write!(
@@ -776,7 +779,7 @@ fn route(
         }
         return Ok((
             200,
-            serde_json::json!({"status":"ok","service":"adm-lifecycle"}),
+            serde_json::json!({"status":"ok","service":"adm-lifecycle","ownerEpoch":cli.lifecycle_fence.as_ref().map(crate::lease::LeaseFence::epoch)}),
         ));
     }
     let mut store = cli.store()?;
@@ -1039,6 +1042,17 @@ fn route(
     Ok((404, serde_json::json!({"error":{"code":"NOT_FOUND"}})))
 }
 
+#[derive(Debug)]
+struct ProviderAuthUnavailable;
+
+impl std::fmt::Display for ProviderAuthUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("provider authentication authority is unavailable")
+    }
+}
+
+impl std::error::Error for ProviderAuthUnavailable {}
+
 fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Value)> {
     let login_route = path
         .strip_prefix("/v1/provider-auth/login/")
@@ -1071,11 +1085,14 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
         )
         .body(body.to_vec())
         .send()
-        .context("connect to the provider authentication authority")?;
+        .map_err(|_| anyhow::Error::new(ProviderAuthUnavailable))?;
     let status = response.status().as_u16();
     let bytes = response
         .bytes()
-        .context("read provider authentication response")?;
+        .map_err(|_| anyhow::Error::new(ProviderAuthUnavailable))?;
+    if status >= 500 {
+        return Err(anyhow::Error::new(ProviderAuthUnavailable));
+    }
     let value = if bytes.is_empty() {
         Value::Null
     } else {

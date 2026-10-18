@@ -367,7 +367,9 @@ else:
     .unwrap();
     let (url, port) = lifecycle_url();
     let mut service = start_service(root.path(), port);
-    wait_for(|| request(&url, "GET", "/health", None).ok());
+    let initial_health = wait_for(|| request(&url, "GET", "/health", None).ok());
+    assert_eq!(initial_health.status(), 200);
+    assert_eq!(initial_health.json::<Value>().unwrap()["ownerEpoch"], 1);
     let (_, competing_port) = lifecycle_url();
     let mut competing_owner = start_service(root.path(), competing_port);
     let competing_result = wait_for(|| competing_owner.try_wait().ok().flatten());
@@ -1230,6 +1232,19 @@ else:
             );
         }
         assert_eq!(received.len(), 2);
+        let unavailable = request_with_token(
+            &url,
+            "POST",
+            "/v1/provider-auth/resolve",
+            Some(&json!({"provider":"synthetic"})),
+            Some("runtime-token"),
+        )
+        .unwrap();
+        assert_eq!(unavailable.status(), 503);
+        assert_eq!(
+            unavailable.json::<Value>().unwrap()["error"]["code"],
+            "PROVIDER_AUTH_UNAVAILABLE"
+        );
         for request in received {
             assert!(!request.contains("runtime-token"));
             assert!(!request.contains("synthetic-lifecycle-token"));

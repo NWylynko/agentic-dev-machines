@@ -25,6 +25,7 @@ export type SharedProviderCatalog = Record<
 type AuthorityOptions = {
   authPath: string;
   configure?: (runtime: any) => void;
+  ownerGuard?: () => Promise<boolean>;
 };
 type LoginOperation = {
   controller: AbortController;
@@ -58,9 +59,78 @@ function cleanPrompt(prompt: AuthPrompt): Omit<AuthPrompt, "signal"> {
   return safe;
 }
 
+export function createOwnerEpochGuard(
+  readOwnerEpoch: () => Promise<number | undefined>,
+): () => Promise<boolean> {
+  let ownerEpoch: number | undefined;
+  let invalidated = false;
+  return async () => {
+    if (invalidated) return false;
+    let currentEpoch: number | undefined;
+    try {
+      currentEpoch = await readOwnerEpoch();
+    } catch {
+      currentEpoch = undefined;
+    }
+    if (!Number.isSafeInteger(currentEpoch) || currentEpoch! <= 0) {
+      if (ownerEpoch !== undefined) invalidated = true;
+      return false;
+    }
+    if (ownerEpoch === undefined) {
+      ownerEpoch = currentEpoch;
+      return true;
+    }
+    if (ownerEpoch !== currentEpoch) {
+      invalidated = true;
+      return false;
+    }
+    return true;
+  };
+}
+
+async function createGuardedCredentialStore(
+  authPath: string,
+  ownerGuard: () => Promise<boolean>,
+) {
+  // Pi does not export these storage primitives. Wrapping its pinned backend
+  // keeps its cross-process lock while fencing the final persisted mutation.
+  const packageEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
+  const storageModule = await import(
+    new URL("./core/auth-storage.js", packageEntry).href
+  );
+  const backend = new storageModule.FileAuthStorageBackend(authPath);
+  const guardedBackend = {
+    withLock<T>(
+      update: (content: string | undefined) => { result: T; next?: string },
+    ): T {
+      return backend.withLock((content: string | undefined) => {
+        const result = update(content);
+        if (result.next !== undefined)
+          throw new Error("Synchronous provider credential writes are not allowed");
+        return result;
+      });
+    },
+    withLockAsync<T>(
+      update: (
+        content: string | undefined,
+      ) => Promise<{ result: T; next?: string }>,
+      options?: { signal?: AbortSignal },
+    ): Promise<T> {
+      return backend.withLockAsync(async (content: string | undefined) => {
+        const result = await update(content);
+        if (result.next !== undefined && !(await ownerGuard()))
+          throw new Error("Lifecycle provider-auth owner fence is not current");
+        return result;
+      }, options);
+    },
+  };
+  return storageModule.AuthStorage.fromStorage(guardedBackend);
+}
+
 export async function createProviderAuthAuthority({
   authPath,
   configure,
+  ownerGuard,
 }: AuthorityOptions) {
   const authDirectory = dirname(authPath);
   await mkdir(authDirectory, { recursive: true, mode: 0o700 });
@@ -77,8 +147,12 @@ export async function createProviderAuthAuthority({
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+  const credentials = ownerGuard
+    ? await createGuardedCredentialStore(authPath, ownerGuard)
+    : undefined;
   const runtime = await ModelRuntime.create({
     authPath,
+    ...(credentials ? { credentials } : {}),
     allowModelNetwork: false,
     refreshOnCreate: false,
   });
@@ -115,6 +189,8 @@ export async function createProviderAuthAuthority({
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      if (ownerGuard && !(await ownerGuard()))
+        return send(response, 503, { status: "unavailable" });
       if (request.method === "GET" && url.pathname === "/health")
         return send(response, 200, { status: "ok" });
       if (
