@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, TcpListener, TcpStream},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -17,6 +17,9 @@ use std::{
 const RUNTIME_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_STATUS_PARALLELISM: usize = 4;
 const MAX_RUNTIME_STATUS_BYTES: u64 = 64 * 1024;
+const UPDATE_MAINTENANCE_SECONDS: u64 = 300;
+const UPDATE_MAINTENANCE_ACK_TIMEOUT: Duration = Duration::from_secs(25);
+static RUNTIME_MAINTENANCE_SIGNAL: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
 pub const INSTALLATION_GUIDE: &str = "https://github.com/NWylynko/agentic-dev-machines/blob/main/docs/installation.md#in-cluster-lifecycle-owner";
 
 pub fn setup_guidance(cli: &crate::Cli) -> String {
@@ -278,6 +281,67 @@ struct RuntimeLeaseRequest {
     holder: String,
     #[serde(rename = "fencingToken")]
     fencing_token: Option<u64>,
+    #[serde(rename = "maintenanceId")]
+    maintenance_id: Option<String>,
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeMaintenanceRequest {
+    #[serde(rename = "maintenanceId")]
+    maintenance_id: String,
+    #[serde(
+        rename = "durationSeconds",
+        default = "default_update_maintenance_seconds"
+    )]
+    duration_seconds: u64,
+}
+
+fn default_update_maintenance_seconds() -> u64 {
+    UPDATE_MAINTENANCE_SECONDS
+}
+
+fn notify_runtime_maintenance_changed() {
+    let mut generation = RUNTIME_MAINTENANCE_SIGNAL
+        .0
+        .lock()
+        .expect("runtime maintenance signal lock");
+    *generation = generation.wrapping_add(1);
+    RUNTIME_MAINTENANCE_SIGNAL.1.notify_all();
+}
+
+fn wait_for_runtime_maintenance(cli: &crate::Cli, maintenance_id: &str) -> Result<Vec<String>> {
+    let deadline = Instant::now() + UPDATE_MAINTENANCE_ACK_TIMEOUT;
+    loop {
+        cli.check_lifecycle_fence()?;
+        let generation = *RUNTIME_MAINTENANCE_SIGNAL
+            .0
+            .lock()
+            .expect("runtime maintenance signal lock");
+        let missing = cli
+            .store()?
+            .unacknowledged_runtime_maintenance(maintenance_id)?;
+        if missing.is_empty() {
+            return Ok(missing);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(missing);
+        }
+        let guard = RUNTIME_MAINTENANCE_SIGNAL
+            .0
+            .lock()
+            .expect("runtime maintenance signal lock");
+        if *guard != generation {
+            continue;
+        }
+        let _ = RUNTIME_MAINTENANCE_SIGNAL
+            .1
+            .wait_timeout(guard, remaining)
+            .expect("runtime maintenance signal wait");
+    }
 }
 
 #[derive(Deserialize)]
@@ -716,6 +780,35 @@ fn route(
         ));
     }
     let mut store = cli.store()?;
+    if method == "POST" && path == "/v1/runtime/maintenance/extend" {
+        cli.check_lifecycle_fence()?;
+        let request: RuntimeMaintenanceRequest = serde_json::from_slice(body)?;
+        ensure!(
+            request.duration_seconds <= UPDATE_MAINTENANCE_SECONDS,
+            "controller update maintenance cannot exceed {UPDATE_MAINTENANCE_SECONDS} seconds"
+        );
+        let (expires_at, workspace_ids) =
+            store.extend_runtime_leases(&request.maintenance_id, request.duration_seconds)?;
+        notify_runtime_maintenance_changed();
+        return Ok((
+            200,
+            serde_json::json!({"maintenanceId":request.maintenance_id,"expiresAt":expires_at,"workspaceIds":workspace_ids}),
+        ));
+    }
+    if method == "POST" && path == "/v1/runtime/maintenance/await" {
+        cli.check_lifecycle_fence()?;
+        let request: RuntimeMaintenanceRequest = serde_json::from_slice(body)?;
+        let missing = wait_for_runtime_maintenance(cli, &request.maintenance_id)?;
+        ensure!(
+            missing.is_empty(),
+            "workspace runtimes did not acknowledge controller update maintenance: {}",
+            missing.join(", ")
+        );
+        return Ok((
+            200,
+            serde_json::json!({"maintenanceId":request.maintenance_id,"ready":true}),
+        ));
+    }
     if path.starts_with("/v1/provider-auth/") {
         cli.check_lifecycle_fence()?;
     }
@@ -908,7 +1001,29 @@ fn route(
                     fencing_token,
                     RUNTIME_LEASE_SECONDS,
                 )?;
-                serde_json::json!({"workspaceId":id,"holder":request.holder,"fencingToken":fencing_token,"expiresAt":expires_at})
+                let maintenance_id =
+                    store.runtime_maintenance_for_lease(id, &request.holder, fencing_token)?;
+                notify_runtime_maintenance_changed();
+                serde_json::json!({"workspaceId":id,"holder":request.holder,"fencingToken":fencing_token,"expiresAt":expires_at,"maintenanceId":maintenance_id})
+            }
+            ("POST", "lease/ack") => {
+                let fencing_token = request
+                    .fencing_token
+                    .context("maintenance acknowledgement needs fencingToken")?;
+                store.acknowledge_runtime_maintenance(
+                    id,
+                    &request.holder,
+                    fencing_token,
+                    request
+                        .maintenance_id
+                        .as_deref()
+                        .context("maintenance acknowledgement needs maintenanceId")?,
+                    request
+                        .expires_at
+                        .context("maintenance acknowledgement needs expiresAt")?,
+                )?;
+                notify_runtime_maintenance_changed();
+                serde_json::json!({"acknowledged":true})
             }
             ("POST", "check") => {
                 let fencing_token = request

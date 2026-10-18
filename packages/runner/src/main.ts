@@ -348,6 +348,7 @@ async function lifecycleRuntimeCall(
     fencingToken?: number;
     holder?: string;
     expiresAt?: number;
+    maintenanceId?: string | null;
   };
   if (!response.ok)
     throw new ApiError(
@@ -547,6 +548,14 @@ if (lifecycleUrl) {
         );
       runtimeLease.expiresAt = renewed.expiresAt!;
       scheduleLeaseExpiry(runtimeLease.expiresAt);
+      if (renewed.maintenanceId) {
+        await lifecycleRuntimeCall(workspaceId, "lease/ack", {
+          holder,
+          fencingToken: runtimeLease.fencingToken,
+          maintenanceId: renewed.maintenanceId,
+          expiresAt: renewed.expiresAt,
+        });
+      }
       restoreLifecycleAvailability();
     } catch (error) {
       if (isLifecycleUnavailable(error)) suspendLifecycleAvailability(error);

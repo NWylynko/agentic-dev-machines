@@ -395,7 +395,7 @@ impl WorkspaceStore {
         fs::create_dir_all(path)?;
         let connection = Connection::open(path.join("workspaces.sqlite"))?;
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,phase TEXT NOT NULL,spec TEXT NOT NULL,fencing_token INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS active_workspace_names ON workspaces(name) WHERE phase!='deleted'; CREATE TABLE IF NOT EXISTS lifecycle_operations(operation_id TEXT PRIMARY KEY,kind TEXT NOT NULL,request TEXT NOT NULL,workspace_id TEXT NOT NULL,status TEXT NOT NULL,accepted_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,stage TEXT,last_error TEXT,timings TEXT NOT NULL DEFAULT '{}',fencing_token INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS runtime_leases(workspace_id TEXT PRIMARY KEY,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS lifecycle_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),fencing_token INTEGER NOT NULL);")?;
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,phase TEXT NOT NULL,spec TEXT NOT NULL,fencing_token INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS active_workspace_names ON workspaces(name) WHERE phase!='deleted'; CREATE TABLE IF NOT EXISTS lifecycle_operations(operation_id TEXT PRIMARY KEY,kind TEXT NOT NULL,request TEXT NOT NULL,workspace_id TEXT NOT NULL,status TEXT NOT NULL,accepted_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,stage TEXT,last_error TEXT,timings TEXT NOT NULL DEFAULT '{}',fencing_token INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS runtime_leases(workspace_id TEXT PRIMARY KEY,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS runtime_maintenance(singleton INTEGER PRIMARY KEY CHECK(singleton=1),maintenance_id TEXT NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS runtime_maintenance_leases(maintenance_id TEXT NOT NULL,workspace_id TEXT NOT NULL,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(maintenance_id,workspace_id)); CREATE TABLE IF NOT EXISTS lifecycle_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),fencing_token INTEGER NOT NULL);")?;
         connection.execute(
             "INSERT INTO lifecycle_owner(singleton,fencing_token) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET fencing_token=MAX(lifecycle_owner.fencing_token,excluded.fencing_token)",
             [fencing_token as i64],
@@ -580,7 +580,7 @@ impl WorkspaceStore {
             )
             .optional()?;
         let now = now();
-        let (fencing_token, expires_at) = match current {
+        let (fencing_token, normal_expiry) = match current {
             Some((active_holder, token, expires_at))
                 if expires_at > now && active_holder == holder =>
             {
@@ -592,6 +592,16 @@ impl WorkspaceStore {
             Some((_, token, _)) => (token.saturating_add(1), now + duration),
             None => (1, now + duration),
         };
+        let maintenance: Option<(String, u64)> = tx
+            .query_row(
+                "SELECT maintenance_id,expires_at FROM runtime_maintenance WHERE singleton=1 AND expires_at>?1",
+                [now as i64],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?;
+        let expires_at = maintenance
+            .as_ref()
+            .map_or(normal_expiry, |(_, until)| normal_expiry.max(*until));
         tx.execute(
             "INSERT INTO runtime_leases(workspace_id,holder,fencing_token,expires_at,lifecycle_fencing_token) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workspace_id) DO UPDATE SET holder=excluded.holder,fencing_token=excluded.fencing_token,expires_at=excluded.expires_at,lifecycle_fencing_token=excluded.lifecycle_fencing_token WHERE runtime_leases.lifecycle_fencing_token<=excluded.lifecycle_fencing_token",
             params![workspace_id, holder, fencing_token as i64, expires_at as i64, self.fencing_token as i64],
@@ -611,6 +621,12 @@ impl WorkspaceStore {
             committed == (holder.to_owned(), fencing_token, expires_at),
             "runtime lease fencing token is stale"
         );
+        if let Some((maintenance_id, _)) = maintenance {
+            tx.execute(
+                "INSERT INTO runtime_maintenance_leases(maintenance_id,workspace_id,holder,fencing_token,expires_at,acknowledged) VALUES(?1,?2,?3,?4,?5,0) ON CONFLICT(maintenance_id,workspace_id) DO UPDATE SET holder=excluded.holder,fencing_token=excluded.fencing_token,expires_at=excluded.expires_at,acknowledged=0",
+                params![maintenance_id, workspace_id, holder, fencing_token as i64, expires_at as i64],
+            )?;
+        }
         tx.commit()?;
         Ok((fencing_token, expires_at))
     }
@@ -645,14 +661,159 @@ impl WorkspaceStore {
             "runtime lease fencing token is stale"
         );
         ensure!(current.2 > now(), "runtime lease expired");
-        let expires_at = now() + duration;
+        let current_time = now();
+        let maintenance_id: Option<String> = tx
+            .query_row(
+                "SELECT maintenance.maintenance_id FROM runtime_maintenance AS maintenance JOIN runtime_maintenance_leases AS leases ON leases.maintenance_id=maintenance.maintenance_id WHERE maintenance.singleton=1 AND maintenance.expires_at>?1 AND leases.workspace_id=?2 AND leases.holder=?3 AND leases.fencing_token=?4",
+                params![current_time as i64, workspace_id, holder, fencing_token as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let expires_at = if maintenance_id.is_some() {
+            current.2.max(current_time + duration)
+        } else {
+            current_time + duration
+        };
         let changed = tx.execute(
             "UPDATE runtime_leases SET expires_at=?4,lifecycle_fencing_token=?5 WHERE workspace_id=?1 AND holder=?2 AND fencing_token=?3 AND expires_at>?6 AND lifecycle_fencing_token<=?5",
-            params![workspace_id, holder, fencing_token as i64, expires_at as i64, self.fencing_token as i64, now() as i64],
+            params![workspace_id, holder, fencing_token as i64, expires_at as i64, self.fencing_token as i64, current_time as i64],
         )?;
         ensure!(changed == 1, "runtime lease fencing token is stale");
+        if let Some(maintenance_id) = maintenance_id {
+            tx.execute(
+                "UPDATE runtime_maintenance_leases SET expires_at=?3 WHERE maintenance_id=?1 AND workspace_id=?2 AND acknowledged=0",
+                params![maintenance_id, workspace_id, expires_at as i64],
+            )?;
+        }
         tx.commit()?;
         Ok(expires_at)
+    }
+    pub fn extend_runtime_leases(
+        &mut self,
+        maintenance_id: &str,
+        duration: u64,
+    ) -> Result<(u64, Vec<String>)> {
+        ensure!(
+            uuid::Uuid::parse_str(maintenance_id).is_ok(),
+            "maintenanceId must be a UUID"
+        );
+        ensure!(
+            (240..=300).contains(&duration),
+            "maintenance duration must be between 240 and 300 seconds"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_store_fence(&tx, self.fencing_token)?;
+        let current_time = now();
+        let expires_at = current_time + duration;
+        tx.execute("DELETE FROM runtime_maintenance_leases", [])?;
+        tx.execute(
+            "INSERT INTO runtime_maintenance(singleton,maintenance_id,expires_at,lifecycle_fencing_token) VALUES(1,?1,?2,?3) ON CONFLICT(singleton) DO UPDATE SET maintenance_id=excluded.maintenance_id,expires_at=excluded.expires_at,lifecycle_fencing_token=excluded.lifecycle_fencing_token",
+            params![maintenance_id, expires_at as i64, self.fencing_token as i64],
+        )?;
+        let mut statement = tx.prepare(
+            "SELECT leases.workspace_id,leases.holder,leases.fencing_token,leases.expires_at FROM runtime_leases AS leases JOIN workspaces ON workspaces.id=leases.workspace_id WHERE leases.expires_at>?1 AND workspaces.phase NOT IN ('deleting','deleted') ORDER BY leases.workspace_id",
+        )?;
+        let leases = statement
+            .query_map([current_time as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut workspace_ids = Vec::with_capacity(leases.len());
+        for (workspace_id, holder, fencing_token, current_expiry) in leases {
+            let lease_expiry = current_expiry.max(expires_at);
+            tx.execute(
+                "UPDATE runtime_leases SET expires_at=?2,lifecycle_fencing_token=?3 WHERE workspace_id=?1 AND holder=?4 AND fencing_token=?5 AND expires_at>?6",
+                params![workspace_id, lease_expiry as i64, self.fencing_token as i64, holder, fencing_token as i64, current_time as i64],
+            )?;
+            tx.execute(
+                "INSERT INTO runtime_maintenance_leases(maintenance_id,workspace_id,holder,fencing_token,expires_at,acknowledged) VALUES(?1,?2,?3,?4,?5,0)",
+                params![maintenance_id, workspace_id, holder, fencing_token as i64, lease_expiry as i64],
+            )?;
+            workspace_ids.push(workspace_id);
+        }
+        tx.commit()?;
+        Ok((expires_at, workspace_ids))
+    }
+    pub fn acknowledge_runtime_maintenance(
+        &mut self,
+        workspace_id: &str,
+        holder: &str,
+        fencing_token: u64,
+        maintenance_id: &str,
+        expires_at: u64,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_store_fence(&tx, self.fencing_token)?;
+        let current_time = now();
+        let active: (String, u64) = tx.query_row(
+            "SELECT maintenance_id,expires_at FROM runtime_maintenance WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+        )?;
+        ensure!(
+            active.0 == maintenance_id && active.1 > current_time,
+            "controller maintenance window is no longer active"
+        );
+        let current: (String, u64, u64) = tx.query_row(
+            "SELECT holder,fencing_token,expires_at FROM runtime_leases WHERE workspace_id=?1",
+            [workspace_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            },
+        )?;
+        ensure!(
+            current.0 == holder
+                && current.1 == fencing_token
+                && current.2 == expires_at
+                && current.2 > current_time,
+            "runtime lease changed before maintenance acknowledgement"
+        );
+        let changed = tx.execute(
+            "UPDATE runtime_maintenance_leases SET expires_at=?5,acknowledged=1 WHERE maintenance_id=?1 AND workspace_id=?2 AND holder=?3 AND fencing_token=?4",
+            params![maintenance_id, workspace_id, holder, fencing_token as i64, expires_at as i64],
+        )?;
+        ensure!(
+            changed == 1,
+            "runtime lease is not part of the maintenance update"
+        );
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn unacknowledged_runtime_maintenance(&self, maintenance_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT workspace_id FROM runtime_maintenance_leases WHERE maintenance_id=?1 AND acknowledged=0 ORDER BY workspace_id",
+        )?;
+        let rows = statement.query_map([maintenance_id], |row| row.get(0))?;
+        rows.map(|row| Ok(row?)).collect()
+    }
+    pub fn runtime_maintenance_for_lease(
+        &self,
+        workspace_id: &str,
+        holder: &str,
+        fencing_token: u64,
+    ) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT maintenance.maintenance_id FROM runtime_maintenance AS maintenance JOIN runtime_maintenance_leases AS leases ON leases.maintenance_id=maintenance.maintenance_id WHERE maintenance.singleton=1 AND maintenance.expires_at>?1 AND leases.workspace_id=?2 AND leases.holder=?3 AND leases.fencing_token=?4",
+                params![now() as i64, workspace_id, holder, fencing_token as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
     pub fn check_runtime_lease(
         &mut self,

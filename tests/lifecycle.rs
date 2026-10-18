@@ -1149,7 +1149,7 @@ else:
     .unwrap()
     .json()
     .unwrap();
-    assert_eq!(runtime_lease["fencingToken"], 1);
+    assert_eq!(runtime_lease["fencingToken"], 1, "{runtime_lease}");
     // A newly booting Pod can start a bot's initial provider turn before its
     // Deployment becomes Ready. Its current Pod-bound lease is authoritative.
     {
@@ -1235,6 +1235,69 @@ else:
             assert!(!request.contains("synthetic-lifecycle-token"));
         }
     }
+    let maintenance_id = "c3d48a23-23e6-44ba-98e7-1cd0c1d94d2f";
+    let maintenance: Value = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/maintenance/extend",
+        Some(&json!({"maintenanceId":maintenance_id,"durationSeconds":300})),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(maintenance["maintenanceId"], maintenance_id);
+    assert!(
+        maintenance["workspaceIds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(runtime_id))
+    );
+    let extended_renewal: Value = request_with_token(
+        &url,
+        "POST",
+        &format!("/v1/workspaces/{runtime_id}/runtime/lease/renew"),
+        Some(&json!({"holder":runtime_pod_uid,"fencingToken":runtime_lease["fencingToken"]})),
+        Some("runtime-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(extended_renewal["maintenanceId"], maintenance_id);
+    assert!(
+        extended_renewal["expiresAt"].as_u64().unwrap()
+            >= maintenance["expiresAt"].as_u64().unwrap()
+    );
+    let acknowledgement = json!({
+        "holder": runtime_pod_uid,
+        "fencingToken": runtime_lease["fencingToken"],
+        "maintenanceId": maintenance_id,
+        "expiresAt": extended_renewal["expiresAt"],
+    });
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &format!("/v1/workspaces/{runtime_id}/runtime/lease/ack"),
+            Some(&acknowledgement),
+            Some("runtime-token"),
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/maintenance/await",
+            Some(&json!({"maintenanceId":maintenance_id})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .status(),
+        200
+    );
     let check_path = format!("/v1/workspaces/{runtime_id}/runtime/check");
     let check_body = json!({"holder":runtime_pod_uid,"fencingToken":runtime_lease["fencingToken"]});
     assert_eq!(
