@@ -85,6 +85,9 @@ async function startRunner(
   return {
     url,
     child,
+    get errors() {
+      return errors;
+    },
     async stop(signal = "SIGTERM") {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill(signal);
@@ -217,7 +220,7 @@ async function startBotLifecycle(
         response.writeHead(403, headers).end(JSON.stringify({ error: { message: "not authorized" } }));
         return;
       }
-      response.writeHead(200, headers).end(JSON.stringify({ workspaceId: id, holder: value.holder, fencingToken: 1, expiresAt: Date.now() + 60000 }));
+      response.writeHead(200, headers).end(JSON.stringify({ workspaceId: id, holder: value.holder, fencingToken: 1, expiresAt: Math.floor(Date.now() / 1000) + 60 }));
       return;
     }
     const authorize = /^\/v1\/workspaces\/([^/]+)\/runtime\/authorize$/.exec(
@@ -404,7 +407,7 @@ test("workspace requests are authorized by lifecycle against the caller's projec
                 workspaceId: "workspace-lifecycle-auth",
                 holder: body.holder,
                 fencingToken: 7,
-                expiresAt: Date.now() + 30_000,
+                expiresAt: Math.floor(Date.now() / 1000) + 30,
               }
             : checkPath && deleting
               ? {
@@ -644,6 +647,70 @@ test(
   },
 );
 
+test("canceling a blocked authoritative check does not fence the workspace", { timeout: 15_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-canceled-check-"));
+  const tokenFile = join(directory, "service-account-token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  await writeFile(tokenFile, "canceled-check-identity\n", { mode: 0o600 });
+  await writeFile(workspaceConfigFile, JSON.stringify({
+    id: "workspace-canceled-check",
+    name: "canceled-check",
+    role: "coding",
+    environment: "pod",
+    localRoot: directory,
+    model: { provider: "faux", id: "faux-1" },
+  }));
+  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+  let blockCheck = false;
+  let checkEnteredResolve;
+  const checkEntered = new Promise((resolve) => {
+    checkEnteredResolve = resolve;
+  });
+  const control = createServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    if (request.url?.endsWith("/runtime/authorize")) {
+      response.writeHead(200, { "content-type": "application/json" }).end('{"allowed":true}');
+      return;
+    }
+    if (request.url?.endsWith("/runtime/check") && blockCheck) {
+      checkEnteredResolve();
+      return;
+    }
+    const body = request.url?.endsWith("/runtime/lease")
+      ? { workspaceId: "workspace-canceled-check", holder, fencingToken: 1, expiresAt: Math.floor(Date.now() / 1000) + 60 }
+      : { workspaceId: "workspace-canceled-check", holder, fencingToken: 1, valid: true };
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+  });
+  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+  const runner = await startRunner(join(directory, "state"), {}, {
+    tokenFile,
+    workspaceConfigFile,
+    lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+    podUid: holder,
+  });
+  t.after(async () => {
+    await runner.stop();
+    await new Promise((resolve) => control.close(resolve));
+  });
+
+  blockCheck = true;
+  const canceled = new AbortController();
+  const pending = runner.request(`/v1/workspaces/workspace-canceled-check/input`, "POST", {
+    requestId: "canceled-authoritative-check",
+    message: "This canceled admission must not fence the owner.",
+  }, canceled.signal, "canceled-check-identity");
+  await checkEntered;
+  canceled.abort(new Error("caller canceled its request"));
+  await assert.rejects(pending);
+  blockCheck = false;
+  assert.equal((await fetch(`${runner.url}/health`)).status, 200);
+  const next = await runner.request(`/v1/workspaces/workspace-canceled-check/input`, "POST", {
+    requestId: "after-canceled-authoritative-check",
+    message: "The same holder can still submit after cancellation.",
+  }, undefined, "canceled-check-identity");
+  assert.equal(next.status, 202);
+});
+
 test("an authoritative changed runtime fence permanently closes the runner", { timeout: 15_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "adm-runner-changed-fence-"));
   const tokenFile = join(directory, "service-account-token");
@@ -693,6 +760,78 @@ test("an authoritative changed runtime fence permanently closes the runner", { t
   const health = await fetch(`${runner.url}/health`);
   assert.equal(health.status, 503);
   assert.equal((await health.json()).status, "error");
+});
+
+test("lease expiry closes a running tool even when its durable abort is fenced", { timeout: 15_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-expired-tool-"));
+  const tokenFile = join(directory, "service-account-token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  const started = join(directory, "tool-started");
+  const afterExpiry = join(directory, "tool-wrote-after-expiry");
+  await writeFile(tokenFile, "expired-tool-identity\n", { mode: 0o600 });
+  await writeFile(workspaceConfigFile, JSON.stringify({
+    id: "workspace-expired-tool",
+    name: "expired-tool",
+    role: "coding",
+    environment: "pod",
+    localRoot: directory,
+    model: { provider: "faux", id: "faux-1" },
+  }));
+  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+  const control = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    const body = text ? JSON.parse(text) : {};
+    const value = request.url?.endsWith("/runtime/authorize")
+      ? { allowed: true }
+      : {
+          workspaceId: "workspace-expired-tool",
+          holder: body.holder ?? holder,
+          fencingToken: 1,
+          expiresAt: Math.floor(Date.now() / 1000) + 5,
+          valid: true,
+        };
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(value));
+  });
+  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+  const runner = await startRunner(join(directory, "state"), {}, {
+    tokenFile,
+    workspaceConfigFile,
+    lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+    podUid: holder,
+  });
+  t.after(async () => {
+    await runner.stop();
+    await new Promise((resolve) => control.close(resolve));
+  });
+
+  const id = "workspace-expired-tool";
+  const active = await runner.request(`/v1/workspaces/${id}/input`, "POST", {
+    requestId: "tool-interrupted-by-expiry",
+    message: "/faux " + JSON.stringify({
+      calls: [{ tool: "bash", args: { command: `touch ${started}; sleep 30; touch ${afterExpiry}` } }],
+      answer: "This turn must be stopped when its lease expires.",
+    }),
+  }, undefined, "expired-tool-identity");
+  assert.equal(active.status, 202);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      await access(started);
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  await access(started);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if ((await fetch(`${runner.url}/health`)).status === 503) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal((await fetch(`${runner.url}/health`)).status, 503);
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  await assert.rejects(access(afterExpiry), { code: "ENOENT" });
+  assert.match(runner.errors, /FATAL failed to stop fenced workspace/);
+  assert.match(runner.errors, /shutdown incomplete: Error: Workspace runtime lease expired/);
 });
 
 test("the runner fences at the server-issued lease expiry deadline", { timeout: 5_000 }, async (t) => {

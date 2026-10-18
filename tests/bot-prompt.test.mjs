@@ -92,7 +92,7 @@ const lifecycle = createServer(async (request, response) => {
       workspaceId,
       holder: body.holder,
       fencingToken: 1,
-      expiresAt: Date.now() + 30_000,
+      expiresAt: Math.floor(Date.now() / 1000) + 30,
     };
   } else if (
     path.endsWith("/runtime/check") ||

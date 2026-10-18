@@ -270,6 +270,7 @@ async function assertActive(id: string, signal?: AbortSignal) {
         restoreLifecycleAvailability();
         return;
       } catch (error) {
+        if (signal?.aborted) throw error;
         if (isLifecycleUnavailable(error)) {
           suspendLifecycleAvailability(error);
           continue;
@@ -290,15 +291,20 @@ function isLifecycleUnavailable(error: unknown): boolean {
 }
 function scheduleLeaseExpiry(expiresAt: number) {
   if (leaseExpiryTimer) clearTimeout(leaseExpiryTimer);
-  const remaining = expiresAt * 1000 - Date.now();
-  if (remaining <= 0) {
-    void fenceLost(new Error("Workspace runtime lease expired"));
+  const remaining = leaseExpiryDelay(expiresAt);
+  if (remaining === undefined) {
+    void fenceLost(new Error("Lifecycle returned an invalid workspace lease expiry"));
     return;
   }
   leaseExpiryTimer = setTimeout(() => {
     void fenceLost(new Error("Workspace runtime lease expired"));
   }, remaining);
   leaseExpiryTimer.unref();
+}
+function leaseExpiryDelay(expiresAt: number): number | undefined {
+  if (!Number.isSafeInteger(expiresAt)) return undefined;
+  const remaining = expiresAt * 1000 - Date.now();
+  return remaining > 0 && remaining <= 301_000 ? remaining : undefined;
 }
 function fenceLost(error: unknown) {
   if (fenceShutdown) return fenceShutdown;
@@ -475,13 +481,18 @@ async function openWorkspace(
   const workspace = await Workspace.open(
     config,
     join(stateDirectory, "sessions", config.id),
-    () => assertActive(config.id),
+    (signal) => assertActive(config.id, signal),
     values["auth-path"],
     botAgents,
     passive,
     deferActivation,
     values.provider,
-    lifecycleUrl ? waitForLifecycleAvailability : undefined,
+    lifecycleUrl
+      ? {
+          wait: waitForLifecycleAvailability,
+          suspend: suspendLifecycleAvailability,
+        }
+      : undefined,
   );
   workspaces.set(config.id, workspace);
   return workspace;
@@ -526,8 +537,7 @@ if (lifecycleUrl) {
     acquired.holder !== holder ||
     !Number.isSafeInteger(acquired.fencingToken) ||
     acquired.fencingToken! < 1 ||
-    !Number.isSafeInteger(acquired.expiresAt) ||
-    acquired.expiresAt! <= Math.floor(Date.now() / 1000)
+    leaseExpiryDelay(acquired.expiresAt!) === undefined
   )
     throw new Error("Lifecycle returned an invalid workspace runtime lease");
   runtimeLease = {
@@ -556,8 +566,7 @@ if (lifecycleUrl) {
         throw new Error("Lifecycle changed the active workspace fence");
       if (
         renewed.holder !== holder ||
-        !Number.isSafeInteger(renewed.expiresAt) ||
-        renewed.expiresAt! <= Math.floor(Date.now() / 1000)
+        leaseExpiryDelay(renewed.expiresAt!) === undefined
       )
         throw new Error(
           "Lifecycle returned an invalid renewed workspace lease",

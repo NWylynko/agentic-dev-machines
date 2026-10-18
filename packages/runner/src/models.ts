@@ -11,11 +11,16 @@ import { readFile } from "node:fs/promises";
 import { workspaceCredentialRuntime } from "./credentials.ts";
 import type { SharedProviderCatalog } from "./provider-auth-authority.ts";
 
+export interface LifecycleAuthorityAvailability {
+  wait(signal?: AbortSignal): Promise<void>;
+  suspend(error: unknown): void;
+}
+
 export async function workspaceModels(
   provider: string | undefined,
   authPath?: string,
   workspaceRoot = "/workspace",
-  waitForAuthority?: (signal?: AbortSignal) => Promise<void>,
+  availability?: LifecycleAuthorityAvailability,
 ): Promise<Models> {
   if (provider !== "faux") {
     const runtime = await workspaceCredentialRuntime(workspaceRoot, {
@@ -32,9 +37,7 @@ export async function workspaceModels(
           }
         : {}),
     });
-    return configureSharedProviderAuth(runtime, undefined, {
-      waitForAuthority,
-    });
+    return configureSharedProviderAuth(runtime, undefined, { availability });
   }
   const models = createModels();
   const faux = fauxProvider({ tokensPerSecond: 100_000 });
@@ -126,7 +129,7 @@ export async function configureSharedProviderAuth<
   runtime: T,
   selectedProviders?: readonly string[],
   options: {
-    waitForAuthority?: (signal?: AbortSignal) => Promise<void>;
+    availability?: LifecycleAuthorityAvailability;
   } = {},
 ): Promise<T> {
   const lifecycleUrl = process.env.ADM_LIFECYCLE_URL;
@@ -139,22 +142,39 @@ export async function configureSharedProviderAuth<
     signal?: AbortSignal,
     body?: unknown,
   ) {
-    await options.waitForAuthority?.(signal);
-    signal?.throwIfAborted();
-    const token = (await readFile(identityFile, "utf8")).trim();
-    if (!token) throw new Error("Projected lifecycle identity token is empty");
-    return fetch(
-      `${lifecycleUrl!.replace(/\/$/, "")}/v1/provider-auth/${path}`,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        signal,
-      },
-    );
+    for (;;) {
+      await options.availability?.wait(signal);
+      signal?.throwIfAborted();
+      const token = (await readFile(identityFile, "utf8")).trim();
+      if (!token) throw new Error("Projected lifecycle identity token is empty");
+      let response: Response;
+      try {
+        response = await fetch(
+          `${lifecycleUrl!.replace(/\/$/, "")}/v1/provider-auth/${path}`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+            },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            signal,
+          },
+        );
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        if (!options.availability || !(error instanceof TypeError)) throw error;
+        options.availability.suspend(error);
+        continue;
+      }
+      if (response.status >= 500 && options.availability) {
+        options.availability.suspend(
+          new Error(`Shared provider authentication service unavailable (${response.status})`),
+        );
+        continue;
+      }
+      return response;
+    }
   }
   let catalog: SharedProviderCatalog = {};
   const catalogRequests = new Map<

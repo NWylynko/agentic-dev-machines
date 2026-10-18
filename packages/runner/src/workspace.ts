@@ -22,7 +22,10 @@ import { defaultRemoteEnv, KubernetesExecutionEnv } from "./kubernetes-env.ts";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
-import { workspaceModels } from "./models.ts";
+import {
+  workspaceModels,
+  type LifecycleAuthorityAvailability,
+} from "./models.ts";
 import {
   activeWorkspaceConversation,
   createWorkspaceConversation,
@@ -139,7 +142,7 @@ export class Workspace {
   private accepting = true;
   private admissions = Promise.resolve();
   private models: Models;
-  private readonly assertActive: () => Promise<void>;
+  private readonly assertActive: (signal?: AbortSignal) => Promise<void>;
   private readonly loopTask: ReturnType<
     typeof createScheduleExtension
   >["loopTask"];
@@ -151,7 +154,7 @@ export class Workspace {
     harness: Workspace["harness"],
     conversation: Workspace["conversation"],
     models: Models,
-    assertActive: () => Promise<void>,
+    assertActive: (signal?: AbortSignal) => Promise<void>,
     loopTask: Workspace["loopTask"],
     mcpClose?: () => Promise<void>,
   ) {
@@ -170,13 +173,13 @@ export class Workspace {
   static async open(
     config: WorkspaceConfig,
     directory: string,
-    assertActive: () => Promise<void>,
+    assertActive: (signal?: AbortSignal) => Promise<void>,
     authPath?: string,
     botAgents?: BotAgentManagement,
     passive = false,
     deferActivation = false,
     runtimeProvider?: string,
-    waitForAuthority?: (signal?: AbortSignal) => Promise<void>,
+    availability?: LifecycleAuthorityAvailability,
   ): Promise<Workspace> {
     if (!passive) await assertActive();
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -256,14 +259,14 @@ export class Workspace {
           name: "workspace-lifecycle",
           hooks: [
             hook(ToolTask, {
-              beforeTool: async () => {
-                await assertActive();
+              beforeTool: async (_call, _api, context) => {
+                await assertActive(context.abortSignal);
                 return undefined;
               },
             }),
             hook(GenerationTask, {
-              beforeRequest: async () => {
-                await assertActive();
+              beforeRequest: async (_request, _api, context) => {
+                await assertActive(context.abortSignal);
                 return undefined;
               },
               afterResponse: async (message) => {
@@ -286,7 +289,7 @@ export class Workspace {
         config.model?.provider ?? runtimeProvider,
         authPath,
         config.localRoot ?? "/workspace",
-        waitForAuthority,
+        availability,
       );
       const fencedStorage = new Proxy(storage, {
         get(target, property) {
@@ -1064,15 +1067,48 @@ export class Workspace {
   async close(destroy = false) {
     if (this.closed) return;
     this.accepting = false;
-    await this.admissions;
-    if (destroy) await this.conversation.abort(context, { background: true });
+    const errors: unknown[] = [];
+    const attempt = async (cleanup: () => Promise<unknown>) => {
+      try {
+        await cleanup();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+    await attempt(() => this.admissions);
     this.closed = true;
-    this.unsubscribe();
-    await this.kubeEnv?.cleanup(context);
-    await this.localEnv?.cleanup(context);
-    await this.harness.close(context);
-    await this.sandbox?.close();
-    await this.mcpClose?.();
-    this.events.emit("close");
+    try {
+      this.unsubscribe();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (destroy)
+      await attempt(() =>
+        this.conversation.abort(context, { background: true }),
+      );
+    for (const cleanup of [
+      () => this.kubeEnv?.cleanup(context),
+      () => this.localEnv?.cleanup(context),
+      () => this.harness.close(context),
+      () => this.sandbox?.close(),
+      () => this.mcpClose?.(),
+    ])
+      await attempt(async () => {
+        await cleanup();
+      });
+    try {
+      this.events.emit("close");
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length) {
+      const detail = errors
+        .map((error) => (error instanceof Error ? `${error.name}: ${error.message}` : String(error)))
+        .join("; ");
+      throw new AggregateError(
+        errors,
+        `Workspace ${this.config.id} shutdown incomplete: ${detail}`,
+      );
+    }
   }
 }

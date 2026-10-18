@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -858,6 +859,190 @@ test("OAuth refresh and logout recheck the owner epoch while the credential lock
     assert.equal(afterLogout[providerId].refresh, "old-refresh-secret");
   } finally {
     await active.authority.close();
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("shared auth retries a controller transport failure only after its lease gate reopens", async (t) => {
+  const { createAssistantMessageEventStream } = await import("@earendil-works/pi-ai");
+  const directory = await mkdtemp(join(tmpdir(), "adm-provider-gated-retry-"));
+  const authPath = join(directory, "auth.json");
+  const identityPath = join(directory, "pod-token");
+  await writeFile(identityPath, "synthetic-pod-identity");
+  const providerId = "adm-gated-auth";
+  let providerRequests = 0;
+  const model = {
+    id: "gated-model",
+    name: "Gated model",
+    api: "adm-gated-api",
+    provider: providerId,
+    baseUrl: "https://provider.invalid/v1",
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    reasoning: false,
+    contextWindow: 1000,
+    maxTokens: 100,
+  };
+  const provider = {
+    id: providerId,
+    name: "Gated provider",
+    auth: {
+      apiKey: {
+        name: "Synthetic key",
+        login: async () => ({ type: "api_key", key: "gated-shared-secret" }),
+        resolve: async ({ credential }) => credential?.key
+          ? { auth: { apiKey: credential.key } }
+          : undefined,
+      },
+    },
+    getModels: () => [model],
+    stream: () => { throw new Error("not used"); },
+    streamSimple: (_model, _context, options) => {
+      providerRequests += 1;
+      assert.equal(options.apiKey, "gated-shared-secret");
+      const stream = createAssistantMessageEventStream();
+      stream.end({
+        role: "assistant",
+        content: [{ type: "text", text: "accepted after authority recovery" }],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: {
+          input: 1,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      });
+      return stream;
+    },
+  };
+  const authority = await createProviderAuthAuthority({
+    authPath,
+    configure(runtime) { runtime.registerNativeProvider(provider); },
+  });
+  const savedUrl = process.env.ADM_LIFECYCLE_URL;
+  const savedIdentity = process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE;
+  let resolveAttempts = 0;
+  let suspendedResolve;
+  const suspended = new Promise((resolve) => { suspendedResolve = resolve; });
+  let available = true;
+  let releaseWaiters = [];
+  const availability = {
+    wait(signal) {
+      signal?.throwIfAborted();
+      if (available) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const waiter = () => {
+          signal?.removeEventListener("abort", aborted);
+          resolve();
+        };
+        const aborted = () => {
+          releaseWaiters = releaseWaiters.filter((item) => item !== waiter);
+          reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+        };
+        signal?.addEventListener("abort", aborted, { once: true });
+        releaseWaiters.push(waiter);
+      });
+    },
+    suspend(error) {
+      available = false;
+      suspendedResolve(error);
+    },
+  };
+  const proxy = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    if (request.url === "/v1/runtime/check") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ valid: true, holder: "same-pod-uid", fencingToken: 7 }));
+      return;
+    }
+    if (request.url === "/v1/provider-auth/resolve" && resolveAttempts++ === 0) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "controller updating" } }));
+      return;
+    }
+    const upstream = await fetch(`http://127.0.0.1:${authority.server.address().port}${request.url}`, {
+      method: request.method,
+      headers: request.headers.authorization
+        ? { authorization: request.headers.authorization, "content-type": "application/json" }
+        : { "content-type": "application/json" },
+      ...(body ? { body } : {}),
+    });
+    response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+    response.end(await upstream.text());
+  });
+  try {
+    await new Promise((resolve) => authority.server.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${proxy.address().port}`;
+    process.env.ADM_LIFECYCLE_URL = url;
+    process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE = identityPath;
+    const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+    const { InMemoryCredentialStore } = await import("@earendil-works/pi-ai");
+    const { configureSharedProviderAuth } = await import("../src/models.ts");
+    const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), refreshOnCreate: false });
+    runtime.registerNativeProvider(provider);
+    await configureSharedProviderAuth(runtime, [providerId], { availability });
+    const login = await fetch(`http://127.0.0.1:${authority.server.address().port}/v1/provider-auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: providerId, type: "api_key" }),
+    });
+    const { operationId } = await login.json();
+    await fetch(`http://127.0.0.1:${authority.server.address().port}/v1/provider-auth/login/${operationId}/events`);
+
+    const pending = runtime.completeSimple(model, {
+      messages: [{ role: "user", content: "wait through controller update", timestamp: Date.now() }],
+    });
+    const firstOutcome = await Promise.race([
+      suspended.then((error) => ({ kind: "suspended", error })),
+      pending.then(
+        (result) => ({ kind: "completed", result }),
+        (error) => ({ kind: "failed", error }),
+      ),
+    ]);
+    assert.equal(firstOutcome.kind, "suspended");
+    const outage = await suspended;
+    assert.match(String(outage), /503/);
+    assert.equal(providerRequests, 0, "a provider request cannot escape while authority is suspended");
+    assert.equal(resolveAttempts, 1, "shared auth resolve is attempted only once before recovery");
+    const check = await fetch(`${url}/v1/runtime/check`, { method: "POST" });
+    assert.deepEqual(await check.json(), { valid: true, holder: "same-pod-uid", fencingToken: 7 });
+    available = true;
+    for (const release of releaseWaiters) release();
+    releaseWaiters = [];
+    const result = await pending;
+    assert.equal(result.stopReason, "stop", JSON.stringify(result));
+    assert.equal(result.content[0].text, "accepted after authority recovery");
+    assert.equal(resolveAttempts, 2);
+    assert.equal(providerRequests, 1);
+
+    const logout = await fetch(`http://127.0.0.1:${authority.server.address().port}/v1/provider-auth/logout`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: providerId }),
+    });
+    assert.equal(logout.status, 200);
+    const missing = await runtime.completeSimple(model, {
+      messages: [{ role: "user", content: "do not retry missing auth", timestamp: Date.now() }],
+    });
+    assert.equal(missing.stopReason, "error");
+    assert.match(missing.errorMessage, /Provider is not authenticated/);
+    assert.equal(resolveAttempts, 3, "401 is terminal and does not enter the availability retry loop");
+    assert.equal(providerRequests, 1);
+  } finally {
+    if (savedUrl === undefined) delete process.env.ADM_LIFECYCLE_URL;
+    else process.env.ADM_LIFECYCLE_URL = savedUrl;
+    if (savedIdentity === undefined) delete process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE;
+    else process.env.ADM_LIFECYCLE_IDENTITY_TOKEN_FILE = savedIdentity;
+    await new Promise((resolve) => proxy.close(resolve));
+    await authority.close();
     await rm(directory, { recursive: true });
   }
 });
