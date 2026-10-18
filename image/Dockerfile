@@ -15,7 +15,9 @@ WORKDIR /src
 COPY package.json package-lock.json ./
 COPY packages/runner/package.json packages/runner/package.json
 COPY packages/terminal/package.json packages/terminal/package.json
+COPY scripts/patch-pi-interactive.mjs scripts/patch-pi-interactive.mjs
 RUN npm ci --ignore-scripts
+RUN node scripts/patch-pi-interactive.mjs
 COPY packages/runner packages/runner
 RUN npx esbuild packages/runner/src/main.ts --bundle --platform=node --format=esm --packages=external --outfile=/out/runner.mjs \
  && npx esbuild packages/runner/src/provider-auth-main.ts --bundle --platform=node --format=esm --packages=external --outfile=/out/provider-auth.mjs \

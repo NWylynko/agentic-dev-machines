@@ -11,6 +11,7 @@
     "node": ">=24.0.0"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-pi-interactive.mjs",
     "test": "node --test packages/runner/test/*.test.mjs image/browser.test.mjs tests/lifecycle-rbac.test.mjs && node --import tsx --test packages/terminal/test/*.test.ts",
     "test:runner": "node --test packages/runner/test/*.test.mjs",
     "test:terminal": "node --import tsx --test packages/terminal/test/*.test.ts",

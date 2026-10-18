@@ -107,7 +107,7 @@ const piAssistantMessage = (message: any) => ({
       : [],
 });
 
-function importedPiSession(text: string) {
+export function importedPiSession(text: string) {
   const lines = text.split(/\r?\n/).filter(Boolean);
   let header: Record<string, any>;
   try {
@@ -155,7 +155,10 @@ function importedPiSession(text: string) {
     "session_info",
     "label",
   ]);
-  const messageNodes = new Map<string, { id: string; parentId: string | null; message: any }>();
+  const messageNodes = new Map<
+    string,
+    { id: string; parentId: string | null; message: any }
+  >();
   for (const entry of entries) {
     if (entry.type === "message") {
       if (
@@ -166,11 +169,17 @@ function importedPiSession(text: string) {
       let parentId = entry.parentId;
       while (parentId && !messageNodes.has(parentId))
         parentId = byId.get(parentId)?.parentId ?? null;
-      messageNodes.set(entry.id, { id: entry.id, parentId, message: entry.message });
+      messageNodes.set(entry.id, {
+        id: entry.id,
+        parentId,
+        message: entry.message,
+      });
       continue;
     }
     if (!ignoredState.has(entry.type))
-      throw new Error(`Unsupported Pi transcript entry type: ${clean(entry.type)}`);
+      throw new Error(
+        `Unsupported Pi transcript entry type: ${clean(entry.type)}`,
+      );
   }
   let selectedMessageLeaf: string | null = leafId;
   while (selectedMessageLeaf && !messageNodes.has(selectedMessageLeaf))
@@ -178,7 +187,8 @@ function importedPiSession(text: string) {
   const messages = [...messageNodes.values()];
   if (!messages.length || messages.length > 1000)
     throw new Error("Pi session must contain one to 1000 supported messages");
-  if (!selectedMessageLeaf) throw new Error("Selected Pi branch contains no messages");
+  if (!selectedMessageLeaf)
+    throw new Error("Selected Pi branch contains no messages");
   return {
     session: {
       ...(typeof header.id === "string" ? { id: header.id } : {}),
@@ -275,6 +285,7 @@ export class WorkspaceTerminal extends Container {
   private modelSelector?: ModelSelectorComponent;
   private activeSelector?: Component & { handleInput(data: string): void };
   private modelRuntime?: RemoteModelRuntime;
+  private workspaceEventListeners = new Set<(event: WorkspaceEvent) => void>();
   constructor(options: TerminalOptions) {
     super();
     this.options = options;
@@ -479,7 +490,7 @@ export class WorkspaceTerminal extends Container {
     if (!token) throw new Error("Workspace runtime token file is empty");
     return { authorization: `Bearer ${token}` } as Record<string, string>;
   }
-  async request(
+  async request<T = any>(
     path: string,
     body?: unknown,
     signal: AbortSignal | undefined = this.controller?.signal,
@@ -503,7 +514,131 @@ export class WorkspaceTerminal extends Container {
         detail?.error?.message ?? `Runner returned HTTP ${response.status}`,
       );
     }
-    return response.json();
+    return response.json() as Promise<T>;
+  }
+  /** Observe the same authorized, cursor-replayed stream used by the terminal UI. */
+  subscribeWorkspaceEvents(listener: (event: WorkspaceEvent) => void) {
+    this.workspaceEventListeners.add(listener);
+    return () => this.workspaceEventListeners.delete(listener);
+  }
+  getRemoteSnapshot() {
+    return {
+      connected: this.connected,
+      diagnostics: this.options.diagnostics === true,
+      status: this.status,
+      workspaceName: this.workspaceName,
+      role: this.role,
+      cwd: this.workingDirectory,
+      conversationId: this.conversationId,
+      cursor: this.cursor,
+      events: this.records.slice(),
+      models: this.modelRuntime?.getAvailableSnapshot() ?? [],
+      selectedModel: this.modelRuntime?.selected,
+      thinkingLevel: this.thinkingLevel,
+      liveMessage: this.liveMessage,
+      liveTools: new Map(this.liveTools),
+    };
+  }
+  async executeBash(
+    command: string,
+    onChunk: (chunk: string) => void,
+    options: {
+      excludeFromContext?: boolean;
+      id?: string;
+      signal?: AbortSignal;
+      onAdmitted?: (operationId: string) => void;
+    },
+  ) {
+    const requestId = options.id ?? randomUUID();
+    const admission = await this.request<{ operationId: string }>(
+      "/bash",
+      {
+        command,
+        requestId,
+        ...(options.excludeFromContext ? { excludeFromContext: true } : {}),
+      },
+      options.signal,
+    );
+    if (!admission.operationId)
+      throw new Error("Runner did not admit the bash operation");
+    options.onAdmitted?.(admission.operationId);
+    const response = await fetch(
+      this.endpoint(
+        `/bash/${encodeURIComponent(admission.operationId)}/events`,
+      ),
+      { headers: await this.authorizationHeaders(), signal: options.signal },
+    );
+    if (!response.ok || !response.body)
+      throw new Error(`Runner bash stream returned HTTP ${response.status}`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let eventName = "message";
+    let dataLines: string[] = [];
+    let result: Record<string, unknown> | undefined;
+    const dispatch = () => {
+      if (dataLines.length === 0) return;
+      let payload: unknown;
+      try {
+        payload = JSON.parse(dataLines.join("\n"));
+      } catch {
+        throw new Error("Runner returned invalid bash event data");
+      }
+      if (eventName === "output") {
+        const chunk = payload as { text?: unknown };
+        if (typeof chunk.text !== "string")
+          throw new Error("Runner bash output event was malformed");
+        onChunk(chunk.text);
+      } else if (eventName === "result") {
+        if (!payload || typeof payload !== "object")
+          throw new Error("Runner bash result event was malformed");
+        result = payload as Record<string, unknown>;
+      }
+      eventName = "message";
+      dataLines = [];
+    };
+    while (!result) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline).replace(/\r$/, "");
+        buffer = buffer.slice(newline + 1);
+        if (!line) dispatch();
+        else if (line.startsWith(":")) {
+          /* SSE keepalive */
+        } else if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        else if (line.startsWith("data:"))
+          dataLines.push(line.slice(5).trimStart());
+        newline = buffer.indexOf("\n");
+      }
+    }
+    await reader.cancel();
+    if (!result)
+      throw new Error("Runner bash stream ended before a result was received");
+    if (result.command !== command || typeof result.output !== "string")
+      throw new Error(
+        "Runner returned a bash result for a different operation",
+      );
+    return {
+      output: result.output,
+      exitCode:
+        typeof result.exitCode === "number" ? result.exitCode : undefined,
+      cancelled: result.cancelled === true,
+      truncated: result.truncated === true,
+      ...(typeof result.fullOutputPath === "string"
+        ? { fullOutputPath: result.fullOutputPath }
+        : {}),
+    };
+  }
+  async abortBash(operationId: string) {
+    return this.request(`/bash/${encodeURIComponent(operationId)}/abort`, {});
+  }
+  async runProviderAuth(action: "login" | "logout", provider?: string) {
+    if (action === "logout" && !provider)
+      throw new Error("Provider is required for logout");
+    await this.runAdminCommand(action, provider ? [provider] : []);
   }
   async connect() {
     if (this.connecting || this.closed) return;
@@ -711,6 +846,7 @@ export class WorkspaceTerminal extends Container {
       const usage = event?.usage ?? this.liveMessage?.usage;
       if (usage) this.usageText = `${usage.totalTokens ?? 0} tokens`;
       this.refresh();
+      for (const listener of this.workspaceEventListeners) listener(item);
       return;
     }
     if (
@@ -733,6 +869,7 @@ export class WorkspaceTerminal extends Container {
     else if (item.kind === "assistant" && item.data?.stopReason === "error")
       this.status = `Provider error · ${clean(item.data?.error ?? "The provider request failed")}`;
     this.refresh();
+    for (const listener of this.workspaceEventListeners) listener(item);
   }
   private refreshUsage() {
     const assistantEvents = this.records.filter(

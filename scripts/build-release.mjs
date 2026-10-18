@@ -20,9 +20,15 @@ import YAML from "yaml";
 
 const execute = promisify(execFile);
 const project = fileURLToPath(new URL("../", import.meta.url));
-const platformName = process.platform === "darwin" ? "darwin" : process.platform;
-if (!["linux", "darwin"].includes(platformName) || !["x64", "arm64"].includes(process.arch))
-  throw new Error(`Unsupported release platform: ${process.platform}/${process.arch}`);
+const platformName =
+  process.platform === "darwin" ? "darwin" : process.platform;
+if (
+  !["linux", "darwin"].includes(platformName) ||
+  !["x64", "arm64"].includes(process.arch)
+)
+  throw new Error(
+    `Unsupported release platform: ${process.platform}/${process.arch}`,
+  );
 const platform = `${platformName}-${process.arch === "x64" ? "amd64" : "arm64"}`;
 const { values } = parseArgs({
   options: Object.fromEntries(
@@ -44,7 +50,8 @@ const staging = await mkdtemp(join(tmpdir(), "adm-release-"));
 try {
   await mkdir(join(staging, "bin"));
   const binaries = [[values.adm, "adm"]];
-  if (values.repositories) binaries.push([values.repositories, "adm-repositories"]);
+  if (values.repositories)
+    binaries.push([values.repositories, "adm-repositories"]);
   else if (platform.startsWith("linux-"))
     throw new Error("Linux release packages require --repositories");
   for (const [source, name] of binaries) {
@@ -58,6 +65,7 @@ try {
     "package-lock.json",
     "packages/runner/package.json",
     "packages/terminal/package.json",
+    "scripts/patch-pi-interactive.mjs",
   ]) {
     const destination = join(staging, file);
     await mkdir(dirname(destination), { recursive: true });
@@ -133,7 +141,10 @@ try {
   await mkdir(output, { recursive: true });
   const archive = `adm-${platform}.tar.gz`;
   await execute("tar", ["-czf", join(output, archive), "-C", staging, "."]);
-  const binaryAssets = binaries.map(([source, name]) => [name, `${name}-${platform}`]);
+  const binaryAssets = binaries.map(([source, name]) => [
+    name,
+    `${name}-${platform}`,
+  ]);
   for (const [name, artifact] of binaryAssets)
     await copyFile(join(staging, "bin", name), join(output, artifact));
   await copyFile(join(staging, "LICENSE"), join(output, "LICENSE"));

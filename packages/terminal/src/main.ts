@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
+import { ProcessTerminal } from "@earendil-works/pi-tui";
+import { InteractiveMode } from "@earendil-works/pi-coding-agent";
+import { DurableInteractiveRuntime } from "./native-runtime.ts";
 import { WorkspaceTerminal } from "./terminal.ts";
-import { configureTerminalKeybindings } from "./keybindings.ts";
 async function runTerminal() {
-  await configureTerminalKeybindings();
   const args = process.argv.slice(2);
   let url = "http://127.0.0.1:7432",
     workspaceId = "",
@@ -55,9 +55,6 @@ async function runTerminal() {
   if (!workspaceId) throw new Error("--workspace ID is required");
   if (!process.stdin.isTTY || !process.stdout.isTTY)
     throw new Error("Attachment requires an interactive terminal");
-  const ui = new TuiMainScreen(new ProcessTerminal());
-  let finish!: () => void;
-  const done = new Promise<void>((resolve) => (finish = resolve));
   const terminal = new WorkspaceTerminal({
     url,
     workspaceId,
@@ -67,24 +64,18 @@ async function runTerminal() {
       ? { adminCommand: { executable: adminExecutable, args: adminArgs } }
       : {}),
     diagnostics,
-    tui: ui,
-    onRender: () => ui.requestRender(),
-    onDetach: finish,
   });
-  ui.addChild(terminal);
-  ui.setFocus(terminal);
-  const detach = () => finish();
-  process.on("SIGINT", detach);
-  process.on("SIGTERM", detach);
+  const remote = new DurableInteractiveRuntime(terminal);
   try {
-    ui.start();
-    void terminal.connect();
-    await done;
+    await terminal.connect();
+    await remote.initialize();
+    const mode = new InteractiveMode(remote, {
+      terminal: new ProcessTerminal(),
+    });
+    await mode.run();
   } finally {
+    await remote.dispose();
     terminal.close();
-    ui.stop();
-    process.off("SIGINT", detach);
-    process.off("SIGTERM", detach);
     process.stdin.pause();
   }
 }
