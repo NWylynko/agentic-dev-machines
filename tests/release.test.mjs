@@ -203,6 +203,25 @@ test(
       { cwd: installed },
     );
     assert.equal(provider.stderr, "");
+    const interactivePatch = await readFile(
+      join(
+        installed,
+        "node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js",
+      ),
+      "utf8",
+    );
+    assert.match(interactivePatch, /remotePorts\?\.projectTrust/);
+    assert.match(interactivePatch, /authMetadata\.isAnthropicSubscription\(\)/);
+    const interactiveMode = await execute(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        'const { InteractiveMode } = await import("@earendil-works/pi-coding-agent"); if (typeof InteractiveMode !== "function") throw new Error("InteractiveMode missing");',
+      ],
+      { cwd: installed },
+    );
+    assert.equal(interactiveMode.stderr, "");
 
     const identity = "release-fixture-pod-identity";
     const holder = "731db50f-237a-4f43-af54-a9d033e9c3b1";

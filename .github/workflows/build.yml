@@ -58,6 +58,7 @@ jobs:
           zsh --version
 
       - run: npm ci
+      - run: npm run test:pi-patch
 
       - name: Build adm-repositories
         run: CGO_ENABLED=0 go build -C packages/repositories -trimpath -ldflags='-s -w' -o /tmp/adm-repositories .

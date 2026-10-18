@@ -17,6 +17,7 @@
     "test:install": "node --test tests/install.test.mjs",
     "test:release": "node --test tests/release.test.mjs",
     "test:publish": "node --test tests/publish.test.mjs tests/assemble-release.test.mjs",
+    "test:pi-patch": "node scripts/test-pi-interactive-patch.mjs",
     "test:repositories": "PATH=\"$(go env GOPATH)/bin:$PATH\" go test -C packages/repositories -count=1 -timeout 180s",
     "test:cluster": "node tests/live-cluster.mjs",
     "test:cluster-contract": "node tests/cluster-contract.mjs",

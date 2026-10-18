@@ -120,6 +120,14 @@ try {
     ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
     { cwd: staging, maxBuffer: 1024 * 1024 },
   );
+  await execute(
+    process.execPath,
+    [
+      join(project, "scripts/patch-pi-interactive.mjs"),
+      join(staging, "node_modules/@earendil-works/pi-coding-agent"),
+    ],
+    { cwd: project, maxBuffer: 1024 * 1024 },
+  );
   await writeFile(join(staging, "VERSION"), values.version + "\n");
   await writeFile(join(staging, "IMAGE"), values.image + "\n");
   await mkdir(output, { recursive: true });
