@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { execFile, spawn } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { terminalKeybindings } from "./keybindings.ts";
 import {
@@ -18,6 +19,7 @@ import {
   matchesKey,
   stripTerminalSequences,
   Text,
+  getNativeClipboard,
 } from "@earendil-works/pi-tui";
 import {
   ModelSelectorComponent,
@@ -34,7 +36,11 @@ import {
   type SettingsConfig,
   type SessionTreeNode,
 } from "@earendil-works/pi-coding-agent";
-import type { Model, ModelsRefreshResult } from "@earendil-works/pi-ai";
+import type {
+  ImageContent,
+  Model,
+  ModelsRefreshResult,
+} from "@earendil-works/pi-ai";
 export type WorkspaceEvent = {
   seq?: number;
   workspaceId: string;
@@ -48,6 +54,10 @@ type TerminalOptions = {
   tokenFile?: string;
   identityFile?: string;
   diagnostics?: boolean;
+  adminCommand?: { executable: string; args: string[] };
+  readClipboardImage?: () => Promise<
+    { bytes: Uint8Array; mimeType: string } | undefined
+  >;
   writeClipboard?: (text: string) => Promise<void>;
   tui?: TUI;
   onRender?: () => void;
@@ -59,6 +69,29 @@ const clean = (text: unknown) =>
     "",
   );
 const execFileAsync = promisify(execFile);
+const detectImageMimeType = (bytes: Uint8Array): string => {
+  if (
+    bytes.length >= 8 &&
+    [137, 80, 78, 71, 13, 10, 26, 10].every(
+      (byte, index) => bytes[index] === byte,
+    )
+  )
+    return "image/png";
+  if (
+    bytes.length >= 3 &&
+    bytes[0] === 255 &&
+    bytes[1] === 216 &&
+    bytes[2] === 255
+  )
+    return "image/jpeg";
+  if (
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" &&
+    String.fromCharCode(...bytes.slice(8, 12)) === "WEBP"
+  )
+    return "image/webp";
+  throw new Error("Clipboard data is not a supported PNG, JPEG, or WebP image");
+};
 const piAssistantMessage = (message: any) => ({
   ...message,
   content: Array.isArray(message?.content)
@@ -123,6 +156,7 @@ export class WorkspaceTerminal extends Container {
   private records: WorkspaceEvent[] = [];
   private role = "";
   private workspaceName = "";
+  private workingDirectory = "/workspace";
   private conversationId?: number;
   private cursor = 0;
   private controller?: AbortController;
@@ -134,17 +168,22 @@ export class WorkspaceTerminal extends Container {
   private currentModel = "model unavailable";
   private thinkingLevel = "off";
   private usageText = "usage unavailable";
+  private costText = "$0.000";
+  private contextText = "context unavailable";
   private liveMessage?: any;
   private liveTools = new Map<string, any>();
   private toolViews: ToolExecutionComponent[] = [];
   private assistantViews: AssistantMessageComponent[] = [];
   private toolsExpanded = false;
+  private startupExpanded = false;
   private inputPending = false;
   private pendingInput?: {
     message: string;
     requestId: string;
     whenBusy: string;
+    images?: ImageContent[];
   };
+  private pendingImages: ImageContent[] = [];
   private modelSelector?: ModelSelectorComponent;
   private activeSelector?: Component & { handleInput(data: string): void };
   private modelRuntime?: RemoteModelRuntime;
@@ -176,7 +215,9 @@ export class WorkspaceTerminal extends Container {
     this.toolViews = [];
     this.assistantViews = [];
     this.heading.setText(
-      `adm · ${clean(this.workspaceName || this.options.workspaceId)}${this.role ? ` · ${this.role}` : ""}${this.options.diagnostics ? " · DIAGNOSTICS" : ""}`,
+      this.startupExpanded
+        ? `▛▀▜  Pi v1.2.0\n▌ ▌  Esc interrupt · Ctrl+C detach · / commands · Ctrl+O more\nCtrl+T thinking · Shift+Tab cycle thinking · /model select model · Shift+Enter new line\nCtrl+R reconnect · Ctrl+C detach · /help commands\n\nPi can explain its own features and look up its docs. Ask it how to use Pi.`
+        : `▛▀▜  Pi v1.2.0\n▌ ▌  Esc interrupt · Ctrl+C detach · / commands · Ctrl+O more\nPress Ctrl+O to show full startup help.\n\nPi can explain its own features and look up its docs. Ask it how to use Pi.`,
     );
     this.transcript.clear();
     for (const item of this.records) {
@@ -265,7 +306,11 @@ export class WorkspaceTerminal extends Container {
                   .join("\n")
               : "";
         this.transcript.addChild(
-          new UserMessageComponent(userText, markdownTheme, 1),
+          new UserMessageComponent(
+            `${userText}${Array.isArray(content) && content.some((part: any) => part?.type === "image") ? `${userText ? "\n" : ""}[Image attached]` : ""}`,
+            markdownTheme,
+            1,
+          ),
         );
       } else {
         this.transcript.addChild(
@@ -320,7 +365,7 @@ export class WorkspaceTerminal extends Container {
       }
     }
     this.statusLine.setText(
-      `${clean(this.status)} · ${clean(this.currentModel)} · thinking ${clean(this.thinkingLevel)} · ${clean(this.usageText)}\nEnter: steer · Shift+Enter: new line · ${shortcut("app.tools.expand")}: tool details · ${shortcut("app.thinking.toggle")}: thinking · ${shortcut("app.thinking.cycle")}: cycle thinking · /model · /settings · /thinking · /session · /copy · /export · /resume · /new · /fork · /tree · /hotkeys · /compact · /reset · /retry · Ctrl+R: reconnect · Ctrl+C: detach`,
+      `${clean(this.workingDirectory)}\n${clean(this.costText)} · ${clean(this.contextText)} · ${clean(this.usageText)} · ${clean(this.currentModel)} · ${clean(this.thinkingLevel)} · ${clean(this.status)}\nEnter: send or steer · Shift+Enter: new line · ${shortcut("app.tools.expand")}: tool details · ${shortcut("app.thinking.toggle")}: thinking · ${shortcut("app.thinking.cycle")}: cycle thinking · /help for commands · Ctrl+R: reconnect · Ctrl+C: detach`,
     );
     this.options.onRender?.();
   }
@@ -398,10 +443,14 @@ export class WorkspaceTerminal extends Container {
         this.liveMessage = undefined;
         this.liveTools.clear();
         this.usageText = "usage unavailable";
+        this.costText = "$0.000";
+        this.contextText = "context unavailable";
       }
       this.conversationId = conversationId;
       this.role = workspace.role;
       this.workspaceName = workspace.name;
+      if (typeof workspace.cwd === "string" && workspace.cwd.trim())
+        this.workingDirectory = workspace.cwd;
       const [catalog, settings] = await Promise.all([
         this.request("/models", undefined, controller.signal),
         this.request("/settings", undefined, controller.signal),
@@ -589,15 +638,40 @@ export class WorkspaceTerminal extends Container {
     this.liveMessage = undefined;
     if (item.kind === "tool") this.liveTools.delete(item.data?.toolCallId);
     this.records.push(item);
-    if (item.kind === "assistant" && item.data?.message?.usage) {
-      const usage = item.data.message.usage;
-      this.usageText = `${usage.totalTokens ?? 0} tokens`;
-    }
+    if (item.kind === "assistant") this.refreshUsage();
     if (item.kind === "status")
       this.status = clean(item.data?.status ?? item.data?.text ?? "Connected");
     else if (item.kind === "assistant" && item.data?.stopReason === "error")
       this.status = `Provider error · ${clean(item.data?.error ?? "The provider request failed")}`;
     this.refresh();
+  }
+  private refreshUsage() {
+    const assistantEvents = this.records.filter(
+      (event) => event.kind === "assistant" && event.data?.message?.usage,
+    );
+    if (!assistantEvents.length) return;
+    const totals = assistantEvents.reduce(
+      (summary, event) => {
+        const usage = event.data.message.usage;
+        summary.tokens += Number(usage.totalTokens) || 0;
+        summary.cost += Number(usage.cost?.total) || 0;
+        summary.lastContext =
+          (Number(usage.input) || 0) +
+          (Number(usage.cacheRead) || 0) +
+          (Number(usage.cacheWrite) || 0);
+        return summary;
+      },
+      { tokens: 0, cost: 0, lastContext: 0 },
+    );
+    this.usageText = `${totals.tokens} tokens`;
+    this.costText = `$${totals.cost.toFixed(3)}`;
+    const contextWindow = this.modelRuntime?.getModel(
+      this.modelRuntime.selected?.provider ?? "",
+      this.modelRuntime.selected?.id ?? "",
+    )?.contextWindow;
+    this.contextText = contextWindow
+      ? `${((totals.lastContext / contextWindow) * 100).toFixed(1)}%/${Math.round(contextWindow / 1000)}k`
+      : `${totals.lastContext} context tokens`;
   }
   private async consume(response: Response, controller: AbortController) {
     try {
@@ -660,9 +734,14 @@ export class WorkspaceTerminal extends Container {
       return;
     }
     if (terminalKeybindings.matches(data, "app.tools.expand" as any)) {
-      this.toolsExpanded = !this.toolsExpanded;
-      for (const tool of this.toolViews) tool.setExpanded(this.toolsExpanded);
-      this.options.onRender?.();
+      if (this.toolViews.length) {
+        this.toolsExpanded = !this.toolsExpanded;
+        for (const tool of this.toolViews) tool.setExpanded(this.toolsExpanded);
+        this.options.onRender?.();
+      } else {
+        this.startupExpanded = !this.startupExpanded;
+        this.refresh();
+      }
       return;
     }
     if (terminalKeybindings.matches(data, "app.thinking.toggle" as any)) {
@@ -695,6 +774,14 @@ export class WorkspaceTerminal extends Container {
       void this.chooseThinkingLevel(
         levels[(currentIndex + 1) % levels.length]!,
       );
+      return;
+    }
+    if (terminalKeybindings.matches(data, "app.editor.external" as any)) {
+      void this.openExternalEditor();
+      return;
+    }
+    if (terminalKeybindings.matches(data, "app.clipboard.pasteImage" as any)) {
+      void this.pasteClipboardImage();
       return;
     }
     if (this.inputPending) return;
@@ -739,6 +826,22 @@ export class WorkspaceTerminal extends Container {
             : clean(workspace.status);
         this.status = `${status} · ${workspace.goals?.length ?? 0} goals · ${workspace.loops?.length ?? 0} loops`;
         clearInput();
+        return;
+      }
+      if (message === "/login" || message.startsWith("/login ")) {
+        const provider = message.slice(6).trim();
+        await this.runAdminCommand("login", provider ? [provider] : []);
+        clearInput();
+        await this.refreshProviderCatalog();
+        return;
+      }
+      if (message.startsWith("/logout")) {
+        const [, provider, extra] =
+          /^\/logout(?:\s+(\S+))?(?:\s+(\S+))?$/.exec(message) ?? [];
+        if (!provider || extra) throw new Error("Usage: /logout PROVIDER");
+        await this.runAdminCommand("logout", [provider]);
+        clearInput();
+        await this.refreshProviderCatalog();
         return;
       }
       if (message === "/model") {
@@ -1036,17 +1139,22 @@ export class WorkspaceTerminal extends Container {
       const followUp = message.startsWith("/followup ");
       const content = followUp ? message.slice(10).trim() : message;
       const whenBusy = followUp ? "followUp" : "steer";
+      const images = this.pendingImages;
       if (
         this.pendingInput?.message !== content ||
-        this.pendingInput?.whenBusy !== whenBusy
+        this.pendingInput?.whenBusy !== whenBusy ||
+        JSON.stringify(this.pendingInput?.images ?? []) !==
+          JSON.stringify(images)
       )
         this.pendingInput = {
           message: content,
           requestId: randomUUID(),
           whenBusy,
+          ...(images.length ? { images } : {}),
         };
       await this.request("/input", this.pendingInput);
       this.pendingInput = undefined;
+      this.pendingImages = [];
       if (this.input instanceof Editor) this.input.addToHistory(content);
       this.status = followUp ? "Follow-up queued" : "Input accepted";
       clearInput();
@@ -1385,12 +1493,46 @@ export class WorkspaceTerminal extends Container {
       );
       if (this.modelRuntime) this.modelRuntime.selected = result.selected;
       this.currentModel = `${model.provider}/${model.id}`;
+      this.refreshUsage();
       this.status = `Model selected · ${clean(model.provider)}/${clean(model.id)}`;
     } catch (error) {
       this.status = `Model selection failed: ${error instanceof Error ? error.message : error}`;
     } finally {
       this.closeModelSelector();
     }
+  }
+  private async runAdminCommand(command: "login" | "logout", args: string[]) {
+    const adminCommand = this.options.adminCommand;
+    if (!adminCommand)
+      throw new Error(
+        "Provider authentication is unavailable in this attach session",
+      );
+    if (this.controller) this.controller.abort();
+    this.connected = false;
+    this.options.tui?.stop();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(
+          adminCommand.executable,
+          [...adminCommand.args, command, ...args],
+          { stdio: "inherit", env: process.env },
+        );
+        child.once("error", reject);
+        child.once("exit", (code, signal) => {
+          if (code === 0) resolve();
+          else reject(new Error(`adm ${command} exited ${signal ?? code}`));
+        });
+      });
+    } finally {
+      this.options.tui?.start();
+    }
+  }
+  private async refreshProviderCatalog() {
+    await this.connect();
+    this.status = this.connected
+      ? "Provider authentication updated"
+      : this.status;
+    this.refresh();
   }
   private closeModelSelector() {
     this.modelSelector?.dispose();
@@ -1400,6 +1542,75 @@ export class WorkspaceTerminal extends Container {
   private setInputText(value: string) {
     if (this.input instanceof Editor) this.input.setText(value);
     else this.input.setValue(value);
+  }
+  private async openExternalEditor() {
+    const command = process.env.VISUAL || process.env.EDITOR;
+    if (!command?.trim()) {
+      this.status = "Set EDITOR or VISUAL to use the external editor";
+      this.refresh();
+      return;
+    }
+    const [executable, ...args] = command.trim().split(/\s+/);
+    const directory = await mkdtemp(join(tmpdir(), "adm-pi-editor-"));
+    const path = join(directory, "prompt.txt");
+    const prompt =
+      this.input instanceof Editor
+        ? this.input.getText()
+        : this.input.getValue();
+    await writeFile(path, prompt, { encoding: "utf8", mode: 0o600 });
+    this.options.tui?.stop();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(executable!, [...args, path], {
+          stdio: "inherit",
+          env: process.env,
+        });
+        child.once("error", reject);
+        child.once("exit", (code, signal) => {
+          if (code === 0) resolve();
+          else reject(new Error(`Editor exited ${signal ?? code}`));
+        });
+      });
+      const edited = await readFile(path, "utf8");
+      if (this.input instanceof Editor) this.input.setText(edited);
+      else this.input.setValue(edited);
+      this.status = "External editor updated the prompt";
+    } catch (error) {
+      this.status = `External editor failed: ${error instanceof Error ? error.message : error}`;
+    } finally {
+      this.options.tui?.start();
+      await rm(directory, { recursive: true });
+      this.refresh();
+    }
+  }
+  private async pasteClipboardImage() {
+    try {
+      const image = this.options.readClipboardImage
+        ? await this.options.readClipboardImage()
+        : await getNativeClipboard()
+            ?.getImage()
+            .then((bytes) =>
+              bytes
+                ? { bytes, mimeType: detectImageMimeType(bytes) }
+                : undefined,
+            );
+      if (!image) throw new Error("No image is available on the clipboard");
+      if (!["image/png", "image/jpeg", "image/webp"].includes(image.mimeType))
+        throw new Error("Clipboard image must be PNG, JPEG, or WebP");
+      if (!image.bytes.length || image.bytes.length > 4 * 1024 * 1024)
+        throw new Error("Clipboard image exceeds the 4 MiB prompt limit");
+      this.pendingImages = [
+        {
+          type: "image",
+          mimeType: image.mimeType,
+          data: Buffer.from(image.bytes).toString("base64"),
+        },
+      ];
+      this.status = `Image attached from clipboard · ${(image.bytes.length / 1024).toFixed(0)} KiB`;
+    } catch (error) {
+      this.status = `Clipboard image unavailable: ${error instanceof Error ? error.message : error}`;
+    }
+    this.refresh();
   }
   close() {
     this.closed = true;

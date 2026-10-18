@@ -62,6 +62,24 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
                     },
                     timestamp: 2,
                   },
+                  {
+                    seq: 3,
+                    workspaceId: "work",
+                    kind: "assistant",
+                    data: {
+                      text: "Second answer",
+                      message: {
+                        role: "assistant",
+                        usage: {
+                          input: 2,
+                          output: 3,
+                          totalTokens: 5,
+                          cost: { total: 0.03 },
+                        },
+                      },
+                    },
+                    timestamp: 3,
+                  },
                 ],
                 nextAfter: 2,
                 hasMore: false,
@@ -74,7 +92,14 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
         JSON.stringify({
           selected: { provider: "faux", id: "faux-1" },
           providers: [],
-          models: [{ provider: "faux", id: "faux-1", reasoning: true }],
+          models: [
+            {
+              provider: "faux",
+              id: "faux-1",
+              reasoning: true,
+              contextWindow: 500000,
+            },
+          ],
         }),
       );
     } else if (url.pathname.endsWith("/settings")) {
@@ -143,6 +168,20 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
   });
   try {
     await terminal.connect();
+    const startup = stripTerminalSequences(terminal.render(120).join("\n"));
+    assert.match(startup, /Pi v1\.2\.0/);
+    assert.match(startup, /Ctrl\+O to show full startup help/);
+    assert.match(startup, /\/workspace/);
+    assert.match(startup, /0\.0%\/500k/);
+    assert.match(startup, /22 tokens/);
+    assert.match(startup, /\$0\.050/);
+    assert.doesNotMatch(startup, /adm · demo/);
+    terminal.handleInput("\x0f");
+    assert.match(
+      stripTerminalSequences(terminal.render(120).join("\n")),
+      /Ctrl\+T thinking · Shift\+Tab cycle thinking/,
+    );
+    terminal.handleInput("\x0f");
     await terminal.submit("/thinking");
     assert.ok(
       (terminal as any).activeSelector,
@@ -159,9 +198,9 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
       terminal.render(100).join("\n"),
     );
     assert.match(sessionStats, /1 prompt/);
-    assert.match(sessionStats, /1 reply/);
-    assert.match(sessionStats, /17 tokens/);
-    assert.match(sessionStats, /\$0\.020/);
+    assert.match(sessionStats, /2 replies/);
+    assert.match(sessionStats, /22 tokens/);
+    assert.match(sessionStats, /\$0\.050/);
 
     await terminal.submit("/fork");
     assert.ok(
@@ -185,7 +224,7 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
     terminal.handleInput("\r");
     assert.match(
       stripTerminalSequences(terminal.render(100).join("\n")),
-      /Auto-compact is not configurable through adm attach/,
+      /Auto-compact is not configurable through adm\s+attach/,
     );
 
     await terminal.submit("/new");
@@ -308,6 +347,66 @@ test("/copy copies the selected assistant reply and only explicit bot messages",
   }
 });
 
+test("provider login and logout delegate to the host CLI and reconnect the Durable terminal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-provider-cli-"));
+  const output = join(directory, "commands.json");
+  let stream: import("node:http").ServerResponse | undefined;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, "http://localhost");
+    response.setHeader("content-type", "application/json");
+    if (url.pathname.endsWith("/history"))
+      response.end(
+        JSON.stringify({ events: [], nextAfter: 0, hasMore: false }),
+      );
+    else if (url.pathname.endsWith("/models"))
+      response.end(
+        JSON.stringify({ providers: [], models: [], selected: null }),
+      );
+    else if (url.pathname.endsWith("/settings"))
+      response.end(JSON.stringify({ thinkingLevel: "off" }));
+    else if (url.pathname.endsWith("/events")) {
+      stream = response;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(": attached\n\n");
+    } else
+      response.end(
+        JSON.stringify({
+          id: "work",
+          name: "demo",
+          role: "coding",
+          status: "idle",
+        }),
+      );
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address() as import("node:net").AddressInfo;
+  const terminal = new WorkspaceTerminal({
+    url: `http://127.0.0.1:${address.port}`,
+    workspaceId: "work",
+    adminCommand: {
+      executable: process.execPath,
+      args: [
+        "-e",
+        `require('node:fs').appendFileSync(${JSON.stringify(output)}, process.argv.slice(1).join(' ') + '\\n')`,
+      ],
+    },
+  });
+  try {
+    await terminal.connect();
+    await terminal.submit("/login openai");
+    assert.match(await readFile(output, "utf8"), /login openai/);
+    await terminal.submit("/logout openai");
+    assert.match(await readFile(output, "utf8"), /logout openai/);
+  } finally {
+    terminal.close();
+    stream?.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true });
+  }
+});
+
 test("/export writes the selected Durable transcript as local Markdown", async () => {
   let stream: import("node:http").ServerResponse | undefined;
   const server = createServer((request, response) => {
@@ -389,7 +488,7 @@ test("/export writes the selected Durable transcript as local Markdown", async (
   }
 });
 
-test("Pi keybindings.json configures mapped shortcuts while detach stays fixed", async () => {
+test("Pi keybindings.json configures mapped shortcuts and startup help while detach stays fixed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "adm-keybindings-"));
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = directory;
@@ -419,7 +518,7 @@ test("Pi keybindings.json configures mapped shortcuts while detach stays fixed",
       workspaceId: "work",
     });
     remapped.handleInput("\x05");
-    assert.equal((remapped as any).toolsExpanded, true);
+    assert.equal((remapped as any).startupExpanded, true);
     remapped.close();
     let detached = false;
     const detachTerminal = new WorkspaceTerminal({
@@ -682,7 +781,14 @@ test(
           JSON.stringify({
             selected: { provider: "faux", id: "faux-1" },
             providers: [],
-            models: [{ provider: "faux", id: "faux-1", reasoning: true }],
+            models: [
+              {
+                provider: "faux",
+                id: "faux-1",
+                reasoning: true,
+                contextWindow: 500000,
+              },
+            ],
           }),
         );
       } else if (url.pathname.endsWith("/settings")) {

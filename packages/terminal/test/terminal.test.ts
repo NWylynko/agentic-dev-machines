@@ -4,7 +4,14 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -153,13 +160,20 @@ const event = (seq: number, kind: string, text: string) => ({
   data: { text },
   timestamp: Date.now(),
 });
-function changedTerminal(url: string, diagnostics = false) {
+function changedTerminal(
+  url: string,
+  diagnostics = false,
+  readClipboardImage?: () => Promise<
+    { bytes: Uint8Array; mimeType: string } | undefined
+  >,
+) {
   let notify: () => void = () => {};
   const ui = new TuiMainScreen(new ProcessTerminal());
   const terminal = new WorkspaceTerminal({
     url,
     workspaceId: "work",
     diagnostics,
+    readClipboardImage,
     tui: ui,
     onRender() {
       notify();
@@ -225,6 +239,71 @@ test("Pi editor submits multiline prompts and restores them from editor history"
     terminal.handleInput("\x1b[A");
     assert.match(terminalText(terminal), /first line/);
     assert.match(terminalText(terminal), /second line/);
+  } finally {
+    terminal.close();
+    await service.close();
+  }
+});
+
+test(
+  "Pi external-editor binding returns edited text to the workspace prompt",
+  { timeout: 5000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-editor-"));
+    const editor = join(directory, "editor.sh");
+    await writeFile(editor, '#!/bin/sh\nprintf "edited by Pi\\n" > "$1"\n');
+    await chmod(editor, 0o700);
+    const previous = process.env.EDITOR;
+    process.env.EDITOR = editor;
+    let terminal!: WorkspaceTerminal;
+    let notify = () => {};
+    terminal = new WorkspaceTerminal({
+      url: "http://127.0.0.1",
+      workspaceId: "work",
+      onRender: () => notify(),
+    });
+    const edited = new Promise<void>((resolve) => {
+      notify = () => {
+        if (/External editor\s+updated/.test(terminalText(terminal))) resolve();
+      };
+    });
+    try {
+      terminal.handleInput("draft");
+      terminal.handleInput("\x07");
+      await edited;
+      assert.match(terminalText(terminal), /edited by Pi/);
+    } finally {
+      terminal.close();
+      if (previous === undefined) delete process.env.EDITOR;
+      else process.env.EDITOR = previous;
+      await rm(directory, { recursive: true });
+    }
+  },
+);
+
+test("Pi clipboard image paste reaches the owning Durable prompt with its request identity", async () => {
+  const service = await fixture();
+  const { terminal, waitFor } = changedTerminal(
+    service.url,
+    false,
+    async () => ({
+      bytes: Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      mimeType: "image/png",
+    }),
+  );
+  try {
+    await terminal.connect();
+    const attached = waitFor("Image attached from clipboard");
+    terminal.handleInput("\x16");
+    await attached;
+    const accepted = waitFor("Input accepted");
+    terminal.handleInput("Describe this image");
+    terminal.handleInput("\r");
+    await accepted;
+    assert.equal(service.requests.at(-1).body.message, "Describe this image");
+    assert.equal(service.requests.at(-1).body.images[0].mimeType, "image/png");
+    assert.equal(service.requests.at(-1).body.images[0].data, "iVBORw0KGgo=");
+    assert.equal(service.requests.at(-1).body.requestId.length > 0, true);
   } finally {
     terminal.close();
     await service.close();

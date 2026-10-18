@@ -6,26 +6,33 @@ import {
   TUI_KEYBINDINGS,
   setKeybindings,
   type KeybindingsConfig,
+  type KeyId,
 } from "@earendil-works/pi-tui";
-
-const ADM_KEYBINDINGS = {
+const PI_APP_KEYBINDINGS = {
   "app.thinking.cycle": {
     defaultKeys: "shift+tab",
     description: "Cycle thinking level",
   },
   "app.thinking.toggle": {
     defaultKeys: "ctrl+t",
-    description: "Toggle thinking display",
+    description: "Toggle thinking blocks",
   },
   "app.tools.expand": {
     defaultKeys: "ctrl+o",
-    description: "Expand tool details",
+    description: "Expand tool output",
+  },
+  "app.editor.external": {
+    defaultKeys: "ctrl+g",
+    description: "Open external editor",
+  },
+  "app.clipboard.pasteImage": {
+    defaultKeys: ["alt+v", "ctrl+v"] as KeyId[],
+    description: "Paste image from clipboard",
   },
 } as const;
-
 export const terminalKeybindings = new KeybindingsManager({
   ...TUI_KEYBINDINGS,
-  ...ADM_KEYBINDINGS,
+  ...PI_APP_KEYBINDINGS,
 });
 setKeybindings(terminalKeybindings);
 

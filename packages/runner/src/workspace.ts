@@ -13,6 +13,7 @@ import {
   type EntryRecord,
   type ConversationId,
   type TaskInspection,
+  type UserInput,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
@@ -446,7 +447,7 @@ export class Workspace {
   }
 
   async input(
-    message: string,
+    message: UserInput,
     requestId?: string,
     whenBusy: "steer" | "followUp" | "reject" = "steer",
   ) {

@@ -52,7 +52,9 @@ if (!["127.0.0.1", "::1", "localhost"].includes(host) && !lifecycleUrl)
     "Non-loopback runner binds require --lifecycle-url for authenticated authorization",
   );
 if (lifecycleUrl && !tokenFile)
-  throw new Error("Lifecycle-authenticated runner requires --token-file for its projected Pod identity");
+  throw new Error(
+    "Lifecycle-authenticated runner requires --token-file for its projected Pod identity",
+  );
 if (!Number.isInteger(port) || port < 0 || port > 65535)
   throw new Error("Invalid port");
 await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
@@ -89,7 +91,9 @@ async function atomicJson(path: string, value: unknown) {
 const ownerPath = join(stateDirectory, "owner.json");
 const ownerDatabasePath = join(stateDirectory, "owner.sqlite");
 let ownerDatabase: DatabaseSync | undefined;
-let runtimeLease: { workspaceId: string; holder: string; fencingToken: number } | undefined;
+let runtimeLease:
+  | { workspaceId: string; holder: string; fencingToken: number }
+  | undefined;
 let runtimeLeaseError: Error | undefined;
 let fenceShutdown: Promise<void> | undefined;
 async function processStart(pid: number): Promise<string | undefined> {
@@ -220,7 +224,11 @@ async function isDeleted(id: string) {
 }
 async function assertActive(id: string) {
   if (runtimeLeaseError)
-    throw new ApiError(503, "RUNTIME_OWNERSHIP_LOST", runtimeLeaseError.message);
+    throw new ApiError(
+      503,
+      "RUNTIME_OWNERSHIP_LOST",
+      runtimeLeaseError.message,
+    );
   if (await isDeleted(id))
     throw new ApiError(
       410,
@@ -229,7 +237,11 @@ async function assertActive(id: string) {
     );
   if (lifecycleUrl) {
     if (!runtimeLease || runtimeLease.workspaceId !== id)
-      throw new ApiError(503, "RUNTIME_LEASE_MISSING", "Workspace runtime does not hold its lifecycle fence");
+      throw new ApiError(
+        503,
+        "RUNTIME_LEASE_MISSING",
+        "Workspace runtime does not hold its lifecycle fence",
+      );
     try {
       await lifecycleRuntimeCall(id, "check", {
         holder: runtimeLease.holder,
@@ -245,13 +257,17 @@ async function assertActive(id: string) {
 function fenceLost(error: unknown) {
   if (fenceShutdown) return fenceShutdown;
   runtimeLeaseError = error instanceof Error ? error : new Error(String(error));
-  process.stderr.write(`FATAL workspace runtime lost its lifecycle fence: ${runtimeLeaseError.message}\n`);
+  process.stderr.write(
+    `FATAL workspace runtime lost its lifecycle fence: ${runtimeLeaseError.message}\n`,
+  );
   fenceShutdown = (async () => {
     for (const workspace of workspaces.values()) {
       try {
         await workspace.close(true);
       } catch (closeError) {
-        process.stderr.write(`FATAL failed to stop fenced workspace ${workspace.config.id}: ${String(closeError)}\n`);
+        process.stderr.write(
+          `FATAL failed to stop fenced workspace ${workspace.config.id}: ${String(closeError)}\n`,
+        );
       }
     }
   })();
@@ -281,9 +297,11 @@ async function lifecycleRuntimeCall(
       },
     );
   } catch (error) {
-    throw new Error(`Workspace lifecycle ${action} request failed: ${(error as Error).message}`);
+    throw new Error(
+      `Workspace lifecycle ${action} request failed: ${(error as Error).message}`,
+    );
   }
-  const value = await response.json().catch(() => ({})) as {
+  const value = (await response.json().catch(() => ({}))) as {
     error?: { code?: string; message?: string };
     fencingToken?: number;
     holder?: string;
@@ -320,7 +338,11 @@ async function authorizeRuntimeRequest(
       ? decodeURIComponent(match[1])
       : [...configs.keys()][0];
     if (!id)
-      throw new ApiError(401, "UNAUTHORIZED", "Workspace runtime identity is unavailable");
+      throw new ApiError(
+        401,
+        "UNAUTHORIZED",
+        "Workspace runtime identity is unavailable",
+      );
     let response: Response;
     try {
       response = await fetch(
@@ -331,16 +353,28 @@ async function authorizeRuntimeRequest(
             authorization,
             "content-type": "application/json",
           },
-          body: JSON.stringify({ action: runtimeAction(request.method ?? "GET", pathname) }),
+          body: JSON.stringify({
+            action: runtimeAction(request.method ?? "GET", pathname),
+          }),
           signal: AbortSignal.timeout(5_000),
         },
       );
     } catch (error) {
-      throw new ApiError(503, "AUTHORIZATION_UNAVAILABLE", `Lifecycle authorization is unavailable: ${(error as Error).message}`);
+      throw new ApiError(
+        503,
+        "AUTHORIZATION_UNAVAILABLE",
+        `Lifecycle authorization is unavailable: ${(error as Error).message}`,
+      );
     }
     if (!response.ok) {
-      const value = await response.json().catch(() => ({})) as { error?: { code?: string; message?: string } };
-      throw new ApiError(response.status, value.error?.code ?? "UNAUTHORIZED", value.error?.message ?? "Lifecycle rejected the workspace request");
+      const value = (await response.json().catch(() => ({}))) as {
+        error?: { code?: string; message?: string };
+      };
+      throw new ApiError(
+        response.status,
+        value.error?.code ?? "UNAUTHORIZED",
+        value.error?.message ?? "Lifecycle rejected the workspace request",
+      );
     }
     return;
   }
@@ -349,7 +383,11 @@ async function authorizeRuntimeRequest(
   try {
     expected = Buffer.from((await readFile(tokenFile, "utf8")).trim());
   } catch (error) {
-    throw new ApiError(503, "AUTH_UNAVAILABLE", `Runtime token unavailable: ${(error as Error).message}`);
+    throw new ApiError(
+      503,
+      "AUTH_UNAVAILABLE",
+      `Runtime token unavailable: ${(error as Error).message}`,
+    );
   }
   const supplied = authorization.startsWith("Bearer ")
     ? Buffer.from(authorization.slice(7))
@@ -359,7 +397,11 @@ async function authorizeRuntimeRequest(
     expected.length !== supplied.length ||
     !timingSafeEqual(expected, supplied)
   )
-    throw new ApiError(401, "UNAUTHORIZED", "A valid workspace runtime bearer token is required");
+    throw new ApiError(
+      401,
+      "UNAUTHORIZED",
+      "A valid workspace runtime bearer token is required",
+    );
 }
 async function openWorkspace(
   config: WorkspaceConfig,
@@ -391,7 +433,9 @@ if (values["workspace-config"]) {
     persistedIdentity &&
     JSON.stringify(persistedIdentity) !== JSON.stringify(config)
   )
-    throw new Error("Mounted workspace configuration conflicts with persisted runtime identity");
+    throw new Error(
+      "Mounted workspace configuration conflicts with persisted runtime identity",
+    );
   if (!previous) {
     const registration = {
       ...config,
@@ -404,10 +448,14 @@ if (values["workspace-config"]) {
 if (lifecycleUrl) {
   const config = [...configs.values()][0];
   if (!config || configs.size !== 1)
-    throw new Error("A lifecycle-owned Pod runtime must open exactly one workspace");
+    throw new Error(
+      "A lifecycle-owned Pod runtime must open exactly one workspace",
+    );
   const holder = values["pod-uid"] ?? process.env.ADM_POD_UID;
   if (!holder || !/^[0-9a-f-]{36}$/i.test(holder))
-    throw new Error("Lifecycle-owned Pod runtime requires its Kubernetes Pod UID");
+    throw new Error(
+      "Lifecycle-owned Pod runtime requires its Kubernetes Pod UID",
+    );
   const acquired = await lifecycleRuntimeCall(config.id, "lease", { holder });
   if (
     acquired.holder !== holder ||
@@ -680,12 +728,16 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
     config.model = { provider: values.provider, id: values.model ?? "faux-1" };
   return config;
 }
-async function body(request: IncomingMessage) {
+async function body(request: IncomingMessage, maxBytes = 1024 * 1024) {
   let text = "";
   for await (const chunk of request) {
     text += chunk;
-    if (text.length > 1024 * 1024)
-      throw new ApiError(413, "BODY_TOO_LARGE", "Request body exceeds 1 MiB");
+    if (Buffer.byteLength(text) > maxBytes)
+      throw new ApiError(
+        413,
+        "BODY_TOO_LARGE",
+        "Request body exceeds the route limit",
+      );
   }
   let value: unknown;
   try {
@@ -729,7 +781,10 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url!, "http://127.0.0.1");
     if (url.pathname === "/health" && request.method === "GET") {
       if (runtimeLeaseError)
-        return json(response, 503, { status: "error", error: runtimeLeaseError.message });
+        return json(response, 503, {
+          status: "error",
+          error: runtimeLeaseError.message,
+        });
       return json(response, 200, { status: "ok", version: "0.1.0" });
     }
     await authorizeRuntimeRequest(request, url.pathname);
@@ -882,11 +937,19 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && action === "runtime-status") {
       const status = await workspace.status();
-      const catalog = await workspace.modelCatalog(new AbortController().signal, false);
-      const activity = ["needs_model", "running", "error", "idle"].includes(status.status)
+      const catalog = await workspace.modelCatalog(
+        new AbortController().signal,
+        false,
+      );
+      const activity = ["needs_model", "running", "error", "idle"].includes(
+        status.status,
+      )
         ? status.status
         : "unavailable";
-      const error = typeof status.error === "string" ? status.error.slice(0, 2000) : undefined;
+      const error =
+        typeof status.error === "string"
+          ? status.error.slice(0, 2000)
+          : undefined;
       return json(response, 200, {
         activity: { status: activity, ...(error ? { error } : {}) },
         ...(catalog.selected ? { selectedModel: catalog.selected } : {}),
@@ -1109,16 +1172,73 @@ const server = createServer(async (request, response) => {
       });
     }
     if (request.method === "POST" && action === "input") {
-      const data = await body(request);
+      const data = await body(request, 6 * 1024 * 1024);
       const message = data.message,
+        images = data.images,
         requestId = data.requestId,
         whenBusy = data.whenBusy;
-      if (typeof message !== "string" || !message.trim())
+      if (
+        typeof message !== "string" ||
+        (!message.trim() && images === undefined)
+      )
         throw new ApiError(
           400,
           "INVALID_MESSAGE",
-          "Input requires a nonempty message",
+          "Input requires text or image content",
         );
+      if (
+        images !== undefined &&
+        (!Array.isArray(images) || images.length < 1 || images.length > 4)
+      )
+        throw new ApiError(
+          400,
+          "INVALID_IMAGES",
+          "Input images must contain one to four images",
+        );
+      const content =
+        images === undefined
+          ? message
+          : [
+              ...(message.trim()
+                ? [{ type: "text" as const, text: message }]
+                : []),
+              ...images.map((image) => {
+                if (!image || typeof image !== "object" || Array.isArray(image))
+                  throw new ApiError(
+                    400,
+                    "INVALID_IMAGE",
+                    "Image content must be an object",
+                  );
+                const candidate = image as Record<string, unknown>;
+                if (
+                  candidate.type !== "image" ||
+                  !["image/png", "image/jpeg", "image/webp"].includes(
+                    String(candidate.mimeType),
+                  ) ||
+                  typeof candidate.data !== "string" ||
+                  !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+                    candidate.data,
+                  )
+                )
+                  throw new ApiError(
+                    400,
+                    "INVALID_IMAGE",
+                    "Image must use base64 PNG, JPEG, or WebP content",
+                  );
+                const bytes = Buffer.from(candidate.data, "base64");
+                if (!bytes.length || bytes.length > 4 * 1024 * 1024)
+                  throw new ApiError(
+                    413,
+                    "IMAGE_TOO_LARGE",
+                    "Each prompt image must be at most 4 MiB",
+                  );
+                return {
+                  type: "image" as const,
+                  mimeType: candidate.mimeType as string,
+                  data: candidate.data,
+                };
+              }),
+            ];
       if (requestId !== undefined && typeof requestId !== "string")
         throw new ApiError(
           400,
@@ -1137,7 +1257,7 @@ const server = createServer(async (request, response) => {
         return json(
           response,
           202,
-          await workspace.input(message, requestId, whenBusy),
+          await workspace.input(content, requestId, whenBusy),
         );
       });
     }

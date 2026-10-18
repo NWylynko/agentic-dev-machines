@@ -5,4 +5,7 @@ keep this file up to date
 - Ctrl+C and terminal disconnection detach only. Only explicit abort controls send cancellation requests.
 - Bot chat must suppress ordinary assistant/tool events in both history and live updates unless --diagnostics was explicitly selected.
 - Resume SSE from its durable sequence cursor and preserve request identity across ambiguous input responses. Reconnect is explicit and uses no polling timer.
+- Provider login/logout are host CLI subprocesses that suspend the TUI; never send lifecycle admin credentials or provider secrets to the workspace Pod.
+- Clipboard images travel only through the bounded Durable input API, preserving the request ID across retries. Never execute tools or create a Pi session in the client.
+- Keep `docs/pi-terminal-parity.md` accurate about mapped controls and missing workspace-owned contracts; unsupported settings must fail visibly.
 - Tests use the public Pi component and real local HTTP server, plus an isolated PTY process. They do not control an operator's Herdr session or call models.

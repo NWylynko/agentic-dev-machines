@@ -9,11 +9,13 @@ async function runTerminal() {
     workspaceId = "",
     tokenFile: string | undefined,
     identityFile: string | undefined,
+    adminExecutable: string | undefined,
+    adminArgs: string[] = [],
     diagnostics = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--help" || args[i] === "-h") {
       console.log(
-        "adm terminal --url URL --workspace ID [--identity-file PATH] [--diagnostics]\nCtrl+C detaches. Agents keep running. Ctrl+R reconnects. /help lists commands.",
+        "adm terminal --url URL --workspace ID [--identity-file PATH] [--admin-executable PATH --admin-args-json JSON] [--diagnostics]\nCtrl+C detaches. Agents keep running. Ctrl+R reconnects. /help lists commands.",
       );
       return;
     }
@@ -25,7 +27,9 @@ async function runTerminal() {
       args[i] === "--url" ||
       args[i] === "--workspace" ||
       args[i] === "--token-file" ||
-      args[i] === "--identity-file"
+      args[i] === "--identity-file" ||
+      args[i] === "--admin-executable" ||
+      args[i] === "--admin-args-json"
     ) {
       const value = args[++i];
       if (!value || value.startsWith("--"))
@@ -33,7 +37,17 @@ async function runTerminal() {
       if (args[i - 1] === "--url") url = value;
       else if (args[i - 1] === "--workspace") workspaceId = value;
       else if (args[i - 1] === "--token-file") tokenFile = value;
-      else identityFile = value;
+      else if (args[i - 1] === "--identity-file") identityFile = value;
+      else if (args[i - 1] === "--admin-executable") adminExecutable = value;
+      else {
+        const parsed: unknown = JSON.parse(value);
+        if (
+          !Array.isArray(parsed) ||
+          parsed.some((entry) => typeof entry !== "string")
+        )
+          throw new Error("--admin-args-json must be a JSON array of strings");
+        adminArgs = parsed;
+      }
       continue;
     }
     throw new Error(`Unknown argument: ${args[i]}`);
@@ -49,6 +63,9 @@ async function runTerminal() {
     workspaceId,
     tokenFile,
     identityFile,
+    ...(adminExecutable
+      ? { adminCommand: { executable: adminExecutable, args: adminArgs } }
+      : {}),
     diagnostics,
     tui: ui,
     onRender: () => ui.requestRender(),

@@ -457,6 +457,44 @@ test(
 );
 
 test(
+  "Durable prompt input preserves validated pasted image content",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-terminal-image-"));
+    const runner = await runnerFor(directory);
+    t.after(() => runner.stop());
+    const path = "/v1/workspaces/image-demo";
+    const registered = await runner.request(path, "PUT", {
+      id: "image-demo",
+      name: "image demo",
+      role: "coding",
+      environment: "local",
+      localRoot: directory,
+      model: { provider: "faux", id: "faux-1" },
+    });
+    assert.equal(registered.status, 200);
+    const image = {
+      type: "image",
+      mimeType: "image/png",
+      data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pWQAAAAASUVORK5CYII=",
+    };
+    const submitted = await runner.request(path + "/input", "POST", {
+      message: "What is in this picture?",
+      requestId: "image-prompt-1",
+      images: [image],
+    });
+    assert.equal(submitted.status, 202);
+    const history = await runner.request(path + "/history?limit=100");
+    const user = history.body.events.find((event) => event.kind === "user");
+    assert.ok(user);
+    assert.deepEqual(user.data.message.content, [
+      { type: "text", text: "What is in this picture?" },
+      image,
+    ]);
+  },
+);
+
+test(
   "a root-owned loop delivers to its Durable owner while a new session is selected across restart",
   { timeout: 20000 },
   async (t) => {
