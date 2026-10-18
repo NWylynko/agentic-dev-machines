@@ -50,6 +50,10 @@ import {
   scheduleDocument,
 } from "./schedule.ts";
 import { ApiError, type RunnerEvent, type WorkspaceConfig } from "./types.ts";
+import {
+  parseWorkspaceSettingsPatch,
+  WorkspaceBehaviorSettings,
+} from "./workspace-settings.ts";
 
 function textContent(content: unknown): string {
   if (typeof content === "string") return content;
@@ -145,6 +149,7 @@ export class Workspace {
   private accepting = true;
   private admissions = Promise.resolve();
   private models: Models;
+  private behaviorSettings: WorkspaceBehaviorSettings;
   private readonly assertActive: (signal?: AbortSignal) => Promise<void>;
   private readonly loopTask: ReturnType<
     typeof createScheduleExtension
@@ -157,6 +162,7 @@ export class Workspace {
     harness: Workspace["harness"],
     conversation: Workspace["conversation"],
     models: Models,
+    behaviorSettings: WorkspaceBehaviorSettings,
     assertActive: (signal?: AbortSignal) => Promise<void>,
     loopTask: Workspace["loopTask"],
     mcpClose?: () => Promise<void>,
@@ -165,6 +171,7 @@ export class Workspace {
     this.harness = harness;
     this.conversation = conversation;
     this.models = models;
+    this.behaviorSettings = behaviorSettings;
     this.assertActive = assertActive;
     this.loopTask = loopTask;
     this.mcpClose = mcpClose;
@@ -187,6 +194,7 @@ export class Workspace {
     if (!passive) await assertActive();
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
+    const behaviorSettings = await WorkspaceBehaviorSettings.open(directory);
     let openedWorkspace: Workspace | undefined;
     let reportedError: string | undefined;
     let mcpError: string | undefined;
@@ -257,9 +265,10 @@ export class Workspace {
         registry.install(botExtension(config, assertActive, botAgents));
         registry.install(createCodemodeExtension({ sandbox, models: false }));
       }
-      const resources = config.role === "coding" && config.environment !== "kubernetes"
-        ? new WorkspaceResources(config, directory)
-        : undefined;
+      const resources =
+        config.role === "coding" && config.environment !== "kubernetes"
+          ? new WorkspaceResources(config, directory)
+          : undefined;
       registry.install(
         defineExtension({
           name: "workspace-lifecycle",
@@ -273,7 +282,13 @@ export class Workspace {
             hook(GenerationTask, {
               beforeRequest: async (request, _api, context) => {
                 await assertActive(context.abortSignal);
-                return resources ? { messages: await resources.requestMessages(request.messages) } : undefined;
+                return resources
+                  ? {
+                      messages: await resources.requestMessages(
+                        request.messages,
+                      ),
+                    }
+                  : undefined;
               },
               afterResponse: async (message) => {
                 reportedError =
@@ -313,6 +328,7 @@ export class Workspace {
         {
           models,
           registry,
+          settings: behaviorSettings.harness,
           ...(execution ? { env: () => openedWorkspace!.execution! } : {}),
           onReport: recordError,
         },
@@ -362,6 +378,7 @@ export class Workspace {
         harness,
         activeConversation,
         models,
+        behaviorSettings,
         assertActive,
         schedule.loopTask,
         mcp?.close,
@@ -998,23 +1015,23 @@ export class Workspace {
 
   async settings() {
     const agent = await this.conversation.agent(context);
-    return { thinkingLevel: agent.thinkingLevel };
+    return {
+      thinkingLevel: agent.thinkingLevel,
+      ...this.behaviorSettings.current,
+    };
   }
 
-  async changeThinkingLevel(level: string) {
-    const valid = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-    if (!valid.includes(level))
-      throw new ApiError(
-        400,
-        "INVALID_THINKING_LEVEL",
-        "Thinking level is not supported by Pi",
-      );
+  async changeSettings(value: unknown) {
+    const patch = parseWorkspaceSettingsPatch(value);
     return this.withAdmission(async () => {
-      await this.assertIdleForNavigation();
-      await this.conversation.configure(
-        { thinkingLevel: level as never },
-        context,
-      );
+      if (patch.thinkingLevel !== undefined) {
+        await this.assertIdleForNavigation();
+        await this.conversation.configure(
+          { thinkingLevel: patch.thinkingLevel as never },
+          context,
+        );
+      }
+      await this.behaviorSettings.update(patch);
       return this.settings();
     });
   }
@@ -1114,7 +1131,11 @@ export class Workspace {
     }
     if (errors.length) {
       const detail = errors
-        .map((error) => (error instanceof Error ? `${error.name}: ${error.message}` : String(error)))
+        .map((error) =>
+          error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error),
+        )
         .join("; ");
       throw new AggregateError(
         errors,

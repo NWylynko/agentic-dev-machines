@@ -123,7 +123,11 @@ async function freePort() {
   return port;
 }
 
-async function startPodRunner(root, lifecycle, { id, name, role, host, podUid, port = 7432 }) {
+async function startPodRunner(
+  root,
+  lifecycle,
+  { id, name, role, host, podUid, port = 7432 },
+) {
   const workspace = {
     id,
     name,
@@ -151,14 +155,18 @@ async function startPodRunner(root, lifecycle, { id, name, role, host, podUid, p
     }),
     { mode: 0o600 },
   );
-  const runner = await startRunner(join(root, id), { ADM_RUNTIME_PORT: String(port) }, {
-    host,
-    port,
-    tokenFile,
-    workspaceConfigFile,
-    lifecycleUrl: lifecycle.url,
-    podUid,
-  });
+  const runner = await startRunner(
+    join(root, id),
+    { ADM_RUNTIME_PORT: String(port) },
+    {
+      host,
+      port,
+      tokenFile,
+      workspaceConfigFile,
+      lifecycleUrl: lifecycle.url,
+      podUid,
+    },
+  );
   return { runner, token, workspace };
 }
 
@@ -173,7 +181,7 @@ async function startBotLifecycle(
   await writeFile(tokenFile, "fixture-runtime-token\n", { mode: 0o600 });
   const authorizations = [];
   const operations = new Map();
-  const tokens = new Map([['fixture-runtime-token', 'fixture-source']]);
+  const tokens = new Map([["fixture-runtime-token", "fixture-source"]]);
   let signalDirectoryRequest;
   let signalDirectoryAbort;
   const directoryRequest = new Promise((resolve) => {
@@ -202,26 +210,69 @@ async function startBotLifecycle(
         response.once("close", signalDirectoryAbort);
         return;
       }
-      response.writeHead(200, headers).end(JSON.stringify(workspaces.filter((workspace) => workspace.role === "coding" && workspace.phase !== "deleted" && workspace.phase !== "deleting")));
+      response
+        .writeHead(200, headers)
+        .end(
+          JSON.stringify(
+            workspaces.filter(
+              (workspace) =>
+                workspace.role === "coding" &&
+                workspace.phase !== "deleted" &&
+                workspace.phase !== "deleting",
+            ),
+          ),
+        );
       return;
     }
-    const runtime = /^\/v1\/workspaces\/([^/]+)\/runtime\/(authorize|lease|lease\/renew|check)$/.exec(request.url ?? "");
+    const runtime =
+      /^\/v1\/workspaces\/([^/]+)\/runtime\/(authorize|lease|lease\/renew|check)$/.exec(
+        request.url ?? "",
+      );
     if (request.method === "POST" && runtime) {
       const id = decodeURIComponent(runtime[1]);
       const action = runtime[2];
       if (action === "authorize") {
         const target = workspaces.find((workspace) => workspace.id === id);
-        const allowed = target && target.phase !== "deleted" && target.phase !== "deleting" && (sourceId === id || (target.role === "coding" && workspaces.some((workspace) => workspace.id === sourceId && workspace.role === "bot")));
+        const allowed =
+          target &&
+          target.phase !== "deleted" &&
+          target.phase !== "deleting" &&
+          (sourceId === id ||
+            (target.role === "coding" &&
+              workspaces.some(
+                (workspace) =>
+                  workspace.id === sourceId && workspace.role === "bot",
+              )));
         authorizations.push({ id, action: value.action, sourceId });
-        response.writeHead(allowed ? 200 : 403, headers).end(JSON.stringify(allowed ? { allowed: true } : { error: { message: "not authorized" } }));
+        response
+          .writeHead(allowed ? 200 : 403, headers)
+          .end(
+            JSON.stringify(
+              allowed
+                ? { allowed: true }
+                : { error: { message: "not authorized" } },
+            ),
+          );
         return;
       }
       const own = workspaces.find((workspace) => workspace.id === sourceId);
       if (id !== sourceId || !own) {
-        response.writeHead(403, headers).end(JSON.stringify({ error: { message: "not authorized" } }));
+        response
+          .writeHead(403, headers)
+          .end(JSON.stringify({ error: { message: "not authorized" } }));
         return;
       }
-      response.writeHead(200, headers).end(JSON.stringify({ workspaceId: id, holder: value.holder, fencingToken: 1, expiresAt: Math.floor(Date.now() / 1000) + 60, valid: true }));
+      response
+        .writeHead(200, headers)
+        .end(
+          JSON.stringify({
+            workspaceId: id,
+            holder: value.holder,
+            fencingToken: 1,
+            expiresAt: Math.floor(Date.now() / 1000) + 60,
+            valid: true,
+          }),
+        );
       return;
     }
     const authorize = /^\/v1\/workspaces\/([^/]+)\/runtime\/authorize$/.exec(
@@ -267,10 +318,16 @@ async function startBotLifecycle(
       response.writeHead(202, headers).end(JSON.stringify(receipt));
       return;
     }
-    const operationStatus = /^\/v1\/runtime\/operations\/([^/]+)$/.exec(request.url ?? "");
+    const operationStatus = /^\/v1\/runtime\/operations\/([^/]+)$/.exec(
+      request.url ?? "",
+    );
     if (request.method === "GET" && operationStatus) {
-      const receipt = operations.get(decodeURIComponent(operationStatus[1]))?.receipt;
-      response.writeHead(receipt ? 200 : 404, headers).end(JSON.stringify(receipt ?? { error: { message: "not found" } }));
+      const receipt = operations.get(
+        decodeURIComponent(operationStatus[1]),
+      )?.receipt;
+      response
+        .writeHead(receipt ? 200 : 404, headers)
+        .end(JSON.stringify(receipt ?? { error: { message: "not found" } }));
       return;
     }
     response
@@ -295,7 +352,9 @@ async function startBotLifecycle(
       const tokenPath = join(directory, `${workspace.id}-token`);
       return writeFile(tokenPath, `${token}\n`, { mode: 0o600 }).then(() => {
         tokens.set(token, workspace.id);
-        const existing = workspaces.findIndex((item) => item.id === workspace.id);
+        const existing = workspaces.findIndex(
+          (item) => item.id === workspace.id,
+        );
         if (existing < 0) workspaces.push(workspace);
         else workspaces[existing] = workspace;
         return tokenPath;
@@ -355,20 +414,39 @@ test("a pod runtime opens its immutable workspace directly from mounted runtime 
 });
 
 test("a mounted bot runtime keeps its identity when the Pod restarts", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "adm-runner-mounted-bot-restart-"));
+  const directory = await mkdtemp(
+    join(tmpdir(), "adm-runner-mounted-bot-restart-"),
+  );
   const configPath = join(directory, "workspace.json");
-  await writeFile(configPath, JSON.stringify({
-    id: "mounted-bot-restart",
-    name: "watcher",
-    role: "bot",
-    environment: "pod",
-  }));
-  let runner = await startRunner(directory, {}, { workspaceConfigFile: configPath, defaultModel: false });
-  assert.equal((await runner.request("/v1/workspaces/mounted-bot-restart")).status, 200);
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      id: "mounted-bot-restart",
+      name: "watcher",
+      role: "bot",
+      environment: "pod",
+    }),
+  );
+  let runner = await startRunner(
+    directory,
+    {},
+    { workspaceConfigFile: configPath, defaultModel: false },
+  );
+  assert.equal(
+    (await runner.request("/v1/workspaces/mounted-bot-restart")).status,
+    200,
+  );
   await runner.stop();
-  runner = await startRunner(directory, {}, { workspaceConfigFile: configPath, defaultModel: false });
+  runner = await startRunner(
+    directory,
+    {},
+    { workspaceConfigFile: configPath, defaultModel: false },
+  );
   t.after(() => runner.stop());
-  assert.equal((await runner.request("/v1/workspaces/mounted-bot-restart")).status, 200);
+  assert.equal(
+    (await runner.request("/v1/workspaces/mounted-bot-restart")).status,
+    200,
+  );
 });
 
 test("workspace requests are authorized by lifecycle against the caller's projected identity", async (t) => {
@@ -476,13 +554,23 @@ test("workspace requests are authorized by lifecycle against the caller's projec
   assert.equal(projectedStatus.status, 200);
   const projectedBody = await projectedStatus.json();
   assert.ok(["idle", "running"].includes(projectedBody.activity.status));
-  assert.deepEqual(projectedBody.selectedModel, { provider: "faux", id: "faux-1" });
+  assert.deepEqual(projectedBody.selectedModel, {
+    provider: "faux",
+    id: "faux-1",
+  });
   assert.ok(
-    authorizations.some((entry) => entry.path.endsWith("/authorize") && entry.authorization === "Bearer rotating-pod-identity-token" && entry.body.action === "read"),
+    authorizations.some(
+      (entry) =>
+        entry.path.endsWith("/authorize") &&
+        entry.authorization === "Bearer rotating-pod-identity-token" &&
+        entry.body.action === "read",
+    ),
     "runtime status is available only to an identity scoped to this workspace Pod",
   );
   assert.ok(
-    !authorizations.some((entry) => entry.authorization === "Bearer lifecycle-controller-token"),
+    !authorizations.some(
+      (entry) => entry.authorization === "Bearer lifecycle-controller-token",
+    ),
     "the controller credential never crosses into the workspace Pod",
   );
   const admitted = await fetch(
@@ -525,7 +613,8 @@ test("workspace requests are authorized by lifecycle against the caller's projec
   const rejection = await fenced.json();
   // An in-flight commit may observe deletion before this request reaches its own fence check.
   assert.ok(
-    (fenced.status === 503 && rejection.error.code === "RUNTIME_OWNERSHIP_LOST") ||
+    (fenced.status === 503 &&
+      rejection.error.code === "RUNTIME_OWNERSHIP_LOST") ||
       (fenced.status === 410 && rejection.error.code === "WORKSPACE_DELETED"),
     JSON.stringify({ status: fenced.status, rejection }),
   );
@@ -544,20 +633,25 @@ test(
   "a controller transport outage pauses new work while an active turn survives until the same lease is renewed",
   { timeout: 35_000 },
   async (t) => {
-    const directory = await mkdtemp(join(tmpdir(), "adm-runner-lifecycle-outage-"));
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-lifecycle-outage-"),
+    );
     const tokenFile = join(directory, "service-account-token");
     const workspaceConfigFile = join(directory, "workspace.json");
     const repository = join(directory, "repository");
     const marker = join(directory, "tool-started");
     await writeFile(tokenFile, "temporary-outage-identity\n", { mode: 0o600 });
-    await writeFile(workspaceConfigFile, JSON.stringify({
-      id: "workspace-lifecycle-outage",
-      name: "lifecycle-outage",
-      role: "coding",
-      environment: "pod",
-      localRoot: repository,
-      model: { provider: "faux", id: "faux-1" },
-    }));
+    await writeFile(
+      workspaceConfigFile,
+      JSON.stringify({
+        id: "workspace-lifecycle-outage",
+        name: "lifecycle-outage",
+        role: "coding",
+        environment: "pod",
+        localRoot: repository,
+        model: { provider: "faux", id: "faux-1" },
+      }),
+    );
     let unavailable = false;
     let renewedDuringOutage;
     const renewalDuringOutage = new Promise((resolve) => {
@@ -569,22 +663,31 @@ test(
       for await (const chunk of request) text += chunk;
       const body = JSON.parse(text);
       const headers = { "content-type": "application/json" };
-      if (request.headers.authorization !== "Bearer temporary-outage-identity") {
-        response.writeHead(401, headers).end(JSON.stringify({ error: { code: "UNAUTHORIZED" } }));
+      if (
+        request.headers.authorization !== "Bearer temporary-outage-identity"
+      ) {
+        response
+          .writeHead(401, headers)
+          .end(JSON.stringify({ error: { code: "UNAUTHORIZED" } }));
         return;
       }
       if (unavailable) {
-        if (request.url?.endsWith("/runtime/lease/renew")) renewedDuringOutage();
-        response.writeHead(503, headers).end(JSON.stringify({ error: { code: "SERVICE_UNAVAILABLE" } }));
+        if (request.url?.endsWith("/runtime/lease/renew"))
+          renewedDuringOutage();
+        response
+          .writeHead(503, headers)
+          .end(JSON.stringify({ error: { code: "SERVICE_UNAVAILABLE" } }));
         return;
       }
-      response.writeHead(200, headers).end(JSON.stringify({
-        workspaceId: "workspace-lifecycle-outage",
-        holder: body.holder ?? holder,
-        fencingToken: 1,
-        expiresAt: Math.floor(Date.now() / 1000) + 30,
-        valid: true,
-      }));
+      response.writeHead(200, headers).end(
+        JSON.stringify({
+          workspaceId: "workspace-lifecycle-outage",
+          holder: body.holder ?? holder,
+          fencingToken: 1,
+          expiresAt: Math.floor(Date.now() / 1000) + 30,
+          valid: true,
+        }),
+      );
     });
     await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
     const runner = await startRunner(
@@ -603,13 +706,29 @@ test(
     });
 
     const id = "workspace-lifecycle-outage";
-    const active = await runner.request(`/v1/workspaces/${id}/input`, "POST", {
-      requestId: "held-across-controller-update",
-      message: "/faux " + JSON.stringify({
-        calls: [{ tool: "bash", args: { command: `touch ${marker}; sleep 12; printf held > ${join(repository, "tool-finished")}` } }],
-        answer: "The in-flight turn completed after the controller returned.",
-      }),
-    }, undefined, "temporary-outage-identity");
+    const active = await runner.request(
+      `/v1/workspaces/${id}/input`,
+      "POST",
+      {
+        requestId: "held-across-controller-update",
+        message:
+          "/faux " +
+          JSON.stringify({
+            calls: [
+              {
+                tool: "bash",
+                args: {
+                  command: `touch ${marker}; sleep 12; printf held > ${join(repository, "tool-finished")}`,
+                },
+              },
+            ],
+            answer:
+              "The in-flight turn completed after the controller returned.",
+          }),
+      },
+      undefined,
+      "temporary-outage-identity",
+    );
     assert.equal(active.status, 202);
     for (let attempt = 0; attempt < 100; attempt++) {
       try {
@@ -624,18 +743,31 @@ test(
     await renewalDuringOutage;
 
     const canceled = new AbortController();
-    const canceledAdmission = runner.request(`/v1/workspaces/${id}/input`, "POST", {
-      requestId: "canceled-while-controller-is-down",
-      message: "This canceled admission must never be queued.",
-    }, canceled.signal, "temporary-outage-identity");
+    const canceledAdmission = runner.request(
+      `/v1/workspaces/${id}/input`,
+      "POST",
+      {
+        requestId: "canceled-while-controller-is-down",
+        message: "This canceled admission must never be queued.",
+      },
+      canceled.signal,
+      "temporary-outage-identity",
+    );
     await new Promise((resolve) => setTimeout(resolve, 50));
     canceled.abort();
     await assert.rejects(canceledAdmission, { name: "AbortError" });
 
-    const waiting = runner.request(`/v1/workspaces/${id}/input`, "POST", {
-      requestId: "admission-waits-for-authority",
-      message: "Continue after the controller has the same runtime lease again.",
-    }, undefined, "temporary-outage-identity");
+    const waiting = runner.request(
+      `/v1/workspaces/${id}/input`,
+      "POST",
+      {
+        requestId: "admission-waits-for-authority",
+        message:
+          "Continue after the controller has the same runtime lease again.",
+      },
+      undefined,
+      "temporary-outage-identity",
+    );
     const early = await Promise.race([
       waiting.then((result) => ({ result })),
       new Promise((resolve) => setTimeout(() => resolve({ held: true }), 100)),
@@ -646,249 +778,361 @@ test(
     unavailable = false;
     const resumed = await waiting;
     assert.equal(resumed.status, 202);
-    await nextEvent(runner, id, (event) =>
-      event.kind === "assistant" && event.data.text.includes("controller returned"),
+    await nextEvent(
+      runner,
+      id,
+      (event) =>
+        event.kind === "assistant" &&
+        event.data.text.includes("controller returned"),
       0,
       false,
       25_000,
       "temporary-outage-identity",
     );
-    assert.equal(await readFile(join(repository, "tool-finished"), "utf8"), "held");
+    assert.equal(
+      await readFile(join(repository, "tool-finished"), "utf8"),
+      "held",
+    );
   },
 );
 
-test("canceling a blocked authoritative check does not fence the workspace", { timeout: 15_000 }, async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "adm-runner-canceled-check-"));
-  const tokenFile = join(directory, "service-account-token");
-  const workspaceConfigFile = join(directory, "workspace.json");
-  await writeFile(tokenFile, "canceled-check-identity\n", { mode: 0o600 });
-  await writeFile(workspaceConfigFile, JSON.stringify({
-    id: "workspace-canceled-check",
-    name: "canceled-check",
-    role: "coding",
-    environment: "pod",
-    localRoot: directory,
-    model: { provider: "faux", id: "faux-1" },
-  }));
-  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
-  let blockCheck = false;
-  let checkEnteredResolve;
-  const checkEntered = new Promise((resolve) => {
-    checkEnteredResolve = resolve;
-  });
-  const control = createServer(async (request, response) => {
-    for await (const _chunk of request) {}
-    if (request.url?.endsWith("/runtime/authorize")) {
-      response.writeHead(200, { "content-type": "application/json" }).end('{"allowed":true}');
-      return;
-    }
-    if (request.url?.endsWith("/runtime/check") && blockCheck) {
-      checkEnteredResolve();
-      return;
-    }
-    const body = request.url?.endsWith("/runtime/lease")
-      ? { workspaceId: "workspace-canceled-check", holder, fencingToken: 1, expiresAt: Math.floor(Date.now() / 1000) + 60 }
-      : { workspaceId: "workspace-canceled-check", holder, fencingToken: 1, valid: true };
-    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
-  });
-  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-  const runner = await startRunner(join(directory, "state"), {}, {
-    tokenFile,
-    workspaceConfigFile,
-    lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
-    podUid: holder,
-  });
-  t.after(async () => {
-    await runner.stop();
-    await new Promise((resolve) => control.close(resolve));
-  });
+test(
+  "canceling a blocked authoritative check does not fence the workspace",
+  { timeout: 15_000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-canceled-check-"),
+    );
+    const tokenFile = join(directory, "service-account-token");
+    const workspaceConfigFile = join(directory, "workspace.json");
+    await writeFile(tokenFile, "canceled-check-identity\n", { mode: 0o600 });
+    await writeFile(
+      workspaceConfigFile,
+      JSON.stringify({
+        id: "workspace-canceled-check",
+        name: "canceled-check",
+        role: "coding",
+        environment: "pod",
+        localRoot: directory,
+        model: { provider: "faux", id: "faux-1" },
+      }),
+    );
+    const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+    let blockCheck = false;
+    let checkEnteredResolve;
+    const checkEntered = new Promise((resolve) => {
+      checkEnteredResolve = resolve;
+    });
+    const control = createServer(async (request, response) => {
+      for await (const _chunk of request) {
+      }
+      if (request.url?.endsWith("/runtime/authorize")) {
+        response
+          .writeHead(200, { "content-type": "application/json" })
+          .end('{"allowed":true}');
+        return;
+      }
+      if (request.url?.endsWith("/runtime/check") && blockCheck) {
+        checkEnteredResolve();
+        return;
+      }
+      const body = request.url?.endsWith("/runtime/lease")
+        ? {
+            workspaceId: "workspace-canceled-check",
+            holder,
+            fencingToken: 1,
+            expiresAt: Math.floor(Date.now() / 1000) + 60,
+          }
+        : {
+            workspaceId: "workspace-canceled-check",
+            holder,
+            fencingToken: 1,
+            valid: true,
+          };
+      response
+        .writeHead(200, { "content-type": "application/json" })
+        .end(JSON.stringify(body));
+    });
+    await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+    const runner = await startRunner(
+      join(directory, "state"),
+      {},
+      {
+        tokenFile,
+        workspaceConfigFile,
+        lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+        podUid: holder,
+      },
+    );
+    t.after(async () => {
+      await runner.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
 
-  blockCheck = true;
-  const canceled = new AbortController();
-  const pending = runner.request(`/v1/workspaces/workspace-canceled-check/input`, "POST", {
-    requestId: "canceled-authoritative-check",
-    message: "This canceled admission must not fence the owner.",
-  }, canceled.signal, "canceled-check-identity");
-  await checkEntered;
-  canceled.abort(new Error("caller canceled its request"));
-  await assert.rejects(pending);
-  blockCheck = false;
-  assert.equal((await fetch(`${runner.url}/health`)).status, 200);
-  const next = await runner.request(`/v1/workspaces/workspace-canceled-check/input`, "POST", {
-    requestId: "after-canceled-authoritative-check",
-    message: "The same holder can still submit after cancellation.",
-  }, undefined, "canceled-check-identity");
-  assert.equal(next.status, 202);
-});
+    blockCheck = true;
+    const canceled = new AbortController();
+    const pending = runner.request(
+      `/v1/workspaces/workspace-canceled-check/input`,
+      "POST",
+      {
+        requestId: "canceled-authoritative-check",
+        message: "This canceled admission must not fence the owner.",
+      },
+      canceled.signal,
+      "canceled-check-identity",
+    );
+    await checkEntered;
+    canceled.abort(new Error("caller canceled its request"));
+    await assert.rejects(pending);
+    blockCheck = false;
+    assert.equal((await fetch(`${runner.url}/health`)).status, 200);
+    const next = await runner.request(
+      `/v1/workspaces/workspace-canceled-check/input`,
+      "POST",
+      {
+        requestId: "after-canceled-authoritative-check",
+        message: "The same holder can still submit after cancellation.",
+      },
+      undefined,
+      "canceled-check-identity",
+    );
+    assert.equal(next.status, 202);
+  },
+);
 
-test("an authoritative changed runtime fence permanently closes the runner", { timeout: 15_000 }, async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "adm-runner-changed-fence-"));
-  const tokenFile = join(directory, "service-account-token");
-  const workspaceConfigFile = join(directory, "workspace.json");
-  await writeFile(tokenFile, "changed-fence-identity\n", { mode: 0o600 });
-  await writeFile(workspaceConfigFile, JSON.stringify({
-    id: "workspace-changed-fence",
-    name: "changed-fence",
-    role: "coding",
-    environment: "pod",
-    localRoot: directory,
-    model: { provider: "faux", id: "faux-1" },
-  }));
-  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
-  let renew;
-  const renewed = new Promise((resolve) => { renew = resolve; });
-  const control = createServer(async (request, response) => {
-    let text = "";
-    for await (const chunk of request) text += chunk;
-    const body = JSON.parse(text);
-    const renewal = request.url?.endsWith("/runtime/lease/renew");
-    if (renewal) renew();
-    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
-      workspaceId: "workspace-changed-fence",
-      holder: renewal ? "b2c3d4e5-f6a7-4890-a123-23456789abcd" : body.holder ?? holder,
-      fencingToken: renewal ? 2 : 1,
-      expiresAt: Math.floor(Date.now() / 1000) + 30,
-      valid: true,
-    }));
-  });
-  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-  const runner = await startRunner(join(directory, "state"), {}, {
-    tokenFile,
-    workspaceConfigFile,
-    lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
-    podUid: holder,
-  });
-  t.after(async () => {
-    await runner.stop();
-    await new Promise((resolve) => control.close(resolve));
-  });
-  await renewed;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    if ((await fetch(`${runner.url}/health`)).status === 503) break;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  const health = await fetch(`${runner.url}/health`);
-  assert.equal(health.status, 503);
-  assert.equal((await health.json()).status, "error");
-});
-
-test("lease expiry closes a running tool even when its durable abort is fenced", { timeout: 15_000 }, async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "adm-runner-expired-tool-"));
-  const tokenFile = join(directory, "service-account-token");
-  const workspaceConfigFile = join(directory, "workspace.json");
-  const started = join(directory, "tool-started");
-  const afterExpiry = join(directory, "tool-wrote-after-expiry");
-  await writeFile(tokenFile, "expired-tool-identity\n", { mode: 0o600 });
-  await writeFile(workspaceConfigFile, JSON.stringify({
-    id: "workspace-expired-tool",
-    name: "expired-tool",
-    role: "coding",
-    environment: "pod",
-    localRoot: directory,
-    model: { provider: "faux", id: "faux-1" },
-  }));
-  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
-  const control = createServer(async (request, response) => {
-    let text = "";
-    for await (const chunk of request) text += chunk;
-    const body = text ? JSON.parse(text) : {};
-    const value = request.url?.endsWith("/runtime/authorize")
-      ? { allowed: true }
-      : {
-          workspaceId: "workspace-expired-tool",
-          holder: body.holder ?? holder,
-          fencingToken: 1,
-          expiresAt: Math.floor(Date.now() / 1000) + 5,
+test(
+  "an authoritative changed runtime fence permanently closes the runner",
+  { timeout: 15_000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-changed-fence-"),
+    );
+    const tokenFile = join(directory, "service-account-token");
+    const workspaceConfigFile = join(directory, "workspace.json");
+    await writeFile(tokenFile, "changed-fence-identity\n", { mode: 0o600 });
+    await writeFile(
+      workspaceConfigFile,
+      JSON.stringify({
+        id: "workspace-changed-fence",
+        name: "changed-fence",
+        role: "coding",
+        environment: "pod",
+        localRoot: directory,
+        model: { provider: "faux", id: "faux-1" },
+      }),
+    );
+    const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+    let renew;
+    const renewed = new Promise((resolve) => {
+      renew = resolve;
+    });
+    const control = createServer(async (request, response) => {
+      let text = "";
+      for await (const chunk of request) text += chunk;
+      const body = JSON.parse(text);
+      const renewal = request.url?.endsWith("/runtime/lease/renew");
+      if (renewal) renew();
+      response.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify({
+          workspaceId: "workspace-changed-fence",
+          holder: renewal
+            ? "b2c3d4e5-f6a7-4890-a123-23456789abcd"
+            : (body.holder ?? holder),
+          fencingToken: renewal ? 2 : 1,
+          expiresAt: Math.floor(Date.now() / 1000) + 30,
           valid: true,
-        };
-    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(value));
-  });
-  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-  const runner = await startRunner(join(directory, "state"), {}, {
-    tokenFile,
-    workspaceConfigFile,
-    lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
-    podUid: holder,
-  });
-  t.after(async () => {
-    await runner.stop();
-    await new Promise((resolve) => control.close(resolve));
-  });
-
-  const id = "workspace-expired-tool";
-  const active = await runner.request(`/v1/workspaces/${id}/input`, "POST", {
-    requestId: "tool-interrupted-by-expiry",
-    message: "/faux " + JSON.stringify({
-      calls: [{ tool: "bash", args: { command: `touch ${started}; sleep 30; touch ${afterExpiry}` } }],
-      answer: "This turn must be stopped when its lease expires.",
-    }),
-  }, undefined, "expired-tool-identity");
-  assert.equal(active.status, 202);
-  for (let attempt = 0; attempt < 100; attempt++) {
-    try {
-      await access(started);
-      break;
-    } catch {
+        }),
+      );
+    });
+    await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+    const runner = await startRunner(
+      join(directory, "state"),
+      {},
+      {
+        tokenFile,
+        workspaceConfigFile,
+        lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+        podUid: holder,
+      },
+    );
+    t.after(async () => {
+      await runner.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+    await renewed;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((await fetch(`${runner.url}/health`)).status === 503) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
-  }
-  await access(started);
-  for (let attempt = 0; attempt < 100; attempt++) {
-    if ((await fetch(`${runner.url}/health`)).status === 503) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  assert.equal((await fetch(`${runner.url}/health`)).status, 503);
-  await new Promise((resolve) => setTimeout(resolve, 750));
-  await assert.rejects(access(afterExpiry), { code: "ENOENT" });
-  assert.match(runner.errors, /FATAL failed to stop fenced workspace/);
-  assert.match(runner.errors, /shutdown incomplete: Error: Workspace runtime lease expired/);
-});
+    const health = await fetch(`${runner.url}/health`);
+    assert.equal(health.status, 503);
+    assert.equal((await health.json()).status, "error");
+  },
+);
 
-test("the runner fences at the server-issued lease expiry deadline", { timeout: 5_000 }, async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "adm-runner-expired-fence-"));
-  const tokenFile = join(directory, "service-account-token");
-  const workspaceConfigFile = join(directory, "workspace.json");
-  await writeFile(tokenFile, "expired-fence-identity\n", { mode: 0o600 });
-  await writeFile(workspaceConfigFile, JSON.stringify({
-    id: "workspace-expired-fence",
-    name: "expired-fence",
-    role: "coding",
-    environment: "pod",
-    localRoot: directory,
-    model: { provider: "faux", id: "faux-1" },
-  }));
-  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
-  const control = createServer(async (request, response) => {
-    let text = "";
-    for await (const chunk of request) text += chunk;
-    const body = JSON.parse(text);
-    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
-      workspaceId: "workspace-expired-fence",
-      holder: body.holder ?? holder,
-      fencingToken: 1,
-      expiresAt: Math.floor(Date.now() / 1000) + 1,
-      valid: true,
-    }));
-  });
-  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-  const runner = await startRunner(join(directory, "state"), {}, {
-    tokenFile,
-    workspaceConfigFile,
-    lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
-    podUid: holder,
-  });
-  t.after(async () => {
-    await runner.stop();
-    await new Promise((resolve) => control.close(resolve));
-  });
-  for (let attempt = 0; attempt < 100; attempt++) {
-    if ((await fetch(`${runner.url}/health`)).status === 503) break;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  const health = await fetch(`${runner.url}/health`);
-  assert.equal(health.status, 503);
-  assert.equal((await health.json()).status, "error");
-});
+test(
+  "lease expiry closes a running tool even when its durable abort is fenced",
+  { timeout: 15_000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-expired-tool-"));
+    const tokenFile = join(directory, "service-account-token");
+    const workspaceConfigFile = join(directory, "workspace.json");
+    const started = join(directory, "tool-started");
+    const afterExpiry = join(directory, "tool-wrote-after-expiry");
+    await writeFile(tokenFile, "expired-tool-identity\n", { mode: 0o600 });
+    await writeFile(
+      workspaceConfigFile,
+      JSON.stringify({
+        id: "workspace-expired-tool",
+        name: "expired-tool",
+        role: "coding",
+        environment: "pod",
+        localRoot: directory,
+        model: { provider: "faux", id: "faux-1" },
+      }),
+    );
+    const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+    const control = createServer(async (request, response) => {
+      let text = "";
+      for await (const chunk of request) text += chunk;
+      const body = text ? JSON.parse(text) : {};
+      const value = request.url?.endsWith("/runtime/authorize")
+        ? { allowed: true }
+        : {
+            workspaceId: "workspace-expired-tool",
+            holder: body.holder ?? holder,
+            fencingToken: 1,
+            expiresAt: Math.floor(Date.now() / 1000) + 5,
+            valid: true,
+          };
+      response
+        .writeHead(200, { "content-type": "application/json" })
+        .end(JSON.stringify(value));
+    });
+    await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+    const runner = await startRunner(
+      join(directory, "state"),
+      {},
+      {
+        tokenFile,
+        workspaceConfigFile,
+        lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+        podUid: holder,
+      },
+    );
+    t.after(async () => {
+      await runner.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+
+    const id = "workspace-expired-tool";
+    const active = await runner.request(
+      `/v1/workspaces/${id}/input`,
+      "POST",
+      {
+        requestId: "tool-interrupted-by-expiry",
+        message:
+          "/faux " +
+          JSON.stringify({
+            calls: [
+              {
+                tool: "bash",
+                args: {
+                  command: `touch ${started}; sleep 30; touch ${afterExpiry}`,
+                },
+              },
+            ],
+            answer: "This turn must be stopped when its lease expires.",
+          }),
+      },
+      undefined,
+      "expired-tool-identity",
+    );
+    assert.equal(active.status, 202);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        await access(started);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    await access(started);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((await fetch(`${runner.url}/health`)).status === 503) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal((await fetch(`${runner.url}/health`)).status, 503);
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    await assert.rejects(access(afterExpiry), { code: "ENOENT" });
+    assert.match(runner.errors, /FATAL failed to stop fenced workspace/);
+    assert.match(
+      runner.errors,
+      /shutdown incomplete: Error: Workspace runtime lease expired/,
+    );
+  },
+);
+
+test(
+  "the runner fences at the server-issued lease expiry deadline",
+  { timeout: 5_000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-expired-fence-"),
+    );
+    const tokenFile = join(directory, "service-account-token");
+    const workspaceConfigFile = join(directory, "workspace.json");
+    await writeFile(tokenFile, "expired-fence-identity\n", { mode: 0o600 });
+    await writeFile(
+      workspaceConfigFile,
+      JSON.stringify({
+        id: "workspace-expired-fence",
+        name: "expired-fence",
+        role: "coding",
+        environment: "pod",
+        localRoot: directory,
+        model: { provider: "faux", id: "faux-1" },
+      }),
+    );
+    const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+    const control = createServer(async (request, response) => {
+      let text = "";
+      for await (const chunk of request) text += chunk;
+      const body = JSON.parse(text);
+      response.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify({
+          workspaceId: "workspace-expired-fence",
+          holder: body.holder ?? holder,
+          fencingToken: 1,
+          expiresAt: Math.floor(Date.now() / 1000) + 1,
+          valid: true,
+        }),
+      );
+    });
+    await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+    const runner = await startRunner(
+      join(directory, "state"),
+      {},
+      {
+        tokenFile,
+        workspaceConfigFile,
+        lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+        podUid: holder,
+      },
+    );
+    t.after(async () => {
+      await runner.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((await fetch(`${runner.url}/health`)).status === 503) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const health = await fetch(`${runner.url}/health`);
+    assert.equal(health.status, 503);
+    assert.equal((await health.json()).status, "error");
+  },
+);
 
 async function nextEvent(
   runner,
@@ -905,7 +1149,10 @@ async function nextEvent(
     : undefined;
   const response = await fetch(
     `${runner.url}/v1/workspaces/${id}/events?after=${after}&diagnostics=${diagnostics}`,
-    { signal: controller.signal, headers: token ? { authorization: `Bearer ${token}` } : {} },
+    {
+      signal: controller.signal,
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    },
   );
   assert.equal(response.status, 200);
   let buffer = "";
@@ -1371,6 +1618,222 @@ test("model catalog and selection operate on the existing durable conversation",
     true,
   );
 });
+
+test("workspace behavior settings update through HTTP and persist across runner restart", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-settings-"));
+  const id = "settings-coder";
+  const path = `/v1/workspaces/${id}`;
+  let runner = await startRunner(directory);
+  t.after(() => runner.stop());
+  assert.equal(
+    (
+      await runner.request(path, "PUT", {
+        id,
+        name: "settings",
+        role: "coding",
+        environment: "local",
+        localRoot: join(directory, "repo"),
+        model: { provider: "faux", id: "faux-1" },
+      })
+    ).status,
+    200,
+  );
+
+  const defaults = await runner.request(path + "/settings");
+  assert.equal(defaults.status, 200);
+  assert.deepEqual(defaults.body, {
+    thinkingLevel: "off",
+    steeringMode: "one-at-a-time",
+    followUpMode: "one-at-a-time",
+    autoCompact: true,
+  });
+
+  const changed = await runner.request(path + "/settings", "PUT", {
+    thinkingLevel: "high",
+    steeringMode: "all",
+    followUpMode: "all",
+    autoCompact: false,
+  });
+  assert.equal(changed.status, 200);
+  assert.deepEqual(changed.body, {
+    thinkingLevel: "high",
+    steeringMode: "all",
+    followUpMode: "all",
+    autoCompact: false,
+  });
+  assert.equal(
+    (await stat(join(directory, "sessions", id, "adm-settings.json"))).mode &
+      0o777,
+    0o600,
+  );
+
+  const secondId = "settings-isolated";
+  const secondPath = `/v1/workspaces/${secondId}`;
+  await runner.request(secondPath, "PUT", {
+    id: secondId,
+    name: "isolated settings",
+    role: "bot",
+    environment: "local",
+    model: { provider: "faux", id: "faux-1" },
+  });
+  assert.deepEqual((await runner.request(secondPath + "/settings")).body, {
+    thinkingLevel: "off",
+    steeringMode: "one-at-a-time",
+    followUpMode: "one-at-a-time",
+    autoCompact: true,
+  });
+
+  const invalid = await runner.request(path + "/settings", "PUT", {
+    steeringMode: "parallel",
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.error.code, "INVALID_SETTINGS");
+  assert.deepEqual(
+    (await runner.request(path + "/settings")).body,
+    changed.body,
+  );
+
+  await runner.stop("SIGKILL");
+  runner = await startRunner(directory);
+  const recovered = await runner.request(path + "/settings");
+  assert.equal(recovered.status, 200);
+  assert.deepEqual(recovered.body, changed.body);
+});
+
+test(
+  "steering mode controls how many queued inputs a real Durable turn admits at once",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-settings-steering-"),
+    );
+    const id = "settings-steering";
+    const path = `/v1/workspaces/${id}`;
+    const marker = join(directory, "tool-started");
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    await runner.request(path, "PUT", {
+      id,
+      name: "settings steering",
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, "repo"),
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const changed = await runner.request(path + "/settings", "PUT", {
+      steeringMode: "all",
+      followUpMode: "all",
+    });
+    assert.equal(changed.status, 200);
+    const start = await runner.request(path + "/input", "POST", {
+      requestId: "settings-hold-tool",
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            { tool: "bash", args: { command: `touch ${marker}; sleep 1` } },
+          ],
+          answer: "Initial turn complete.",
+        }),
+    });
+    assert.equal(start.status, 202);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        await access(marker);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    await access(marker);
+    assert.equal(
+      (
+        await runner.request(path + "/input", "POST", {
+          requestId: "settings-steer-one",
+          whenBusy: "steer",
+          message: "steer-one",
+        })
+      ).status,
+      202,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/input", "POST", {
+          requestId: "settings-follow-up-one",
+          whenBusy: "followUp",
+          message: "follow-up-one",
+        })
+      ).status,
+      202,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/input", "POST", {
+          requestId: "settings-follow-up-two",
+          whenBusy: "followUp",
+          message: "follow-up-two",
+        })
+      ).status,
+      202,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/input", "POST", {
+          requestId: "settings-steer-two",
+          whenBusy: "steer",
+          message: "steer-two",
+        })
+      ).status,
+      202,
+    );
+    await nextEvent(
+      runner,
+      id,
+      (event) =>
+        event.kind === "assistant" && event.data.text === "Echo: steer-two",
+      0,
+      false,
+      10000,
+    );
+    await nextEvent(
+      runner,
+      id,
+      (event) =>
+        event.kind === "assistant" && event.data.text === "Echo: follow-up-two",
+      0,
+      false,
+      10000,
+    );
+    const history = await runner.request(path + "/history");
+    const events = history.body.events;
+    const first = events.findIndex(
+      (event) => event.kind === "user" && event.data.text === "steer-one",
+    );
+    const second = events.findIndex(
+      (event) => event.kind === "user" && event.data.text === "steer-two",
+    );
+    assert.ok(first >= 0 && second > first);
+    assert.equal(
+      events
+        .slice(first + 1, second)
+        .some((event) => event.kind === "assistant"),
+      false,
+    );
+    const firstFollowUp = events.findIndex(
+      (event) => event.kind === "user" && event.data.text === "follow-up-one",
+    );
+    const secondFollowUp = events.findIndex(
+      (event) => event.kind === "user" && event.data.text === "follow-up-two",
+    );
+    assert.ok(firstFollowUp >= 0 && secondFollowUp > firstFollowUp);
+    assert.equal(
+      events
+        .slice(firstFollowUp + 1, secondFollowUp)
+        .some((event) => event.kind === "assistant"),
+      false,
+    );
+  },
+);
 
 test("model selection reports missing provider authentication without falling back", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "adm-runner-model-auth-"));
@@ -2154,22 +2617,43 @@ test(
   "a pod bot controls isolated coding runtimes, observes durable operations, and keeps broad discovery after restart",
   { timeout: 45000 },
   async (t) => {
-    const directory = await mkdtemp(join(tmpdir(), "adm-runner-agent-directory-"));
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-agent-directory-"),
+    );
     const workspaces = [];
     const port = await freePort();
-    const lifecycle = await startBotLifecycle(join(directory, "management"), workspaces, {}, t);
+    const lifecycle = await startBotLifecycle(
+      join(directory, "management"),
+      workspaces,
+      {},
+      t,
+    );
     const botId = "directory-bot";
-    const botWorkspace = { id: botId, name: "bot", role: "bot", phase: "ready", namespace: "fixture-directory-bot" };
+    const botWorkspace = {
+      id: botId,
+      name: "bot",
+      role: "bot",
+      phase: "ready",
+      namespace: "fixture-directory-bot",
+    };
     const botPod = await startPodRunner(directory, lifecycle, {
       ...botWorkspace,
-      host: "127.0.0.1", port,
+      host: "127.0.0.1",
+      port,
       podUid: "11111111-1111-4111-8111-111111111111",
     });
     const targets = new Map();
     async function addTarget(id, name, host) {
       const target = await startPodRunner(directory, lifecycle, {
-        id, name, role: "coding", host, port,
-        podUid: id === "alpha" ? "22222222-2222-4222-8222-222222222222" : "33333333-3333-4333-8333-333333333333",
+        id,
+        name,
+        role: "coding",
+        host,
+        port,
+        podUid:
+          id === "alpha"
+            ? "22222222-2222-4222-8222-222222222222"
+            : "33333333-3333-4333-8333-333333333333",
       });
       targets.set(id, target);
       return target;
@@ -2179,13 +2663,19 @@ test(
     const bot = botPod.runner;
     const targetRunner = (id) => targets.get(id)?.runner;
     t.after(async () => {
-      await Promise.all([bot.stop(), ...[...targets.values()].map(({ runner }) => runner.stop())]);
+      await Promise.all([
+        bot.stop(),
+        ...[...targets.values()].map(({ runner }) => runner.stop()),
+      ]);
       await lifecycle.close();
     });
     const authRequest = async (runner, token, path, method = "GET", body) => {
       const response = await fetch(runner.url + path, {
         method,
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       return { status: response.status, body: await response.json() };
@@ -2193,73 +2683,265 @@ test(
     let cursor = 0;
     async function call(tool, args, requestId, code = false) {
       const calls = code
-        ? [{ tool: "codemode", args: { code: `return await tools.${tool}(${JSON.stringify(args)})` } }]
+        ? [
+            {
+              tool: "codemode",
+              args: {
+                code: `return await tools.${tool}(${JSON.stringify(args)})`,
+              },
+            },
+          ]
         : [{ tool, args }];
-      const input = await authRequest(bot, botPod.token, `/v1/workspaces/${botId}/input`, "POST", {
-        message: "/faux " + JSON.stringify({ calls, answer: "Private lifecycle result." }), requestId,
-      });
+      const input = await authRequest(
+        bot,
+        botPod.token,
+        `/v1/workspaces/${botId}/input`,
+        "POST",
+        {
+          message:
+            "/faux " +
+            JSON.stringify({ calls, answer: "Private lifecycle result." }),
+          requestId,
+        },
+      );
       assert.equal(input.status, 202);
-      const event = await nextEvent(bot, botId,
-        (value) => value.kind === "tool" && value.data.name === (code ? "codemode" : tool),
-        cursor, true, 0, botPod.token);
+      const event = await nextEvent(
+        bot,
+        botId,
+        (value) =>
+          value.kind === "tool" &&
+          value.data.name === (code ? "codemode" : tool),
+        cursor,
+        true,
+        0,
+        botPod.token,
+      );
       cursor = event.seq;
       return event.data;
     }
     const listed = JSON.parse((await call("listAgents", {}, "list")).text);
-    assert.deepEqual(listed.agents.map(({ id, name }) => ({ id, name })), [
-      { id: "alpha", name: "project-albatross" }, { id: "beta", name: "project-bee" },
-    ]);
+    assert.deepEqual(
+      listed.agents.map(({ id, name }) => ({ id, name })),
+      [
+        { id: "alpha", name: "project-albatross" },
+        { id: "beta", name: "project-bee" },
+      ],
+    );
     const codeMode = await call("listAgents", {}, "list-code", true);
     assert.equal(codeMode.isError, false);
     assert.match(codeMode.text, /project-bee/);
 
     const target = targetRunner("alpha");
-    const remoteInput = await authRequest(target, targets.get("alpha").token, "/v1/workspaces/alpha/input", "POST", {
-      message: "/faux " + JSON.stringify({ calls: [{ tool: "write", args: { path: join(directory, "tool.txt"), content: "done" } }], answer: "written" }),
-      requestId: "history-with-tool",
-    });
+    const remoteInput = await authRequest(
+      target,
+      targets.get("alpha").token,
+      "/v1/workspaces/alpha/input",
+      "POST",
+      {
+        message:
+          "/faux " +
+          JSON.stringify({
+            calls: [
+              {
+                tool: "write",
+                args: { path: join(directory, "tool.txt"), content: "done" },
+              },
+            ],
+            answer: "written",
+          }),
+        requestId: "history-with-tool",
+      },
+    );
     assert.equal(remoteInput.status, 202);
-    await nextEvent(target, "alpha", (event) => event.kind === "tool" && event.data.name === "write", 0, true, 0, targets.get("alpha").token);
-    const monitored = JSON.parse((await call("monitorAgent", { agentId: "alpha", after: 0, limit: 2 }, "monitor")).text);
+    await nextEvent(
+      target,
+      "alpha",
+      (event) => event.kind === "tool" && event.data.name === "write",
+      0,
+      true,
+      0,
+      targets.get("alpha").token,
+    );
+    const monitored = JSON.parse(
+      (
+        await call(
+          "monitorAgent",
+          { agentId: "alpha", after: 0, limit: 2 },
+          "monitor",
+        )
+      ).text,
+    );
     assert.equal(monitored.id, "alpha");
     let historyEvents = monitored.history.events;
     let nextAfter = monitored.history.nextAfter;
     while (monitored.history.hasMore) {
-      const page = JSON.parse((await call("monitorAgent", { agentId: "alpha", after: nextAfter, limit: 100 }, `monitor-${nextAfter}`)).text).history;
+      const page = JSON.parse(
+        (
+          await call(
+            "monitorAgent",
+            { agentId: "alpha", after: nextAfter, limit: 100 },
+            `monitor-${nextAfter}`,
+          )
+        ).text,
+      ).history;
       historyEvents = [...historyEvents, ...page.events];
       nextAfter = page.nextAfter;
       if (!page.hasMore) break;
     }
-    assert.ok(historyEvents.some((event) => event.kind === "tool" && event.data.name === "write"));
+    assert.ok(
+      historyEvents.some(
+        (event) => event.kind === "tool" && event.data.name === "write",
+      ),
+    );
 
-    const prompt = JSON.parse((await call("promptAgent", { agentId: "alpha", message: "Report your status." }, "prompt")).text);
+    const prompt = JSON.parse(
+      (
+        await call(
+          "promptAgent",
+          { agentId: "alpha", message: "Report your status." },
+          "prompt",
+        )
+      ).text,
+    );
     assert.equal(prompt.status, "admitted");
-    await nextEvent(target, "alpha", (event) => event.kind === "assistant" && event.data.text.includes("Report your status."), 0, true, 0, targets.get("alpha").token);
-    assert.equal(JSON.parse((await call("saveAgentGoal", { agentId: "alpha", goal: { description: "Ship it" } }, "goal")).text).description, "Ship it");
-    assert.equal(JSON.parse((await call("saveAgentLoop", { agentId: "beta", loop: { prompt: "Check progress", intervalMs: 60000, nextAt: 2000000000000 } }, "loop")).text).prompt, "Check progress");
-    assert.equal((await call("configureAgentModel", { agentId: "beta", provider: "faux", modelId: "faux-1" }, "model")).isError, false);
+    await nextEvent(
+      target,
+      "alpha",
+      (event) =>
+        event.kind === "assistant" &&
+        event.data.text.includes("Report your status."),
+      0,
+      true,
+      0,
+      targets.get("alpha").token,
+    );
+    assert.equal(
+      JSON.parse(
+        (
+          await call(
+            "saveAgentGoal",
+            { agentId: "alpha", goal: { description: "Ship it" } },
+            "goal",
+          )
+        ).text,
+      ).description,
+      "Ship it",
+    );
+    assert.equal(
+      JSON.parse(
+        (
+          await call(
+            "saveAgentLoop",
+            {
+              agentId: "beta",
+              loop: {
+                prompt: "Check progress",
+                intervalMs: 60000,
+                nextAt: 2000000000000,
+              },
+            },
+            "loop",
+          )
+        ).text,
+      ).prompt,
+      "Check progress",
+    );
+    assert.equal(
+      (
+        await call(
+          "configureAgentModel",
+          { agentId: "beta", provider: "faux", modelId: "faux-1" },
+          "model",
+        )
+      ).isError,
+      false,
+    );
 
-    const created = JSON.parse((await call("createAgent", {
-      name: "new-agent", image: "adm-dev:0.1.0", storageClass: "fast", storageSize: "10Gi", cpu: "2", memory: "4Gi", model: { provider: "faux", id: "faux-1" },
-    }, "create")).text);
+    const created = JSON.parse(
+      (
+        await call(
+          "createAgent",
+          {
+            name: "new-agent",
+            image: "adm-dev:0.1.0",
+            storageClass: "fast",
+            storageSize: "10Gi",
+            cpu: "2",
+            memory: "4Gi",
+            model: { provider: "faux", id: "faux-1" },
+          },
+          "create",
+        )
+      ).text,
+    );
     assert.equal(created.status, "accepted");
-    const operation = JSON.parse((await call("monitorAgentOperation", { operationId: created.operationId }, "create-status")).text);
+    const operation = JSON.parse(
+      (
+        await call(
+          "monitorAgentOperation",
+          { operationId: created.operationId },
+          "create-status",
+        )
+      ).text,
+    );
     assert.equal(operation.operationId, created.operationId);
-    const destroyed = JSON.parse((await call("destroyAgent", { agentId: "beta" }, "destroy")).text);
+    const destroyed = JSON.parse(
+      (await call("destroyAgent", { agentId: "beta" }, "destroy")).text,
+    );
     assert.equal(destroyed.kind, "delete");
     assert.equal(destroyed.workspaceId, "beta");
-    assert.equal(JSON.parse((await call("monitorAgentOperation", { operationId: destroyed.operationId }, "delete-status")).text).operationId, destroyed.operationId);
+    assert.equal(
+      JSON.parse(
+        (
+          await call(
+            "monitorAgentOperation",
+            { operationId: destroyed.operationId },
+            "delete-status",
+          )
+        ).text,
+      ).operationId,
+      destroyed.operationId,
+    );
 
     await bot.stop();
-    const restarted = await startPodRunner(directory, lifecycle, { ...botWorkspace, host: "127.0.0.1", port, podUid: "11111111-1111-4111-8111-111111111111" });
-    t.after(() => restarted.runner.stop());
-    const persisted = await authRequest(restarted.runner, restarted.token, `/v1/workspaces/${botId}`);
-    assert.equal(persisted.status, 200);
-    const afterRestart = await authRequest(restarted.runner, restarted.token, `/v1/workspaces/${botId}/input`, "POST", {
-      message: "/faux " + JSON.stringify({ calls: [{ tool: "listAgents", args: {} }], answer: "Private." }), requestId: "restart-list",
+    const restarted = await startPodRunner(directory, lifecycle, {
+      ...botWorkspace,
+      host: "127.0.0.1",
+      port,
+      podUid: "11111111-1111-4111-8111-111111111111",
     });
+    t.after(() => restarted.runner.stop());
+    const persisted = await authRequest(
+      restarted.runner,
+      restarted.token,
+      `/v1/workspaces/${botId}`,
+    );
+    assert.equal(persisted.status, 200);
+    const afterRestart = await authRequest(
+      restarted.runner,
+      restarted.token,
+      `/v1/workspaces/${botId}/input`,
+      "POST",
+      {
+        message:
+          "/faux " +
+          JSON.stringify({
+            calls: [{ tool: "listAgents", args: {} }],
+            answer: "Private.",
+          }),
+        requestId: "restart-list",
+      },
+    );
     assert.equal(afterRestart.status, 202);
-    const afterEvent = await nextEvent(restarted.runner, botId, (event) => event.kind === "tool" && event.data.name === "listAgents", 0, true, 0, restarted.token);
+    const afterEvent = await nextEvent(
+      restarted.runner,
+      botId,
+      (event) => event.kind === "tool" && event.data.name === "listAgents",
+      0,
+      true,
+      0,
+      restarted.token,
+    );
     assert.match(afterEvent.data.text, /project-albatross/);
   },
 );
@@ -2270,19 +2952,48 @@ test(
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-cancel-"));
     const port = await freePort();
-    const lifecycle = await startBotLifecycle(join(directory, "management"), [], { holdDirectory: true }, t);
+    const lifecycle = await startBotLifecycle(
+      join(directory, "management"),
+      [],
+      { holdDirectory: true },
+      t,
+    );
     const pod = await startPodRunner(directory, lifecycle, {
-      id: "cancel-bot", name: "bot", role: "bot", host: "127.0.0.1", port,
+      id: "cancel-bot",
+      name: "bot",
+      role: "bot",
+      host: "127.0.0.1",
+      port,
       podUid: "11111111-1111-4111-8111-111111111111",
     });
-    t.after(async () => { await pod.runner.stop(); await lifecycle.close(); });
-    const call = await pod.runner.request("/v1/workspaces/cancel-bot/input", "POST", {
-      message: `/faux ${JSON.stringify({ calls: [{ tool: "listAgents", args: {} }] })}`,
-      requestId: "cancel-management-request",
-    }, undefined, pod.token);
+    t.after(async () => {
+      await pod.runner.stop();
+      await lifecycle.close();
+    });
+    const call = await pod.runner.request(
+      "/v1/workspaces/cancel-bot/input",
+      "POST",
+      {
+        message: `/faux ${JSON.stringify({ calls: [{ tool: "listAgents", args: {} }] })}`,
+        requestId: "cancel-management-request",
+      },
+      undefined,
+      pod.token,
+    );
     assert.equal(call.status, 202);
     await lifecycle.directoryRequest;
-    assert.equal((await pod.runner.request("/v1/workspaces/cancel-bot/abort", "POST", {}, undefined, pod.token)).status, 200);
+    assert.equal(
+      (
+        await pod.runner.request(
+          "/v1/workspaces/cancel-bot/abort",
+          "POST",
+          {},
+          undefined,
+          pod.token,
+        )
+      ).status,
+      200,
+    );
     await lifecycle.directoryAbort;
   },
 );
@@ -2291,34 +3002,110 @@ test(
   "a pod bot discovers coding agents created later through direct tools and Code Mode",
   { timeout: 30000 },
   async (t) => {
-    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-late-agent-"));
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-bot-late-agent-"),
+    );
     const port = await freePort();
-    const lifecycle = await startBotLifecycle(join(directory, "management"), [], {}, t);
+    const lifecycle = await startBotLifecycle(
+      join(directory, "management"),
+      [],
+      {},
+      t,
+    );
     const bot = await startPodRunner(directory, lifecycle, {
-      id: "late-agent-bot", name: "bot", role: "bot", host: "127.0.0.1", port,
+      id: "late-agent-bot",
+      name: "bot",
+      role: "bot",
+      host: "127.0.0.1",
+      port,
       podUid: "11111111-1111-4111-8111-111111111111",
     });
     const target = await startPodRunner(directory, lifecycle, {
-      id: "created-after-bot", name: "new-project", role: "coding", host: "127.0.0.2", port,
+      id: "created-after-bot",
+      name: "new-project",
+      role: "coding",
+      host: "127.0.0.2",
+      port,
       podUid: "22222222-2222-4222-8222-222222222222",
     });
-    t.after(async () => { await bot.runner.stop(); await target.runner.stop(); await lifecycle.close(); });
+    t.after(async () => {
+      await bot.runner.stop();
+      await target.runner.stop();
+      await lifecycle.close();
+    });
     let cursor = 0;
     async function call(tool, args, requestId, code = false) {
-      const calls = code ? [{ tool: "codemode", args: { code: `return await tools.${tool}(${JSON.stringify(args)})` } }] : [{ tool, args }];
-      assert.equal((await bot.runner.request("/v1/workspaces/late-agent-bot/input", "POST", {
-        message: "/faux " + JSON.stringify({ calls, answer: "Private lifecycle result." }), requestId,
-      }, undefined, bot.token)).status, 202);
-      const event = await nextEvent(bot.runner, "late-agent-bot", (value) => value.kind === "tool" && value.data.name === (code ? "codemode" : tool), cursor, true, 0, bot.token);
+      const calls = code
+        ? [
+            {
+              tool: "codemode",
+              args: {
+                code: `return await tools.${tool}(${JSON.stringify(args)})`,
+              },
+            },
+          ]
+        : [{ tool, args }];
+      assert.equal(
+        (
+          await bot.runner.request(
+            "/v1/workspaces/late-agent-bot/input",
+            "POST",
+            {
+              message:
+                "/faux " +
+                JSON.stringify({ calls, answer: "Private lifecycle result." }),
+              requestId,
+            },
+            undefined,
+            bot.token,
+          )
+        ).status,
+        202,
+      );
+      const event = await nextEvent(
+        bot.runner,
+        "late-agent-bot",
+        (value) =>
+          value.kind === "tool" &&
+          value.data.name === (code ? "codemode" : tool),
+        cursor,
+        true,
+        0,
+        bot.token,
+      );
       cursor = event.seq;
       return event.data;
     }
     const direct = JSON.parse((await call("listAgents", {}, "late-list")).text);
-    assert.deepEqual(direct.agents, [{ id: "created-after-bot", name: "new-project", status: "idle", phase: "ready", ready: true }]);
-    const throughCodeMode = await call("listAgents", {}, "late-list-codemode", true);
+    assert.deepEqual(direct.agents, [
+      {
+        id: "created-after-bot",
+        name: "new-project",
+        status: "idle",
+        phase: "ready",
+        ready: true,
+      },
+    ]);
+    const throughCodeMode = await call(
+      "listAgents",
+      {},
+      "late-list-codemode",
+      true,
+    );
     assert.equal(throughCodeMode.isError, false);
     assert.match(throughCodeMode.text, /created-after-bot/);
-    assert.equal((await target.runner.request("/v1/workspaces/created-after-bot", "GET", undefined, undefined, bot.token)).status, 200);
+    assert.equal(
+      (
+        await target.runner.request(
+          "/v1/workspaces/created-after-bot",
+          "GET",
+          undefined,
+          undefined,
+          bot.token,
+        )
+      ).status,
+      200,
+    );
   },
 );
 

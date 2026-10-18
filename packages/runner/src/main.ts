@@ -260,12 +260,19 @@ async function assertActive(id: string, signal?: AbortSignal) {
     for (;;) {
       await waitForLifecycleAvailability(signal);
       try {
-        const checked = await lifecycleRuntimeCall(id, "check", {
-          holder: runtimeLease.holder,
-          fencingToken: runtimeLease.fencingToken,
-        }, signal);
+        const checked = await lifecycleRuntimeCall(
+          id,
+          "check",
+          {
+            holder: runtimeLease.holder,
+            fencingToken: runtimeLease.fencingToken,
+          },
+          signal,
+        );
         if (checked.valid !== true)
-          throw new Error("Lifecycle returned an invalid workspace lease check");
+          throw new Error(
+            "Lifecycle returned an invalid workspace lease check",
+          );
         restoreLifecycleAvailability();
         return;
       } catch (error) {
@@ -292,7 +299,9 @@ function scheduleLeaseExpiry(expiresAt: number) {
   if (leaseExpiryTimer) clearTimeout(leaseExpiryTimer);
   const remaining = leaseExpiryDelay(expiresAt);
   if (remaining === undefined) {
-    void fenceLost(new Error("Lifecycle returned an invalid workspace lease expiry"));
+    void fenceLost(
+      new Error("Lifecycle returned an invalid workspace lease expiry"),
+    );
     return;
   }
   leaseExpiryTimer = setTimeout(() => {
@@ -1035,12 +1044,19 @@ function importedPiTree(value: unknown, selectedLeafId: unknown) {
       "INVALID_IMPORT",
       "Pi tree import requires one to 1000 entries and a selected leaf",
     );
-  const byId = new Map<string, { id: string; parentId: string | null; message: unknown }>();
+  const byId = new Map<
+    string,
+    { id: string; parentId: string | null; message: unknown }
+  >();
   const roots = new Set<string>();
   const children = new Set<string>();
   for (const item of value) {
     if (!item || typeof item !== "object" || Array.isArray(item))
-      throw new ApiError(400, "INVALID_IMPORT", "Imported entry must be an object");
+      throw new ApiError(
+        400,
+        "INVALID_IMPORT",
+        "Imported entry must be an object",
+      );
     const entry = item as Record<string, unknown>;
     if (
       typeof entry.id !== "string" ||
@@ -1049,24 +1065,43 @@ function importedPiTree(value: unknown, selectedLeafId: unknown) {
       (entry.parentId !== null && typeof entry.parentId !== "string") ||
       byId.has(entry.id)
     )
-      throw new ApiError(400, "INVALID_IMPORT", "Imported entry identity is invalid");
+      throw new ApiError(
+        400,
+        "INVALID_IMPORT",
+        "Imported entry identity is invalid",
+      );
     const parentId = entry.parentId as string | null;
     if (parentId === null) roots.add(entry.id);
     else {
       if (!byId.has(parentId))
-        throw new ApiError(400, "INVALID_IMPORT", "Imported entry parent is missing or out of order");
+        throw new ApiError(
+          400,
+          "INVALID_IMPORT",
+          "Imported entry parent is missing or out of order",
+        );
       children.add(parentId);
     }
     byId.set(entry.id, { id: entry.id, parentId, message: entry.message });
   }
   if (roots.size !== 1)
-    throw new ApiError(400, "INVALID_IMPORT", "Imported branches must share one history root");
+    throw new ApiError(
+      400,
+      "INVALID_IMPORT",
+      "Imported branches must share one history root",
+    );
   const leaves = [...byId.keys()].filter((id) => !children.has(id));
   if (!leaves.includes(selectedLeafId))
-    throw new ApiError(400, "INVALID_IMPORT", "Selected imported leaf does not exist");
+    throw new ApiError(
+      400,
+      "INVALID_IMPORT",
+      "Selected imported leaf does not exist",
+    );
   const branches = leaves.map((leafId) => {
-    const path: { id: string; parentId: string | null; message: unknown }[] = [];
-    let current: { id: string; parentId: string | null; message: unknown } | undefined = byId.get(leafId);
+    const path: { id: string; parentId: string | null; message: unknown }[] =
+      [];
+    let current:
+      | { id: string; parentId: string | null; message: unknown }
+      | undefined = byId.get(leafId);
     while (current) {
       path.push(current);
       current = current.parentId ? byId.get(current.parentId) : undefined;
@@ -1475,7 +1510,9 @@ const server = createServer(async (request, response) => {
       action === "resources/reload" ||
       action === "trust"
     ) {
-      const resources = workspace.resources ?? new WorkspaceResources(
+      const resources =
+        workspace.resources ??
+        new WorkspaceResources(
           workspace.config,
           join(stateDirectory, "sessions", id),
         );
@@ -1514,19 +1551,9 @@ const server = createServer(async (request, response) => {
       return json(response, 200, await workspace.settings());
     if (request.method === "PUT" && action === "settings") {
       const data = await body(request);
-      if (typeof data.thinkingLevel !== "string")
-        throw new ApiError(
-          400,
-          "INVALID_SETTINGS",
-          "thinkingLevel is required",
-        );
       return await serialized(async () => {
         await assertActive(id, requestSignal);
-        return json(
-          response,
-          200,
-          await workspace.changeThinkingLevel(data.thinkingLevel as string),
-        );
+        return json(response, 200, await workspace.changeSettings(data));
       });
     }
     if (request.method === "GET" && action === "models") {
