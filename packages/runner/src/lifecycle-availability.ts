@@ -1,8 +1,11 @@
 let unavailable: Error | undefined;
 let terminalError: Error | undefined;
-let available: Promise<void> = Promise.resolve();
-let resolveAvailable: (() => void) | undefined;
-let rejectAvailable: ((error: Error) => void) | undefined;
+const waiters = new Set<{
+  signal?: AbortSignal;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  abort?: () => void;
+}>();
 
 export function lifecycleAvailabilityError() {
   return terminalError ?? unavailable;
@@ -11,26 +14,25 @@ export function lifecycleAvailabilityError() {
 export function suspendLifecycleAvailability(cause: unknown) {
   if (terminalError || unavailable) return;
   unavailable = cause instanceof Error ? cause : new Error(String(cause));
-  available = new Promise<void>((resolve, reject) => {
-    resolveAvailable = resolve;
-    rejectAvailable = reject;
-  });
 }
 
 export function restoreLifecycleAvailability() {
   if (terminalError) return;
   unavailable = undefined;
-  resolveAvailable?.();
-  resolveAvailable = undefined;
-  rejectAvailable = undefined;
-  available = Promise.resolve();
+  for (const waiter of waiters) {
+    waiter.signal?.removeEventListener("abort", waiter.abort!);
+    waiter.resolve();
+  }
+  waiters.clear();
 }
 
 export function failLifecycleAvailability(cause: unknown) {
   terminalError = cause instanceof Error ? cause : new Error(String(cause));
-  rejectAvailable?.(terminalError);
-  rejectAvailable = undefined;
-  resolveAvailable = undefined;
+  for (const waiter of waiters) {
+    waiter.signal?.removeEventListener("abort", waiter.abort!);
+    waiter.reject(terminalError);
+  }
+  waiters.clear();
 }
 
 export async function waitForLifecycleAvailability(signal?: AbortSignal) {
@@ -38,16 +40,20 @@ export async function waitForLifecycleAvailability(signal?: AbortSignal) {
   if (signal?.aborted)
     throw signal.reason ?? new DOMException("Aborted", "AbortError");
   if (!unavailable) return;
-  if (!signal) return available;
-  return Promise.race([
-    available,
-    new Promise<never>((_, reject) => {
-      signal.addEventListener(
-        "abort",
-        () =>
-          reject(signal.reason ?? new DOMException("Aborted", "AbortError")),
-        { once: true },
-      );
-    }),
-  ]);
+  return new Promise<void>((resolve, reject) => {
+    const waiter = {
+      signal,
+      resolve,
+      reject,
+      abort: undefined as (() => void) | undefined,
+    };
+    if (signal) {
+      waiter.abort = () => {
+        waiters.delete(waiter);
+        reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      };
+      signal.addEventListener("abort", waiter.abort, { once: true });
+    }
+    waiters.add(waiter);
+  });
 }

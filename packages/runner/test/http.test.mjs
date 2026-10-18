@@ -610,6 +610,15 @@ test(
     unavailable = true;
     await renewalDuringOutage;
 
+    const canceled = new AbortController();
+    const canceledAdmission = runner.request(`/v1/workspaces/${id}/input`, "POST", {
+      requestId: "canceled-while-controller-is-down",
+      message: "This canceled admission must never be queued.",
+    }, canceled.signal, "temporary-outage-identity");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    canceled.abort();
+    await assert.rejects(canceledAdmission, { name: "AbortError" });
+
     const waiting = runner.request(`/v1/workspaces/${id}/input`, "POST", {
       requestId: "admission-waits-for-authority",
       message: "Continue after the controller has the same runtime lease again.",
@@ -634,6 +643,103 @@ test(
     assert.equal(await readFile(join(repository, "tool-finished"), "utf8"), "held");
   },
 );
+
+test("an authoritative changed runtime fence permanently closes the runner", { timeout: 15_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-changed-fence-"));
+  const tokenFile = join(directory, "service-account-token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  await writeFile(tokenFile, "changed-fence-identity\n", { mode: 0o600 });
+  await writeFile(workspaceConfigFile, JSON.stringify({
+    id: "workspace-changed-fence",
+    name: "changed-fence",
+    role: "coding",
+    environment: "pod",
+    localRoot: directory,
+    model: { provider: "faux", id: "faux-1" },
+  }));
+  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+  let renew;
+  const renewed = new Promise((resolve) => { renew = resolve; });
+  const control = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    const renewal = request.url?.endsWith("/runtime/lease/renew");
+    if (renewal) renew();
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+      workspaceId: "workspace-changed-fence",
+      holder: renewal ? "b2c3d4e5-f6a7-4890-a123-23456789abcd" : body.holder ?? holder,
+      fencingToken: renewal ? 2 : 1,
+      expiresAt: Math.floor(Date.now() / 1000) + 30,
+      valid: true,
+    }));
+  });
+  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+  const runner = await startRunner(join(directory, "state"), {}, {
+    tokenFile,
+    workspaceConfigFile,
+    lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+    podUid: holder,
+  });
+  t.after(async () => {
+    await runner.stop();
+    await new Promise((resolve) => control.close(resolve));
+  });
+  await renewed;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if ((await fetch(`${runner.url}/health`)).status === 503) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const health = await fetch(`${runner.url}/health`);
+  assert.equal(health.status, 503);
+  assert.equal((await health.json()).status, "error");
+});
+
+test("the runner fences at the server-issued lease expiry deadline", { timeout: 5_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-expired-fence-"));
+  const tokenFile = join(directory, "service-account-token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  await writeFile(tokenFile, "expired-fence-identity\n", { mode: 0o600 });
+  await writeFile(workspaceConfigFile, JSON.stringify({
+    id: "workspace-expired-fence",
+    name: "expired-fence",
+    role: "coding",
+    environment: "pod",
+    localRoot: directory,
+    model: { provider: "faux", id: "faux-1" },
+  }));
+  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+  const control = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+      workspaceId: "workspace-expired-fence",
+      holder: body.holder ?? holder,
+      fencingToken: 1,
+      expiresAt: Math.floor(Date.now() / 1000) + 1,
+      valid: true,
+    }));
+  });
+  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+  const runner = await startRunner(join(directory, "state"), {}, {
+    tokenFile,
+    workspaceConfigFile,
+    lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+    podUid: holder,
+  });
+  t.after(async () => {
+    await runner.stop();
+    await new Promise((resolve) => control.close(resolve));
+  });
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if ((await fetch(`${runner.url}/health`)).status === 503) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const health = await fetch(`${runner.url}/health`);
+  assert.equal(health.status, 503);
+  assert.equal((await health.json()).status, "error");
+});
 
 async function nextEvent(
   runner,

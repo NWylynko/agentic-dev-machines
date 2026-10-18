@@ -235,7 +235,7 @@ async function isDeleted(id: string) {
     throw error;
   }
 }
-async function assertActive(id: string) {
+async function assertActive(id: string, signal?: AbortSignal) {
   if (runtimeLeaseError)
     throw new ApiError(
       503,
@@ -256,12 +256,14 @@ async function assertActive(id: string) {
         "Workspace runtime does not hold its lifecycle fence",
       );
     for (;;) {
-      await waitForLifecycleAvailability();
+      await waitForLifecycleAvailability(signal);
       try {
-        await lifecycleRuntimeCall(id, "check", {
+        const checked = await lifecycleRuntimeCall(id, "check", {
           holder: runtimeLease.holder,
           fencingToken: runtimeLease.fencingToken,
-        });
+        }, signal);
+        if (checked.valid !== true)
+          throw new Error("Lifecycle returned an invalid workspace lease check");
         restoreLifecycleAvailability();
         return;
       } catch (error) {
@@ -277,10 +279,11 @@ async function assertActive(id: string) {
   }
 }
 function isLifecycleUnavailable(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    (!(error instanceof ApiError) || error.status >= 500)
-  );
+  return error instanceof ApiError
+    ? error.status >= 500
+    : error instanceof TypeError ||
+        (error instanceof Error &&
+          ["AbortError", "TimeoutError"].includes(error.name));
 }
 function scheduleLeaseExpiry(expiresAt: number) {
   if (leaseExpiryTimer) clearTimeout(leaseExpiryTimer);
@@ -319,6 +322,7 @@ async function lifecycleRuntimeCall(
   id: string,
   action: string,
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ) {
   if (!lifecycleUrl || !tokenFile)
     throw new Error("Lifecycle runtime transport is not configured");
@@ -335,11 +339,14 @@ async function lifecycleRuntimeCall(
           "content-type": "application/json",
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(5_000),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(5_000)])
+          : AbortSignal.timeout(5_000),
       },
     );
   } catch (error) {
-    throw new Error(
+    if (signal?.aborted) throw error;
+    throw new TypeError(
       `Workspace lifecycle ${action} request failed: ${(error as Error).message}`,
     );
   }
@@ -349,6 +356,7 @@ async function lifecycleRuntimeCall(
     holder?: string;
     expiresAt?: number;
     maintenanceId?: string | null;
+    valid?: boolean;
   };
   if (!response.ok)
     throw new ApiError(
@@ -374,6 +382,7 @@ function runtimeAction(method: string, pathname: string): string {
 async function authorizeRuntimeRequest(
   request: IncomingMessage,
   pathname: string,
+  signal?: AbortSignal,
 ) {
   const authorization = request.headers.authorization ?? "";
   if (lifecycleUrl) {
@@ -388,7 +397,7 @@ async function authorizeRuntimeRequest(
         "Workspace runtime identity is unavailable",
       );
     for (;;) {
-      await waitForLifecycleAvailability();
+      await waitForLifecycleAvailability(signal);
       let response: Response;
       try {
         response = await fetch(
@@ -402,10 +411,13 @@ async function authorizeRuntimeRequest(
             body: JSON.stringify({
               action: runtimeAction(request.method ?? "GET", pathname),
             }),
-            signal: AbortSignal.timeout(5_000),
+            signal: signal
+              ? AbortSignal.any([signal, AbortSignal.timeout(5_000)])
+              : AbortSignal.timeout(5_000),
           },
         );
       } catch (error) {
+        if (signal?.aborted) throw error;
         suspendLifecycleAvailability(error);
         continue;
       }
@@ -466,6 +478,7 @@ async function openWorkspace(
     passive,
     deferActivation,
     values.provider,
+    lifecycleUrl ? waitForLifecycleAvailability : undefined,
   );
   workspaces.set(config.id, workspace);
   return workspace;
@@ -844,6 +857,12 @@ async function serialized<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 const server = createServer(async (request, response) => {
+  const requestController = new AbortController();
+  const requestSignal = requestController.signal;
+  request.once("aborted", () => requestController.abort());
+  response.once("close", () => {
+    if (!response.writableEnded) requestController.abort();
+  });
   try {
     if (request.headers.origin)
       throw new ApiError(
@@ -867,7 +886,7 @@ const server = createServer(async (request, response) => {
         });
       return json(response, 200, { status: "ok", version: "0.1.0" });
     }
-    await authorizeRuntimeRequest(request, url.pathname);
+    await authorizeRuntimeRequest(request, url.pathname, requestSignal);
     if (url.pathname === "/v1/workspaces" && request.method === "GET")
       return json(response, 200, {
         workspaces: await Promise.all(
@@ -899,7 +918,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "PUT" && !action) {
       const config = validateConfig(id, await body(request));
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         const previous = configs.get(id);
         if (
           previous &&
@@ -951,7 +970,7 @@ const server = createServer(async (request, response) => {
     }
     const config = configs.get(id);
     if (!config) {
-      await assertActive(id);
+      await assertActive(id, requestSignal);
       throw new ApiError(404, "WORKSPACE_NOT_FOUND", "Unknown workspace");
     }
     if (request.method === "DELETE" && !action) {
@@ -971,7 +990,7 @@ const server = createServer(async (request, response) => {
     }
     const workspace = workspaces.get(id);
     if (!workspace) {
-      await assertActive(id);
+      await assertActive(id, requestSignal);
       throw new ApiError(404, "WORKSPACE_NOT_FOUND", "Unknown workspace");
     }
     if (request.method === "PUT" && action === "kubernetes-connection") {
@@ -997,7 +1016,7 @@ const server = createServer(async (request, response) => {
           "kubeconfig must be an absolute host-side path list without NUL bytes",
         );
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           200,
@@ -1057,13 +1076,13 @@ const server = createServer(async (request, response) => {
         await workspace.history(after, limit, diagnostics),
       );
     }
-    await assertActive(id);
+    await assertActive(id, requestSignal);
     if (request.method === "GET" && action === "branches")
       return json(response, 200, await workspace.branches());
     if (request.method === "POST" && action === "new") {
       await body(request);
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(response, 200, await workspace.newSession());
       });
     }
@@ -1079,7 +1098,7 @@ const server = createServer(async (request, response) => {
           "conversationId must be a positive Durable conversation ID",
         );
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           200,
@@ -1121,7 +1140,7 @@ const server = createServer(async (request, response) => {
           "entryId must be a positive Durable entry ID",
         );
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           200,
@@ -1141,7 +1160,7 @@ const server = createServer(async (request, response) => {
           "instructions must be text",
         );
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           202,
@@ -1154,7 +1173,7 @@ const server = createServer(async (request, response) => {
       if (data.handoff !== undefined && typeof data.handoff !== "string")
         throw new ApiError(400, "INVALID_HANDOFF", "handoff must be text");
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           202,
@@ -1173,7 +1192,7 @@ const server = createServer(async (request, response) => {
           "thinkingLevel is required",
         );
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           200,
@@ -1210,7 +1229,7 @@ const server = createServer(async (request, response) => {
           "Model selection requires provider and modelId",
         );
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           200,
@@ -1226,7 +1245,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && action === "goals") {
       const data = await body(request);
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           200,
@@ -1240,7 +1259,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && action === "loops") {
       const data = await body(request);
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           200,
@@ -1333,7 +1352,7 @@ const server = createServer(async (request, response) => {
       )
         throw new ApiError(400, "INVALID_QUEUE_MODE", "Invalid whenBusy");
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(
           response,
           202,
@@ -1344,7 +1363,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && action === "abort") {
       const data = await body(request);
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         await workspace.conversation.abort(
           (await import("@earendil-works/chord/context")).BACKGROUND_CONTEXT,
           { background: data.background === true },
@@ -1358,7 +1377,7 @@ const server = createServer(async (request, response) => {
     ) {
       await body(request);
       return await serialized(async () => {
-        await assertActive(id);
+        await assertActive(id, requestSignal);
         return json(response, 202, await workspace.resume());
       });
     }

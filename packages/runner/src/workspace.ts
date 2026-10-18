@@ -174,6 +174,7 @@ export class Workspace {
     passive = false,
     deferActivation = false,
     runtimeProvider?: string,
+    waitForAuthority?: (signal?: AbortSignal) => Promise<void>,
   ): Promise<Workspace> {
     if (!passive) await assertActive();
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -283,6 +284,7 @@ export class Workspace {
         config.model?.provider ?? runtimeProvider,
         authPath,
         config.localRoot ?? "/workspace",
+        waitForAuthority,
       );
       const fencedStorage = new Proxy(storage, {
         get(target, property) {
