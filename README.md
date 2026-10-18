@@ -1,8 +1,8 @@
 # Agentic Dev Machines
 
-On-demand development workspaces for a homelab Kubernetes cluster, controlled through `adm` and opened in Herdr. Coding agents keep working after you disconnect. Removing a Herdr space destroys its workspace and stops its owned activity.
+On-demand development workspaces for a homelab Kubernetes cluster, controlled through `adm` and opened in Herdr. Coding agents keep working after you disconnect. With the optional close-event watcher enabled, removing a bound Herdr space destroys its workspace and stops its owned activity.
 
-**Status:** command-scoped lifecycle forwarding and native installer selection are covered by fixtures. The earlier [live setup record](docs/setup-validation-2026-10-17.md) predates portable-client changes. Cross-platform native runs, cross-node recovery, the node-failure loss window, live Herdr delivery, and provider sessions still need validation.
+**Status:** [portable Linux client checks](docs/client-validation-2026-10-18.md) verified shared workspace identity and files, disconnected agent execution and deletion, and completed history after reconnection. Native installer selection is covered by fixtures. Native macOS/arm64 runs, cross-node recovery, the node-failure loss window, live Herdr delivery, and shared-provider sessions still need validation.
 
 ## Install
 
