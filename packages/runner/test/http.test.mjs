@@ -1373,7 +1373,7 @@ test(
   { timeout: 15000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bash-context-"));
-    const runner = await startRunner(directory);
+    let runner = await startRunner(directory);
     t.after(() => runner.stop());
     const id = "bash-context",
       path = `/v1/workspaces/${id}`;
@@ -2186,6 +2186,7 @@ test("workspace behavior settings update through HTTP and persist across runner 
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
     autoCompact: true,
+    cacheWarmingMode: "off",
   });
 
   const changed = await runner.request(path + "/settings", "PUT", {
@@ -2193,6 +2194,7 @@ test("workspace behavior settings update through HTTP and persist across runner 
     steeringMode: "all",
     followUpMode: "all",
     autoCompact: false,
+    cacheWarmingMode: "idle",
   });
   assert.equal(changed.status, 200);
   assert.deepEqual(changed.body, {
@@ -2200,6 +2202,7 @@ test("workspace behavior settings update through HTTP and persist across runner 
     steeringMode: "all",
     followUpMode: "all",
     autoCompact: false,
+    cacheWarmingMode: "idle",
   });
   assert.equal(
     (await stat(join(directory, "sessions", id, "adm-settings.json"))).mode &
@@ -2221,6 +2224,7 @@ test("workspace behavior settings update through HTTP and persist across runner 
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
     autoCompact: true,
+    cacheWarmingMode: "off",
   });
 
   const invalid = await runner.request(path + "/settings", "PUT", {
@@ -2228,6 +2232,10 @@ test("workspace behavior settings update through HTTP and persist across runner 
   });
   assert.equal(invalid.status, 400);
   assert.equal(invalid.body.error.code, "INVALID_SETTINGS");
+  const invalidCacheMode = await runner.request(path + "/settings", "PUT", {
+    cacheWarmingMode: "always",
+  });
+  assert.equal(invalidCacheMode.status, 400);
   assert.deepEqual(
     (await runner.request(path + "/settings")).body,
     changed.body,
@@ -2239,6 +2247,89 @@ test("workspace behavior settings update through HTTP and persist across runner 
   assert.equal(recovered.status, 200);
   assert.deepEqual(recovered.body, changed.body);
 });
+
+test(
+  "idle cache warming follows a real Durable turn and persists the synthetic provider usage",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-cache-warming-"));
+    let runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const id = "cache-warming-coder";
+    const path = `/v1/workspaces/${id}`;
+    assert.equal(
+      (
+        await runner.request(path, "PUT", {
+          id,
+          name: id,
+          role: "coding",
+          environment: "local",
+          localRoot: join(directory, "repo"),
+          model: { provider: "faux", id: "faux-1" },
+        })
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/settings", "PUT", {
+          cacheWarmingMode: "idle",
+        })
+      ).status,
+      200,
+    );
+    const before = await runner.request(path + "/history?diagnostics=true");
+    assert.equal(
+      (
+        await runner.request(path + "/input", "POST", {
+          requestId: "cache-warming-turn",
+          message: '/faux {"answer":"real harness turn"}',
+        })
+      ).status,
+      202,
+    );
+    const assistant = await nextEvent(
+      runner,
+      id,
+      (event) =>
+        event.kind === "assistant" && event.seq > before.body.nextAfter,
+      before.body.nextAfter,
+      true,
+      5000,
+    );
+    assert.equal(assistant.data.text, "real harness turn");
+    let status;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      status = (await runner.request(path)).body;
+      if (status.cacheWarming.lastUsage) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(
+      status.cacheWarming.lastUsage,
+      `warm usage missing: ${JSON.stringify(status.cacheWarming)}`,
+    );
+    assert.equal(status.cacheWarming.lastUsage.provider, "faux");
+    assert.ok(status.cacheWarming.lastUsage.usage);
+    const durable = new DatabaseSync(
+      join(directory, "sessions", id, "session.sqlite"),
+    );
+    const records = durable
+      .prepare("SELECT record FROM entries ORDER BY id DESC LIMIT 100")
+      .all()
+      .map(({ record }) => JSON.parse(record));
+    durable.close();
+    assert.ok(records.some((record) => record.kind === "adm.cache_warm"));
+    await runner.stop("SIGKILL");
+    runner = await startRunner(directory);
+    status = (await runner.request(path)).body;
+    assert.equal(
+      status.cacheWarming.lastUsage?.provider,
+      "faux",
+      `cache warm entry was not restored; runner errors: ${runner.errors}`,
+    );
+  },
+);
 
 test(
   "steering mode controls how many queued inputs a real Durable turn admits at once",

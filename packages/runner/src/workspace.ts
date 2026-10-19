@@ -26,6 +26,7 @@ import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { WorkspaceResources } from "./resources.ts";
 import { UserBashTask, type BashInput, type BashResult } from "./bash.ts";
+import { WorkspaceCacheWarming } from "./cache-warming.ts";
 import {
   createDurableExtensionBridge,
   createCommandOperation,
@@ -199,6 +200,7 @@ export class Workspace {
   private admissions = Promise.resolve();
   private models: Models;
   private behaviorSettings: WorkspaceBehaviorSettings;
+  private cacheWarming: WorkspaceCacheWarming;
   private registry: ReturnType<typeof createRegistry>;
   private readonly assertActive: (signal?: AbortSignal) => Promise<void>;
   private readonly loopTask: ReturnType<
@@ -213,6 +215,7 @@ export class Workspace {
     conversation: Workspace["conversation"],
     models: Models,
     behaviorSettings: WorkspaceBehaviorSettings,
+    cacheWarming: WorkspaceCacheWarming,
     registry: ReturnType<typeof createRegistry>,
     assertActive: (signal?: AbortSignal) => Promise<void>,
     loopTask: Workspace["loopTask"],
@@ -223,11 +226,13 @@ export class Workspace {
     this.conversation = conversation;
     this.models = models;
     this.behaviorSettings = behaviorSettings;
+    this.cacheWarming = cacheWarming;
     this.registry = registry;
     this.assertActive = assertActive;
     this.loopTask = loopTask;
     this.mcpClose = mcpClose;
-    this.unsubscribe = harness.subscribeCommits(() => {
+    this.unsubscribe = harness.subscribeCommits((publication) => {
+      this.cacheWarming.observeCommit(publication);
       this.events.emit("change");
       for (const operationId of this.bashStreams.keys())
         void this.bashResult(operationId).then((result) => {
@@ -487,7 +492,7 @@ export class Workspace {
                     }
                   : undefined;
               },
-              afterResponse: async (message) => {
+              afterResponse: async (message, api) => {
                 openedWorkspace?.setExtensionGenerationBusy(false);
                 openedWorkspace?.setExtensionUsage(message.usage.totalTokens);
                 reportedError =
@@ -495,6 +500,10 @@ export class Workspace {
                     ? (message.errorMessage ?? "The provider request failed")
                     : undefined;
                 if (openedWorkspace) openedWorkspace.lastError = reportedError;
+                await openedWorkspace?.cacheWarming.afterResponse(
+                  message,
+                  Number(api.conversationId),
+                );
               },
             }),
           ],
@@ -511,6 +520,21 @@ export class Workspace {
         config.localRoot ?? "/workspace",
         availability,
       );
+      const cacheWarming = WorkspaceCacheWarming.open(
+        models,
+        () => behaviorSettings.current.cacheWarmingMode,
+        assertActive,
+        recordError,
+        () =>
+          openedWorkspace?.config.model
+            ? `${openedWorkspace.config.model.provider}/${openedWorkspace.config.model.id}`
+            : undefined,
+        () =>
+          openedWorkspace?.conversation
+            ? Number(openedWorkspace.conversation.id)
+            : undefined,
+      );
+      const harnessModels = cacheWarming.wrapModels();
       const fencedStorage = new Proxy(storage, {
         get(target, property) {
           if (property === "commit")
@@ -525,7 +549,7 @@ export class Workspace {
       const harness = await Harness.open(
         fencedStorage,
         {
-          models,
+          models: harnessModels,
           registry,
           settings: behaviorSettings.harness,
           ...(execution ? { env: () => openedWorkspace!.execution! } : {}),
@@ -560,6 +584,7 @@ export class Workspace {
       });
       await initializeNavigation(harness, Number(conversation.id));
       const activeConversation = await activeWorkspaceConversation(harness);
+      await cacheWarming.attachConversation(activeConversation);
       const selectedModel = (await activeConversation.agent(context)).model;
       const effectiveConfig: WorkspaceConfig = {
         ...config,
@@ -578,6 +603,7 @@ export class Workspace {
         activeConversation,
         models,
         behaviorSettings,
+        cacheWarming,
         registry,
         assertActive,
         schedule.loopTask,
@@ -632,6 +658,22 @@ export class Workspace {
       ),
     );
     const busy = inspection.tasks.some((task) => agentIsBusy(task));
+    const activeBash = inspection.tasks.flatMap((task) => {
+      if (
+        task.record.kind !== "adm.user-bash" ||
+        Number(task.record.conversationId) !== Number(this.conversation.id)
+      )
+        return [];
+      const input = task.record.input as BashInput;
+      return [
+        {
+          operationId: input.operationId,
+          requestId: input.requestId,
+          command: input.command,
+          excludeFromContext: input.excludeFromContext === true,
+        },
+      ];
+    });
     const recent = await this.conversation.entries(
       { order: "descending" },
       1000,
@@ -668,6 +710,8 @@ export class Workspace {
       ...this.config,
       conversationId: Number(this.conversation.id),
       ...(profile ? { profile } : {}),
+      activeBash,
+      cacheWarming: this.cacheWarming.status,
       status,
       goals: schedule.goals,
       loops: schedule.loops,
@@ -775,6 +819,7 @@ export class Workspace {
         { model: { provider, modelId } },
         context,
       );
+      await this.cacheWarming.cancel();
       const effective = (await this.conversation.agent(context)).model;
       this.config = {
         ...this.config,
@@ -1033,6 +1078,7 @@ export class Workspace {
           : undefined,
       );
       this.conversation = await activeWorkspaceConversation(this.harness);
+      await this.cacheWarming.attachConversation(this.conversation);
       const selected = (await this.conversation.agent(context)).model;
       this.config = {
         ...this.config,
@@ -1086,6 +1132,7 @@ export class Workspace {
         sourceSession,
       );
       this.conversation = await activeWorkspaceConversation(this.harness);
+      await this.cacheWarming.attachConversation(this.conversation);
       const selected = (await this.conversation.agent(context)).model;
       this.config = {
         ...this.config,
@@ -1121,6 +1168,7 @@ export class Workspace {
       await selectWorkspaceBranch(this.harness, conversationId);
       const conversation = await activeWorkspaceConversation(this.harness);
       this.conversation = conversation;
+      await this.cacheWarming.attachConversation(conversation);
       const selected = (await conversation.agent(context)).model;
       this.config = {
         ...this.config,
@@ -1157,6 +1205,7 @@ export class Workspace {
         entryId,
       );
       this.conversation = await activeWorkspaceConversation(this.harness);
+      await this.cacheWarming.attachConversation(this.conversation);
       const selected = (await this.conversation.agent(context)).model;
       this.config = {
         ...this.config,
@@ -1228,6 +1277,7 @@ export class Workspace {
         "CODING_RESOURCES_REQUIRED",
         "Extensions are available only in coding workspaces",
       );
+    await this.cacheWarming.cancel();
     await this.clearExtensionRegistry();
     const snapshot = await this.resources.reload();
     this.refreshExtensionRegistry();
@@ -1667,6 +1717,8 @@ export class Workspace {
         );
       }
       await this.behaviorSettings.update(patch);
+      if (patch.cacheWarmingMode !== undefined)
+        await this.cacheWarming.modeChanged();
       if (patch.sessionName !== undefined)
         await nameWorkspaceConversation(this.harness, patch.sessionName);
       return this.settings();
@@ -1754,6 +1806,7 @@ export class Workspace {
     };
     await attempt(() => this.admissions);
     this.closed = true;
+    await attempt(() => this.cacheWarming.cancel());
     try {
       this.unsubscribe();
     } catch (error) {

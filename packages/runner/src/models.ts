@@ -65,6 +65,10 @@ export async function workspaceModels(
   }
   const models = createModels();
   const faux = fauxProvider({ tokensPerSecond: 100_000 });
+  Object.assign(faux.models[0], {
+    cost: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 },
+    promptCache: { short: 12, long: 120 },
+  });
   const answer: FauxResponseFactory = (transcript) => {
     faux.appendResponses([answer]);
     const index = transcript.messages.findLastIndex(

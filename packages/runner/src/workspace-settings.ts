@@ -1,6 +1,8 @@
 import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { HarnessSettings, QueueMode } from "@earendil-works/pi-durable";
+
+export type CacheWarmingMode = "off" | "streaming" | "idle";
 import { ApiError } from "./types.ts";
 
 export type WorkspaceBehaviorSettingsValue = {
@@ -8,6 +10,7 @@ export type WorkspaceBehaviorSettingsValue = {
   followUpMode: QueueMode;
   autoCompact: boolean;
   scopedModels?: string[];
+  cacheWarmingMode: CacheWarmingMode;
 };
 
 export type WorkspaceSettingsPatch = Partial<WorkspaceBehaviorSettingsValue> & {
@@ -20,6 +23,7 @@ export const defaultWorkspaceBehaviorSettings: WorkspaceBehaviorSettingsValue =
     steeringMode: "one-at-a-time",
     followUpMode: "one-at-a-time",
     autoCompact: true,
+    cacheWarmingMode: "off",
   };
 
 const thinkingLevels = new Set([
@@ -45,6 +49,7 @@ export function parseWorkspaceSettingsPatch(
     "autoCompact",
     "sessionName",
     "scopedModels",
+    "cacheWarmingMode",
   ]);
   const keys = Object.keys(data);
   if (!keys.length || keys.some((key) => !allowed.has(key)))
@@ -83,6 +88,10 @@ export function parseWorkspaceSettingsPatch(
   if ("autoCompact" in data) {
     if (typeof data.autoCompact !== "boolean") throw invalidSettings();
     patch.autoCompact = data.autoCompact;
+  }
+  if ("cacheWarmingMode" in data) {
+    if (!isCacheWarmingMode(data.cacheWarmingMode)) throw invalidSettings();
+    patch.cacheWarmingMode = data.cacheWarmingMode;
   }
   return patch;
 }
@@ -136,7 +145,8 @@ export class WorkspaceBehaviorSettings {
       patch.steeringMode === undefined &&
       patch.followUpMode === undefined &&
       patch.autoCompact === undefined &&
-      patch.scopedModels === undefined
+      patch.scopedModels === undefined &&
+      patch.cacheWarmingMode === undefined
     )
       return this.current;
     const next: WorkspaceBehaviorSettingsValue = {
@@ -153,6 +163,9 @@ export class WorkspaceBehaviorSettings {
       ...(patch.scopedModels === undefined
         ? {}
         : { scopedModels: [...patch.scopedModels] }),
+      ...(patch.cacheWarmingMode === undefined
+        ? {}
+        : { cacheWarmingMode: patch.cacheWarmingMode }),
     };
     await writePrivateJson(this.path, next, this.assertActive);
     this.value = next;
@@ -179,6 +192,10 @@ function isModelScope(value: unknown): value is string[] {
   );
 }
 
+function isCacheWarmingMode(value: unknown): value is CacheWarmingMode {
+  return value === "off" || value === "streaming" || value === "idle";
+}
+
 function validateSavedSettings(value: unknown): WorkspaceBehaviorSettingsValue {
   if (
     !value ||
@@ -189,6 +206,10 @@ function validateSavedSettings(value: unknown): WorkspaceBehaviorSettingsValue {
     typeof (value as Record<string, unknown>).autoCompact !== "boolean" ||
     ((value as Record<string, unknown>).scopedModels !== undefined &&
       !isModelScope((value as Record<string, unknown>).scopedModels)) ||
+    ((value as Record<string, unknown>).cacheWarmingMode !== undefined &&
+      !isCacheWarmingMode(
+        (value as Record<string, unknown>).cacheWarmingMode,
+      )) ||
     Object.keys(value).some(
       (key) =>
         ![
@@ -196,11 +217,15 @@ function validateSavedSettings(value: unknown): WorkspaceBehaviorSettingsValue {
           "followUpMode",
           "autoCompact",
           "scopedModels",
+          "cacheWarmingMode",
         ].includes(key),
     )
   )
     throw new Error("Workspace settings file is invalid");
-  return value as WorkspaceBehaviorSettingsValue;
+  return {
+    ...defaultWorkspaceBehaviorSettings,
+    ...(value as WorkspaceBehaviorSettingsValue),
+  };
 }
 
 async function writePrivateJson(
@@ -241,6 +266,6 @@ function invalidSettings() {
   return new ApiError(
     400,
     "INVALID_SETTINGS",
-    "Settings must contain supported thinkingLevel, steeringMode, followUpMode, autoCompact, sessionName, or scopedModels values",
+    "Settings must contain supported thinkingLevel, steeringMode, followUpMode, autoCompact, sessionName, scopedModels, or cacheWarmingMode values",
   );
 }

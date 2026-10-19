@@ -21,3 +21,23 @@ test("workspace behavior settings recheck authority before publishing the file",
   });
   assert.deepEqual(await readdir(directory), []);
 });
+
+test("cache warming preference is validated and persisted privately", async (t) => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "adm-settings-cache-warming-"),
+  );
+  t.after(() => rm(directory, { recursive: true }));
+  const assertActive = async () => {};
+  const settings = await WorkspaceBehaviorSettings.open(
+    directory,
+    assertActive,
+  );
+  assert.equal(settings.current.cacheWarmingMode, "off");
+  await settings.update({ cacheWarmingMode: "idle" });
+  assert.equal(settings.current.cacheWarmingMode, "idle");
+  assert.equal(
+    (await WorkspaceBehaviorSettings.open(directory, assertActive)).current
+      .cacheWarmingMode,
+    "idle",
+  );
+});
