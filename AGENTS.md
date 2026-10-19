@@ -2,6 +2,8 @@ keep this file up to date
 
 # Project notes
 
+- CI lint diagnosis (2026-10-19): CI's stable Rust is 1.99.0; local 1.97.1 missed `clippy::useless_format` inside a setup-connection assertion. Reproduce CI lint failures with its compiler (`cargo +1.99.0 clippy --all-targets -- -D warnings`); constant expected strings need no `format!`.
+
 - Native attach integration (2026-10-19): the CLI runs pinned upstream Pi InteractiveMode through reproducibly patched remote ports, projecting the existing Durable conversation. Actual PTY coverage verifies startup, multiline input, model selection, clean detach during a FIFO-blocked tool, and reconnect to completed history. Native HTML/JSONL exports and coding tool schemas are workspace projections; `/share` remains local. Ctrl+C detaches and Ctrl+R reconnects. The client owns no coding executor or ordinary Pi session. See `docs/pi-terminal-parity.md` for explicit advanced extension and live acceptance limits.
 - Cache warming (2026-10-19): workspace settings persist `off`, `streaming`, or `idle`; the owning runtime reuses Pi's pinned warmer with the actual provider request, one-token refresh cap, lease checks and recorded Durable usage. Model/context/conversation changes and closure cancel warming. Synthetic HTTP/Harness tests cover a real generation, persisted usage after restart, and cancellation without paid provider requests.
 

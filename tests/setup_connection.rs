@@ -158,7 +158,7 @@ else:
         format!("http://127.0.0.1:{port}")
     );
     let args: Value = serde_json::from_slice(&fs::read(args_path).unwrap()).unwrap();
-    assert_eq!(args[4], format!(":7433"));
+    assert_eq!(args[4], ":7433");
     assert!(
         args.as_array()
             .unwrap()
