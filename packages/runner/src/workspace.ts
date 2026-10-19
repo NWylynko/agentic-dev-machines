@@ -351,7 +351,7 @@ export class Workspace {
         config.role === "coding" && config.environment !== "kubernetes"
           ? new WorkspaceResources(config, directory, () => assertActive())
           : undefined;
-      if (resources) {
+      if (resources && !passive) {
         await resources.reload();
         registry.install(
           createDurableExtensionBridge(resources.extensions(), assertActive),
