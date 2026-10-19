@@ -30,7 +30,11 @@ import {
   createDurableExtensionBridge,
   createCommandOperation,
   createShortcutOperation,
-  type ExtensionCommandOperation,
+  ExtensionCommandOperation,
+  ExtensionOperationsDocument,
+  type ExtensionCommandState,
+  type ExtensionCommandEvent,
+  type ExtensionOperationReceipt,
 } from "./extensions.ts";
 import {
   workspaceModels,
@@ -51,6 +55,10 @@ import {
 import { clearWorkspaceInputQueue, workspaceInputQueue } from "./queue.ts";
 import type { Message } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
+import type {
+  ExtensionContext,
+  ExtensionUIContext,
+} from "@earendil-works/pi-coding-agent";
 import { BotProfileDocument, botExtension } from "./bot.ts";
 import type { BotAgentManagement } from "./bot-management.ts";
 import { openMcpExtension } from "./mcp.ts";
@@ -186,6 +194,8 @@ export class Workspace {
     string,
     { fingerprint: string; operationId: string }
   >();
+  private extensionIdle = true;
+  private extensionUsage?: { tokens: number; contextWindow: number };
   private admissions = Promise.resolve();
   private models: Models;
   private behaviorSettings: WorkspaceBehaviorSettings;
@@ -224,6 +234,103 @@ export class Workspace {
           if (result) this.bashStreams.delete(operationId);
         });
     });
+  }
+
+  async extensionContext(
+    signal?: AbortSignal,
+    generationBusy = false,
+  ): Promise<ExtensionContext> {
+    signal?.throwIfAborted();
+    const selected = (await this.conversation.agent(context)).model;
+    const model = selected
+      ? this.models.getModel(selected.provider, selected.modelId)
+      : undefined;
+    if (model && this.extensionUsage)
+      this.extensionUsage.contextWindow = model.contextWindow;
+    const registry = new Proxy(
+      {
+        getAll: () => this.models.getModels(),
+        find: (provider: string, modelId: string) =>
+          this.models.getModel(provider, modelId),
+        getProvider: (provider: string) => this.models.getProvider(provider),
+        getProviderDisplayName: (provider: string) =>
+          this.models.getProvider(provider)?.name ?? provider,
+      },
+      {
+        get(target, property, receiver) {
+          if (Reflect.has(target, property))
+            return Reflect.get(target, property, receiver);
+          throw new Error(
+            `Pi extension operation modelRegistry.${String(property)} is not supported by the Durable bridge`,
+          );
+        },
+      },
+    );
+    const ui = new Proxy(
+      {},
+      {
+        get: (_target, property) => {
+          throw new Error(
+            `Pi extension operation ui.${String(property)} is not available in this Durable context`,
+          );
+        },
+      },
+    ) as ExtensionUIContext;
+    return {
+      ui,
+      mode: "rpc",
+      hasUI: false,
+      cwd: this.config.cwd ?? this.config.localRoot ?? "/workspace",
+      sessionManager: new Proxy(
+        {},
+        {
+          get: (_target, property) => {
+            throw new Error(
+              `Pi sessionManager.${String(property)} is unavailable because this workspace uses Durable history`,
+            );
+          },
+        },
+      ) as ExtensionContext["sessionManager"],
+      modelRegistry: registry as unknown as ExtensionContext["modelRegistry"],
+      model,
+      scopedModels: [],
+      signal,
+      isIdle: () => (generationBusy ? false : this.extensionIdle),
+      isProjectTrusted: () => this.resources?.trust().trusted ?? false,
+      hasPendingMessages: () => {
+        throw new Error(
+          "Pi pending-message state is not available through Durable conversations",
+        );
+      },
+      abort: () => {
+        void this.conversation.abort(context, { background: true });
+      },
+      shutdown: () => {
+        throw new Error(
+          "Pi extension shutdown is not available in a Durable workspace",
+        );
+      },
+      getContextUsage: () => {
+        if (!this.extensionUsage) return undefined;
+        const percent = this.extensionUsage.contextWindow
+          ? (this.extensionUsage.tokens / this.extensionUsage.contextWindow) *
+            100
+          : null;
+        return {
+          tokens: this.extensionUsage.tokens,
+          contextWindow: this.extensionUsage.contextWindow,
+          percent,
+        };
+      },
+      compact: (options) => {
+        void this.conversation.compact(options?.customInstructions, context);
+      },
+      getSystemPrompt: () => {
+        throw new Error(
+          "Pi getSystemPrompt is unavailable outside a provider request",
+        );
+      },
+    };
   }
 
   static async open(
@@ -371,6 +478,7 @@ export class Workspace {
             hook(GenerationTask, {
               beforeRequest: async (request, _api, context) => {
                 await assertActive(context.abortSignal);
+                openedWorkspace?.setExtensionGenerationBusy(true);
                 return resources
                   ? {
                       messages: await resources.requestMessages(
@@ -380,6 +488,8 @@ export class Workspace {
                   : undefined;
               },
               afterResponse: async (message) => {
+                openedWorkspace?.setExtensionGenerationBusy(false);
+                openedWorkspace?.setExtensionUsage(message.usage.totalTokens);
                 reportedError =
                   message.stopReason === "error"
                     ? (message.errorMessage ?? "The provider request failed")
@@ -475,6 +585,7 @@ export class Workspace {
       );
       openedWorkspace = workspace;
       workspace.resources = resources;
+      if (!passive) workspace.refreshExtensionRegistry();
       workspace.lastError = reportedError;
       workspace.mcpError = mcpError;
       workspace.localEnv = localEnv;
@@ -483,6 +594,7 @@ export class Workspace {
       workspace.sandbox = sandbox;
       workspace.passive = passive;
       if (passive) workspace.accepting = false;
+      if (!passive) await workspace.recoverExtensionOperations();
       if (!passive && !deferActivation) await workspace.activate();
       return workspace;
     } catch (error) {
@@ -1116,13 +1228,23 @@ export class Workspace {
         "CODING_RESOURCES_REQUIRED",
         "Extensions are available only in coding workspaces",
       );
-    this.clearExtensionRegistry();
+    await this.clearExtensionRegistry();
     const snapshot = await this.resources.reload();
     this.refreshExtensionRegistry();
     return snapshot;
   }
 
-  clearExtensionRegistry() {
+  async clearExtensionRegistry() {
+    for (const operation of this.extensionOperations.values())
+      operation.cancel();
+    await Promise.all(
+      [...this.extensionOperations.values()].map(
+        (operation) =>
+          new Promise<void>((resolve) =>
+            operation.done ? resolve() : operation.once("finish", resolve),
+          ),
+      ),
+    );
     this.registry.install(createDurableExtensionBridge([], this.assertActive));
   }
 
@@ -1132,8 +1254,38 @@ export class Workspace {
       createDurableExtensionBridge(
         this.resources.extensions(),
         this.assertActive,
+        (signal, generationBusy) =>
+          this.extensionContext(signal, generationBusy),
       ),
     );
+  }
+
+  setExtensionGenerationBusy(busy: boolean) {
+    this.extensionIdle = !busy;
+  }
+
+  setExtensionUsage(tokens: number) {
+    this.extensionUsage = {
+      tokens,
+      contextWindow: this.extensionUsage?.contextWindow ?? 0,
+    };
+  }
+
+  private extensionCommandState(): ExtensionCommandState {
+    return {
+      isIdle: () => this.extensionIdle,
+      isProjectTrusted: () => this.resources?.trust().trusted ?? false,
+      getContextUsage: () => {
+        if (!this.extensionUsage) return undefined;
+        const tokens = this.extensionUsage.tokens;
+        const contextWindow = this.extensionUsage.contextWindow;
+        return {
+          tokens,
+          contextWindow,
+          percent: contextWindow ? (tokens / contextWindow) * 100 : null,
+        };
+      },
+    };
   }
 
   private async startExtensionOperation(
@@ -1144,8 +1296,24 @@ export class Workspace {
   ) {
     if (!operation)
       throw new ApiError(404, "EXTENSION_OPERATION_NOT_FOUND", label);
-    if (requestId) {
-      const previous = this.extensionRequests.get(requestId);
+    const requestedOperation = operation;
+    if (!requestId?.trim() || requestId.length > 128)
+      throw new ApiError(
+        400,
+        "INVALID_REQUEST_ID",
+        "requestId must be a nonempty string up to 128 characters",
+      );
+    let operationId = requestedOperation.id;
+    await this.withAdmission(async () => {
+      await this.assertActive(requestedOperation.signal);
+      const receipts = await this.harness.snapshot(
+        ExtensionOperationsDocument,
+        this.conversation.id,
+        context,
+      );
+      const previous = receipts?.requests.find(
+        (item) => item.requestId === requestId,
+      );
       if (previous) {
         if (previous.fingerprint !== fingerprint)
           throw new ApiError(
@@ -1153,33 +1321,73 @@ export class Workspace {
             "EXTENSION_REQUEST_ID_REUSED",
             "requestId was already used for another extension operation",
           );
-        const existing = this.extensionOperations.get(previous.operationId);
-        if (existing) return { operationId: existing.id };
+        const stored = receipts?.operations.find(
+          (item) => item.id === previous.operationId,
+        );
+        if (stored) {
+          const existing =
+            this.extensionOperations.get(stored.id) ??
+            this.restoreExtensionOperation(stored);
+          this.extensionOperations.set(existing.id, existing);
+        }
+        operationId = previous.operationId;
+        return;
       }
-    }
-    await this.withAdmission(async () => {
-      await this.assertActive(operation.signal);
-      this.extensionOperations.set(operation.id, operation);
-      while (this.extensionOperations.size > 128) {
-        const oldest = this.extensionOperations.entries().next().value as
-          | [string, ExtensionCommandOperation]
-          | undefined;
-        if (!oldest || !oldest[1].done) break;
-        this.extensionOperations.delete(oldest[0]);
-      }
-      if (requestId) {
-        this.extensionRequests.set(requestId, {
-          fingerprint,
-          operationId: operation.id,
-        });
-        while (this.extensionRequests.size > 128)
-          this.extensionRequests.delete(
-            this.extensionRequests.keys().next().value!,
+      const acceptedOperation = requestedOperation;
+      await this.harness.commit(async (tx) => {
+        const document = await tx.doc(
+          ExtensionOperationsDocument,
+          this.conversation.id,
+        );
+        const terminal = new Set([
+          "completed",
+          "failed",
+          "cancelled",
+          "interrupted",
+        ]);
+        while (document.operations.length >= 128) {
+          const oldestTerminal = document.operations.findIndex((item) =>
+            terminal.has(item.status),
           );
-      }
-      operation.start();
+          if (oldestTerminal < 0)
+            throw new ApiError(
+              503,
+              "EXTENSION_RECEIPTS_FULL",
+              "Extension operation receipts are full; no accepted operation was discarded",
+            );
+          document.operations.splice(oldestTerminal, 1);
+        }
+        document.operations.push({
+          id: acceptedOperation.id,
+          requestId,
+          fingerprint,
+          command: acceptedOperation.command,
+          status: "accepted",
+          events: [],
+        });
+        document.requests.push({
+          requestId,
+          fingerprint,
+          operationId: acceptedOperation.id,
+          command: acceptedOperation.command,
+          status: "accepted",
+        });
+      }, context);
+      acceptedOperation.setPersistence(
+        (event) => this.persistExtensionEvent(acceptedOperation.id, event),
+        async (status) => {
+          await this.finishExtensionReceipt(acceptedOperation.id, status);
+          if (
+            this.extensionOperations.get(acceptedOperation.id) ===
+            acceptedOperation
+          )
+            this.extensionOperations.delete(acceptedOperation.id);
+        },
+      );
+      this.extensionOperations.set(acceptedOperation.id, acceptedOperation);
+      acceptedOperation.start();
     });
-    return { operationId: operation.id };
+    return { operationId };
   }
 
   async extensionCommand(name: string, args: string, requestId?: string) {
@@ -1196,6 +1404,7 @@ export class Workspace {
         args,
         this.config.cwd ?? this.config.localRoot!,
         (signal) => this.assertActive(signal),
+        this.extensionCommandState(),
       ),
       `Unknown Pi extension command: ${name}`,
       requestId,
@@ -1216,6 +1425,7 @@ export class Workspace {
         shortcut,
         this.config.cwd ?? this.config.localRoot!,
         (signal) => this.assertActive(signal),
+        this.extensionCommandState(),
       ),
       `Unknown Pi extension shortcut: ${shortcut}`,
       requestId,
@@ -1223,8 +1433,97 @@ export class Workspace {
     );
   }
 
-  extensionOperation(id: string) {
-    return this.extensionOperations.get(id);
+  private restoreExtensionOperation(receipt: ExtensionOperationReceipt) {
+    const operation = new ExtensionCommandOperation(
+      receipt.command,
+      undefined,
+      this.config.cwd ?? this.config.localRoot ?? "/workspace",
+      this.assertActive,
+      { id: receipt.id, history: receipt.events, status: receipt.status },
+    );
+    return operation;
+  }
+
+  private async recoverExtensionOperations() {
+    await this.harness.commit(async (tx) => {
+      const document = await tx.doc(
+        ExtensionOperationsDocument,
+        this.conversation.id,
+      );
+      for (const receipt of document.operations) {
+        if (receipt.status !== "accepted") continue;
+        receipt.status = "interrupted";
+        const request = document.requests.find(
+          (item) => item.operationId === receipt.id,
+        );
+        if (request) request.status = "interrupted";
+        receipt.events.push({
+          type: "error",
+          seq: (receipt.events.at(-1)?.seq ?? 0) + 1,
+          code: "EXTENSION_COMMAND_INTERRUPTED",
+          message:
+            "The workspace restarted while this command was running; it was not repeated.",
+        });
+        receipt.events = receipt.events.slice(-256);
+      }
+    }, context);
+  }
+
+  private async persistExtensionEvent(
+    id: string,
+    event: ExtensionCommandEvent,
+  ) {
+    await this.harness.commit(async (tx) => {
+      const document = await tx.doc(
+        ExtensionOperationsDocument,
+        this.conversation.id,
+      );
+      const receipt = document.operations.find((item) => item.id === id);
+      if (!receipt) throw new Error(`Missing durable extension receipt ${id}`);
+      receipt.events.push(event);
+      receipt.events = receipt.events.slice(-256);
+    }, context);
+  }
+
+  private async finishExtensionReceipt(
+    id: string,
+    status: ExtensionOperationReceipt["status"],
+  ) {
+    await this.harness.commit(async (tx) => {
+      const document = await tx.doc(
+        ExtensionOperationsDocument,
+        this.conversation.id,
+      );
+      const receipt = document.operations.find((item) => item.id === id);
+      if (!receipt) throw new Error(`Missing durable extension receipt ${id}`);
+      receipt.status = status;
+      const request = document.requests.find((item) => item.operationId === id);
+      if (request) request.status = status;
+    }, context);
+  }
+
+  async extensionOperation(id: string) {
+    const active = this.extensionOperations.get(id);
+    if (active) return active;
+    const document = await this.harness.snapshot(
+      ExtensionOperationsDocument,
+      this.conversation.id,
+      context,
+    );
+    const receipt = document?.operations.find((item) => item.id === id);
+    if (!receipt) return undefined;
+    const restored = this.restoreExtensionOperation(receipt);
+    this.extensionOperations.set(id, restored);
+    return restored;
+  }
+
+  async extensionRequestByOperation(id: string) {
+    const document = await this.harness.snapshot(
+      ExtensionOperationsDocument,
+      this.conversation.id,
+      context,
+    );
+    return document?.requests.find((item) => item.operationId === id);
   }
 
   async startBash(

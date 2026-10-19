@@ -38,7 +38,7 @@ export type WorkspaceResourceSnapshot = {
       parameters: unknown;
     }[];
     commands: { name: string; path: string; description?: string }[];
-    shortcuts: { shortcut: string; description?: string }[];
+    shortcuts: { name: string; key: string; description?: string }[];
   }[];
   diagnostics: { type: string; message: string; path?: string }[];
   systemPrompt?: string;
@@ -216,7 +216,8 @@ export class WorkspaceResources {
               : {}),
           })),
           shortcuts: [...extension.shortcuts.values()].map((shortcut) => ({
-            shortcut: shortcut.shortcut,
+            name: `${extension.path}:${shortcut.shortcut}`,
+            key: shortcut.shortcut,
             ...(shortcut.description ? { description: shortcut.description } : {}),
           })),
         }))
@@ -262,12 +263,17 @@ export class WorkspaceResources {
         });
     for (const extension of loaded?.extensions ?? []) {
       const unsupported: string[] = [];
-      if (extension.handlers.size) unsupported.push("lifecycle hooks");
+      const supportedHooks = new Set(["context", "tool_call", "tool_result"]);
+      const unsupportedHooks = [...extension.handlers.keys()].filter(
+        (name) => !supportedHooks.has(name),
+      );
+      if (unsupportedHooks.length)
+        unsupported.push(`hooks (${unsupportedHooks.join(", ")})`);
       if (extension.flags.size) unsupported.push("CLI flags");
       if (unsupported.length)
         diagnostics.push({
           type: "warning",
-          message: `Extension ${basename(extension.path)} registered unsupported capabilities: ${unsupported.join(", ")}. Durable activation supports its tools, commands, remote UI requests, and keyboard shortcuts.`,
+          message: `Extension ${basename(extension.path)} registered unsupported capabilities: ${unsupported.join(", ")}. Durable activation supports tools, commands, remote UI requests, keyboard shortcuts, and hooks: ${[...supportedHooks].join(", ")}.`,
           path: extension.path,
         });
     }

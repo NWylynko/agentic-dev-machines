@@ -1678,9 +1678,10 @@ const server = createServer(async (request, response) => {
       }
       if (request.method === "POST" && action === "extensions/shortcuts") {
         const data = await body(request);
+        const shortcut = data.name ?? data.shortcut;
         if (
-          typeof data.shortcut !== "string" ||
-          data.shortcut.length > 32 ||
+          typeof shortcut !== "string" ||
+          shortcut.length > 512 ||
           (data.requestId !== undefined &&
             (typeof data.requestId !== "string" ||
               data.requestId.length < 1 ||
@@ -1695,15 +1696,26 @@ const server = createServer(async (request, response) => {
           response,
           200,
           await workspace.extensionShortcut(
-            data.shortcut,
+            shortcut,
             data.requestId as string | undefined,
           ),
         );
       }
       if (extensionOperationRoute) {
-        const operation = workspace.extensionOperation(
+        const operation = await workspace.extensionOperation(
           extensionOperationRoute[1]!,
         );
+        if (
+          !operation &&
+          (await workspace.extensionRequestByOperation(
+            extensionOperationRoute[1]!,
+          ))
+        )
+          throw new ApiError(
+            410,
+            "EXTENSION_EVENT_HISTORY_EXPIRED",
+            "This operation receipt is retained, but its bounded event history has expired",
+          );
         if (!operation)
           throw new ApiError(
             404,
@@ -1720,6 +1732,12 @@ const server = createServer(async (request, response) => {
               400,
               "INVALID_CURSOR",
               "after must be nonnegative",
+            );
+          if (after < operation.oldestSequence - 1)
+            throw new ApiError(
+              410,
+              "EXTENSION_EVENT_HISTORY_EXPIRED",
+              "The requested extension event cursor is no longer retained",
             );
           response.writeHead(200, {
             "content-type": "text/event-stream",
@@ -1749,6 +1767,7 @@ const server = createServer(async (request, response) => {
             close();
           };
           operation.on("event", write);
+          operation.once("finish", finish);
           response.once("close", close);
           if (operation.done) finish();
           else for (const event of operation.eventsAfter(after)) write(event);
@@ -1788,7 +1807,7 @@ const server = createServer(async (request, response) => {
           );
         return await serialized(async () => {
           await assertActive(id, requestSignal);
-          workspace.clearExtensionRegistry();
+          await workspace.clearExtensionRegistry();
           const snapshot = Array.isArray(data.updates)
             ? await resources.setTrustUpdates(
                 data.updates as { path: string; decision: boolean | null }[],

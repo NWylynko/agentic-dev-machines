@@ -104,6 +104,13 @@ async function startRunner(directory) {
       }
       lines.close();
     },
+    async crash() {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await exited;
+      }
+      lines.close();
+    },
   };
 }
 
@@ -322,7 +329,7 @@ test(
       ["trust", "PUT", { trusted: true }],
       ["resources/reload", "POST", {}],
       ["extensions", "GET"],
-      ["extensions/commands", "POST", { name: "example", args: "" }],
+      ["extensions/commands", "POST", { name: "example", args: "", requestId: "bot-denied" }],
     ]) {
       const response = await runner.request(
         path + "/" + endpoint,
@@ -343,6 +350,7 @@ test(
     const project = join(directory, "project");
     await mkdir(join(project, ".pi/extensions"), { recursive: true });
     const sentinel = join(directory, "evaluated");
+    const blockedMarker = join(directory, "blocked-command-ran");
     await writeFile(
       join(project, ".pi/extensions/fixture.js"),
       `import { appendFileSync } from "node:fs";
@@ -359,7 +367,10 @@ export default (pi) => {
   });
   pi.registerCommand("extension-hello", {
     description: "Say hello from the workspace extension.",
-    handler: async (args, ctx) => ctx.ui.notify("hello " + args, "info"),
+    handler: async (args, ctx) => {
+      appendFileSync(${JSON.stringify(sentinel)}, "command\\n");
+      ctx.ui.notify("hello " + args, "info");
+    },
   });
   pi.registerCommand("extension-dialog", {
     description: "Select a value through the remote extension UI.",
@@ -368,9 +379,32 @@ export default (pi) => {
       ctx.ui.notify(selected ? "selected " + selected : "cancelled");
     },
   });
+  pi.registerCommand("extension-blocking", {
+    description: "Mark execution and remain active for restart recovery.",
+    handler: async (_args, ctx) => {
+      appendFileSync(${JSON.stringify(blockedMarker)}, "started\\n");
+      ctx.ui.notify("blocking command started");
+      await new Promise(() => {});
+    },
+  });
   pi.registerShortcut("ctrl+x", {
     description: "A workspace extension shortcut.",
     handler: async (ctx) => ctx.ui.notify("shortcut ran", "info"),
+  });
+  pi.on("context", (event) => {
+    event.messages.unshift({
+      role: "system",
+      content: "Extension context hook marker.",
+      timestamp: 0,
+    });
+  });
+  pi.on("tool_call", (event) => {
+    if (event.toolName === "extension_echo")
+      event.input.text = event.input.text + "-hooked";
+  });
+  pi.on("tool_result", (event) => {
+    if (event.toolName === "extension_echo")
+      event.content = [{ type: "text", text: "extension-hook-result" }];
   });
 };`,
     );
@@ -416,20 +450,26 @@ export default (pi) => {
       ),
     );
     assert.ok(discovered.body.extensions.some((extension) =>
-      extension.shortcuts.some((shortcut) => shortcut.shortcut === "ctrl+x"),
+      extension.shortcuts.some((shortcut) =>
+        shortcut.name === extension.path + ":ctrl+x" && shortcut.key === "ctrl+x",
+      ),
     ));
     assert.ok(
       discovered.body.diagnostics.some((diagnostic) =>
-        /unsupported capabilities: lifecycle hooks/.test(diagnostic.message),
+        /unsupported capabilities: hooks \(session_start\)/.test(diagnostic.message),
       ),
     );
-    const command = await runner.request(
-      path + "/extensions/commands",
-      "POST",
-      { name: "extension-hello", args: "Nick", requestId: "hello-request-1" },
-    );
+    const [command, concurrentDuplicate] = await Promise.all([
+      runner.request(path + "/extensions/commands", "POST", {
+        name: "extension-hello", args: "Nick", requestId: "hello-request-1",
+      }),
+      runner.request(path + "/extensions/commands", "POST", {
+        name: "extension-hello", args: "Nick", requestId: "hello-request-1",
+      }),
+    ]);
     assert.equal(command.status, 200);
     assert.equal(typeof command.body.operationId, "string");
+    assert.equal(concurrentDuplicate.body.operationId, command.body.operationId);
     assert.equal((await runner.request(path + "/extensions/commands", "POST", {
       name: "extension-hello",
       args: "Nick",
@@ -458,15 +498,17 @@ export default (pi) => {
         if (line.startsWith("data: ")) notifications.push(JSON.parse(line.slice(6)));
       }
     }
-    await notifyReader.cancel();
     assert.deepEqual(notifications, [
       { type: "notification", seq: 1, message: "hello Nick", level: "info" },
       { type: "result", seq: 2, command: "extension-hello" },
     ]);
+    assert.equal((await notifyReader.read()).done, true);
+    assert.equal((await readFile(sentinel, "utf8")).split("command").length - 1, 1);
+    await notifyReader.cancel();
     const dialog = await runner.request(
       path + "/extensions/commands",
       "POST",
-      { name: "extension-dialog", args: "" },
+      { name: "extension-dialog", args: "", requestId: "dialog-request-1" },
     );
     assert.equal(dialog.status, 200);
     const uiEvents = await fetch(
@@ -513,7 +555,10 @@ export default (pi) => {
     }
     assert.equal(resultEvent.command, "extension-dialog");
     await uiReader.cancel();
-    const shortcut = await runner.request(path + "/extensions/shortcuts", "POST", { shortcut: "ctrl+x" });
+    const shortcutName = discovered.body.extensions.find((extension) =>
+      extension.shortcuts.some((item) => item.key === "ctrl+x"),
+    ).shortcuts[0].name;
+    const shortcut = await runner.request(path + "/extensions/shortcuts", "POST", { name: shortcutName, requestId: "shortcut-request-1" });
     assert.equal(shortcut.status, 200);
     const shortcutEvents = await fetch(new URL(path + "/extensions/commands/" + shortcut.body.operationId + "/events", runner.url));
     const shortcutReader = shortcutEvents.body.getReader();
@@ -570,12 +615,33 @@ export default (pi) => {
           }
         }
       }
-      assert.match(toolResult.text, /extension:durable/);
+      assert.match(toolResult.text, /extension-hook-result/);
     } finally {
       eventsAbort.abort();
       await eventReader.cancel().catch(() => {});
     }
-    await runner.stop();
+    const interrupted = await runner.request(path + "/extensions/commands", "POST", {
+      name: "extension-blocking", args: "", requestId: "blocked-request-1",
+    });
+    assert.equal(interrupted.status, 200);
+    const activeEvents = await fetch(new URL(path + "/extensions/commands/" + interrupted.body.operationId + "/events", runner.url));
+    const activeReader = activeEvents.body.getReader();
+    const activeDecoder = new TextDecoder();
+    let activeBuffer = "";
+    let started = false;
+    while (!started) {
+      const chunk = await activeReader.read();
+      assert.equal(chunk.done, false);
+      activeBuffer += activeDecoder.decode(chunk.value, { stream: true });
+      let newline;
+      while ((newline = activeBuffer.indexOf("\n")) >= 0) {
+        const line = activeBuffer.slice(0, newline).trimEnd();
+        activeBuffer = activeBuffer.slice(newline + 1);
+        if (line.startsWith("data: ") && JSON.parse(line.slice(6)).message === "blocking command started") started = true;
+      }
+    }
+    await activeReader.cancel();
+    await runner.crash();
     runner = await startRunner(directory);
     const afterRestart = await runner.request(path + "/extensions");
     assert.equal(afterRestart.status, 200);
@@ -584,5 +650,20 @@ export default (pi) => {
         extension.commands.some((item) => item.name === "extension-hello"),
       ),
     );
+    const replay = await runner.request(path + "/extensions/commands", "POST", {
+      name: "extension-hello", args: "Nick", requestId: "hello-request-1",
+    });
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.operationId, command.body.operationId);
+    assert.equal((await readFile(sentinel, "utf8")).split("command").length - 1, 1);
+    assert.equal((await readFile(blockedMarker, "utf8")).trim(), "started");
+    const interruptedReplay = await runner.request(path + "/extensions/commands", "POST", {
+      name: "extension-blocking", args: "", requestId: "blocked-request-1",
+    });
+    assert.equal(interruptedReplay.body.operationId, interrupted.body.operationId);
+    const interruptedEvents = await fetch(new URL(path + "/extensions/commands/" + interrupted.body.operationId + "/events", runner.url));
+    const interruptedBody = await interruptedEvents.text();
+    assert.match(interruptedBody, /EXTENSION_COMMAND_INTERRUPTED/);
+    assert.equal((await readFile(blockedMarker, "utf8")).trim(), "started");
   },
 );
