@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -36,7 +36,7 @@ test(
       mode: 0o755,
     });
     const output = join(directory, "dist");
-    await execute(
+    const { stdout: built } = await execute(
       process.execPath,
       [
         join(project, "scripts/build-release.mjs"),
@@ -55,6 +55,7 @@ test(
       ],
       { maxBuffer: 1024 * 1024 },
     );
+    const archive = basename(built.trim().split("\n").at(-1));
     await execute("sha256sum", ["--check", "SHA256SUMS"], { cwd: output });
     const unrelated = join(directory, "outside-checkout");
     await mkdir(unrelated);
@@ -74,7 +75,7 @@ test(
     delete environment.ADM_STATE_DIR;
     const assets = new Map(
       await Promise.all(
-        ["adm-linux-amd64.tar.gz", "SHA256SUMS"].map(async (name) => [
+        [archive, "SHA256SUMS"].map(async (name) => [
           "/" + name,
           await readFile(join(output, name)),
         ]),

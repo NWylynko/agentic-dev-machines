@@ -163,7 +163,10 @@ const server = createServer(async (request, response) => {
   const initial = request.url.endsWith("/lease");
   const valid = body.holder === holder && (initial || body.fencingToken === 1);
   response.writeHead(valid ? 200 : 410, { "content-type": "application/json" });
-  response.end(JSON.stringify(valid ? { holder, fencingToken: 1 } : { error: { message: "stale fixture owner" } }));
+  const lease = request.url.endsWith("/check")
+    ? { valid: true }
+    : { holder, fencingToken: 1, expiresAt: Math.floor(Date.now() / 1000) + 60 };
+  response.end(JSON.stringify(valid ? lease : { error: { message: "stale fixture owner" } }));
 });
 server.listen(7433, "127.0.0.1", () => {
   const child = spawn("/usr/local/bin/adm-dev-entrypoint", [], {
