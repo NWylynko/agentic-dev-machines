@@ -47,15 +47,30 @@ await patch("dist/modes/interactive/interactive-mode.js", [
   ],
   [
     'rawKeyHint("!", "to run bash"),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "to run bash")]),',
+  ],
+  [
     '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!", "to run bash")]),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "to run bash")]),',
+    0,
   ],
   [
     'rawKeyHint("!!", "to run bash (no context)"),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
+  ],
+  [
     '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
+    0,
   ],
   [
     'rawKeyHint("!", "bash"),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "bash")]),',
+  ],
+  [
     '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!", "bash")]),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "bash")]),',
+    0,
   ],
   [
     `checkForNewPiVersion(this.version).then((newRelease) => {
@@ -103,6 +118,21 @@ await patch("dist/modes/interactive/interactive-mode.js", [
   [
     "if (this.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(this.sessionManager.getCwd())) {",
     "if (this.settingsManager.isProjectTrusted() || !(this.runtimeHost.remotePorts?.projectTrust ? this.runtimeHost.remotePorts.projectTrust.hasTrustRequiringResources(this.sessionManager.getCwd()) : hasTrustRequiringProjectResources(this.sessionManager.getCwd()))) {",
+  ],
+  [
+    "this.settingsManager.isProjectTrusted()",
+    "isProjectTrusted(this.runtimeHost, this.sessionManager, this.settingsManager)",
+    4,
+  ],
+  [
+    "function isEmbeddedStatus(editor) {",
+    `function isProjectTrusted(runtimeHost, sessionManager, settingsManager) {
+    if (runtimeHost.remotePorts?.projectTrust) {
+        return runtimeHost.remotePorts.projectTrust.get(sessionManager.getCwd()) === true;
+    }
+    return settingsManager.isProjectTrusted();
+}
+function isEmbeddedStatus(editor) {`,
   ],
   [
     `if ((await this.session.modelRuntime.checkAuth("anthropic"))?.type === "oauth") {
@@ -229,6 +259,24 @@ await patch("dist/modes/interactive/theme/theme.d.ts", [
     "export declare function loadThemeFromPath(themePath: string, mode?: TerminalColorMode): Theme;\n/** Create a Pi theme from trusted remote JSON without reading the local filesystem. */\nexport declare function createThemeFromJson(json: unknown, mode?: TerminalColorMode, sourcePath?: string, sourceInfo?: SourceInfo): Theme;",
   ],
 ]);
+
+await patch("dist/core/export-html/index.js", [
+  [
+    "function generateHtml(sessionData, themeName) {",
+    "export function renderSessionHtml(sessionData, themeName) {",
+  ],
+  ["generateHtml(sessionData, opts.themeName)", "renderSessionHtml(sessionData, opts.themeName)", 2],
+]);
+await patch("dist/core/export-html/index.d.ts", [
+  [
+    "export declare function exportSessionToHtml(",
+    "export declare function renderSessionHtml(sessionData: unknown, themeName?: string): string;\nexport declare function exportSessionToHtml(",
+  ],
+]);
+for (const path of ["dist/index.js", "dist/index.d.ts"]) {
+  const sourceMap = path.endsWith(".js") ? "//# sourceMappingURL=index.js.map" : "//# sourceMappingURL=index.d.ts.map";
+  await patch(path, [[sourceMap, `export { renderSessionHtml } from "./core/export-html/index.js";\n${sourceMap}`]]);
+}
 
 for (const path of ["dist/index.js", "dist/index.d.ts"]) {
   await patch(path, [
