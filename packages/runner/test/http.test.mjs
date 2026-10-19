@@ -1324,6 +1324,16 @@ test("native bash executes in the workspace harness and records replayable nativ
   };
   assert.equal((await runner.request(path, "PUT", config)).status, 200);
 
+  const invalid = await runner.request(`${path}/bash`, "POST", {
+    command: "printf 'must-not-enter-context'",
+    requestId: "invalid-exclusion",
+    excludeFromContext: "true",
+  });
+  assert.equal(
+    invalid.status,
+    400,
+    "context exclusion requires an explicit boolean",
+  );
   const admitted = await runner.request(`${path}/bash`, "POST", {
     command: "printf 'native-output'",
     requestId: "bash-once",

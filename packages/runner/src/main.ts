@@ -1204,12 +1204,14 @@ const server = createServer(async (request, response) => {
       const data = await body(request);
       if (
         typeof data.command !== "string" ||
-        typeof data.requestId !== "string"
+        typeof data.requestId !== "string" ||
+        (data.excludeFromContext !== undefined &&
+          typeof data.excludeFromContext !== "boolean")
       )
         throw new ApiError(
           400,
           "INVALID_BASH",
-          "Bash requires command and requestId",
+          "Bash requires command, requestId, and an optional boolean excludeFromContext",
         );
       const workspace = workspaces.get(id);
       if (!workspace)
