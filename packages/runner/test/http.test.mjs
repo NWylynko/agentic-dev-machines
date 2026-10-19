@@ -1345,6 +1345,12 @@ test("native bash executes in the workspace harness and records replayable nativ
   assert.equal(entry.kind, "message");
   assert.equal(entry.data.message.role, "bashExecution");
   assert.equal(entry.data.message.output, "native-output");
+  const branches = await runner.request(path + "/branches");
+  const sessionInfo = branches.body.branches.find(
+    (branch) => branch.conversationId === history.body.activeConversationId,
+  ).sessionInfo;
+  assert.equal(sessionInfo.firstMessage, "");
+  assert.doesNotMatch(sessionInfo.allMessagesText, /native-output/);
   const retry = await runner.request(`${path}/bash`, "POST", {
     command: "printf 'duplicate'",
     requestId: "bash-once",

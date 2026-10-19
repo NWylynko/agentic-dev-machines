@@ -107,6 +107,12 @@ async function branchSessionInfo(
       context,
     );
     for (const entry of page.items) {
+      if (entry.kind === "admbash") {
+        const data = entry.data as { timestamp?: unknown } | undefined;
+        if (typeof data?.timestamp === "number")
+          modified = Math.max(modified, data.timestamp);
+        continue;
+      }
       if (workspace.role === "bot" && entry.kind === "adm.message") {
         const data = entry.data as
           | { text?: unknown; timestamp?: unknown }
