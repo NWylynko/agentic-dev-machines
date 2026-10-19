@@ -1826,6 +1826,65 @@ test(
   },
 );
 
+test(
+  "model cycling scope is validated against the workspace catalogue and persists",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-model-scope-"));
+    let runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const path = "/v1/workspaces/scoped-coder";
+    await runner.request(path, "PUT", {
+      id: "scoped-coder",
+      name: "scope",
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, "repo"),
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const available = (await runner.request(path + "/models")).body.models;
+    const selected = available
+      .slice(0, 2)
+      .map((model) => `${model.provider}/${model.id}`);
+    assert.ok(selected.length);
+    const changed = await runner.request(path + "/settings", "PUT", {
+      scopedModels: selected,
+    });
+    assert.equal(changed.status, 200);
+    assert.deepEqual(changed.body.scopedModels, selected);
+    for (const scopedModels of [
+      ["absent/model"],
+      [...selected, selected[0]],
+      "all",
+    ]) {
+      assert.equal(
+        (await runner.request(path + "/settings", "PUT", { scopedModels }))
+          .status,
+        400,
+      );
+    }
+    assert.deepEqual(
+      (await runner.request(path + "/settings")).body.scopedModels,
+      selected,
+    );
+    await runner.stop("SIGKILL");
+    runner = await startRunner(directory);
+    assert.deepEqual(
+      (await runner.request(path + "/settings")).body.scopedModels,
+      selected,
+    );
+    assert.equal(
+      (await runner.request(path + "/settings", "PUT", { scopedModels: [] }))
+        .status,
+      200,
+    );
+    assert.deepEqual(
+      (await runner.request(path + "/settings")).body.scopedModels,
+      [],
+    );
+  },
+);
+
 test("workspace behavior settings update through HTTP and persist across runner restart", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "adm-runner-settings-"));
   const id = "settings-coder";

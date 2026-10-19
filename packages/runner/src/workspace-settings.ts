@@ -7,6 +7,7 @@ export type WorkspaceBehaviorSettingsValue = {
   steeringMode: QueueMode;
   followUpMode: QueueMode;
   autoCompact: boolean;
+  scopedModels?: string[];
 };
 
 export type WorkspaceSettingsPatch = Partial<WorkspaceBehaviorSettingsValue> & {
@@ -43,12 +44,17 @@ export function parseWorkspaceSettingsPatch(
     "followUpMode",
     "autoCompact",
     "sessionName",
+    "scopedModels",
   ]);
   const keys = Object.keys(data);
   if (!keys.length || keys.some((key) => !allowed.has(key)))
     throw invalidSettings();
 
   const patch: WorkspaceSettingsPatch = {};
+  if ("scopedModels" in data) {
+    if (!isModelScope(data.scopedModels)) throw invalidSettings();
+    patch.scopedModels = [...data.scopedModels];
+  }
   if ("sessionName" in data) {
     if (
       typeof data.sessionName !== "string" ||
@@ -129,7 +135,8 @@ export class WorkspaceBehaviorSettings {
     if (
       patch.steeringMode === undefined &&
       patch.followUpMode === undefined &&
-      patch.autoCompact === undefined
+      patch.autoCompact === undefined &&
+      patch.scopedModels === undefined
     )
       return this.current;
     const next: WorkspaceBehaviorSettingsValue = {
@@ -143,6 +150,9 @@ export class WorkspaceBehaviorSettings {
       ...(patch.autoCompact === undefined
         ? {}
         : { autoCompact: patch.autoCompact }),
+      ...(patch.scopedModels === undefined
+        ? {}
+        : { scopedModels: [...patch.scopedModels] }),
     };
     await writePrivateJson(this.path, next, this.assertActive);
     this.value = next;
@@ -154,6 +164,21 @@ function isQueueMode(value: unknown): value is QueueMode {
   return value === "all" || value === "one-at-a-time";
 }
 
+function isModelScope(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= 256 &&
+    new Set(value).size === value.length &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        /^[^/\s]+\/.+/.test(item) &&
+        item.length <= 512 &&
+        !/[\x00-\x1f\x7f]/.test(item),
+    )
+  );
+}
+
 function validateSavedSettings(value: unknown): WorkspaceBehaviorSettingsValue {
   if (
     !value ||
@@ -162,8 +187,16 @@ function validateSavedSettings(value: unknown): WorkspaceBehaviorSettingsValue {
     !isQueueMode((value as Record<string, unknown>).steeringMode) ||
     !isQueueMode((value as Record<string, unknown>).followUpMode) ||
     typeof (value as Record<string, unknown>).autoCompact !== "boolean" ||
+    ((value as Record<string, unknown>).scopedModels !== undefined &&
+      !isModelScope((value as Record<string, unknown>).scopedModels)) ||
     Object.keys(value).some(
-      (key) => !["steeringMode", "followUpMode", "autoCompact"].includes(key),
+      (key) =>
+        ![
+          "steeringMode",
+          "followUpMode",
+          "autoCompact",
+          "scopedModels",
+        ].includes(key),
     )
   )
     throw new Error("Workspace settings file is invalid");
@@ -208,6 +241,6 @@ function invalidSettings() {
   return new ApiError(
     400,
     "INVALID_SETTINGS",
-    "Settings must contain supported thinkingLevel, steeringMode, followUpMode, autoCompact, or sessionName values",
+    "Settings must contain supported thinkingLevel, steeringMode, followUpMode, autoCompact, sessionName, or scopedModels values",
   );
 }

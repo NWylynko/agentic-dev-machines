@@ -1059,9 +1059,7 @@ export class Workspace {
   }
 
   clearExtensionRegistry() {
-    this.registry.install(
-      createDurableExtensionBridge([], this.assertActive),
-    );
+    this.registry.install(createDurableExtensionBridge([], this.assertActive));
   }
 
   refreshExtensionRegistry() {
@@ -1102,6 +1100,19 @@ export class Workspace {
   async changeSettings(value: unknown) {
     const patch = parseWorkspaceSettingsPatch(value);
     return this.withAdmission(async () => {
+      if (patch.scopedModels?.length) {
+        const available = new Set(
+          (await this.models.getAvailable()).map(
+            (model) => `${model.provider}/${model.id}`,
+          ),
+        );
+        if (patch.scopedModels.some((id) => !available.has(id)))
+          throw new ApiError(
+            400,
+            "INVALID_MODEL_SCOPE",
+            "Model scope must contain only authenticated models in this workspace catalogue",
+          );
+      }
       if (patch.thinkingLevel !== undefined) {
         await this.assertIdleForNavigation();
         await this.conversation.configure(
