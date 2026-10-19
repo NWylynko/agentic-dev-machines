@@ -385,7 +385,7 @@ async function lifecycleRuntimeCall(
 }
 function runtimeAction(method: string, pathname: string): string {
   const endpoint = pathname.match(/^\/v1\/workspaces\/[^/]+(?:\/(.*))?$/)?.[1];
-  if (endpoint && /^(resources|trust|extensions)(\/|$)/.test(endpoint))
+  if (endpoint && /^(resources|trust|extensions|tools)(\/|$)/.test(endpoint))
     return "resources";
   if (endpoint === "bash" || endpoint?.startsWith("bash/")) return "bash";
   if (method === "GET") return "read";
@@ -1181,7 +1181,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|tools|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1476,6 +1476,8 @@ const server = createServer(async (request, response) => {
       );
     }
     await assertActive(id, requestSignal);
+    if (request.method === "GET" && action === "tools")
+      return json(response, 200, await workspace.toolMetadata());
     if (request.method === "GET" && action === "branches")
       return json(response, 200, await workspace.branches());
     if (request.method === "POST" && action === "new") {

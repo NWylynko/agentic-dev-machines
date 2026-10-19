@@ -16,7 +16,15 @@ test("upstream session projection sends prompts to Durable and replays streamed 
   let trustUpdates: unknown;
   let bashRequest: unknown;
   let savedQueue = { steering: ["steer me"], followUp: ["then do this"] };
-  const savedSettings = { thinkingLevel: "off", steeringMode: "one-at-a-time", followUpMode: "one-at-a-time", autoCompact: true, scopedModels: ["faux/faux-1"], cacheWarmingMode: "idle", sessionName: "saved name" };
+  const savedSettings = {
+    thinkingLevel: "off",
+    steeringMode: "one-at-a-time",
+    followUpMode: "one-at-a-time",
+    autoCompact: true,
+    scopedModels: ["faux/faux-1"],
+    cacheWarmingMode: "idle",
+    sessionName: "saved name",
+  };
   const server = createServer(async (request, response) => {
     const url = new URL(request.url!, "http://localhost");
     response.setHeader("content-type", "application/json");
@@ -101,6 +109,8 @@ test("upstream session projection sends prompts to Durable and replays streamed 
       response.end(JSON.stringify(savedQueue));
     } else if (url.pathname.endsWith("/queue")) {
       response.end(JSON.stringify(savedQueue));
+    } else if (url.pathname.endsWith("/tools")) {
+      response.end(JSON.stringify({ tools: [], activeToolNames: [] }));
     } else if (url.pathname.endsWith("/resources")) {
       response.end(
         JSON.stringify({
@@ -211,14 +221,19 @@ test("upstream session projection sends prompts to Durable and replays streamed 
     assert.deepEqual(remote.session.getSteeringMessages(), ["steer me"]);
     assert.deepEqual(remote.session.getFollowUpMessages(), ["then do this"]);
     assert.deepEqual(
-      remote.session.scopedModels.map(({ model }) => `${model.provider}/${model.id}`),
+      remote.session.scopedModels.map(
+        ({ model }) => `${model.provider}/${model.id}`,
+      ),
       ["faux/faux-1"],
     );
     assert.equal(remote.session.model?.provider, "faux");
     assert.ok(
       remote.session.sessionManager
         .getEntries()
-        .some((entry) => entry.type === "message" && entry.message.role === "bashExecution"),
+        .some(
+          (entry) =>
+            entry.type === "message" && entry.message.role === "bashExecution",
+        ),
       "Durable history preserves Pi bash execution messages",
     );
     assert.equal(remote.session.steeringMode, "one-at-a-time");
@@ -415,6 +430,8 @@ test("pinned upstream InteractiveMode starts over the Durable workspace projecti
       response.end(JSON.stringify({ steering: [], followUp: [] }));
     } else if (url.pathname.endsWith("/extensions")) {
       response.end(JSON.stringify({ extensions: [], diagnostics: [] }));
+    } else if (url.pathname.endsWith("/tools")) {
+      response.end(JSON.stringify({ tools: [], activeToolNames: [] }));
     } else if (url.pathname.endsWith("/resources")) {
       response.end(
         JSON.stringify({

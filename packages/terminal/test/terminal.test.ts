@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -11,11 +11,12 @@ import {
   readFile,
   rm,
   writeFile,
+  watch,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { WorkspaceTerminal } from "../src/terminal.ts";
+import { WorkspaceTerminal, type WorkspaceEvent } from "../src/terminal.ts";
 import {
   ProcessTerminal,
   stripTerminalSequences,
@@ -27,6 +28,14 @@ function terminalText(terminal: WorkspaceTerminal) {
 }
 function visibleTerminalText(text: string) {
   return stripTerminalSequences(text).replace(/\s+/g, " ");
+}
+function stopProcessGroup(child: { pid?: number }) {
+  if (!child.pid) return;
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
 }
 async function fixture(
   role = "coding",
@@ -61,13 +70,52 @@ async function fixture(
           events: found,
           nextAfter: found.at(-1)?.seq || 0,
           hasMore: false,
+          activeConversationId: 12,
         }),
       );
+    } else if (url.pathname.endsWith("/settings")) {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          thinkingLevel: "off",
+          steeringMode: "one-at-a-time",
+          followUpMode: "one-at-a-time",
+          autoCompact: true,
+        }),
+      );
+    } else if (url.pathname.endsWith("/queue/clear")) {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ steering: [], followUp: [] }));
+    } else if (url.pathname.endsWith("/queue")) {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ steering: [], followUp: [] }));
+    } else if (url.pathname.endsWith("/tools")) {
+      res.end(JSON.stringify({ tools: [], activeToolNames: [] }));
+    } else if (url.pathname.endsWith("/resources")) {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          cwd: "/repos/demo",
+          trust: { trusted: true, trustRequired: false, source: null },
+          themes: [],
+          prompts: [],
+          skills: [],
+          agentsFiles: [],
+          extensions: [],
+          diagnostics: [],
+          appendSystemPrompt: [],
+        }),
+      );
+    } else if (url.pathname.endsWith("/extensions")) {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ extensions: [], diagnostics: [] }));
     } else if (url.pathname.endsWith("/models")) {
-      if (holdRefresh && url.searchParams.get("refresh") === "true") {
+      if (url.searchParams.get("refresh") === "true") {
         refreshStartedResolve();
-        res.once("close", refreshClosedResolve);
-        return;
+        if (holdRefresh) {
+          res.once("close", refreshClosedResolve);
+          return;
+        }
       }
       res.setHeader("content-type", "application/json");
       res.end(
@@ -104,6 +152,8 @@ async function fixture(
           id: "work",
           name: "demo",
           role,
+          cwd: "/repos/demo",
+          conversationId: 12,
           status: "idle",
           goals: [],
           loops: [],
@@ -163,6 +213,124 @@ const event = (seq: number, kind: string, text: string) => ({
   data: { text },
   timestamp: Date.now(),
 });
+
+test(
+  "native adm attach PTY starts Pi and submits editor text to the existing Durable conversation",
+  { timeout: 20000 },
+  async (t) => {
+    const service = await fixture("coding", [], { holdRefresh: true });
+    const args = [
+      process.execPath,
+      "--import",
+      "tsx",
+      fileURLToPath(new URL("../src/main.ts", import.meta.url)),
+      "--url",
+      service.url,
+      "--workspace",
+      "work",
+    ];
+    const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`;
+    const child = spawn(
+      "script",
+      [
+        "--quiet",
+        "--return",
+        "--command",
+        args.map(quote).join(" "),
+        "/dev/null",
+      ],
+      { stdio: ["pipe", "pipe", "pipe"], detached: true },
+    );
+    t.after(() => stopProcessGroup(child));
+    let output = "";
+    try {
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          child.stdout.on("data", (chunk) => {
+            output += chunk;
+            if (stripTerminalSequences(output).includes("/repos/demo"))
+              resolve();
+          });
+          child.stderr.on("data", (chunk) => (output += chunk));
+          child.once("error", reject);
+          child.once("exit", (code) =>
+            reject(new Error(`Native TUI exited (${code}): ${output}`)),
+          );
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`Native TUI startup timed out: ${output}`)),
+            5000,
+          ),
+        ),
+      ]);
+      await Promise.race([
+        service.refreshStarted,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Pi InteractiveMode did not finish startup: ${output}`,
+                ),
+              ),
+            5000,
+          ),
+        ),
+      ]);
+      const accepted = service.admission();
+      const prompt = "Continue the existing workspace conversation";
+      child.stdin.write(`\x1b[200~${prompt}\x1b[201~`);
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          const check = () => {
+            if (visibleTerminalText(output).includes(prompt)) resolve();
+          };
+          child.stdout.on("data", (chunk) => {
+            output += chunk;
+            check();
+          });
+          check();
+          child.once("exit", (code) =>
+            reject(
+              new Error(
+                `Native TUI exited before editor accepted paste (${code}): ${output}`,
+              ),
+            ),
+          );
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(`Editor did not render pasted prompt: ${output}`),
+              ),
+            5000,
+          ),
+        ),
+      ]);
+      child.stdin.write("\r");
+      const request = await Promise.race([
+        accepted,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(new Error(`Native prompt was not admitted: ${output}`)),
+            5000,
+          ),
+        ),
+      ]);
+      assert.equal(request.path.endsWith("/input"), true);
+      assert.equal(request.body.message, prompt);
+      const exited = once(child, "exit");
+      child.stdin.write("\x04");
+      assert.equal((await exited)[0], 0, output);
+    } finally {
+      stopProcessGroup(child);
+      await service.close();
+    }
+  },
+);
 function changedTerminal(
   url: string,
   diagnostics = false,
@@ -622,57 +790,117 @@ test(
         args.map(quote).join(" "),
         "/dev/null",
       ],
-      { stdio: ["pipe", "pipe", "pipe"] },
+      { stdio: ["pipe", "pipe", "pipe"], detached: true },
     );
     let output = "";
     try {
-      await new Promise<void>((resolve, reject) => {
-        child.stdout.on("data", (chunk) => {
-          output += chunk;
-          if (output.includes("Faux 1")) resolve();
-        });
-        child.stderr.on("data", (chunk) => (output += chunk));
-        child.once("error", reject);
-        child.once("exit", (code) =>
-          reject(
-            new Error(
-              `Terminal exited before showing the selector (${code}): ${output}`,
+      const modelRequest = service.admission();
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          child.stdout.on("data", (chunk) => {
+            output += chunk;
+            if (stripTerminalSequences(output).includes("/repos/demo"))
+              resolve();
+          });
+          child.stderr.on("data", (chunk) => (output += chunk));
+          child.once("error", reject);
+          child.once("exit", (code) =>
+            reject(
+              new Error(
+                `Terminal exited before native startup (${code}): ${output}`,
+              ),
             ),
+          );
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`Native startup timed out: ${output}`)),
+            5000,
           ),
-        );
-      });
-      child.stdin.write("\r");
-      await new Promise<void>((resolve, reject) => {
-        const limit = setTimeout(
-          () =>
-            reject(new Error(`Model selection did not complete: ${output}`)),
-          4000,
-        );
-        child.stdout.on("data", (chunk) => {
-          output += chunk;
-          if (
-            visibleTerminalText(output).includes("Model selected · faux/faux-1")
-          ) {
-            clearTimeout(limit);
-            resolve();
-          }
-        });
-        child.stderr.on("data", (chunk) => (output += chunk));
-      });
-      assert.ok(
-        service.requests.some(
-          (request) =>
-            request.method === "PUT" &&
-            request.path.endsWith("/model") &&
-            request.body.provider === "faux" &&
-            request.body.modelId === "faux-1",
         ),
-      );
+      ]);
+      await Promise.race([
+        service.refreshStarted,
+        new Promise((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Native model readiness missing: ${visibleTerminalText(output)}; requests=${JSON.stringify(service.requests)}`,
+                ),
+              ),
+            4000,
+          ),
+        ),
+      ]);
+      child.stdin.write("/model\r");
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          const check = () => {
+            if (visibleTerminalText(output).includes("Faux 1")) resolve();
+          };
+          child.stdout.on("data", (chunk) => {
+            output += chunk;
+            check();
+          });
+          check();
+          child.once("exit", (code) =>
+            reject(
+              new Error(
+                `Terminal exited before native selector rendered (${code}): ${output}`,
+              ),
+            ),
+          );
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(new Error(`Native model selector timed out: ${output}`)),
+            5000,
+          ),
+        ),
+      ]);
+      child.stdin.write("\r");
+      const request = await Promise.race([
+        modelRequest,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(new Error(`Model selection did not complete: ${output}`)),
+            5000,
+          ),
+        ),
+      ]);
+      assert.equal(request.method, "PUT");
+      assert.ok(request.path.endsWith("/model"));
+      assert.equal(request.body.provider, "faux");
+      assert.equal(request.body.modelId, "faux-1");
+      await Promise.race([
+        new Promise<void>((resolve) => {
+          const check = () => {
+            if (visibleTerminalText(output).includes("Model: faux-1"))
+              resolve();
+          };
+          child.stdout.on("data", check);
+          check();
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Model acknowledgement missing: ${visibleTerminalText(output)}`,
+                ),
+              ),
+            4000,
+          ),
+        ),
+      ]);
       const exited = once(child, "exit");
-      child.stdin.write("\x03");
-      assert.equal((await exited)[0], 0);
+      child.stdin.write("\x04");
+      assert.equal((await exited)[0], 0, output);
     } finally {
-      if (child.exitCode === null) child.kill("SIGTERM");
+      stopProcessGroup(child);
       await service.close();
     }
   },
@@ -742,7 +970,7 @@ test(
         args.map(quote).join(" "),
         "/dev/null",
       ],
-      { stdio: ["pipe", "pipe", "pipe"] },
+      { stdio: ["pipe", "pipe", "pipe"], detached: true },
     );
     let output = "";
     try {
@@ -772,7 +1000,7 @@ test(
         false,
       );
     } finally {
-      if (child.exitCode === null) child.kill("SIGTERM");
+      stopProcessGroup(child);
       await service.close();
     }
   },
@@ -881,7 +1109,10 @@ test(
         "--provider",
         "faux",
       ],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, HOME: stateDirectory },
+      },
     );
     let runnerErrors = "";
     runner.stderr.on("data", (chunk) => (runnerErrors += chunk));
@@ -942,217 +1173,182 @@ test(
             args.map(quote).join(" "),
             "/dev/null",
           ],
-          { stdio: ["pipe", "pipe", "pipe"] },
+          {
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: true,
+            env: {
+              ...process.env,
+              HOME: stateDirectory,
+              XDG_CONFIG_HOME: join(stateDirectory, "client-config"),
+            },
+          },
         );
+      let readyResolve = () => {};
+      const ready = new Promise<void>((resolve) => {
+        readyResolve = resolve;
+      });
+      const proxy = createServer((req, res) => {
+        if (req.url?.includes("/models?refresh=true")) readyResolve();
+        const upstream = httpRequest(
+          new URL(req.url!, runnerUrl),
+          { method: req.method, headers: req.headers },
+          (incoming) => {
+            res.writeHead(incoming.statusCode!, incoming.headers);
+            incoming.pipe(res);
+          },
+        );
+        upstream.on("error", (error) => res.destroy(error));
+        res.on("close", () => upstream.destroy());
+        req.pipe(upstream);
+      });
+      proxy.listen(0, "127.0.0.1");
+      await once(proxy, "listening");
+      args[args.indexOf("--url") + 1] =
+        `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+      const fifo = join(stateDirectory, "release");
+      const marker = join(stateDirectory, "tool-started");
+      assert.equal((await once(spawn("mkfifo", [fifo]), "exit"))[0], 0);
+      const watchController = new AbortController();
+      const changes = watch(stateDirectory, { signal: watchController.signal });
+      const started = (async () => {
+        for await (const event of changes)
+          if (event.filename === "tool-started") return;
+      })();
       const first = attach();
-      let firstOutput = "";
-      const waitForOutput = (
-        child: ReturnType<typeof attach>,
-        contains: string,
-      ) => {
-        if (visibleTerminalText(firstOutput).includes(contains))
-          return Promise.resolve();
-        return new Promise<void>((resolve, reject) => {
-          const cleanup = () => {
-            clearTimeout(timeout);
-            child.stdout.off("data", onStdout);
-            child.stderr.off("data", onStderr);
-            child.off("error", onError);
-            child.off("exit", onExit);
-          };
-          const complete = () => {
-            cleanup();
-            resolve();
-          };
-          const onStdout = (chunk: Buffer) => {
-            firstOutput += chunk.toString();
-            if (visibleTerminalText(firstOutput).includes(contains)) complete();
-          };
-          const onStderr = (chunk: Buffer) => {
-            firstOutput += chunk.toString();
-            if (visibleTerminalText(firstOutput).includes(contains)) complete();
-          };
-          const onError = (error: Error) => {
-            cleanup();
-            reject(error);
-          };
-          const onExit = (code: number | null) => {
-            cleanup();
-            reject(new Error(`Terminal exited ${code}: ${firstOutput}`));
-          };
-          const timeout = setTimeout(() => {
-            cleanup();
-            reject(
-              new Error(`Timed out waiting for ${contains}: ${firstOutput}`),
-            );
-          }, 5000);
-          child.stdout.on("data", onStdout);
-          child.stderr.on("data", onStderr);
-          child.once("error", onError);
-          child.once("exit", onExit);
-        });
-      };
-      try {
-        const connected = waitForOutput(first, "Connected ·");
-        await connected;
-        const multilinePrompt =
-          "The runner continued after terminal detach\nKeep the second line.";
-        first.stdin.write(multilinePrompt + "\r");
-        await waitForOutput(first, "Input accepted");
-        const detached = once(first, "exit");
-        first.stdin.write("\x03");
-        assert.equal((await detached)[0], 0);
-
-        const historyResponse = await fetch(
-          `${runnerUrl}${path}/history?limit=1000`,
-        );
-        const history = await historyResponse.json();
-        assert.ok(
-          history.events.some(
-            (event: any) =>
-              event.kind === "user" && event.data.text === multilinePrompt,
-          ),
-          "the real PTY must submit both editor lines as one prompt",
-        );
-        assert.ok(
-          history.events.some(
-            (event: any) =>
-              event.kind === "assistant" &&
-              event.data.text.includes(
-                "Echo: The runner continued after terminal detach",
+      const terminals = [first];
+      const output = new Map<typeof first, string>();
+      const waitOutput = (child: typeof first, text: string) =>
+        new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Missing native output ${text}: ${visibleTerminalText(output.get(child) ?? "")}`,
+                ),
               ),
+            5000,
+          );
+          const check = () => {
+            if (visibleTerminalText(output.get(child) ?? "").includes(text)) {
+              clearTimeout(timer);
+              child.stdout.off("data", check);
+              resolve();
+            }
+          };
+          child.stdout.on("data", check);
+          check();
+        });
+      const capture = (child: typeof first) => {
+        output.set(child, "");
+        child.stdout.on("data", (data) =>
+          output.set(child, output.get(child)! + data),
+        );
+        child.stderr.on("data", (data) =>
+          output.set(child, output.get(child)! + data),
+        );
+      };
+      capture(first);
+      const observer = new WorkspaceTerminal({
+        url: runnerUrl,
+        workspaceId: id,
+        autoModelSelector: false,
+      });
+      try {
+        await Promise.race([
+          ready,
+          new Promise((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `Native startup did not refresh: ${visibleTerminalText(output.get(first) ?? "")}; runner=${runnerErrors}`,
+                  ),
+                ),
+              5000,
+            ),
+          ),
+        ]);
+        const prompt =
+          "/faux \n" +
+          JSON.stringify({
+            calls: [
+              {
+                tool: "bash",
+                args: { command: `touch ${marker}; cat ${fifo}` },
+              },
+            ],
+            answer: "Done after terminal detach",
+          });
+        first.stdin.write(`\x1b[200~${prompt}\x1b[201~`);
+        await waitOutput(first, "/faux");
+        first.stdin.write("\r");
+        await Promise.race([
+          started,
+          new Promise((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `Native tool did not start: ${visibleTerminalText(output.get(first) ?? "")}; runner=${runnerErrors}`,
+                  ),
+                ),
+              5000,
+            ),
+          ),
+        ]);
+        const firstExit = once(first, "exit");
+        first.stdin.write("\x03");
+        assert.equal((await firstExit)[0], 0);
+        const pending = await (
+          await fetch(`${runnerUrl}${path}/history`)
+        ).json();
+        assert.ok(
+          pending.events.some(
+            (event: WorkspaceEvent) =>
+              event.kind === "user" && event.data.text === prompt,
           ),
         );
-
-        firstOutput = "";
+        assert.ok(
+          !pending.events.some(
+            (event: WorkspaceEvent) =>
+              event.kind === "assistant" &&
+              event.data.text === "Done after terminal detach",
+          ),
+        );
+        await observer.connect();
+        const complete = new Promise<void>((resolve) =>
+          observer.subscribeWorkspaceEvents((event) => {
+            if (
+              event.kind === "assistant" &&
+              event.data.text === "Done after terminal detach"
+            )
+              resolve();
+          }),
+        );
+        await writeFile(fifo, "released\n");
+        await complete;
         const second = attach();
-        try {
-          await waitForOutput(
-            second,
-            "Echo: The runner continued after terminal detach",
-          );
-          assert.match(
-            stripTerminalSequences(firstOutput),
-            /Echo: The runner continued after terminal detach/,
-          );
-
-          firstOutput = "";
-          second.stdin.write("/session\r");
-          await waitForOutput(second, "Workspace session");
-          firstOutput = "";
-          second.stdin.write("/hotkeys\r");
-          await waitForOutput(second, "Keyboard shortcuts");
-          await waitForOutput(second, "Ctrl+O");
-          await waitForOutput(second, "Shift+Tab");
-          assert.match(stripTerminalSequences(firstOutput), /Ctrl\+O/);
-          assert.match(stripTerminalSequences(firstOutput), /Shift\+Tab/);
-
-          const failedInput = await fetch(`${runnerUrl}${path}/input`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              message: "/faux-fail-once finish after refreshing credentials",
-              requestId: "terminal-provider-failure",
-            }),
-          });
-          assert.equal(failedInput.status, 202);
-          await waitForOutput(
-            second,
-            "Provider error · Authentication credentials are invalid",
-          );
-          const failedStatus = await fetch(`${runnerUrl}${path}`);
-          const failedWorkspace = await failedStatus.json();
-          assert.equal(failedWorkspace.status, "error");
-          assert.match(
-            failedWorkspace.error,
-            /authentication credentials are invalid/i,
-          );
-
-          second.stdin.write("/status\r");
-          await waitForOutput(second, "0 goals · 0 loops");
-          assert.match(
-            visibleTerminalText(firstOutput),
-            /Provider error · Authentication credentials are invalid/,
-          );
-          second.stdin.write("/retry\r");
-          await waitForOutput(second, "Provider retry queued");
-          await waitForOutput(
-            second,
-            "Echo: Continue the unanswered request from assistant error entry",
-          );
-          const resumedStatus = await fetch(`${runnerUrl}${path}`);
-          const resumedWorkspace = await resumedStatus.json();
-          assert.equal(resumedWorkspace.status, "idle");
-          assert.equal(resumedWorkspace.error, undefined);
-
-          firstOutput = "";
-          second.stdin.write("/newgoal Ship the release\r");
-          await waitForOutput(second, "Goal saved");
-          firstOutput = "";
-          second.stdin.write("/goal Retire the old API\r");
-          await waitForOutput(second, "Goal saved");
-          firstOutput = "";
-          second.stdin.write("/loop 3600 Review the release status\r");
-          await waitForOutput(second, "Loop saved");
-
-          const managed = await fetch(`${runnerUrl}${path}`);
-          const beforeControls = await managed.json();
-          const [completedGoal, cancelledGoal] = beforeControls.goals;
-          const [cancelledLoop] = beforeControls.loops;
-          assert.equal(completedGoal.description, "Ship the release");
-          assert.equal(cancelledGoal.description, "Retire the old API");
-          assert.equal(cancelledLoop.prompt, "Review the release status");
-
-          firstOutput = "";
-          second.stdin.write("/goals\r");
-          await waitForOutput(second, completedGoal.id);
-          await waitForOutput(second, cancelledGoal.id);
-          firstOutput = "";
-          second.stdin.write("/loops\r");
-          await waitForOutput(second, cancelledLoop.id);
-
-          firstOutput = "";
-          second.stdin.write(`/complete-goal ${completedGoal.id}\r`);
-          await waitForOutput(second, "Goal marked completed");
-          firstOutput = "";
-          second.stdin.write(`/cancel-goal ${cancelledGoal.id}\r`);
-          await waitForOutput(second, "Goal cancelled");
-          firstOutput = "";
-          second.stdin.write(`/cancel-loop ${cancelledLoop.id}\r`);
-          await waitForOutput(second, "Loop cancelled");
-
-          const managedAfter = await fetch(`${runnerUrl}${path}`);
-          const afterControls = await managedAfter.json();
-          assert.deepEqual(
-            afterControls.goals.map((goal: any) => goal.status),
-            ["completed", "cancelled"],
-          );
-          assert.equal(afterControls.loops[0].status, "cancelled");
-
-          const priorConversationId = afterControls.conversationId;
-          firstOutput = "";
-          second.stdin.write("/new\r");
-          await waitForOutput(second, "New workspace session");
-          const newBranches = await fetch(`${runnerUrl}${path}/branches`);
-          const newNavigation = await newBranches.json();
-          assert.notEqual(
-            newNavigation.activeConversationId,
-            priorConversationId,
-          );
-          const newHistoryResponse = await fetch(
-            `${runnerUrl}${path}/history?limit=1000`,
-          );
-          const newHistory = await newHistoryResponse.json();
-          assert.deepEqual(newHistory.events, []);
-
-          const detachedAgain = once(second, "exit");
-          second.stdin.write("\x03");
-          assert.equal((await detachedAgain)[0], 0);
-        } finally {
-          if (second.exitCode === null) second.kill("SIGTERM");
-        }
+        terminals.push(second);
+        capture(second);
+        await waitOutput(second, "Done after terminal detach");
+        const secondExit = once(second, "exit");
+        second.stdin.write("\x03");
+        assert.equal((await secondExit)[0], 0);
+        const recovered = await (
+          await fetch(`${runnerUrl}${path}/history`)
+        ).json();
+        assert.equal(
+          recovered.events.filter(
+            (event: WorkspaceEvent) => event.kind === "user",
+          ).length,
+          1,
+        );
       } finally {
-        if (first.exitCode === null) first.kill("SIGTERM");
+        observer.close();
+        watchController.abort();
+        for (const child of terminals) stopProcessGroup(child);
+        proxy.closeAllConnections();
+        await new Promise<void>((resolve) => proxy.close(() => resolve()));
       }
     } finally {
       runner.kill("SIGTERM");

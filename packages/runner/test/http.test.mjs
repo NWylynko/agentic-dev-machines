@@ -588,6 +588,7 @@ test("workspace requests are authorized by lifecycle against the caller's projec
   );
   for (const [endpoint, method, body] of [
     ["resources", "GET"],
+    ["tools", "GET"],
     ["trust", "GET"],
     ["trust", "PUT", { trusted: true }],
     ["resources/reload", "POST", {}],

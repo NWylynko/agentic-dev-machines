@@ -137,6 +137,15 @@ test(
         await transport.connect();
         await runtime.initialize();
         const session = runtime.sessionProjection();
+        if (role === "coding") {
+          assert.ok(
+            session.getToolDefinitions().some((tool) => tool.name === "bash"),
+          );
+          assert.equal(
+            typeof session.getToolDefinition("bash")?.parameters,
+            "object",
+          );
+        } else assert.deepEqual(session.getToolDefinitions(), []);
         const jsonl = join(directory, `${role}.jsonl`);
         assert.equal(await session.exportToJsonl(jsonl), jsonl);
         const records = (await readFile(jsonl, "utf8"))
@@ -174,6 +183,9 @@ test(
             ),
           );
         } else {
+          assert.ok(
+            data.tools.some((tool: { name: string }) => tool.name === "bash"),
+          );
           assert.match(transcript, /CODING_TOOL_OUTPUT/);
           assert.match(transcript, /Coding export answer/);
         }

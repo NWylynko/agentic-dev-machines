@@ -82,6 +82,7 @@ type ActiveBashOperation = {
   excludeFromContext: boolean;
 };
 type TerminalOptions = {
+  autoModelSelector?: boolean;
   url: string;
   workspaceId: string;
   tokenFile?: string;
@@ -557,7 +558,9 @@ export class WorkspaceTerminal extends Container {
       signal,
     });
     if (!response.ok || !response.body)
-      throw new Error(`Runner returned HTTP ${response.status} for operation stream`);
+      throw new Error(
+        `Runner returned HTTP ${response.status} for operation stream`,
+      );
     if (!response.headers.get("content-type")?.includes("text/event-stream"))
       throw new Error("Runner returned a non-event-stream operation response");
     const reader = response.body.getReader();
@@ -750,8 +753,8 @@ export class WorkspaceTerminal extends Container {
       this.cacheWarming = workspace.cacheWarming;
       this.role = workspace.role;
       this.workspaceName = workspace.name;
-      if (typeof workspace.cwd === "string" && workspace.cwd.trim())
-        this.workingDirectory = workspace.cwd;
+      const cwd = workspace.cwd ?? workspace.localRoot;
+      if (typeof cwd === "string" && cwd.trim()) this.workingDirectory = cwd;
       const [catalog, settings] = await Promise.all([
         this.request("/models", undefined, controller.signal),
         this.request("/settings", undefined, controller.signal),
@@ -812,7 +815,8 @@ export class WorkspaceTerminal extends Container {
       this.connected = true;
       this.status = `Connected · ${workspaceStatus}`;
       this.refresh();
-      if (!catalog.selected) this.openModelSelector();
+      if (!catalog.selected && this.options.autoModelSelector !== false)
+        this.openModelSelector();
       void this.consume(response, controller);
     } catch (error) {
       if (!controller.signal.aborted) {

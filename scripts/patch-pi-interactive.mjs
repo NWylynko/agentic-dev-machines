@@ -88,6 +88,16 @@ await patch("dist/modes/interactive/interactive-mode.js", [
         }`,
   ],
   [
+    `handleCtrlC() {
+        const now = Date.now();`,
+    `handleCtrlC() {
+        if (this.runtimeHost.remotePorts?.isRemote) {
+            void this.shutdown();
+            return;
+        }
+        const now = Date.now();`,
+  ],
+  [
     `this.checkForPackageUpdates()
             .then((updates) => {`,
     `Promise.resolve(this.runtimeHost.remotePorts?.isRemote ? [] : this.checkForPackageUpdates())
@@ -129,16 +139,16 @@ await patch("dist/modes/interactive/interactive-mode.js", [
   ],
   [
     "this.restoreQueuedMessagesToEditor({ abort: true });",
-    'void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => this.showError(`Failed to restore queued messages: ${error instanceof Error ? error.message : String(error)}`));',
+    "void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => this.showError(`Failed to restore queued messages: ${error instanceof Error ? error.message : String(error)}`));",
     3,
   ],
   [
-    'this.restoreQueuedMessagesToEditor();\n                    await this.session.abort();',
-    'await this.restoreQueuedMessagesToEditor();\n                    await this.session.abort();',
+    "this.restoreQueuedMessagesToEditor();\n                    await this.session.abort();",
+    "await this.restoreQueuedMessagesToEditor();\n                    await this.session.abort();",
   ],
   [
-    'const restored = this.restoreQueuedMessagesToEditor();',
-    'const restored = await this.restoreQueuedMessagesToEditor();',
+    "const restored = this.restoreQueuedMessagesToEditor();",
+    "const restored = await this.restoreQueuedMessagesToEditor();",
   ],
   [
     'this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());',
@@ -156,7 +166,7 @@ await patch("dist/modes/interactive/interactive-mode.js", [
   ],
   [
     "this.session.clearQueue();\n            this.compactionQueuedMessages = queuedMessages;",
-    'void this.session.clearQueue().catch((clearError) => this.showError(`Failed to restore queue after compaction error: ${clearError instanceof Error ? clearError.message : String(clearError)}`));\n            this.compactionQueuedMessages = queuedMessages;',
+    "void this.session.clearQueue().catch((clearError) => this.showError(`Failed to restore queue after compaction error: ${clearError instanceof Error ? clearError.message : String(clearError)}`));\n            this.compactionQueuedMessages = queuedMessages;",
   ],
   [
     "function isEmbeddedStatus(editor) {",
@@ -206,6 +216,31 @@ function isEmbeddedStatus(editor) {`,
   [
     '    async showOAuthSelector(mode) {\n        if (mode === "login") {',
     '    async showOAuthSelector(mode) {\n        if (mode === "login" && this.runtimeHost.remotePorts?.authActions) {\n            this.ui.stop();\n            try {\n                await this.runtimeHost.remotePorts.authActions.login();\n                await this.updateAvailableProviderCount();\n                this.showStatus("Provider authentication updated");\n            }\n            catch (error) {\n                this.showError(`Provider login failed: ${error instanceof Error ? error.message : String(error)}`);\n            }\n            finally {\n                this.ui.start();\n            }\n            return;\n        }\n        if (mode === "login") {',
+  ],
+  [
+    `onAutoCompactChange: (enabled) => {\n                    this.session.setAutoCompactionEnabled(enabled);\n                    this.footer.setAutoCompactEnabled(enabled);\n                },`,
+    `onAutoCompactChange: (enabled) => {\n                    void Promise.resolve().then(() => this.session.setAutoCompactionEnabled(enabled)).then(() => {\n                        this.footer.setAutoCompactEnabled(enabled);\n                        this.showStatus("Auto-compaction updated");\n                    }).catch((error) => this.showError("Failed to update auto-compaction: " + (error instanceof Error ? error.message : String(error))));\n                },`,
+  ],
+  [
+    `onSteeringModeChange: (mode) => {\n                    this.session.setSteeringMode(mode);\n                },`,
+    `onSteeringModeChange: (mode) => {\n                    void Promise.resolve().then(() => this.session.setSteeringMode(mode)).then(() => this.showStatus("Steering mode updated")).catch((error) => this.showError("Failed to update steering mode: " + (error instanceof Error ? error.message : String(error))));\n                },`,
+  ],
+  [
+    `onFollowUpModeChange: (mode) => {\n                    this.session.setFollowUpMode(mode);\n                },`,
+    `onFollowUpModeChange: (mode) => {\n                    void Promise.resolve().then(() => this.session.setFollowUpMode(mode)).then(() => this.showStatus("Follow-up mode updated")).catch((error) => this.showError("Failed to update follow-up mode: " + (error instanceof Error ? error.message : String(error))));\n                },`,
+  ],
+  [
+    "onCacheWarmingModeChange: (mode) => {\n                    this.session.setCacheWarmingMode(mode);\n                    this.showStatus(`Cache warming: ${mode}`);\n                },",
+    `onCacheWarmingModeChange: (mode) => {\n                    void Promise.resolve().then(() => this.session.setCacheWarmingMode(mode)).then(() => this.showStatus("Cache warming updated")).catch((error) => this.showError("Failed to update cache warming: " + (error instanceof Error ? error.message : String(error))));\n                },`,
+  ],
+  ["handleNameCommand(text) {", "async handleNameCommand(text) {"],
+  [
+    "                this.handleNameCommand(text);",
+    "                await this.handleNameCommand(text);",
+  ],
+  [
+    `        this.session.setSessionName(name);\n        const sessionName = this.sessionManager.getSessionName();`,
+    `        await this.session.setSessionName(name);\n        const sessionName = this.sessionManager.getSessionName();`,
   ],
 ]);
 
@@ -302,7 +337,11 @@ await patch("dist/core/export-html/index.js", [
     "function generateHtml(sessionData, themeName) {",
     "export function renderSessionHtml(sessionData, themeName) {",
   ],
-  ["generateHtml(sessionData, opts.themeName)", "renderSessionHtml(sessionData, opts.themeName)", 2],
+  [
+    "generateHtml(sessionData, opts.themeName)",
+    "renderSessionHtml(sessionData, opts.themeName)",
+    2,
+  ],
 ]);
 await patch("dist/core/export-html/index.d.ts", [
   [
@@ -311,8 +350,15 @@ await patch("dist/core/export-html/index.d.ts", [
   ],
 ]);
 for (const path of ["dist/index.js", "dist/index.d.ts"]) {
-  const sourceMap = path.endsWith(".js") ? "//# sourceMappingURL=index.js.map" : "//# sourceMappingURL=index.d.ts.map";
-  await patch(path, [[sourceMap, `export { renderSessionHtml } from "./core/export-html/index.js";\n${sourceMap}`]]);
+  const sourceMap = path.endsWith(".js")
+    ? "//# sourceMappingURL=index.js.map"
+    : "//# sourceMappingURL=index.d.ts.map";
+  await patch(path, [
+    [
+      sourceMap,
+      `export { renderSessionHtml } from "./core/export-html/index.js";\n${sourceMap}`,
+    ],
+  ]);
 }
 
 for (const path of ["dist/index.js", "dist/index.d.ts"]) {
@@ -323,6 +369,34 @@ for (const path of ["dist/index.js", "dist/index.d.ts"]) {
     ],
   ]);
 }
+
+await patch("dist/modes/interactive/interactive-mode.js", [
+  ["await this.handleShareCommand();", "await this.handleShareCommand(text);"],
+  [
+    "        this.setupKeyHandlers();\n        this.setupEditorSubmitHandler();",
+    `        this.setupKeyHandlers();
+        if (this.runtimeHost.remotePorts?.reconnect) this.ui.addInputListener((data) => {
+            if (data !== "\\x12") return;
+            void this.runtimeHost.remotePorts.reconnect().then(() => this.showStatus("Workspace reconnected")).catch((error) => this.showError(String(error)));
+            return { consume: true };
+        });
+        this.setupEditorSubmitHandler();`,
+  ],
+  [
+    "    async handleShareCommand() {",
+    `    async handleShareCommand(text) {
+        if (this.runtimeHost.remotePorts?.isRemote) {
+            try {
+                const path = this.getPathCommandArgument(text ?? "/share", "/share");
+                const exported = path?.endsWith(".jsonl") ? await this.session.exportToJsonl(path) : await this.session.exportToHtml(path);
+                this.showStatus("Session exported locally: " + exported);
+            } catch (error) {
+                this.showError("Failed to export session: " + (error instanceof Error ? error.message : String(error)));
+            }
+            return;
+        }`,
+  ],
+]);
 
 console.log(
   `Patched pinned InteractiveMode remote trust port in ${packageRoot}`,

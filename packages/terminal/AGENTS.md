@@ -10,6 +10,6 @@ keep this file up to date
 - `/import PATH.jsonl` may read a bounded native transcript locally, but persistence and selection must happen atomically in the owning Pod's Durable conversation API. Reject unsupported records visibly; never create a client Pi session.
 - `/share PATH` is a user-requested local export. Public publication needs a separate explicit contract and confirmation.
 - `/bash` must delegate through the host CLI to the owning coding Pod; bots must remain unable to enter development shells.
-- Keep working toward the approved reproducible InteractiveMode remote-port patch. Component reuse and mapped commands do not establish full upstream parity.
+- The CLI uses pinned InteractiveMode through the reproducible remote-port patch. Keep its actual keyboard and PTY coverage; do not replace it with the legacy component layout. Advanced extension API limits remain explicit in the parity audit.
 - Keep `docs/pi-terminal-parity.md` accurate about mapped controls and missing workspace-owned contracts; unsupported settings must fail visibly.
 - Tests use the public Pi component and real local HTTP server, plus an isolated PTY process. They do not control an operator's Herdr session or call models.

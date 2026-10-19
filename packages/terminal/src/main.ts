@@ -56,6 +56,7 @@ async function runTerminal() {
   if (!process.stdin.isTTY || !process.stdout.isTTY)
     throw new Error("Attachment requires an interactive terminal");
   const terminal = new WorkspaceTerminal({
+    autoModelSelector: false,
     url,
     workspaceId,
     tokenFile,

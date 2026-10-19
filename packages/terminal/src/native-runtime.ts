@@ -24,6 +24,7 @@ import {
   type ExtensionUIContext,
   type ResolvedCommand,
   type ExtensionShortcut,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { KeyId } from "@earendil-works/pi-tui";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
@@ -149,10 +150,28 @@ function parseWorkspaceQueue(value: Partial<WorkspaceQueue>): WorkspaceQueue {
   return { steering: [...steering], followUp: [...followUp] };
 }
 const shortcutBases = new Set([
-  ..."abcdefghijklmnopqrstuvwxyz0123456789`-=[]\\;',./!@#$%^&*()_+|~{}:?<>".split(""),
-  "escape", "esc", "enter", "return", "tab", "space", "backspace",
-  "delete", "insert", "clear", "home", "end", "pageUp", "pageDown",
-  "up", "down", "left", "right", ...Array.from({ length: 12 }, (_, i) => `f${i + 1}`),
+  ..."abcdefghijklmnopqrstuvwxyz0123456789`-=[]\\;',./!@#$%^&*()_+|~{}:?<>".split(
+    "",
+  ),
+  "escape",
+  "esc",
+  "enter",
+  "return",
+  "tab",
+  "space",
+  "backspace",
+  "delete",
+  "insert",
+  "clear",
+  "home",
+  "end",
+  "pageUp",
+  "pageDown",
+  "up",
+  "down",
+  "left",
+  "right",
+  ...Array.from({ length: 12 }, (_, i) => `f${i + 1}`),
 ]);
 function isKeyId(value: string): value is KeyId {
   const parts = value.split("+");
@@ -160,10 +179,12 @@ function isKeyId(value: string): value is KeyId {
   const modifiers = parts;
   return Boolean(
     base &&
-      shortcutBases.has(base) &&
-      modifiers.length <= 3 &&
-      new Set(modifiers).size === modifiers.length &&
-      modifiers.every((modifier) => ["ctrl", "shift", "alt", "super"].includes(modifier)),
+    shortcutBases.has(base) &&
+    modifiers.length <= 3 &&
+    new Set(modifiers).size === modifiers.length &&
+    modifiers.every((modifier) =>
+      ["ctrl", "shift", "alt", "super"].includes(modifier),
+    ),
   );
 }
 function isQueueMode(value: string): value is "all" | "one-at-a-time" {
@@ -277,6 +298,9 @@ class DurableSessionManagerProjection {
   }
   getSessionFile(): undefined {
     return undefined;
+  }
+  isPersisted() {
+    return false;
   }
   getSessionDir() {
     return this.getCwd();
@@ -417,6 +441,7 @@ class DurableAgentProjection {
 
 /** A view of the Pod's current Durable conversation. It never creates a Pi AgentSession. */
 export class DurableInteractiveRuntime {
+  private toolDefinitions: ToolDefinition[] = [];
   readonly services = {
     agentDir: resolve(
       process.env.XDG_CONFIG_HOME ?? `${process.env.HOME ?? "."}/.config`,
@@ -427,6 +452,7 @@ export class DurableInteractiveRuntime {
   readonly session: ReturnType<DurableInteractiveRuntime["sessionProjection"]>;
   readonly remotePorts = {
     isRemote: true as const,
+    reconnect: async () => this.refreshSessionView(),
     supportsBash: false,
     projectTrust: {
       get: (_cwd: string): ProjectTrustDecision =>
@@ -633,11 +659,17 @@ export class DurableInteractiveRuntime {
       throw new Error(
         `Connect to the workspace before starting Pi InteractiveMode: ${this.current.status}`,
       );
-    const settingsRequest = this.transport.request<Partial<WorkspaceSettings>>("/settings");
-    const queueRequest = this.transport.request<Partial<WorkspaceQueue>>("/queue");
-    const extensionsRequest = this.current.role === "coding"
-      ? this.transport.request<RemoteExtensions>("/extensions")
-      : Promise.resolve<RemoteExtensions>({ extensions: [], diagnostics: [] });
+    const settingsRequest =
+      this.transport.request<Partial<WorkspaceSettings>>("/settings");
+    const queueRequest =
+      this.transport.request<Partial<WorkspaceQueue>>("/queue");
+    const extensionsRequest =
+      this.current.role === "coding"
+        ? this.transport.request<RemoteExtensions>("/extensions")
+        : Promise.resolve<RemoteExtensions>({
+            extensions: [],
+            diagnostics: [],
+          });
     const resourcesRequest =
       this.current.role === "bot"
         ? Promise.resolve<WorkspaceResourceSnapshot>({
@@ -659,6 +691,21 @@ export class DurableInteractiveRuntime {
       resourcesRequest,
     ]);
     this.resources = resources;
+    const tools =
+      this.current.role === "coding"
+        ? await this.transport.request<{
+            tools: Pick<
+              ToolDefinition,
+              "name" | "label" | "description" | "parameters"
+            >[];
+          }>("/tools")
+        : { tools: [] };
+    this.toolDefinitions = tools.tools.map((tool) => ({
+      ...tool,
+      execute: async () => {
+        throw new Error("Tools execute only inside the owning workspace");
+      },
+    }));
     this.settings = {
       ...this.settings,
       ...parseWorkspaceSettings(data),
@@ -671,7 +718,16 @@ export class DurableInteractiveRuntime {
 
   snapshot(): WorkspaceSnapshot & { catalog?: ModelCatalog } {
     this.current = this.transport.getRemoteSnapshot();
-    return { ...this.current, catalog: this.catalog };
+    return {
+      ...this.current,
+      catalog: this.catalog,
+      ...(this.catalog
+        ? {
+            models: this.catalog.models ?? this.current.models,
+            selectedModel: this.catalog.selected,
+          }
+        : {}),
+    };
   }
   settingsValue() {
     return this.settings;
@@ -680,7 +736,9 @@ export class DurableInteractiveRuntime {
     return this.settings.sessionName || undefined;
   }
   isBashRunning() {
-    return Boolean(this.activeBashOperationId || this.snapshot().activeBash.length);
+    return Boolean(
+      this.activeBashOperationId || this.snapshot().activeBash.length,
+    );
   }
   updateCatalog(catalog: ModelCatalog) {
     this.catalog = catalog;
@@ -688,6 +746,34 @@ export class DurableInteractiveRuntime {
   private configureExtensions(catalog: RemoteExtensions) {
     this.extensions = catalog;
     const commands: ResolvedCommand[] = [];
+    for (const name of [
+      "goal",
+      "loop",
+      "abort",
+      "retry",
+      "reconnect",
+      "status",
+    ]) {
+      commands.push({
+        name,
+        invocationName: name,
+        sourceInfo: {
+          path: "adm",
+          source: "adm",
+          scope: "user",
+          origin: "package",
+          baseDir: "adm",
+        },
+        handler: async (args) => {
+          if (name === "reconnect") await this.refreshSessionView();
+          else {
+            await this.transport.submit(`/${name}${args ? " " + args : ""}`);
+            this.current = this.transport.getRemoteSnapshot();
+          }
+          this.extensionUi?.notify(this.snapshot().status, "info");
+        },
+      });
+    }
     const shortcuts = new Map<string, ExtensionShortcut>();
     for (const extension of catalog.extensions) {
       if (!extension.active) continue;
@@ -709,11 +795,15 @@ export class DurableInteractiveRuntime {
       }
       for (const shortcut of extension.shortcuts) {
         if (!isKeyId(shortcut.key))
-          throw new Error(`Runner returned invalid extension shortcut key ${shortcut.key}`);
+          throw new Error(
+            `Runner returned invalid extension shortcut key ${shortcut.key}`,
+          );
         shortcuts.set(shortcut.key, {
           shortcut: shortcut.key,
           extensionPath: extension.path,
-          ...(shortcut.description ? { description: shortcut.description } : {}),
+          ...(shortcut.description
+            ? { description: shortcut.description }
+            : {}),
           handler: async () =>
             this.runExtensionOperation("shortcut", shortcut.name, ""),
         });
@@ -729,40 +819,54 @@ export class DurableInteractiveRuntime {
   ) {
     const ui = this.extensionUi;
     if (!ui)
-      throw new Error("Pi extension UI is not ready for this workspace command");
+      throw new Error(
+        "Pi extension UI is not ready for this workspace command",
+      );
     const requestId = randomUUID();
     const route =
       kind === "command" ? "/extensions/commands" : "/extensions/shortcuts";
     const admission = await this.transport.request<{ operationId: string }>(
       route,
-      kind === "command"
-        ? { name, args, requestId }
-        : { name, requestId },
+      kind === "command" ? { name, args, requestId } : { name, requestId },
     );
     let after = 0;
     for await (const event of this.transport.subscribeOperationEvents<ExtensionOperationEvent>(
       `/extensions/commands/${encodeURIComponent(admission.operationId)}/events?after=${after}`,
     )) {
       if (!Number.isSafeInteger(event.seq) || event.seq <= after)
-        throw new Error("Runner returned an invalid extension operation sequence");
+        throw new Error(
+          "Runner returned an invalid extension operation sequence",
+        );
       after = event.seq;
       if (event.type === "ui_request") {
         if (!event.requestId || !event.method)
           throw new Error("Runner returned an invalid extension UI request");
-        const options = event.timeout === undefined ? undefined : { timeout: event.timeout };
+        const options =
+          event.timeout === undefined ? undefined : { timeout: event.timeout };
         let result: string | boolean | null;
         if (event.method === "select")
           result =
-            (await ui.select(event.title ?? "Select", event.options ?? [], options)) ??
-            null;
+            (await ui.select(
+              event.title ?? "Select",
+              event.options ?? [],
+              options,
+            )) ?? null;
         else if (event.method === "confirm")
-          result = await ui.confirm(event.title ?? "Confirm", event.message ?? "", options);
+          result = await ui.confirm(
+            event.title ?? "Confirm",
+            event.message ?? "",
+            options,
+          );
         else if (event.method === "input")
           result =
-            (await ui.input(event.title ?? "Input", event.placeholder, options)) ??
-            null;
+            (await ui.input(
+              event.title ?? "Input",
+              event.placeholder,
+              options,
+            )) ?? null;
         else if (event.method === "editor")
-          result = (await ui.editor(event.title ?? "Edit", event.prefill)) ?? null;
+          result =
+            (await ui.editor(event.title ?? "Edit", event.prefill)) ?? null;
         else result = ui.getEditorText();
         await this.transport.request(
           `/extensions/commands/${encodeURIComponent(admission.operationId)}/ui`,
@@ -781,11 +885,16 @@ export class DurableInteractiveRuntime {
       } else if (event.type === "working_visible") {
         ui.setWorkingVisible(event.visible === true);
       } else if (event.type === "error") {
-        throw new Error(event.message ?? `Extension ${kind} failed (${event.code ?? "unknown"})`);
+        throw new Error(
+          event.message ??
+            `Extension ${kind} failed (${event.code ?? "unknown"})`,
+        );
       } else if (event.type === "result") {
         return;
       } else {
-        throw new Error(`Runner returned unsupported extension event ${event.type}`);
+        throw new Error(
+          `Runner returned unsupported extension event ${event.type}`,
+        );
       }
     }
     throw new Error("Extension operation stream ended before a result");
@@ -796,7 +905,7 @@ export class DurableInteractiveRuntime {
       systemPrompt: "",
       ...(model ? { model } : {}),
       thinkingLevel: this.settings.thinkingLevel,
-      tools: [],
+      tools: this.toolDefinitions,
       messages: this.session.messages,
       isStreaming: this.streaming,
       ...(this.snapshot().liveMessage
@@ -826,14 +935,12 @@ export class DurableInteractiveRuntime {
       },
       get scopedModels() {
         const available = modelRuntime.getAvailableSnapshot();
-        return runtime
-          .settingsValue()
-          .scopedModels.flatMap((id) => {
-            const model = available.find(
-              (candidate) => `${candidate.provider}/${candidate.id}` === id,
-            );
-            return model ? [{ model }] : [];
-          });
+        return runtime.settingsValue().scopedModels.flatMap((id) => {
+          const model = available.find(
+            (candidate) => `${candidate.provider}/${candidate.id}` === id,
+          );
+          return model ? [{ model }] : [];
+        });
       },
       get state() {
         return agent.state;
@@ -903,8 +1010,9 @@ export class DurableInteractiveRuntime {
       getUserMessagesForForking: () => runtime.userMessagesForForking(),
       getSteeringMessages: () => [...runtime.queue.steering],
       getFollowUpMessages: () => [...runtime.queue.followUp],
-      getToolDefinition: () => undefined,
-      getToolDefinitions: () => [],
+      getToolDefinition: (name: string) =>
+        runtime.toolDefinitions.find((tool) => tool.name === name),
+      getToolDefinitions: () => runtime.toolDefinitions,
       executeBash: (
         command: string,
         onChunk?: (chunk: string) => void,
@@ -925,7 +1033,16 @@ export class DurableInteractiveRuntime {
             name: runtime.sessionName(),
             entries: manager.getBranch(),
             ...(runtime.snapshot().role === "coding"
-              ? { systemPrompt: resources.getSystemPrompt() ?? "" }
+              ? {
+                  systemPrompt: resources.getSystemPrompt() ?? "",
+                  tools: runtime.toolDefinitions.map(
+                    ({ name, description, parameters }) => ({
+                      name,
+                      description,
+                      parameters,
+                    }),
+                  ),
+                }
               : {}),
           },
           outputPath,
@@ -963,7 +1080,9 @@ export class DurableInteractiveRuntime {
       },
       setScopedModels: (models: { model: SessionModel }[]) =>
         runtime.updateSettings({
-          scopedModels: models.map(({ model }) => `${model.provider}/${model.id}`),
+          scopedModels: models.map(
+            ({ model }) => `${model.provider}/${model.id}`,
+          ),
         }),
       setCacheWarmingMode: (mode: "off" | "streaming" | "idle") =>
         runtime.updateSettings({ cacheWarmingMode: mode }),
@@ -991,17 +1110,19 @@ export class DurableInteractiveRuntime {
         runtime.updateSettings({ steeringMode: mode }),
       setFollowUpMode: (mode: "all" | "one-at-a-time") =>
         runtime.updateSettings({ followUpMode: mode }),
-      setSessionName: (name: string) => runtime.updateSettings({ sessionName: name }),
+      setSessionName: (name: string) =>
+        runtime.updateSettings({ sessionName: name }),
       compact: (instructions?: string) => runtime.compact(instructions),
       reset: (handoff?: string) => runtime.reset(handoff),
       navigateTree: (entryId: string) => runtime.forkEntry(entryId),
       bindExtensions: async (options?: { uiContext?: ExtensionUIContext }) => {
         runtime.extensionUi = options?.uiContext;
       },
-      getAvailableTools: () => [],
-      getActiveToolNames: () => [],
-      getSteeringMode: () => "all",
-      getFollowUpMode: () => "all",
+      getAvailableTools: () => runtime.toolDefinitions,
+      getActiveToolNames: () =>
+        runtime.toolDefinitions.map((tool) => tool.name),
+      getSteeringMode: () => runtime.settings.steeringMode,
+      getFollowUpMode: () => runtime.settings.followUpMode,
     };
     return session;
   }
@@ -1127,7 +1248,11 @@ export class DurableInteractiveRuntime {
         (candidate) => candidate.invocationName === invocation,
       );
       if (command) {
-        await this.runExtensionOperation("command", command.name, rest.join(" "));
+        await this.runExtensionOperation(
+          "command",
+          command.name,
+          rest.join(" "),
+        );
         return;
       }
     }
@@ -1191,6 +1316,11 @@ export class DurableInteractiveRuntime {
       "PUT",
     );
     this.modelRuntime.select(result.selected.provider, result.selected.id);
+    this.updateCatalog({
+      ...this.catalog,
+      models: this.modelRuntime.getAvailableSnapshot(),
+      selected: result.selected,
+    });
   }
   private async cycleModel(direction: "forward" | "backward") {
     const models = this.modelRuntime.getAvailableSnapshot();
@@ -1211,7 +1341,9 @@ export class DurableInteractiveRuntime {
     return {
       model: next,
       thinkingLevel: this.settings.thinkingLevel,
-      isScoped: this.settings.scopedModels.includes(`${next.provider}/${next.id}`),
+      isScoped: this.settings.scopedModels.includes(
+        `${next.provider}/${next.id}`,
+      ),
     };
   }
   private async setThinkingLevel(level: ThinkingLevel) {
@@ -1472,6 +1604,7 @@ export class DurableInteractiveRuntime {
   }
   private async refreshSessionView() {
     await this.transport.connect();
+    await this.initialize();
     this.current = this.transport.getRemoteSnapshot();
     this.modelRuntime.refreshSnapshot();
     await this.rebindSession?.(this.session);

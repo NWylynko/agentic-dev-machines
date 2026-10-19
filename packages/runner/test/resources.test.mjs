@@ -325,6 +325,7 @@ test(
     );
     for (const [endpoint, method, data] of [
       ["resources", "GET"],
+      ["tools", "GET"],
       ["trust", "GET"],
       ["trust", "PUT", { trusted: true }],
       ["resources/reload", "POST", {}],

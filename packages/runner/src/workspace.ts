@@ -790,6 +790,25 @@ export class Workspace {
     };
   }
 
+  async toolMetadata() {
+    if (this.config.role !== "coding")
+      throw new ApiError(
+        403,
+        "CODING_RESOURCES_REQUIRED",
+        "Tool definitions are available only to the owning coding workspace",
+      );
+    const agent = await this.conversation.agent(context);
+    return {
+      tools: agent.tools.map((tool) => ({
+        name: tool.name,
+        label: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      })),
+      activeToolNames: agent.tools.map((tool) => tool.name),
+    };
+  }
+
   async changeModel(provider: string, modelId: string) {
     return this.withAdmission(async () => {
       const inspection = await this.harness.inspect(context);
