@@ -1180,7 +1180,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|resources\/reload|resources|trust))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|resources\/reload|resources|trust|extensions|extensions\/commands))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1511,16 +1511,47 @@ const server = createServer(async (request, response) => {
     if (
       action === "resources" ||
       action === "resources/reload" ||
-      action === "trust"
+      action === "trust" ||
+      action === "extensions" ||
+      action === "extensions/commands"
     ) {
       const resources =
         workspace.resources ??
         new WorkspaceResources(
           workspace.config,
           join(stateDirectory, "sessions", id),
+          () => assertActive(id, requestSignal),
         );
       if (request.method === "GET" && action === "resources")
         return json(response, 200, await resources.get());
+      if (request.method === "GET" && action === "extensions") {
+        const snapshot = await resources.get();
+        return json(response, 200, {
+          extensions: snapshot.extensions,
+          diagnostics: snapshot.diagnostics,
+        });
+      }
+      if (request.method === "POST" && action === "extensions/commands") {
+        const data = await body(request);
+        if (
+          typeof data.name !== "string" ||
+          !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(data.name) ||
+          (data.args !== undefined && typeof data.args !== "string")
+        )
+          throw new ApiError(
+            400,
+            "INVALID_EXTENSION_COMMAND",
+            "name and optional string args are required",
+          );
+        return json(
+          response,
+          200,
+          await workspace.extensionCommand(
+            data.name,
+            (data.args as string | undefined) ?? "",
+          ),
+        );
+      }
       if (request.method === "GET" && action === "trust")
         return json(response, 200, resources.trust());
       if (request.method === "PUT" && action === "trust") {
@@ -1533,21 +1564,20 @@ const server = createServer(async (request, response) => {
           );
         return await serialized(async () => {
           await assertActive(id, requestSignal);
-          return json(
-            response,
-            200,
-            Array.isArray(data.updates)
-              ? await resources.setTrustUpdates(
-                  data.updates as { path: string; decision: boolean | null }[],
-                )
-              : await resources.setTrust(data.trusted as boolean),
-          );
+          workspace.clearExtensionRegistry();
+          const snapshot = Array.isArray(data.updates)
+            ? await resources.setTrustUpdates(
+                data.updates as { path: string; decision: boolean | null }[],
+              )
+            : await resources.setTrust(data.trusted as boolean);
+          workspace.refreshExtensionRegistry();
+          return json(response, 200, snapshot);
         });
       }
       if (request.method === "POST" && action === "resources/reload")
         return await serialized(async () => {
           await assertActive(id, requestSignal);
-          return json(response, 200, await resources.reload());
+          return json(response, 200, await workspace.reloadResources());
         });
     }
     if (request.method === "GET" && action === "settings")

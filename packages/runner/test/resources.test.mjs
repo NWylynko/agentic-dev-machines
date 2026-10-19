@@ -50,6 +50,7 @@ async function startRunner(directory) {
     });
   });
   return {
+    url,
     async inspectPrompt(path) {
       const controller = new AbortController();
       const stream = await fetch(url + path + "/events", {
@@ -107,7 +108,7 @@ async function startRunner(directory) {
 }
 
 test(
-  "workspace resource discovery honors persistent project trust and reload without executing extensions",
+  "workspace resource discovery activates extensions only after persistent project trust",
   { timeout: 30000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-resources-"));
@@ -217,15 +218,10 @@ test(
     assert.ok(
       trusted.body.extensions.some(
         (extension) =>
-          extension.path.endsWith("unsafe.js") && extension.active === false,
+          extension.path.endsWith("unsafe.js") && extension.active === true,
       ),
     );
-    assert.ok(
-      trusted.body.diagnostics.some((diagnostic) =>
-        /not activated/.test(diagnostic.message),
-      ),
-    );
-    await assert.rejects(access(sentinel), { code: "ENOENT" });
+    assert.equal(await readFile(sentinel, "utf8"), "executed");
     await writeFile(
       join(project, ".pi/prompts/review.md"),
       "---\ndescription: Updated review\n---\nReview the updated changes.",
@@ -294,7 +290,7 @@ test(
       500,
       "failed reload cannot silently serve stale trusted resources",
     );
-    await assert.rejects(access(sentinel), { code: "ENOENT" });
+    assert.equal(await readFile(sentinel, "utf8"), "executed");
   },
 );
 
@@ -325,6 +321,8 @@ test(
       ["trust", "GET"],
       ["trust", "PUT", { trusted: true }],
       ["resources/reload", "POST", {}],
+      ["extensions", "GET"],
+      ["extensions/commands", "POST", { name: "example", args: "" }],
     ]) {
       const response = await runner.request(
         path + "/" + endpoint,
@@ -334,5 +332,156 @@ test(
       assert.equal(response.status, 403);
       assert.equal(response.body.error.code, "CODING_RESOURCES_REQUIRED");
     }
+  },
+);
+
+test(
+  "trusted Pi extensions register Durable tools and callable commands while untrusted code stays inert",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-extension-bridge-"));
+    const project = join(directory, "project");
+    await mkdir(join(project, ".pi/extensions"), { recursive: true });
+    const sentinel = join(directory, "evaluated");
+    await writeFile(
+      join(project, ".pi/extensions/fixture.js"),
+      `import { appendFileSync } from "node:fs";
+import { Type } from "typebox";
+appendFileSync(${JSON.stringify(sentinel)}, "loaded\\n");
+export default (pi) => {
+  pi.on("session_start", async () => {});
+  pi.registerTool({
+    name: "extension_echo",
+    label: "Extension Echo",
+    description: "Echo through a trusted workspace extension.",
+    parameters: Type.Object({ text: Type.String() }),
+    async execute(_id, { text }) { return { content: [{ type: "text", text: "extension:" + text }] }; },
+  });
+  pi.registerCommand("extension-hello", {
+    description: "Say hello from the workspace extension.",
+    handler: async (args, ctx) => ctx.ui.notify("hello " + args, "info"),
+  });
+  pi.registerCommand("extension-dialog", {
+    description: "Request a selector unsupported by this bridge slice.",
+    handler: async (_args, ctx) => ctx.ui.select("Pick", ["one"]),
+  });
+};`,
+    );
+    let runner = await startRunner(directory);
+    t.after(async () => {
+      await runner?.stop();
+      await rm(directory, { recursive: true });
+    });
+    const path = "/v1/workspaces/extensions-demo";
+    assert.equal(
+      (
+        await runner.request(path, "PUT", {
+          id: "extensions-demo",
+          name: "extensions",
+          role: "coding",
+          environment: "local",
+          localRoot: project,
+          model: { provider: "faux", id: "faux-1" },
+        })
+      ).status,
+      200,
+    );
+    assert.equal((await runner.request(path + "/extensions")).status, 200);
+    assert.equal(await readFile(sentinel, "utf8").catch(() => ""), "");
+    assert.equal(
+      (await runner.request(path + "/trust", "PUT", { trusted: true })).status,
+      200,
+    );
+    assert.equal((await readFile(sentinel, "utf8")).trim(), "loaded");
+
+    const discovered = await runner.request(path + "/extensions");
+    assert.equal(discovered.status, 200);
+    assert.ok(
+      discovered.body.extensions.some((extension) =>
+        extension.tools.some((tool) => tool.name === "extension_echo"),
+      ),
+    );
+    assert.ok(
+      discovered.body.extensions.some((extension) =>
+        extension.commands.some(
+          (command) => command.name === "extension-hello",
+        ),
+      ),
+    );
+    assert.ok(
+      discovered.body.diagnostics.some((diagnostic) =>
+        /unsupported capabilities: lifecycle hooks/.test(diagnostic.message),
+      ),
+    );
+    const command = await runner.request(
+      path + "/extensions/commands",
+      "POST",
+      { name: "extension-hello", args: "Nick" },
+    );
+    assert.equal(command.status, 200);
+    assert.deepEqual(command.body, {
+      command: "extension-hello",
+      notifications: [{ message: "hello Nick", type: "info" }],
+    });
+    const unsupportedDialog = await runner.request(
+      path + "/extensions/commands",
+      "POST",
+      { name: "extension-dialog", args: "" },
+    );
+    assert.equal(unsupportedDialog.status, 500);
+    assert.match(
+      unsupportedDialog.body.error.message,
+      /not supported by the Durable bridge/,
+    );
+
+    const eventsAbort = new AbortController();
+    const eventResponse = await fetch(new URL(path + "/events", runner.url), {
+      signal: AbortSignal.any([eventsAbort.signal, AbortSignal.timeout(10000)]),
+    });
+    const eventReader = eventResponse.body.getReader();
+    try {
+      const input = await runner.request(path + "/input", "POST", {
+        requestId: "trusted-extension-tool",
+        message:
+          "/faux " +
+          JSON.stringify({
+            calls: [{ tool: "extension_echo", args: { text: "durable" } }],
+            answer: "Extension tool completed.",
+          }),
+      });
+      assert.equal(input.status, 202);
+      let buffer = "";
+      const decoder = new TextDecoder();
+      let toolResult;
+      while (!toolResult) {
+        const chunk = await eventReader.read();
+        assert.equal(chunk.done, false);
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let newline;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, newline).trimEnd();
+          buffer = buffer.slice(newline + 1);
+          if (!line.startsWith("data: ")) continue;
+          const event = JSON.parse(line.slice(6));
+          if (event.kind === "tool" && event.data.name === "extension_echo") {
+            toolResult = event.data;
+            break;
+          }
+        }
+      }
+      assert.match(toolResult.text, /extension:durable/);
+    } finally {
+      eventsAbort.abort();
+      await eventReader.cancel().catch(() => {});
+    }
+    await runner.stop();
+    runner = await startRunner(directory);
+    const afterRestart = await runner.request(path + "/extensions");
+    assert.equal(afterRestart.status, 200);
+    assert.ok(
+      afterRestart.body.extensions.some((extension) =>
+        extension.commands.some((item) => item.name === "extension-hello"),
+      ),
+    );
   },
 );

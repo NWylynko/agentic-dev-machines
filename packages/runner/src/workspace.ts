@@ -24,6 +24,10 @@ import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { WorkspaceResources } from "./resources.ts";
 import {
+  createDurableExtensionBridge,
+  executePiCommand,
+} from "./extensions.ts";
+import {
   workspaceModels,
   type LifecycleAuthorityAvailability,
 } from "./models.ts";
@@ -152,6 +156,7 @@ export class Workspace {
   private admissions = Promise.resolve();
   private models: Models;
   private behaviorSettings: WorkspaceBehaviorSettings;
+  private registry: ReturnType<typeof createRegistry>;
   private readonly assertActive: (signal?: AbortSignal) => Promise<void>;
   private readonly loopTask: ReturnType<
     typeof createScheduleExtension
@@ -165,6 +170,7 @@ export class Workspace {
     conversation: Workspace["conversation"],
     models: Models,
     behaviorSettings: WorkspaceBehaviorSettings,
+    registry: ReturnType<typeof createRegistry>,
     assertActive: (signal?: AbortSignal) => Promise<void>,
     loopTask: Workspace["loopTask"],
     mcpClose?: () => Promise<void>,
@@ -174,6 +180,7 @@ export class Workspace {
     this.conversation = conversation;
     this.models = models;
     this.behaviorSettings = behaviorSettings;
+    this.registry = registry;
     this.assertActive = assertActive;
     this.loopTask = loopTask;
     this.mcpClose = mcpClose;
@@ -196,7 +203,10 @@ export class Workspace {
     if (!passive) await assertActive();
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
-    const behaviorSettings = await WorkspaceBehaviorSettings.open(directory);
+    const behaviorSettings = await WorkspaceBehaviorSettings.open(
+      directory,
+      () => assertActive(),
+    );
     let openedWorkspace: Workspace | undefined;
     let reportedError: string | undefined;
     let mcpError: string | undefined;
@@ -269,8 +279,14 @@ export class Workspace {
       }
       const resources =
         config.role === "coding" && config.environment !== "kubernetes"
-          ? new WorkspaceResources(config, directory)
+          ? new WorkspaceResources(config, directory, () => assertActive())
           : undefined;
+      if (resources) {
+        await resources.reload();
+        registry.install(
+          createDurableExtensionBridge(resources.extensions(), assertActive),
+        );
+      }
       registry.install(
         defineExtension({
           name: "workspace-lifecycle",
@@ -381,6 +397,7 @@ export class Workspace {
         activeConversation,
         models,
         behaviorSettings,
+        registry,
         assertActive,
         schedule.loopTask,
         mcp?.close,
@@ -1026,6 +1043,60 @@ export class Workspace {
       ...this.behaviorSettings.current,
       ...(name ? { sessionName: name } : {}),
     };
+  }
+
+  async reloadResources() {
+    if (!this.resources)
+      throw new ApiError(
+        403,
+        "CODING_RESOURCES_REQUIRED",
+        "Extensions are available only in coding workspaces",
+      );
+    this.clearExtensionRegistry();
+    const snapshot = await this.resources.reload();
+    this.refreshExtensionRegistry();
+    return snapshot;
+  }
+
+  clearExtensionRegistry() {
+    this.registry.install(
+      createDurableExtensionBridge([], this.assertActive),
+    );
+  }
+
+  refreshExtensionRegistry() {
+    if (!this.resources) return;
+    this.registry.install(
+      createDurableExtensionBridge(
+        this.resources.extensions(),
+        this.assertActive,
+      ),
+    );
+  }
+
+  async extensionCommand(name: string, args: string) {
+    if (!this.resources || this.config.role !== "coding")
+      throw new ApiError(
+        403,
+        "CODING_RESOURCES_REQUIRED",
+        "Extensions are available only in coding workspaces",
+      );
+    return this.withAdmission(async () => {
+      const result = await executePiCommand(
+        this.resources!.extensions(),
+        name,
+        args,
+        this.config.cwd ?? this.config.localRoot!,
+        () => this.assertActive(),
+      );
+      if (!result)
+        throw new ApiError(
+          404,
+          "EXTENSION_COMMAND_NOT_FOUND",
+          `Unknown Pi extension command: ${name}`,
+        );
+      return result;
+    });
   }
 
   async changeSettings(value: unknown) {

@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readFile, rename } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { HarnessSettings, QueueMode } from "@earendil-works/pi-durable";
 import { ApiError } from "./types.ts";
@@ -85,13 +85,16 @@ export class WorkspaceBehaviorSettings {
   private value: WorkspaceBehaviorSettingsValue;
   readonly harness: HarnessSettings;
   private readonly path: string;
+  private readonly assertActive: () => Promise<void>;
 
   private constructor(
     directory: string,
     value: WorkspaceBehaviorSettingsValue,
+    assertActive: () => Promise<void>,
   ) {
     this.path = join(directory, "adm-settings.json");
     this.value = value;
+    this.assertActive = assertActive;
     const current = this;
     this.harness = {
       get steeringMode() {
@@ -106,7 +109,7 @@ export class WorkspaceBehaviorSettings {
     };
   }
 
-  static async open(directory: string) {
+  static async open(directory: string, assertActive: () => Promise<void>) {
     const path = join(directory, "adm-settings.json");
     let value = defaultWorkspaceBehaviorSettings;
     try {
@@ -115,7 +118,7 @@ export class WorkspaceBehaviorSettings {
     } catch (error) {
       if (!isMissing(error)) throw error;
     }
-    return new WorkspaceBehaviorSettings(directory, value);
+    return new WorkspaceBehaviorSettings(directory, value, assertActive);
   }
 
   get current() {
@@ -141,7 +144,7 @@ export class WorkspaceBehaviorSettings {
         ? {}
         : { autoCompact: patch.autoCompact }),
     };
-    await writePrivateJson(this.path, next);
+    await writePrivateJson(this.path, next, this.assertActive);
     this.value = next;
     return this.current;
   }
@@ -167,7 +170,11 @@ function validateSavedSettings(value: unknown): WorkspaceBehaviorSettingsValue {
   return value as WorkspaceBehaviorSettingsValue;
 }
 
-async function writePrivateJson(path: string, value: unknown) {
+async function writePrivateJson(
+  path: string,
+  value: unknown,
+  assertActive: () => Promise<void>,
+) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   await chmod(dirname(path), 0o700);
   const temporary = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -178,7 +185,13 @@ async function writePrivateJson(path: string, value: unknown) {
   } finally {
     await file.close();
   }
-  await rename(temporary, path);
+  try {
+    await assertActive();
+    await rename(temporary, path);
+  } catch (error) {
+    await unlink(temporary).catch(() => {});
+    throw error;
+  }
   const directory = await open(dirname(path), "r");
   try {
     await directory.sync();

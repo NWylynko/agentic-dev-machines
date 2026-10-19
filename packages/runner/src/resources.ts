@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { ApiError, type WorkspaceConfig } from "./types.ts";
 import type { Message } from "@earendil-works/pi-ai";
+import type { LoadedPiExtension } from "./extensions.ts";
 
 export type WorkspaceResourceSnapshot = {
   cwd: string;
@@ -26,7 +27,18 @@ export type WorkspaceResourceSnapshot = {
   prompts: PromptTemplate[];
   skills: (Skill & { content: string })[];
   agentsFiles: { path: string; content: string }[];
-  extensions: { name: string; path: string; active: false }[];
+  extensions: {
+    name: string;
+    path: string;
+    active: boolean;
+    tools: {
+      name: string;
+      label: string;
+      description: string;
+      parameters: unknown;
+    }[];
+    commands: { name: string; description?: string }[];
+  }[];
   diagnostics: { type: string; message: string; path?: string }[];
   systemPrompt?: string;
   systemPromptSource?: { path: string };
@@ -34,13 +46,19 @@ export type WorkspaceResourceSnapshot = {
   appendSystemPromptSources: { path: string }[];
 };
 
-/** Discovers files in the owning workspace; it never creates an agent/session or activates extension code. */
+/** Discovers workspace resources and loads extension code only under persisted project trust. */
 export class WorkspaceResources {
   private snapshot?: WorkspaceResourceSnapshot;
+  private loadedExtensions: LoadedPiExtension[] = [];
   private readonly cwd: string;
   private readonly agentDir: string;
+  private readonly assertActive: () => Promise<void>;
 
-  constructor(config: WorkspaceConfig, sessionDirectory: string) {
+  constructor(
+    config: WorkspaceConfig,
+    sessionDirectory: string,
+    assertActive: () => Promise<void> = async () => {},
+  ) {
     if (config.role !== "coding")
       throw new ApiError(
         403,
@@ -55,6 +73,7 @@ export class WorkspaceResources {
       );
     this.cwd = config.cwd ?? config.localRoot!;
     this.agentDir = join(sessionDirectory, "pi");
+    this.assertActive = assertActive;
   }
 
   trust(): WorkspaceResourceSnapshot["trust"] {
@@ -69,6 +88,10 @@ export class WorkspaceResources {
 
   async get() {
     return this.snapshot ?? this.reload();
+  }
+
+  extensions() {
+    return this.loadedExtensions;
   }
 
   async requestMessages(
@@ -134,6 +157,7 @@ export class WorkspaceResources {
         "Trust updates must select this workspace cwd or its ancestors with boolean or null decisions",
       );
     await this.prepare();
+    await this.assertActive();
     new ProjectTrustStore(this.agentDir).setMany(updates);
     await chmod(join(this.agentDir, "trust.json"), 0o600);
     return this.reload();
@@ -158,23 +182,47 @@ export class WorkspaceResources {
     });
     // Discovery must not install a missing configured package as a side effect of reading a screen.
     const resolved = await packages.resolve(async () => "error");
+    await this.assertActive();
     const loader = new DefaultResourceLoader({
       cwd: this.cwd,
       agentDir: this.agentDir,
       settingsManager,
-      noExtensions: true,
+      noExtensions: !trust.trusted,
     });
     await loader.reload();
     const skills = loader.getSkills();
     const prompts = loader.getPrompts();
     const themes = loader.getThemes();
-    const extensions = resolved.extensions
-      .filter((extension) => extension.enabled)
-      .map((extension) => ({
-        name: basename(extension.path),
-        path: extension.path,
-        active: false as const,
-      }));
+    const loaded = trust.trusted ? loader.getExtensions() : undefined;
+    this.loadedExtensions =
+      (loaded?.extensions as unknown as LoadedPiExtension[] | undefined) ?? [];
+    const extensions = loaded
+      ? loaded.extensions.map((extension) => ({
+          name: basename(extension.path),
+          path: extension.path,
+          active: true,
+          tools: [...extension.tools.values()].map(({ definition: tool }) => ({
+            name: tool.name,
+            label: tool.label,
+            description: tool.description,
+            parameters: tool.parameters,
+          })),
+          commands: [...extension.commands.values()].map((command) => ({
+            name: command.name,
+            ...(command.description
+              ? { description: command.description }
+              : {}),
+          })),
+        }))
+      : resolved.extensions
+          .filter((extension) => extension.enabled)
+          .map((extension) => ({
+            name: basename(extension.path),
+            path: extension.path,
+            active: false,
+            tools: [],
+            commands: [],
+          }));
     const diagnostics = [
       ...skills.diagnostics,
       ...prompts.diagnostics,
@@ -186,12 +234,37 @@ export class WorkspaceResources {
         message: error.error.message,
         path: error.path,
       });
-    if (extensions.length)
+    for (const error of loaded?.errors ?? [])
+      diagnostics.push({
+        type: "error",
+        message: error.error,
+        path: error.path,
+      });
+    if (extensions.some((extension) => !extension.active))
       diagnostics.push({
         type: "warning",
         message:
-          "Discovered extensions are not activated in Durable; extension execution requires the workspace extension bridge.",
+          "Workspace extensions are inactive until this project is trusted.",
       });
+    if (loaded?.warnings)
+      for (const warning of loaded.warnings)
+        diagnostics.push({
+          type: "warning",
+          message: warning.warning,
+          path: warning.path,
+        });
+    for (const extension of loaded?.extensions ?? []) {
+      const unsupported: string[] = [];
+      if (extension.handlers.size) unsupported.push("lifecycle hooks");
+      if (extension.shortcuts.size) unsupported.push("keyboard shortcuts");
+      if (extension.flags.size) unsupported.push("CLI flags");
+      if (unsupported.length)
+        diagnostics.push({
+          type: "warning",
+          message: `Extension ${basename(extension.path)} registered unsupported capabilities: ${unsupported.join(", ")}. Durable activation supports its tools and commands only.`,
+          path: extension.path,
+        });
+    }
     const snapshot: WorkspaceResourceSnapshot = {
       cwd: this.cwd,
       trust,
