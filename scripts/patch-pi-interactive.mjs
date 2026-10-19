@@ -25,9 +25,10 @@ async function patch(relativePath, replacements) {
   for (const [before, after, expected = 1] of replacements) {
     const count = source.split(before).length - 1;
     if (source.includes(after)) continue;
-    if (count !== expected)
+    if (expected === 0 && count === 0) continue;
+    if (count !== (expected === 0 ? 1 : expected))
       throw new Error(
-        `Expected ${expected} pinned Pi patch points in ${relativePath}, found ${count}: ${before.slice(0, 90)}`,
+        `Expected ${expected === 0 ? "at most one" : expected} pinned Pi patch points in ${relativePath}, found ${count}: ${before.slice(0, 90)}`,
       );
     source = source.replaceAll(before, after);
   }
@@ -46,17 +47,13 @@ await patch("dist/modes/interactive/interactive-mode.js", [
         ]);`,
   ],
   [
-    'rawKeyHint("!", "to run bash"),',
-    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "to run bash")]),',
-  ],
-  [
     '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!", "to run bash")]),',
     '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "to run bash")]),',
     0,
   ],
   [
-    'rawKeyHint("!!", "to run bash (no context)"),',
-    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
+    'rawKeyHint("!", "to run bash"),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "to run bash")]),',
   ],
   [
     '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
@@ -64,13 +61,17 @@ await patch("dist/modes/interactive/interactive-mode.js", [
     0,
   ],
   [
-    'rawKeyHint("!", "bash"),',
-    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "bash")]),',
+    'rawKeyHint("!!", "to run bash (no context)"),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
   ],
   [
     '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!", "bash")]),',
     '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "bash")]),',
     0,
+  ],
+  [
+    'rawKeyHint("!", "bash"),',
+    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "bash")]),',
   ],
   [
     `checkForNewPiVersion(this.version).then((newRelease) => {
@@ -109,6 +110,7 @@ await patch("dist/modes/interactive/interactive-mode.js", [
   [
     "if (!this.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(cwd)) {",
     "if (!this.settingsManager.isProjectTrusted() || !(await (this.runtimeHost.remotePorts?.projectTrust?.hasTrustRequiringResources(cwd) ?? hasTrustRequiringProjectResources(cwd)))) {",
+    0,
   ],
   ["trustStore.set(cwd, true);", "await trustStore.set(cwd, true);"],
   [
@@ -118,6 +120,7 @@ await patch("dist/modes/interactive/interactive-mode.js", [
   [
     "if (this.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(this.sessionManager.getCwd())) {",
     "if (this.settingsManager.isProjectTrusted() || !(this.runtimeHost.remotePorts?.projectTrust ? this.runtimeHost.remotePorts.projectTrust.hasTrustRequiringResources(this.sessionManager.getCwd()) : hasTrustRequiringProjectResources(this.sessionManager.getCwd()))) {",
+    0,
   ],
   [
     "this.settingsManager.isProjectTrusted()",
@@ -141,10 +144,7 @@ await patch("dist/modes/interactive/interactive-mode.js", [
     'this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());',
     'this.defaultEditor.onAction("app.message.dequeue", () => { void this.handleDequeue(); });',
   ],
-  [
-    'handleDequeue() {\n        const restored = this.restoreQueuedMessagesToEditor();',
-    'async handleDequeue() {\n        const restored = await this.restoreQueuedMessagesToEditor();',
-  ],
+  ["handleDequeue() {", "async handleDequeue() {"],
   ["clearAllQueues() {", "async clearAllQueues() {"],
   [
     "const { steering, followUp } = this.session.clearQueue();",
