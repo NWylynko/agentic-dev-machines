@@ -396,6 +396,7 @@ function runtimeAction(method: string, pathname: string): string {
   if (endpoint === "resume" || endpoint === "retry") return "resume";
   if (endpoint === "goals") return "goal";
   if (endpoint === "loops") return "loop";
+  if (endpoint === "queue/clear") return "prompt";
   return "read";
 }
 async function authorizeRuntimeRequest(
@@ -1179,7 +1180,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|resources\/reload|resources|trust))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|resources\/reload|resources|trust))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1551,6 +1552,15 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && action === "settings")
       return json(response, 200, await workspace.settings());
+    if (request.method === "GET" && action === "queue")
+      return json(response, 200, await workspace.inputQueue());
+    if (request.method === "POST" && action === "queue/clear") {
+      await body(request);
+      return await serialized(async () => {
+        await assertActive(id, requestSignal);
+        return json(response, 200, await workspace.clearInputQueue());
+      });
+    }
     if (request.method === "PUT" && action === "settings") {
       const data = await body(request);
       return await serialized(async () => {

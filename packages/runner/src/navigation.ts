@@ -15,6 +15,7 @@ type Branch = {
   parentConversationId?: number;
   forkEntryId?: number;
   createdAt: number;
+  name?: string;
 };
 
 type WorkspaceNavigation = {
@@ -53,6 +54,22 @@ export async function workspaceBranches(harness: Harness) {
       branches: [],
     }
   );
+}
+
+export async function nameWorkspaceConversation(
+  harness: Harness,
+  name: string,
+) {
+  await harness.commit(async (tx) => {
+    const navigation = await tx.doc(navigationDocument);
+    const branch = navigation.branches.find(
+      (item) => item.conversationId === navigation.activeConversationId,
+    );
+    if (!branch)
+      throw new Error("Active Durable conversation has no navigation record");
+    if (name) branch.name = name;
+    else delete branch.name;
+  }, context);
 }
 
 function messageText(content: unknown): string {
@@ -122,6 +139,7 @@ async function branchSessionInfo(
     path: id,
     id,
     cwd: workspace.cwd,
+    ...(branch.name ? { name: branch.name } : {}),
     created: new Date(branch.createdAt).toISOString(),
     modified: new Date(modified).toISOString(),
     messageCount,
@@ -233,7 +251,9 @@ export async function createWorkspaceImportedTree(
   if (!selected) throw new Error("Imported selected branch is missing");
   const state = await workspaceBranches(harness);
   if (state.activeConversationId !== parentConversationId)
-    throw new Error("Workspace conversation changed; retry importing the session");
+    throw new Error(
+      "Workspace conversation changed; retry importing the session",
+    );
   const selectedDurableIds = new Map<string, EntryId>();
   const appendEntry = async (
     tx: Parameters<Parameters<Harness["commit"]>[0]>[0],
@@ -288,9 +308,14 @@ export async function createWorkspaceImportedTree(
         )
           shared++;
         if (shared === 0)
-          throw new Error("Imported native branches have no shared history root");
-        const forkEntryId = selectedDurableIds.get(selected.entries[shared - 1].id);
-        if (!forkEntryId) throw new Error("Imported branch point was not persisted");
+          throw new Error(
+            "Imported native branches have no shared history root",
+          );
+        const forkEntryId = selectedDurableIds.get(
+          selected.entries[shared - 1].id,
+        );
+        if (!forkEntryId)
+          throw new Error("Imported branch point was not persisted");
         const child = await tx.forkConversation(root.id, forkEntryId, {
           ownership: { kind: "ownerless" },
         });
@@ -305,7 +330,9 @@ export async function createWorkspaceImportedTree(
       }
       const navigation = await tx.doc(navigationDocument);
       if (navigation.activeConversationId !== parentConversationId)
-        throw new Error("Workspace conversation changed; retry importing the session");
+        throw new Error(
+          "Workspace conversation changed; retry importing the session",
+        );
       navigation.branches.push(...importedBranches);
       navigation.activeConversationId = Number(root.id);
     }, context);

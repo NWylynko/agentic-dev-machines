@@ -1662,6 +1662,170 @@ test("model catalog and selection operate on the existing durable conversation",
   );
 });
 
+test(
+  "session names belong to Durable branches and survive restart",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-session-names-"));
+    let runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const path = "/v1/workspaces/named-coder";
+    await runner.request(path, "PUT", {
+      id: "named-coder",
+      name: "coder",
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, "repo"),
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const original = (await runner.request(path + "/branches")).body
+      .activeConversationId;
+    const named = await runner.request(path + "/settings", "PUT", {
+      sessionName: "Investigate streaming",
+    });
+    assert.equal(named.status, 200);
+    assert.equal(named.body.sessionName, "Investigate streaming");
+    assert.equal((await runner.request(path + "/new", "POST", {})).status, 200);
+    assert.equal(
+      (await runner.request(path + "/settings")).body.sessionName,
+      undefined,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/settings", "PUT", {
+          sessionName: "Second conversation",
+        })
+      ).status,
+      200,
+    );
+    const branches = (await runner.request(path + "/branches")).body.branches;
+    assert.deepEqual(
+      branches.map((branch) => branch.sessionInfo.name),
+      ["Investigate streaming", "Second conversation"],
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/branch", "PUT", {
+          conversationId: original,
+        })
+      ).status,
+      200,
+    );
+    await runner.stop("SIGKILL");
+    runner = await startRunner(directory);
+    assert.equal(
+      (await runner.request(path + "/settings")).body.sessionName,
+      "Investigate streaming",
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/settings", "PUT", {
+          sessionName: "x".repeat(201),
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (await runner.request(path + "/settings", "PUT", { sessionName: "" }))
+        .status,
+      200,
+    );
+    assert.equal(
+      (await runner.request(path + "/settings")).body.sessionName,
+      undefined,
+    );
+  },
+);
+
+test(
+  "clearing queued input preserves the active tool and committed history",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-clear-queue-"));
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const path = "/v1/workspaces/queue-coder";
+    const fifo = join(directory, "release");
+    const marker = join(directory, "tool-started");
+    const made = spawn("mkfifo", [fifo]);
+    assert.equal((await once(made, "exit"))[0], 0);
+    await runner.request(path, "PUT", {
+      id: "queue-coder",
+      name: "queue",
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, "repo"),
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const changes = watch(directory);
+    const started = (async () => {
+      for await (const event of changes) {
+        if (event.filename === "tool-started") return;
+      }
+    })();
+    t.after(() => changes.return());
+    await runner.request(path + "/input", "POST", {
+      requestId: "held-current",
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [
+            { tool: "bash", args: { command: `touch ${marker}; cat ${fifo}` } },
+          ],
+          answer: "Active turn completed.",
+        }),
+    });
+    await started;
+    for (const [whenBusy, message] of [
+      ["steer", "Queued steering"],
+      ["followUp", "Queued follow-up"],
+    ]) {
+      assert.equal(
+        (
+          await runner.request(path + "/input", "POST", {
+            requestId: whenBusy,
+            message,
+            whenBusy,
+          })
+        ).status,
+        202,
+      );
+    }
+    const expected = {
+      steering: ["Queued steering"],
+      followUp: ["Queued follow-up"],
+    };
+    assert.deepEqual((await runner.request(path + "/queue")).body, expected);
+    const cleared = await runner.request(path + "/queue/clear", "POST", {});
+    assert.equal(cleared.status, 200);
+    assert.deepEqual(cleared.body, { cleared: 2, ...expected });
+    assert.deepEqual((await runner.request(path + "/queue")).body, {
+      steering: [],
+      followUp: [],
+    });
+    await writeFile(fifo, "continue\n");
+    await nextEvent(
+      runner,
+      "queue-coder",
+      (event) =>
+        event.kind === "assistant" &&
+        event.data.text === "Active turn completed.",
+    );
+    const history = (await runner.request(path + "/history")).body.events;
+    assert.equal(history.filter((event) => event.kind === "user").length, 1);
+    assert.ok(
+      history.some(
+        (event) =>
+          event.kind === "tool" && event.data.text.includes("continue"),
+      ),
+    );
+    assert.equal(
+      (await runner.request(path + "/queue/clear", "POST", {})).body.cleared,
+      0,
+    );
+  },
+);
+
 test("workspace behavior settings update through HTTP and persist across runner restart", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "adm-runner-settings-"));
   const id = "settings-coder";

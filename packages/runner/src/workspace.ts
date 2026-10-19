@@ -33,10 +33,12 @@ import {
   createWorkspaceImportedTree,
   forkWorkspaceBranch,
   initializeNavigation,
+  nameWorkspaceConversation,
   selectWorkspaceBranch,
   workspaceBranchList,
   workspaceBranches,
 } from "./navigation.ts";
+import { clearWorkspaceInputQueue, workspaceInputQueue } from "./queue.ts";
 import type { Message } from "@earendil-works/pi-ai";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { BotProfileDocument, botExtension } from "./bot.ts";
@@ -1015,9 +1017,14 @@ export class Workspace {
 
   async settings() {
     const agent = await this.conversation.agent(context);
+    const navigation = await workspaceBranches(this.harness);
+    const name = navigation.branches.find(
+      (branch) => branch.conversationId === Number(this.conversation.id),
+    )?.name;
     return {
       thinkingLevel: agent.thinkingLevel,
       ...this.behaviorSettings.current,
+      ...(name ? { sessionName: name } : {}),
     };
   }
 
@@ -1032,8 +1039,20 @@ export class Workspace {
         );
       }
       await this.behaviorSettings.update(patch);
+      if (patch.sessionName !== undefined)
+        await nameWorkspaceConversation(this.harness, patch.sessionName);
       return this.settings();
     });
+  }
+
+  async inputQueue() {
+    return workspaceInputQueue(this.harness, this.conversation);
+  }
+
+  async clearInputQueue() {
+    return this.withAdmission(() =>
+      clearWorkspaceInputQueue(this.conversation),
+    );
   }
 
   private async assertIdleForNavigation() {

@@ -11,6 +11,7 @@ export type WorkspaceBehaviorSettingsValue = {
 
 export type WorkspaceSettingsPatch = Partial<WorkspaceBehaviorSettingsValue> & {
   thinkingLevel?: string;
+  sessionName?: string;
 };
 
 export const defaultWorkspaceBehaviorSettings: WorkspaceBehaviorSettingsValue =
@@ -41,12 +42,22 @@ export function parseWorkspaceSettingsPatch(
     "steeringMode",
     "followUpMode",
     "autoCompact",
+    "sessionName",
   ]);
   const keys = Object.keys(data);
   if (!keys.length || keys.some((key) => !allowed.has(key)))
     throw invalidSettings();
 
   const patch: WorkspaceSettingsPatch = {};
+  if ("sessionName" in data) {
+    if (
+      typeof data.sessionName !== "string" ||
+      data.sessionName.length > 200 ||
+      /[\x00-\x1f\x7f]/.test(data.sessionName)
+    )
+      throw invalidSettings();
+    patch.sessionName = data.sessionName;
+  }
   if ("thinkingLevel" in data) {
     if (
       typeof data.thinkingLevel !== "string" ||
@@ -184,6 +195,6 @@ function invalidSettings() {
   return new ApiError(
     400,
     "INVALID_SETTINGS",
-    "Settings must contain supported thinkingLevel, steeringMode, followUpMode, or autoCompact values",
+    "Settings must contain supported thinkingLevel, steeringMode, followUpMode, autoCompact, or sessionName values",
   );
 }
