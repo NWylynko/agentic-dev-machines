@@ -362,8 +362,15 @@ export default (pi) => {
     handler: async (args, ctx) => ctx.ui.notify("hello " + args, "info"),
   });
   pi.registerCommand("extension-dialog", {
-    description: "Request a selector unsupported by this bridge slice.",
-    handler: async (_args, ctx) => ctx.ui.select("Pick", ["one"]),
+    description: "Select a value through the remote extension UI.",
+    handler: async (_args, ctx) => {
+      const selected = await ctx.ui.select("Pick", ["one"]);
+      ctx.ui.notify(selected ? "selected " + selected : "cancelled");
+    },
+  });
+  pi.registerShortcut("ctrl+x", {
+    description: "A workspace extension shortcut.",
+    handler: async (ctx) => ctx.ui.notify("shortcut ran", "info"),
   });
 };`,
     );
@@ -408,6 +415,9 @@ export default (pi) => {
         ),
       ),
     );
+    assert.ok(discovered.body.extensions.some((extension) =>
+      extension.shortcuts.some((shortcut) => shortcut.shortcut === "ctrl+x"),
+    ));
     assert.ok(
       discovered.body.diagnostics.some((diagnostic) =>
         /unsupported capabilities: lifecycle hooks/.test(diagnostic.message),
@@ -416,23 +426,114 @@ export default (pi) => {
     const command = await runner.request(
       path + "/extensions/commands",
       "POST",
-      { name: "extension-hello", args: "Nick" },
+      { name: "extension-hello", args: "Nick", requestId: "hello-request-1" },
     );
     assert.equal(command.status, 200);
-    assert.deepEqual(command.body, {
-      command: "extension-hello",
-      notifications: [{ message: "hello Nick", type: "info" }],
-    });
-    const unsupportedDialog = await runner.request(
+    assert.equal(typeof command.body.operationId, "string");
+    assert.equal((await runner.request(path + "/extensions/commands", "POST", {
+      name: "extension-hello",
+      args: "Nick",
+      requestId: "hello-request-1",
+    })).body.operationId, command.body.operationId);
+    assert.equal((await runner.request(path + "/extensions/commands", "POST", {
+      name: "extension-hello",
+      args: "different",
+      requestId: "hello-request-1",
+    })).status, 409);
+    const notifyEvents = await fetch(
+      new URL(path + "/extensions/commands/" + command.body.operationId + "/events", runner.url),
+    );
+    const notifyReader = notifyEvents.body.getReader();
+    let notifyBuffer = "";
+    const notifyDecoder = new TextDecoder();
+    const notifications = [];
+    while (notifications.length < 2) {
+      const chunk = await notifyReader.read();
+      assert.equal(chunk.done, false);
+      notifyBuffer += notifyDecoder.decode(chunk.value, { stream: true });
+      let newline;
+      while ((newline = notifyBuffer.indexOf("\n")) >= 0) {
+        const line = notifyBuffer.slice(0, newline).trimEnd();
+        notifyBuffer = notifyBuffer.slice(newline + 1);
+        if (line.startsWith("data: ")) notifications.push(JSON.parse(line.slice(6)));
+      }
+    }
+    await notifyReader.cancel();
+    assert.deepEqual(notifications, [
+      { type: "notification", seq: 1, message: "hello Nick", level: "info" },
+      { type: "result", seq: 2, command: "extension-hello" },
+    ]);
+    const dialog = await runner.request(
       path + "/extensions/commands",
       "POST",
       { name: "extension-dialog", args: "" },
     );
-    assert.equal(unsupportedDialog.status, 500);
-    assert.match(
-      unsupportedDialog.body.error.message,
-      /not supported by the Durable bridge/,
+    assert.equal(dialog.status, 200);
+    const uiEvents = await fetch(
+      new URL(path + "/extensions/commands/" + dialog.body.operationId + "/events", runner.url),
     );
+    const uiReader = uiEvents.body.getReader();
+    const uiDecoder = new TextDecoder();
+    let uiBuffer = "";
+    let uiRequest;
+    while (!uiRequest) {
+      const chunk = await uiReader.read();
+      assert.equal(chunk.done, false);
+      uiBuffer += uiDecoder.decode(chunk.value, { stream: true });
+      let newline;
+      while ((newline = uiBuffer.indexOf("\n")) >= 0) {
+        const line = uiBuffer.slice(0, newline).trimEnd();
+        uiBuffer = uiBuffer.slice(newline + 1);
+        if (!line.startsWith("data: ")) continue;
+        const event = JSON.parse(line.slice(6));
+        if (event.type === "ui_request") uiRequest = event;
+      }
+    }
+    assert.equal(uiRequest.method, "select");
+    assert.deepEqual(uiRequest.options, ["one"]);
+    const uiResponse = await runner.request(
+      path + "/extensions/commands/" + dialog.body.operationId + "/ui",
+      "POST",
+      { requestId: uiRequest.requestId, result: "one" },
+    );
+    assert.equal(uiResponse.status, 200);
+    let resultEvent;
+    while (!resultEvent) {
+      const chunk = await uiReader.read();
+      assert.equal(chunk.done, false);
+      uiBuffer += uiDecoder.decode(chunk.value, { stream: true });
+      let newline;
+      while ((newline = uiBuffer.indexOf("\n")) >= 0) {
+        const line = uiBuffer.slice(0, newline).trimEnd();
+        uiBuffer = uiBuffer.slice(newline + 1);
+        if (!line.startsWith("data: ")) continue;
+        const event = JSON.parse(line.slice(6));
+        if (event.type === "result") resultEvent = event;
+      }
+    }
+    assert.equal(resultEvent.command, "extension-dialog");
+    await uiReader.cancel();
+    const shortcut = await runner.request(path + "/extensions/shortcuts", "POST", { shortcut: "ctrl+x" });
+    assert.equal(shortcut.status, 200);
+    const shortcutEvents = await fetch(new URL(path + "/extensions/commands/" + shortcut.body.operationId + "/events", runner.url));
+    const shortcutReader = shortcutEvents.body.getReader();
+    const shortcutDecoder = new TextDecoder();
+    let shortcutBuffer = "";
+    const shortcutResult = [];
+    while (shortcutResult.length < 2) {
+      const chunk = await shortcutReader.read();
+      assert.equal(chunk.done, false);
+      shortcutBuffer += shortcutDecoder.decode(chunk.value, { stream: true });
+      let newline;
+      while ((newline = shortcutBuffer.indexOf("\n")) >= 0) {
+        const line = shortcutBuffer.slice(0, newline).trimEnd();
+        shortcutBuffer = shortcutBuffer.slice(newline + 1);
+        if (line.startsWith("data: ")) shortcutResult.push(JSON.parse(line.slice(6)));
+      }
+    }
+    assert.equal(shortcutResult[0].message, "shortcut ran");
+    assert.equal(shortcutResult[1].type, "result");
+    await shortcutReader.cancel();
 
     const eventsAbort = new AbortController();
     const eventResponse = await fetch(new URL(path + "/events", runner.url), {

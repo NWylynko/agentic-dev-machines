@@ -1181,7 +1181,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|resources\/reload|resources|trust|extensions|extensions\/commands|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1196,6 +1196,8 @@ const server = createServer(async (request, response) => {
       );
     }
     const action = match[2];
+    const extensionOperationRoute =
+      /^extensions\/commands\/([^/]+)\/(events|ui|cancel)$/.exec(action ?? "");
     if (!workspaceIdPattern.test(id))
       throw new ApiError(400, "INVALID_ID", "Invalid immutable workspace ID");
     if (action === "bash" && request.method === "POST") {
@@ -1626,7 +1628,9 @@ const server = createServer(async (request, response) => {
       action === "resources/reload" ||
       action === "trust" ||
       action === "extensions" ||
-      action === "extensions/commands"
+      action === "extensions/commands" ||
+      action === "extensions/shortcuts" ||
+      Boolean(extensionOperationRoute)
     ) {
       const resources =
         workspace.resources ??
@@ -1649,7 +1653,11 @@ const server = createServer(async (request, response) => {
         if (
           typeof data.name !== "string" ||
           !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(data.name) ||
-          (data.args !== undefined && typeof data.args !== "string")
+          (data.args !== undefined && typeof data.args !== "string") ||
+          (data.requestId !== undefined &&
+            (typeof data.requestId !== "string" ||
+              data.requestId.length < 1 ||
+              data.requestId.length > 128))
         )
           throw new ApiError(
             400,
@@ -1662,8 +1670,109 @@ const server = createServer(async (request, response) => {
           await workspace.extensionCommand(
             data.name,
             (data.args as string | undefined) ?? "",
+            data.requestId as string | undefined,
           ),
         );
+      }
+      if (request.method === "POST" && action === "extensions/shortcuts") {
+        const data = await body(request);
+        if (
+          typeof data.shortcut !== "string" ||
+          data.shortcut.length > 32 ||
+          (data.requestId !== undefined &&
+            (typeof data.requestId !== "string" ||
+              data.requestId.length < 1 ||
+              data.requestId.length > 128))
+        )
+          throw new ApiError(
+            400,
+            "INVALID_EXTENSION_SHORTCUT",
+            "shortcut must be text",
+          );
+        return json(
+          response,
+          200,
+          await workspace.extensionShortcut(
+            data.shortcut,
+            data.requestId as string | undefined,
+          ),
+        );
+      }
+      if (extensionOperationRoute) {
+        const operation = workspace.extensionOperation(
+          extensionOperationRoute[1]!,
+        );
+        if (!operation)
+          throw new ApiError(
+            404,
+            "EXTENSION_OPERATION_NOT_FOUND",
+            "Unknown or completed extension operation",
+          );
+        if (
+          request.method === "GET" &&
+          extensionOperationRoute[2] === "events"
+        ) {
+          const after = Number(url.searchParams.get("after") ?? 0);
+          if (!Number.isSafeInteger(after) || after < 0)
+            throw new ApiError(
+              400,
+              "INVALID_CURSOR",
+              "after must be nonnegative",
+            );
+          response.writeHead(200, {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+          });
+          response.flushHeaders();
+          let ended = false;
+          let lastSent = after;
+          const write = (event: { seq: number }) => {
+            if (!ended && event.seq > lastSent) {
+              lastSent = event.seq;
+              response.write(
+                `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`,
+              );
+            }
+          };
+          const close = () => {
+            if (ended) return;
+            ended = true;
+            operation.off("event", write);
+            operation.off("finish", finish);
+            response.end();
+          };
+          const finish = () => {
+            for (const event of operation.eventsAfter(after)) write(event);
+            close();
+          };
+          operation.on("event", write);
+          response.once("close", close);
+          if (operation.done) finish();
+          else for (const event of operation.eventsAfter(after)) write(event);
+          return;
+        }
+        if (request.method === "POST" && extensionOperationRoute[2] === "ui") {
+          const data = await body(request);
+          if (
+            typeof data.requestId !== "string" ||
+            !("result" in data) ||
+            !operation.respond(data.requestId, data.result)
+          )
+            throw new ApiError(
+              409,
+              "EXTENSION_UI_RESPONSE_REJECTED",
+              "Unknown request or invalid UI response",
+            );
+          return json(response, 200, { accepted: true });
+        }
+        if (
+          request.method === "POST" &&
+          extensionOperationRoute[2] === "cancel"
+        ) {
+          operation.cancel();
+          return json(response, 202, { cancelled: true });
+        }
       }
       if (request.method === "GET" && action === "trust")
         return json(response, 200, resources.trust());

@@ -28,7 +28,9 @@ import { WorkspaceResources } from "./resources.ts";
 import { UserBashTask, type BashInput, type BashResult } from "./bash.ts";
 import {
   createDurableExtensionBridge,
-  executePiCommand,
+  createCommandOperation,
+  createShortcutOperation,
+  type ExtensionCommandOperation,
 } from "./extensions.ts";
 import {
   workspaceModels,
@@ -178,6 +180,11 @@ export class Workspace {
   kubeEnv?: KubernetesExecutionEnv;
   private execution?: ExecutionEnv;
   private accepting = true;
+  private extensionOperations = new Map<string, ExtensionCommandOperation>();
+  private extensionRequests = new Map<
+    string,
+    { fingerprint: string; operationId: string }
+  >();
   private admissions = Promise.resolve();
   private models: Models;
   private behaviorSettings: WorkspaceBehaviorSettings;
@@ -1135,29 +1142,95 @@ export class Workspace {
     );
   }
 
-  async extensionCommand(name: string, args: string) {
+  private async startExtensionOperation(
+    operation: ExtensionCommandOperation | undefined,
+    label: string,
+    requestId?: string,
+    fingerprint = label,
+  ) {
+    if (!operation)
+      throw new ApiError(404, "EXTENSION_OPERATION_NOT_FOUND", label);
+    if (requestId) {
+      const previous = this.extensionRequests.get(requestId);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint)
+          throw new ApiError(
+            409,
+            "EXTENSION_REQUEST_ID_REUSED",
+            "requestId was already used for another extension operation",
+          );
+        const existing = this.extensionOperations.get(previous.operationId);
+        if (existing) return { operationId: existing.id };
+      }
+    }
+    await this.withAdmission(async () => {
+      await this.assertActive(operation.signal);
+      this.extensionOperations.set(operation.id, operation);
+      while (this.extensionOperations.size > 128) {
+        const oldest = this.extensionOperations.entries().next().value as
+          | [string, ExtensionCommandOperation]
+          | undefined;
+        if (!oldest || !oldest[1].done) break;
+        this.extensionOperations.delete(oldest[0]);
+      }
+      if (requestId) {
+        this.extensionRequests.set(requestId, {
+          fingerprint,
+          operationId: operation.id,
+        });
+        while (this.extensionRequests.size > 128)
+          this.extensionRequests.delete(
+            this.extensionRequests.keys().next().value!,
+          );
+      }
+      operation.start();
+    });
+    return { operationId: operation.id };
+  }
+
+  async extensionCommand(name: string, args: string, requestId?: string) {
     if (!this.resources || this.config.role !== "coding")
       throw new ApiError(
         403,
         "CODING_RESOURCES_REQUIRED",
         "Extensions are available only in coding workspaces",
       );
-    return this.withAdmission(async () => {
-      const result = await executePiCommand(
-        this.resources!.extensions(),
+    return this.startExtensionOperation(
+      createCommandOperation(
+        this.resources.extensions(),
         name,
         args,
         this.config.cwd ?? this.config.localRoot!,
-        () => this.assertActive(),
+        (signal) => this.assertActive(signal),
+      ),
+      `Unknown Pi extension command: ${name}`,
+      requestId,
+      JSON.stringify(["command", name, args]),
+    );
+  }
+
+  async extensionShortcut(shortcut: string, requestId?: string) {
+    if (!this.resources || this.config.role !== "coding")
+      throw new ApiError(
+        403,
+        "CODING_RESOURCES_REQUIRED",
+        "Extensions are available only in coding workspaces",
       );
-      if (!result)
-        throw new ApiError(
-          404,
-          "EXTENSION_COMMAND_NOT_FOUND",
-          `Unknown Pi extension command: ${name}`,
-        );
-      return result;
-    });
+    return this.startExtensionOperation(
+      createShortcutOperation(
+        this.resources.extensions(),
+        shortcut,
+        this.config.cwd ?? this.config.localRoot!,
+        (signal) => this.assertActive(signal),
+      ),
+      `Unknown Pi extension shortcut: ${shortcut}`,
+      requestId,
+      JSON.stringify(["shortcut", shortcut]),
+    );
+  }
+
+  extensionOperation(id: string) {
+    return this.extensionOperations.get(id);
   }
 
   async startBash(
@@ -1376,6 +1449,8 @@ export class Workspace {
   async close(destroy = false) {
     if (this.closed) return;
     this.accepting = false;
+    for (const operation of this.extensionOperations.values())
+      operation.cancel();
     const errors: unknown[] = [];
     const attempt = async (cleanup: () => Promise<unknown>) => {
       try {

@@ -37,7 +37,8 @@ export type WorkspaceResourceSnapshot = {
       description: string;
       parameters: unknown;
     }[];
-    commands: { name: string; description?: string }[];
+    commands: { name: string; path: string; description?: string }[];
+    shortcuts: { shortcut: string; description?: string }[];
   }[];
   diagnostics: { type: string; message: string; path?: string }[];
   systemPrompt?: string;
@@ -209,9 +210,14 @@ export class WorkspaceResources {
           })),
           commands: [...extension.commands.values()].map((command) => ({
             name: command.name,
+            path: command.name,
             ...(command.description
               ? { description: command.description }
               : {}),
+          })),
+          shortcuts: [...extension.shortcuts.values()].map((shortcut) => ({
+            shortcut: shortcut.shortcut,
+            ...(shortcut.description ? { description: shortcut.description } : {}),
           })),
         }))
       : resolved.extensions
@@ -222,6 +228,7 @@ export class WorkspaceResources {
             active: false,
             tools: [],
             commands: [],
+            shortcuts: [],
           }));
     const diagnostics = [
       ...skills.diagnostics,
@@ -256,12 +263,11 @@ export class WorkspaceResources {
     for (const extension of loaded?.extensions ?? []) {
       const unsupported: string[] = [];
       if (extension.handlers.size) unsupported.push("lifecycle hooks");
-      if (extension.shortcuts.size) unsupported.push("keyboard shortcuts");
       if (extension.flags.size) unsupported.push("CLI flags");
       if (unsupported.length)
         diagnostics.push({
           type: "warning",
-          message: `Extension ${basename(extension.path)} registered unsupported capabilities: ${unsupported.join(", ")}. Durable activation supports its tools and commands only.`,
+          message: `Extension ${basename(extension.path)} registered unsupported capabilities: ${unsupported.join(", ")}. Durable activation supports its tools, commands, remote UI requests, and keyboard shortcuts.`,
           path: extension.path,
         });
     }
