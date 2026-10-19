@@ -1308,6 +1308,264 @@ test("malformed path encoding is reported as a client error without terminating 
   assert.equal((await runner.request("/health")).status, 200);
 });
 
+test("native bash executes in the workspace harness and records replayable native history", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-bash-"));
+  const runner = await startRunner(directory);
+  t.after(() => runner.stop());
+  const id = "native-bash",
+    path = `/v1/workspaces/${id}`;
+  const config = {
+    id,
+    name: id,
+    role: "coding",
+    environment: "local",
+    localRoot: join(directory, "repo"),
+    model: { provider: "faux", id: "faux-1" },
+  };
+  assert.equal((await runner.request(path, "PUT", config)).status, 200);
+
+  const admitted = await runner.request(`${path}/bash`, "POST", {
+    command: "printf 'native-output'",
+    requestId: "bash-once",
+  });
+  assert.equal(admitted.status, 202);
+  const stream = await fetch(
+    `${runner.url}${path}/bash/${admitted.body.operationId}/events`,
+  );
+  const events = await stream.text();
+  assert.match(events, /event: output/);
+  assert.match(events, /native-output/);
+  assert.match(events, /event: result/);
+  assert.match(events, /"exitCode":0/);
+
+  const history = await runner.request(`${path}/history`);
+  const entry = history.body.events.find(
+    (event) => event.data.operationId === admitted.body.operationId,
+  );
+  assert.equal(entry.kind, "message");
+  assert.equal(entry.data.message.role, "bashExecution");
+  assert.equal(entry.data.message.output, "native-output");
+  const retry = await runner.request(`${path}/bash`, "POST", {
+    command: "printf 'duplicate'",
+    requestId: "bash-once",
+  });
+  assert.equal(retry.body.operationId, admitted.body.operationId);
+});
+
+test(
+  "excluded native bash output is absent from the next model context",
+  { timeout: 15000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bash-context-"));
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const id = "bash-context",
+      path = `/v1/workspaces/${id}`;
+    const config = {
+      id,
+      name: id,
+      role: "coding",
+      environment: "local",
+      localRoot: join(directory, "repo"),
+      model: { provider: "faux", id: "faux-1" },
+    };
+    assert.equal((await runner.request(path, "PUT", config)).status, 200);
+    const excluded = await runner.request(path + "/bash", "POST", {
+      command: "printf 'PRIVATE_BASH_RESULT'",
+      requestId: "excluded-result",
+      excludeFromContext: true,
+    });
+    assert.equal(excluded.status, 202);
+    const response = await fetch(
+      `${runner.url}${path}/bash/${excluded.body.operationId}/events`,
+    );
+    await response.text();
+    const before = await runner.request(path + "/history?diagnostics=true");
+    await runner.request(path + "/input", "POST", {
+      message: "/faux-inspect-system-prompt",
+      requestId: "inspect-after-bash",
+    });
+    const assistant = await nextEvent(
+      runner,
+      id,
+      (event) =>
+        event.kind === "assistant" && event.seq > before.body.nextAfter,
+      before.body.nextAfter,
+      true,
+      10000,
+    );
+    assert.doesNotMatch(assistant.data.text, /PRIVATE_BASH_RESULT/);
+  },
+);
+
+test("a disconnected client leaves a FIFO-backed bash command running for reconnect", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-bash-reconnect-"));
+  const runner = await startRunner(directory);
+  t.after(() => runner.stop());
+  const id = "bash-reconnect",
+    path = `/v1/workspaces/${id}`;
+  const repo = join(directory, "repo"),
+    gate = join(directory, "bash-gate");
+  const config = {
+    id,
+    name: id,
+    role: "coding",
+    environment: "local",
+    localRoot: repo,
+    model: { provider: "faux", id: "faux-1" },
+  };
+  assert.equal((await runner.request(path, "PUT", config)).status, 200);
+  const fifo = spawn("mkfifo", [gate]);
+  const [fifoCode] = await once(fifo, "exit");
+  assert.equal(fifoCode, 0);
+  const admitted = await runner.request(path + "/bash", "POST", {
+    command: `printf before; cat '${gate}'; printf continued`,
+    requestId: "disconnect-keeps-shell",
+  });
+  const first = await fetch(
+    `${runner.url}${path}/bash/${admitted.body.operationId}/events`,
+  );
+  const firstReader = first.body.getReader();
+  const firstOutput = await firstReader.read();
+  assert.match(new TextDecoder().decode(firstOutput.value), /before/);
+  await firstReader.cancel();
+  const replay = await fetch(
+    `${runner.url}${path}/bash/${admitted.body.operationId}/events`,
+  );
+  const replayReader = replay.body.getReader();
+  const replayOutput = await replayReader.read();
+  assert.match(new TextDecoder().decode(replayOutput.value), /before/);
+  await replayReader.cancel();
+  const writer = spawn("sh", ["-c", `printf fifo-output > '${gate}'`]);
+  const [writerCode] = await once(writer, "exit");
+  assert.equal(writerCode, 0);
+  const reconnected = await fetch(
+    `${runner.url}${path}/bash/${admitted.body.operationId}/events`,
+  );
+  const events = await reconnected.text();
+  assert.match(events, /fifo-outputcontinued/);
+  assert.match(events, /event: result/);
+});
+
+test("aborting native bash kills that operation and records cancellation", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-bash-abort-"));
+  const runner = await startRunner(directory);
+  t.after(() => runner.stop());
+  const id = "bash-abort",
+    path = `/v1/workspaces/${id}`;
+  const config = {
+    id,
+    name: id,
+    role: "coding",
+    environment: "local",
+    localRoot: join(directory, "repo"),
+    model: { provider: "faux", id: "faux-1" },
+  };
+  assert.equal((await runner.request(path, "PUT", config)).status, 200);
+  const admitted = await runner.request(path + "/bash", "POST", {
+    command: "exec sleep 30",
+    requestId: "abort-this-shell",
+  });
+  assert.equal(admitted.status, 202);
+  const aborted = await runner.request(
+    `${path}/bash/${admitted.body.operationId}/abort`,
+    "POST",
+    {},
+  );
+  assert.equal(aborted.body.status, "aborted");
+  const resultResponse = await fetch(
+    `${runner.url}${path}/bash/${admitted.body.operationId}/events`,
+  );
+  const events = await resultResponse.text();
+  assert.match(events, /"cancelled":true/);
+  assert.match(events, /"exitCode":130/);
+});
+
+test("native bash bounds retained output and provides a spill path", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-runner-bash-output-"));
+  const runner = await startRunner(directory);
+  t.after(() => runner.stop());
+  const id = "bash-output",
+    path = `/v1/workspaces/${id}`;
+  const config = {
+    id,
+    name: id,
+    role: "coding",
+    environment: "local",
+    localRoot: join(directory, "repo"),
+    model: { provider: "faux", id: "faux-1" },
+  };
+  assert.equal((await runner.request(path, "PUT", config)).status, 200);
+  const admitted = await runner.request(path + "/bash", "POST", {
+    command: "head -c 1200000 /dev/zero | tr '\\000' x",
+    requestId: "large-bash-output",
+    excludeFromContext: true,
+  });
+  const response = await fetch(
+    `${runner.url}${path}/bash/${admitted.body.operationId}/events`,
+  );
+  const events = await response.text();
+  const result = JSON.parse(
+    events.match(/event: result\ndata: (.+)\n\n/)?.[1] ?? "null",
+  );
+  assert.equal(result.truncated, true);
+  assert.ok(Buffer.byteLength(result.output) <= 1024 * 1024);
+  assert.equal(typeof result.fullOutputPath, "string");
+});
+
+test(
+  "an unsafe Bash intent interrupted by runner restart never executes twice",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bash-restart-"));
+    let runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const id = "bash-restart",
+      path = `/v1/workspaces/${id}`;
+    const repo = join(directory, "repo"),
+      marker = join(directory, "marker"),
+      pids = join(directory, "pids");
+    const config = {
+      id,
+      name: id,
+      role: "coding",
+      environment: "local",
+      localRoot: repo,
+      model: { provider: "faux", id: "faux-1" },
+    };
+    assert.equal((await runner.request(path, "PUT", config)).status, 200);
+    const directoryWatch = watch(directory);
+    const markerWritten = (async () => {
+      for await (const _event of directoryWatch) {
+        try {
+          await access(marker);
+          await directoryWatch.return();
+          return;
+        } catch {}
+      }
+    })();
+    const admitted = await runner.request(path + "/bash", "POST", {
+      command: `printf x >> '${marker}'; printf '%s\\n' $$ >> '${pids}'; exec sleep 30`,
+      requestId: "unsafe-restart-marker",
+      excludeFromContext: true,
+    });
+    await markerWritten;
+    await runner.stop("SIGKILL");
+    runner = await startRunner(directory);
+    const response = await fetch(
+      `${runner.url}${path}/bash/${admitted.body.operationId}/events`,
+    );
+    const events = await response.text();
+    assert.match(events, /execution intent; it was not restarted/);
+    assert.equal(await readFile(marker, "utf8"), "x");
+    for (const pid of (await readFile(pids, "utf8")).trim().split("\n")) {
+      try {
+        process.kill(Number(pid), "SIGKILL");
+      } catch {}
+    }
+  },
+);
+
 test(
   "provider failure survives restart and explicit resume succeeds without repeating completed tools",
   { timeout: 20000 },

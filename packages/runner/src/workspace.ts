@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -14,6 +15,7 @@ import {
   type ConversationId,
   type TaskInspection,
   type UserInput,
+  type Cursor,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
@@ -23,6 +25,7 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { WorkspaceResources } from "./resources.ts";
+import { UserBashTask, type BashInput, type BashResult } from "./bash.ts";
 import {
   createDurableExtensionBridge,
   executePiCommand,
@@ -70,6 +73,13 @@ function textContent(content: unknown): string {
     .join("\n");
 }
 
+type BashHistoryData = {
+  operationId: string;
+  requestId: string;
+  message: BashResult;
+  timestamp: number;
+};
+
 export function entryEvent(
   config: WorkspaceConfig,
   entry: EntryRecord,
@@ -88,6 +98,8 @@ export function entryEvent(
     return { ...base, kind: "message", data: custom ?? {} };
   if (entry.kind === "adm.status")
     return { ...base, kind: "status", data: custom ?? {} };
+  if (entry.kind === "admbash")
+    return { ...base, kind: "message", data: custom ?? {} };
   if (message?.role === "user")
     return {
       ...base,
@@ -145,6 +157,19 @@ export class Workspace {
     ReturnType<Awaited<ReturnType<typeof Harness.open>>["root"]>
   >;
   events = new EventEmitter();
+  private bashStreams = new Map<
+    string,
+    {
+      next: number;
+      bytes: number;
+      chunks: {
+        operationId: string;
+        sequence: number;
+        text: string;
+        stream: "stdout" | "stderr";
+      }[];
+    }
+  >();
   closed = false;
   passive = false;
   lastError?: string;
@@ -184,9 +209,13 @@ export class Workspace {
     this.assertActive = assertActive;
     this.loopTask = loopTask;
     this.mcpClose = mcpClose;
-    this.unsubscribe = harness.subscribeCommits(() =>
-      this.events.emit("change"),
-    );
+    this.unsubscribe = harness.subscribeCommits(() => {
+      this.events.emit("change");
+      for (const operationId of this.bashStreams.keys())
+        void this.bashResult(operationId).then((result) => {
+          if (result) this.bashStreams.delete(operationId);
+        });
+    });
   }
 
   static async open(
@@ -227,6 +256,40 @@ export class Workspace {
       if (openedWorkspace) openedWorkspace.mcpError = mcpError;
     };
     const registry = createRegistry();
+    registry.install(
+      defineExtension({
+        name: "workspace-user-bash",
+        tasks: [UserBashTask],
+        hooks: [
+          hook(UserBashTask, {
+            assertActive: (signal) => assertActive(signal),
+            output: (operationId, text, stream) => {
+              const workspace = openedWorkspace;
+              if (!workspace) return;
+              const state = workspace.bashStreams.get(operationId) ?? {
+                next: 1,
+                bytes: 0,
+                chunks: [],
+              };
+              const chunk = {
+                operationId,
+                sequence: state.next++,
+                text,
+                stream,
+              };
+              state.chunks.push(chunk);
+              state.bytes += Buffer.byteLength(text);
+              while (state.bytes > 256 * 1024 && state.chunks.length) {
+                const dropped = state.chunks.shift()!;
+                state.bytes -= Buffer.byteLength(dropped.text);
+              }
+              workspace.bashStreams.set(operationId, state);
+              workspace.events.emit("bash", chunk);
+            },
+          }),
+        ],
+      }),
+    );
     const schedule = createScheduleExtension(
       (message, requestId, loopId, generation, conversationId, call) => {
         if (!openedWorkspace)
@@ -1095,6 +1158,123 @@ export class Workspace {
         );
       return result;
     });
+  }
+
+  async startBash(
+    command: string,
+    requestId: string,
+    excludeFromContext = false,
+  ) {
+    if (this.config.role !== "coding")
+      throw new ApiError(
+        403,
+        "BASH_FORBIDDEN",
+        "Bash is available only to coding workspaces",
+      );
+    if (
+      typeof command !== "string" ||
+      !command.trim() ||
+      command.length > 100_000
+    )
+      throw new ApiError(
+        400,
+        "INVALID_BASH",
+        "Bash requires a nonempty command up to 100000 characters",
+      );
+    if (typeof requestId !== "string" || !requestId || requestId.length > 200)
+      throw new ApiError(
+        400,
+        "INVALID_REQUEST_ID",
+        "Bash requires a requestId up to 200 characters",
+      );
+    return this.withAdmission(async () => {
+      const completed = await this.findBashEntry(
+        (data) => data.requestId === requestId,
+      );
+      if (completed) return { operationId: completed.operationId };
+      const inspection = await this.harness.inspect(context);
+      const active = inspection.tasks.find(
+        (item) =>
+          item.record.kind === "adm.user-bash" &&
+          (item.record.input as BashInput).requestId === requestId,
+      );
+      if (active)
+        return { operationId: (active.record.input as BashInput).operationId };
+      const operationId = randomUUID();
+      const input: BashInput = {
+        operationId,
+        requestId,
+        command,
+        ...(excludeFromContext ? { excludeFromContext: true } : {}),
+      };
+      await this.conversation.commit(
+        (tx) =>
+          tx.createTask(UserBashTask, input, {
+            ownership: { kind: "conversation" },
+            background: true,
+          }),
+        context,
+      );
+      return { operationId };
+    });
+  }
+
+  async abortBash(operationId: string) {
+    const inspection = await this.harness.inspect(context);
+    const task = inspection.tasks.find(
+      (item) =>
+        item.record.kind === "adm.user-bash" &&
+        (item.record.input as BashInput).operationId === operationId,
+    );
+    if (!task) return { status: "completed" as const };
+    await this.harness.abortTask(task.record.id, context);
+    return { status: "aborted" as const };
+  }
+
+  async bashResult(operationId: string): Promise<BashResult | undefined> {
+    return (
+      await this.findBashEntry((data) => data.operationId === operationId)
+    )?.message;
+  }
+
+  private async findBashEntry(
+    predicate: (data: BashHistoryData) => boolean,
+  ): Promise<BashHistoryData | undefined> {
+    let cursor: Cursor | undefined;
+    do {
+      const page = await this.conversation.entries(
+        { order: "descending" },
+        1000,
+        cursor,
+        context,
+      );
+      const entry = page.items.find(
+        (item) =>
+          item.kind === "admbash" && predicate(item.data as BashHistoryData),
+      );
+      if (entry) return entry.data as BashHistoryData;
+      cursor = page.next;
+    } while (cursor);
+    return undefined;
+  }
+
+  async bashReplay(operationId: string, after = 0) {
+    const result = await this.bashResult(operationId);
+    if (result)
+      return {
+        result,
+        chunks: [] as {
+          operationId: string;
+          sequence: number;
+          text: string;
+          stream: "stdout" | "stderr";
+        }[],
+      };
+    return {
+      chunks: (this.bashStreams.get(operationId)?.chunks ?? []).filter(
+        (chunk) => chunk.sequence > after,
+      ),
+    };
   }
 
   async changeSettings(value: unknown) {

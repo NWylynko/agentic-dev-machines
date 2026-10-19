@@ -591,31 +591,7 @@ fn handle_http(
         Ok((status, body)) => (status, body),
         Err(error) => {
             let message = format!("{error:#}");
-            let (status, code) = if error.is::<ProviderAuthUnavailable>() {
-                (503, "PROVIDER_AUTH_UNAVAILABLE")
-            } else if message.contains("operationId was already used") {
-                (409, "OPERATION_CONFLICT")
-            } else if message.contains("not authorized for workspace")
-                || message.contains("not authorized for lifecycle operations")
-                || message.contains("not authorized to create this workspace role")
-                || message.contains("not authorized to delete this workspace role")
-                || message.contains("held by another pod")
-                || message.contains("runtime lease fencing token is stale")
-                || message.contains("runtime status is restricted to its own workspace")
-                || message
-                    .contains("project resources are restricted to the owning coding workspace")
-                || message.contains("wrong audience")
-                || message.contains("not bound to a Pod")
-            {
-                (403, "RUNTIME_FORBIDDEN")
-            } else if message.contains("deleting")
-                || message.contains("lease expired")
-                || message.contains("lease is not held")
-            {
-                (410, "WORKSPACE_UNAVAILABLE")
-            } else {
-                (400, "INVALID_REQUEST")
-            };
+            let (status, code) = runtime_http_error_status(&error, &message);
             (
                 status,
                 serde_json::json!({"error":{"code":code,"message":message}}),
@@ -642,6 +618,34 @@ fn handle_http(
     )?;
     stream.write_all(&body)?;
     Ok(())
+}
+
+fn runtime_http_error_status(error: &anyhow::Error, message: &str) -> (u16, &'static str) {
+    if error.is::<ProviderAuthUnavailable>() {
+        (503, "PROVIDER_AUTH_UNAVAILABLE")
+    } else if message.contains("operationId was already used") {
+        (409, "OPERATION_CONFLICT")
+    } else if message.contains("not authorized for workspace")
+        || message.contains("not authorized for lifecycle operations")
+        || message.contains("not authorized to create this workspace role")
+        || message.contains("not authorized to delete this workspace role")
+        || message.contains("held by another pod")
+        || message.contains("runtime lease fencing token is stale")
+        || message.contains("runtime status is restricted to its own workspace")
+        || message.contains("bash execution is restricted to the owning coding workspace")
+        || message.contains("project resources are restricted to the owning coding workspace")
+        || message.contains("wrong audience")
+        || message.contains("not bound to a Pod")
+    {
+        (403, "RUNTIME_FORBIDDEN")
+    } else if message.contains("deleting")
+        || message.contains("lease expired")
+        || message.contains("lease is not held")
+    {
+        (410, "WORKSPACE_UNAVAILABLE")
+    } else {
+        (400, "INVALID_REQUEST")
+    }
 }
 
 fn is_runtime_auth_route(method: &str, path: &str) -> bool {
@@ -1555,6 +1559,7 @@ fn authorize_workspace_action(
                 | "delete"
                 | "status"
                 | "resources"
+                | "bash"
         ),
         "unknown runtime action"
     );
@@ -1572,10 +1577,23 @@ fn authorize_workspace_action(
         "project resources are restricted to the owning coding workspace"
     );
     ensure!(
+        action != "bash" || bash_action_allowed(&source.id, &source.role, &target.id, &target.role),
+        "bash execution is restricted to the owning coding workspace"
+    );
+    ensure!(
         source.id == target.id || (source.role == "bot" && target.role == "coding"),
         "runtime caller is not authorized for workspace"
     );
     Ok(())
+}
+
+fn bash_action_allowed(
+    source_id: &str,
+    source_role: &str,
+    target_id: &str,
+    target_role: &str,
+) -> bool {
+    source_id == target_id && source_role == "coding" && target_role == "coding"
 }
 
 pub(crate) fn authorize_runtime_caller(
@@ -1650,6 +1668,19 @@ mod provider_auth_wait_tests {
         sync::mpsc,
         thread,
     };
+
+    #[test]
+    fn bash_action_is_limited_to_the_owning_coding_workspace() {
+        assert!(bash_action_allowed("code", "coding", "code", "coding"));
+        assert!(!bash_action_allowed("bot", "bot", "bot", "bot"));
+        assert!(!bash_action_allowed("bot", "bot", "code", "coding"));
+        assert!(!bash_action_allowed("code", "coding", "other", "coding"));
+        let error = anyhow::anyhow!("bash execution is restricted to the owning coding workspace");
+        assert_eq!(
+            runtime_http_error_status(&error, &error.to_string()),
+            (403, "RUNTIME_FORBIDDEN")
+        );
+    }
 
     #[test]
     fn projected_identity_bypass_is_limited_to_exact_runtime_routes() {

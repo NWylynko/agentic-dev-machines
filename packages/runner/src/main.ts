@@ -387,6 +387,7 @@ function runtimeAction(method: string, pathname: string): string {
   const endpoint = pathname.match(/^\/v1\/workspaces\/[^/]+(?:\/(.*))?$/)?.[1];
   if (endpoint && /^(resources|trust|extensions)(\/|$)/.test(endpoint))
     return "resources";
+  if (endpoint === "bash" || endpoint?.startsWith("bash/")) return "bash";
   if (method === "GET") return "read";
   if (method === "DELETE") return "delete";
   if (method === "PUT" && endpoint === "model") return "model";
@@ -1180,7 +1181,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|resources\/reload|resources|trust|extensions|extensions\/commands))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|resources\/reload|resources|trust|extensions|extensions\/commands|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1197,6 +1198,118 @@ const server = createServer(async (request, response) => {
     const action = match[2];
     if (!workspaceIdPattern.test(id))
       throw new ApiError(400, "INVALID_ID", "Invalid immutable workspace ID");
+    if (action === "bash" && request.method === "POST") {
+      const data = await body(request);
+      if (
+        typeof data.command !== "string" ||
+        typeof data.requestId !== "string"
+      )
+        throw new ApiError(
+          400,
+          "INVALID_BASH",
+          "Bash requires command and requestId",
+        );
+      const workspace = workspaces.get(id);
+      if (!workspace)
+        throw new ApiError(
+          404,
+          "WORKSPACE_NOT_FOUND",
+          "Workspace was not found",
+        );
+      return json(
+        response,
+        202,
+        await workspace.startBash(
+          data.command,
+          data.requestId,
+          data.excludeFromContext === true,
+        ),
+      );
+    }
+    const bashOperation = /^bash\/([^/]+)(?:\/(events|abort))?$/.exec(
+      action ?? "",
+    );
+    if (bashOperation && bashOperation[1]) {
+      const operationId = decodeURIComponent(bashOperation[1]);
+      const workspace = workspaces.get(id);
+      if (!workspace)
+        throw new ApiError(
+          404,
+          "WORKSPACE_NOT_FOUND",
+          "Workspace was not found",
+        );
+      if (bashOperation[2] === "abort" && request.method === "POST")
+        return json(response, 200, await workspace.abortBash(operationId));
+      if (bashOperation[2] === "events" && request.method === "GET") {
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-store",
+          connection: "keep-alive",
+        });
+        response.flushHeaders();
+        let closed = false;
+        let cursor = Number(url.searchParams.get("after") ?? 0);
+        const sendChunk = (chunk: {
+          operationId: string;
+          sequence: number;
+          text: string;
+          stream: "stdout" | "stderr";
+        }) => {
+          if (
+            chunk.operationId !== operationId ||
+            chunk.sequence <= cursor ||
+            closed
+          )
+            return;
+          cursor = chunk.sequence;
+          response.write(
+            `id: ${cursor}\nevent: output\ndata: ${JSON.stringify(chunk)}\n\n`,
+          );
+        };
+        const finish = async () => {
+          const result = await workspace.bashResult(operationId);
+          if (result && !closed) {
+            closed = true;
+            if (result.output && cursor === 0)
+              response.write(
+                `event: output\ndata: ${JSON.stringify({ operationId, text: result.output, stream: "stdout" })}\n\n`,
+              );
+            response.end(`event: result\ndata: ${JSON.stringify(result)}\n\n`);
+          }
+        };
+        const onChange = () => {
+          void finish();
+        };
+        const onOutput = (chunk: {
+          operationId: string;
+          text: string;
+          stream: "stdout" | "stderr";
+        }) => {
+          sendChunk(chunk as typeof chunk & { sequence: number });
+        };
+        workspace.events.on("change", onChange);
+        workspace.events.on("bash", onOutput);
+        response.once("close", () => {
+          closed = true;
+          workspace.events.off("change", onChange);
+          workspace.events.off("bash", onOutput);
+        });
+        const replay = await workspace.bashReplay(operationId, cursor);
+        for (const chunk of replay.chunks) sendChunk(chunk);
+        if (replay.result) {
+          if (replay.result.output && cursor === 0)
+            response.write(
+              `event: output\ndata: ${JSON.stringify({ operationId, text: replay.result.output, stream: "stdout" })}\n\n`,
+            );
+          closed = true;
+          response.end(
+            `event: result\ndata: ${JSON.stringify(replay.result)}\n\n`,
+          );
+        }
+        void finish();
+        return;
+      }
+    }
     if (request.method === "PUT" && !action) {
       const config = validateConfig(id, await body(request));
       return await serialized(async () => {
