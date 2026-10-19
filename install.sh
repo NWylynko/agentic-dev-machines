@@ -97,6 +97,8 @@ base_url=${base_url%/}
 archive_name=adm-$platform.tar.gz
 mkdir -p "$prefix/releases" "$bin_dir"
 lock_dir=$prefix/install.lock
+# Installers before the mkdir lock left a regular file here from flock.
+if [ -f "$lock_dir" ] && [ ! -L "$lock_dir" ]; then rm -f "$lock_dir"; fi
 mkdir "$lock_dir" 2>/dev/null || fail 'another ADM installation is in progress'
 temporary=$(mktemp -d "$prefix/.install.XXXXXXXX")
 cleanup() {
@@ -104,6 +106,7 @@ cleanup() {
   rmdir "$lock_dir" 2>/dev/null || :
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 printf 'Downloading ADM %s...\n' "$version"
