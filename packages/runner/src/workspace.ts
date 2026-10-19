@@ -34,6 +34,7 @@ import {
 } from "./extensions.ts";
 import {
   workspaceModels,
+  workspaceProviderMetadata,
   type LifecycleAuthorityAvailability,
 } from "./models.ts";
 import {
@@ -597,14 +598,7 @@ export class Workspace {
       ? await this.models.refresh({ signal })
       : undefined;
     const available = await this.models.getAvailable(undefined, { signal });
-    const providers = await Promise.all(
-      this.models.getProviders().map(async (provider) => ({
-        id: provider.id,
-        name: provider.name,
-        authenticated:
-          (await this.models.checkAuth(provider.id, { signal })) !== undefined,
-      })),
-    );
+    const providers = await workspaceProviderMetadata(this.models, signal);
     const selected = (await this.conversation.agent(context)).model;
     return {
       selected: selected

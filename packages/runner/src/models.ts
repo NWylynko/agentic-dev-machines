@@ -16,6 +16,30 @@ export interface LifecycleAuthorityAvailability {
   suspend(error: unknown): void;
 }
 
+export async function workspaceProviderMetadata(
+  models: Models,
+  signal?: AbortSignal,
+) {
+  return Promise.all(
+    models.getProviders().map(async (provider) => {
+      const auth = await models.checkAuth(provider.id, { signal });
+      return {
+        id: provider.id,
+        name: provider.name,
+        authenticated: auth !== undefined,
+        ...(auth
+          ? {
+              authType: auth.type,
+              subscription:
+                auth.type === "oauth" &&
+                provider.auth.oauth?.isSubscription === true,
+            }
+          : {}),
+      };
+    }),
+  );
+}
+
 export async function workspaceModels(
   provider: string | undefined,
   authPath?: string,
@@ -146,7 +170,8 @@ export async function configureSharedProviderAuth<
       await options.availability?.wait(signal);
       signal?.throwIfAborted();
       const token = (await readFile(identityFile, "utf8")).trim();
-      if (!token) throw new Error("Projected lifecycle identity token is empty");
+      if (!token)
+        throw new Error("Projected lifecycle identity token is empty");
       let response: Response;
       try {
         response = await fetch(
@@ -169,7 +194,9 @@ export async function configureSharedProviderAuth<
       }
       if (response.status >= 500 && options.availability) {
         options.availability.suspend(
-          new Error(`Shared provider authentication service unavailable (${response.status})`),
+          new Error(
+            `Shared provider authentication service unavailable (${response.status})`,
+          ),
         );
         continue;
       }

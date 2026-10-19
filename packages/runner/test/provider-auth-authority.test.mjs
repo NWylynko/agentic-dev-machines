@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
+import { workspaceProviderMetadata } from "../src/models.ts";
 import {
   createOwnerEpochGuard,
   createProviderAuthAuthority,
@@ -111,6 +112,16 @@ test("shared model selection preserves missing-login state and OAuth account mod
     await runtime.refresh({ allowNetwork: false, providers: [providerId] });
     assert.equal(runtime.isUsingOAuth(providerId), true);
     assert.equal(runtime.isUsingSubscription(providerId), true);
+    const terminalMetadata = (await workspaceProviderMetadata(runtime)).find(
+      (provider) => provider.id === providerId,
+    );
+    assert.equal(terminalMetadata.authenticated, true);
+    assert.equal(terminalMetadata.authType, "oauth");
+    assert.equal(terminalMetadata.subscription, true);
+    assert.doesNotMatch(
+      JSON.stringify(terminalMetadata),
+      /catalog-(access|refresh)-secret|synthetic-catalog-pod-token/,
+    );
     const catalog = await fetch(`${url}/v1/provider-auth/catalog`, {
       method: "POST",
     });
