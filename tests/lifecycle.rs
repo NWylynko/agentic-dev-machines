@@ -1904,6 +1904,19 @@ else:
             &url,
             "POST",
             &authorize_path,
+            Some(&json!({"action":"resources"})),
+            Some(&final_pod_token)
+        )
+        .unwrap()
+        .status(),
+        200,
+        "a coding runtime owner can inspect and manage its own project resources"
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &authorize_path,
             Some(&json!({"action":"status"})),
             Some("lifecycle-token")
         )
@@ -2174,6 +2187,21 @@ else:
         "a valid token bound to a different workspace cannot read this runtime status"
     );
     let cross_authorize = format!("/v1/workspaces/{bot_id}/runtime/authorize");
+    for target in [&authorize_path, &cross_authorize] {
+        assert_eq!(
+            request_with_token(
+                &url,
+                "POST",
+                target,
+                Some(&json!({"action":"resources"})),
+                Some("bot-token")
+            )
+            .unwrap()
+            .status(),
+            403,
+            "bots cannot inspect project files or change project trust"
+        );
+    }
     assert_eq!(
         request_with_token(
             &url,

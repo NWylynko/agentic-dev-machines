@@ -19,6 +19,6 @@ The second client reconnected and verified the private result file and the compl
 
 The first attempt at this second check expected the receipt status `accepted`; the installed runtime returns `admitted`. That assertion was corrected after both first-attempt disposable workspaces were cleaned up.
 
-Raw command records and reproducible scripts are retained outside the checkout under `/tmp/adm-batches-20261018/live-clients/`: `validate-workspace.py`, `workspace-proof-results.json`, `validate-independent-work.py`, and `independent-work-results.json`.
+Raw command records and scripts were stored under `/tmp/adm-batches-20261018/live-clients/` during the run. The October 19 environment restart removed that temporary directory; those raw files are no longer available. The observations and workspace IDs above are the retained record.
 
 Native macOS/arm64 execution, live Herdr delivery and keyboard interactions, real shared-provider authentication, controller updates, Pod replacement, cross-node recovery, and node-loss durability remain outside these checks. The release matrix and fixture tests cover additional behavior but do not establish those live outcomes.

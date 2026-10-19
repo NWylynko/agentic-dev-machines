@@ -262,17 +262,15 @@ async function startBotLifecycle(
           .end(JSON.stringify({ error: { message: "not authorized" } }));
         return;
       }
-      response
-        .writeHead(200, headers)
-        .end(
-          JSON.stringify({
-            workspaceId: id,
-            holder: value.holder,
-            fencingToken: 1,
-            expiresAt: Math.floor(Date.now() / 1000) + 60,
-            valid: true,
-          }),
-        );
+      response.writeHead(200, headers).end(
+        JSON.stringify({
+          workspaceId: id,
+          holder: value.holder,
+          fencingToken: 1,
+          expiresAt: Math.floor(Date.now() / 1000) + 60,
+          valid: true,
+        }),
+      );
       return;
     }
     const authorize = /^\/v1\/workspaces\/([^/]+)\/runtime\/authorize$/.exec(
@@ -479,29 +477,44 @@ test("workspace requests are authorized by lifecycle against the caller's projec
       request.headers.authorization === "Bearer rotating-pod-identity-token";
     const leasePath = request.url?.endsWith("/runtime/lease");
     const checkPath = request.url?.endsWith("/runtime/check");
-    const status = !authorized ? 401 : checkPath && deleting ? 410 : 200;
+    const resourceDenied = body.action === "resources";
+    const status = !authorized
+      ? 401
+      : resourceDenied
+        ? 403
+        : checkPath && deleting
+          ? 410
+          : 200;
     response.writeHead(status, { "content-type": "application/json" });
     response.end(
       JSON.stringify(
         !authorized
           ? { error: { code: "UNAUTHORIZED" } }
-          : leasePath
+          : resourceDenied
             ? {
-                workspaceId: "workspace-lifecycle-auth",
-                holder: body.holder,
-                fencingToken: 7,
-                expiresAt: Math.floor(Date.now() / 1000) + 30,
+                error: {
+                  code: "PROJECT_RESOURCES_FORBIDDEN",
+                  message:
+                    "Only the owning coding workspace can manage resources",
+                },
               }
-            : checkPath && deleting
+            : leasePath
               ? {
-                  error: {
-                    code: "WORKSPACE_DELETED",
-                    message: "Workspace is deleting",
-                  },
+                  workspaceId: "workspace-lifecycle-auth",
+                  holder: body.holder,
+                  fencingToken: 7,
+                  expiresAt: Math.floor(Date.now() / 1000) + 30,
                 }
-              : checkPath
-                ? { valid: true }
-                : { allowed: true },
+              : checkPath && deleting
+                ? {
+                    error: {
+                      code: "WORKSPACE_DELETED",
+                      message: "Workspace is deleting",
+                    },
+                  }
+                : checkPath
+                  ? { valid: true }
+                  : { allowed: true },
       ),
     );
   });
@@ -573,6 +586,36 @@ test("workspace requests are authorized by lifecycle against the caller's projec
     ),
     "the controller credential never crosses into the workspace Pod",
   );
+  for (const [endpoint, method, body] of [
+    ["resources", "GET"],
+    ["trust", "GET"],
+    ["trust", "PUT", { trusted: true }],
+    ["resources/reload", "POST", {}],
+    ["extensions", "GET"],
+    ["extensions/commands/review", "POST", {}],
+  ]) {
+    const result = await fetch(
+      `${runner.url}/v1/workspaces/workspace-lifecycle-auth/${endpoint}`,
+      {
+        method,
+        headers: {
+          authorization: "Bearer rotating-pod-identity-token",
+          "content-type": "application/json",
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      },
+    );
+    assert.equal(result.status, 403);
+    assert.equal(
+      (await result.json()).error.code,
+      "PROJECT_RESOURCES_FORBIDDEN",
+    );
+    assert.equal(
+      authorizations.filter((entry) => entry.path.endsWith("/authorize")).at(-1)
+        .body.action,
+      "resources",
+    );
+  }
   const admitted = await fetch(
     `${runner.url}/v1/workspaces/workspace-lifecycle-auth/input`,
     {

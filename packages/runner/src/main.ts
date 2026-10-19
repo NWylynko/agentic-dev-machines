@@ -385,6 +385,8 @@ async function lifecycleRuntimeCall(
 }
 function runtimeAction(method: string, pathname: string): string {
   const endpoint = pathname.match(/^\/v1\/workspaces\/[^/]+(?:\/(.*))?$/)?.[1];
+  if (endpoint && /^(resources|trust|extensions)(\/|$)/.test(endpoint))
+    return "resources";
   if (method === "GET") return "read";
   if (method === "DELETE") return "delete";
   if (method === "PUT" && endpoint === "model") return "model";

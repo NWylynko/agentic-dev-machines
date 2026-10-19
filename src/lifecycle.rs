@@ -602,6 +602,8 @@ fn handle_http(
                 || message.contains("held by another pod")
                 || message.contains("runtime lease fencing token is stale")
                 || message.contains("runtime status is restricted to its own workspace")
+                || message
+                    .contains("project resources are restricted to the owning coding workspace")
                 || message.contains("wrong audience")
                 || message.contains("not bound to a Pod")
             {
@@ -1552,6 +1554,7 @@ fn authorize_workspace_action(
                 | "model"
                 | "delete"
                 | "status"
+                | "resources"
         ),
         "unknown runtime action"
     );
@@ -1563,6 +1566,10 @@ fn authorize_workspace_action(
     ensure!(
         action != "status" || source.id == target.id,
         "runtime status is restricted to its own workspace"
+    );
+    ensure!(
+        action != "resources" || (source.id == target.id && target.role == "coding"),
+        "project resources are restricted to the owning coding workspace"
     );
     ensure!(
         source.id == target.id || (source.role == "bot" && target.role == "coding"),
