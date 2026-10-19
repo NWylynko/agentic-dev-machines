@@ -125,6 +125,40 @@ await patch("dist/modes/interactive/interactive-mode.js", [
     4,
   ],
   [
+    "this.restoreQueuedMessagesToEditor({ abort: true });",
+    'void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => this.showError(`Failed to restore queued messages: ${error instanceof Error ? error.message : String(error)}`));',
+    3,
+  ],
+  [
+    'this.restoreQueuedMessagesToEditor();\n                    await this.session.abort();',
+    'await this.restoreQueuedMessagesToEditor();\n                    await this.session.abort();',
+  ],
+  [
+    'const restored = this.restoreQueuedMessagesToEditor();',
+    'const restored = await this.restoreQueuedMessagesToEditor();',
+  ],
+  [
+    'this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());',
+    'this.defaultEditor.onAction("app.message.dequeue", () => { void this.handleDequeue(); });',
+  ],
+  [
+    'handleDequeue() {\n        const restored = this.restoreQueuedMessagesToEditor();',
+    'async handleDequeue() {\n        const restored = await this.restoreQueuedMessagesToEditor();',
+  ],
+  ["clearAllQueues() {", "async clearAllQueues() {"],
+  [
+    "const { steering, followUp } = this.session.clearQueue();",
+    "const { steering, followUp } = await this.session.clearQueue();",
+  ],
+  [
+    "restoreQueuedMessagesToEditor(options) {\n        const { steering, followUp } = this.clearAllQueues();",
+    "async restoreQueuedMessagesToEditor(options) {\n        const { steering, followUp } = await this.clearAllQueues();",
+  ],
+  [
+    "this.session.clearQueue();\n            this.compactionQueuedMessages = queuedMessages;",
+    'void this.session.clearQueue().catch((clearError) => this.showError(`Failed to restore queue after compaction error: ${clearError instanceof Error ? clearError.message : String(clearError)}`));\n            this.compactionQueuedMessages = queuedMessages;',
+  ],
+  [
     "function isEmbeddedStatus(editor) {",
     `function isProjectTrusted(runtimeHost, sessionManager, settingsManager) {
     if (runtimeHost.remotePorts?.projectTrust) {
@@ -202,6 +236,9 @@ export type RemoteInteractiveModeSession = {
     modelRuntime: object;
     resourceLoader: object;
     extensionRunner: object;
+    scopedModels: ReadonlyArray<{ model: import("@earendil-works/pi-ai").Model<any>; thinkingLevel?: import("@earendil-works/pi-agent-core").ThinkingLevel }>;
+    setScopedModels(models: Array<{ model: import("@earendil-works/pi-ai").Model<any>; thinkingLevel?: import("@earendil-works/pi-agent-core").ThinkingLevel }>): void | Promise<void>;
+    clearQueue(): Promise<{ steering: string[]; followUp: string[] }>;
 };
 /** Remote runtime surface that preserves the Pi session API without owning a Pi session. */
 export type RemoteInteractiveModeRuntime = {
