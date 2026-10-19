@@ -1899,19 +1899,21 @@ else:
     );
     let authorize_path = format!("/v1/workspaces/{runtime_id}/runtime/authorize");
     let prompt_action = json!({"action":"prompt"});
-    assert_eq!(
-        request_with_token(
-            &url,
-            "POST",
-            &authorize_path,
-            Some(&json!({"action":"resources"})),
-            Some(&final_pod_token)
-        )
-        .unwrap()
-        .status(),
-        200,
-        "a coding runtime owner can inspect and manage its own project resources"
-    );
+    for action in ["resources", "bash"] {
+        assert_eq!(
+            request_with_token(
+                &url,
+                "POST",
+                &authorize_path,
+                Some(&json!({"action":action})),
+                Some(&final_pod_token)
+            )
+            .unwrap()
+            .status(),
+            200,
+            "a coding runtime owner can manage its project resources and user bash commands"
+        );
+    }
     assert_eq!(
         request_with_token(
             &url,
@@ -2187,20 +2189,22 @@ else:
         "a valid token bound to a different workspace cannot read this runtime status"
     );
     let cross_authorize = format!("/v1/workspaces/{bot_id}/runtime/authorize");
-    for target in [&authorize_path, &cross_authorize] {
-        assert_eq!(
-            request_with_token(
-                &url,
-                "POST",
-                target,
-                Some(&json!({"action":"resources"})),
-                Some("bot-token")
-            )
-            .unwrap()
-            .status(),
-            403,
-            "bots cannot inspect project files or change project trust"
-        );
+    for action in ["resources", "bash"] {
+        for target in [&authorize_path, &cross_authorize] {
+            assert_eq!(
+                request_with_token(
+                    &url,
+                    "POST",
+                    target,
+                    Some(&json!({"action":action})),
+                    Some("bot-token")
+                )
+                .unwrap()
+                .status(),
+                403,
+                "bots cannot inspect project files, change trust, or execute user bash"
+            );
+        }
     }
     assert_eq!(
         request_with_token(

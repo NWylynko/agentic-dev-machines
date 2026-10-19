@@ -76,7 +76,7 @@ export const UserBashTask = defineTask<
       await runtime.hooks.each("assertActive", (assertActive) =>
         assertActive(runtime.signal),
       );
-      const outputWrites: Promise<void>[] = [];
+      const outputWrites = new Set<Promise<void>>();
       let executed: Awaited<ReturnType<ExecutionEnv["exec"]>>;
       try {
         executed = await env.exec(
@@ -93,14 +93,14 @@ export const UserBashTask = defineTask<
                 output = output.slice(cut);
                 bytes -= Buffer.byteLength(removed);
               }
-              outputWrites.push(
-                runtime.hooks
-                  .each("output", (emit) =>
-                    emit(task.input.operationId, text, info.stream),
-                  )
-                  .then(() => {})
-                  .catch((error) => runtime.report(error)),
-              );
+              const written = runtime.hooks
+                .each("output", (emit) =>
+                  emit(task.input.operationId, text, info.stream),
+                )
+                .then(() => {})
+                .catch((error) => runtime.report(error));
+              outputWrites.add(written);
+              void written.finally(() => outputWrites.delete(written));
             },
           },
           withAbortSignal(runtime.signal, context),
