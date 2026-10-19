@@ -5,7 +5,16 @@ import type {
   AgentMessage,
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type {
+  Api,
+  ImageContent,
+  Model,
+  TextContent,
+} from "@earendil-works/pi-ai";
+import type {
+  AgentEvent as DurableAgentEvent,
+  NestedToolExecutionResult,
+} from "@earendil-works/pi-durable";
 import {
   createExtensionRuntime,
   SettingsManager,
@@ -189,6 +198,90 @@ function isKeyId(value: string): value is KeyId {
 }
 function isQueueMode(value: string): value is "all" | "one-at-a-time" {
   return value === "all" || value === "one-at-a-time";
+}
+type DurableToolExecutionEnd = Extract<
+  DurableAgentEvent,
+  { type: "tool_execution_end" }
+>;
+function isToolContentBlock(
+  value: unknown,
+): value is TextContent | ImageContent {
+  const block = value as Record<string, unknown> | null;
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    ((block.type === "text" && typeof block.text === "string") ||
+      (block.type === "image" &&
+        typeof block.data === "string" &&
+        typeof block.mimeType === "string"))
+  );
+}
+// Durable's nested output is a string for one text item, an image, "" for
+// none, a content list, or a tool's structured value; diagnostics explain an
+// error result the Harness wrote itself.
+function nestedToolResultContent(
+  result: NestedToolExecutionResult,
+): (TextContent | ImageContent)[] {
+  const output = result.structuredOutput;
+  if (output === undefined)
+    return result.diagnostics.map(({ message }) => ({
+      type: "text",
+      text: message,
+    }));
+  if (typeof output === "string")
+    return output ? [{ type: "text", text: output }] : [];
+  const blocks: unknown[] = Array.isArray(output) ? output : [output];
+  if (blocks.every(isToolContentBlock)) return blocks;
+  return [{ type: "text", text: JSON.stringify(output, null, 2) }];
+}
+// Pi's tool row renders `result.content`. Durable ends a model-issued call
+// with its toolResult entry, a nested call with its result, and a faulted or
+// orphaned call with neither.
+function piToolExecutionEnd(event: DurableToolExecutionEnd) {
+  const call = {
+    type: "tool_execution_end" as const,
+    toolCallId: event.toolCallId,
+    toolName: event.toolName,
+    ...(event.parentToolCallId
+      ? { parentToolCallId: event.parentToolCallId }
+      : {}),
+  };
+  const message = event.entry?.model?.find(
+    (candidate) =>
+      candidate.role === "toolResult" &&
+      candidate.toolCallId === event.toolCallId,
+  );
+  if (message?.role === "toolResult")
+    return {
+      ...call,
+      result: { content: message.content, details: message.details },
+      isError: message.isError,
+      durationMs: message.durationMs,
+    };
+  if (event.result)
+    return {
+      ...call,
+      result: {
+        content: nestedToolResultContent(event.result),
+        details: event.result.details,
+      },
+      isError: event.result.isError,
+      durationMs: event.result.durationMs,
+    };
+  return {
+    ...call,
+    result: {
+      content: [
+        {
+          type: "text" as const,
+          text: event.entry
+            ? "Durable ended this tool call with an entry that has no tool result."
+            : "Tool call ended without a result: its task faulted or was orphaned, or its run ended first.",
+        },
+      ],
+    },
+    isError: true,
+  };
 }
 type WorkspaceSnapshot = ReturnType<WorkspaceTerminal["getRemoteSnapshot"]>;
 type DurablePiEventListener = (
@@ -1465,7 +1558,7 @@ export class DurableInteractiveRuntime {
           partialResult: tool?.result ?? { content: [] },
         } as AgentSessionEvent);
       } else if (data?.type === "tool_execution_end") {
-        void this.emit(data as AgentSessionEvent);
+        void this.emit(piToolExecutionEnd(data) as AgentSessionEvent);
       } else if (data?.type === "turn_start") {
         this.streaming = true;
         void this.emit({ type: "turn_start" } as AgentSessionEvent);

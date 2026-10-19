@@ -358,7 +358,7 @@ test("upstream session projection sends prompts to Durable and replays streamed 
   }
 });
 
-test("pinned upstream InteractiveMode starts over the Durable workspace projection", async () => {
+test("pinned upstream InteractiveMode starts over the Durable workspace projection and renders live tool ends", async () => {
   const projectRoot = process.cwd();
   const stagedPi = join(
     projectRoot,
@@ -486,6 +486,123 @@ test("pinned upstream InteractiveMode starts over the Durable workspace projecti
       terminal.input,
       "InteractiveMode must register the editor input handler",
     );
+
+    // Durable ends a model-issued call with its toolResult entry, a nested
+    // Code Mode call with its result, and an orphaned call with neither.
+    const piEnds: AgentSessionEvent[] = [];
+    const unsubscribe = remote.session.subscribe((event: AgentSessionEvent) => {
+      if (event.type === "tool_execution_end") piEnds.push(event);
+    });
+    const live = (data: object) =>
+      stream!.write(
+        `event: live\ndata: ${JSON.stringify({ workspaceId: "work", kind: "live", data })}\n\n`,
+      );
+    live({
+      type: "tool_execution_start",
+      toolCallId: "call-code",
+      toolName: "codemode",
+      args: { code: "await tools.read({ path: 'notes.md' })" },
+    });
+    live({
+      type: "tool_execution_start",
+      toolCallId: "call-code/1",
+      toolName: "read",
+      parentToolCallId: "call-code",
+      args: { path: "notes.md" },
+    });
+    live({
+      type: "tool_execution_end",
+      toolCallId: "call-code/1",
+      toolName: "read",
+      parentToolCallId: "call-code",
+      result: {
+        taskId: 31,
+        structuredOutput: "nested notes contents",
+        isError: false,
+        diagnostics: [],
+        durationMs: 4,
+      },
+    });
+    live({
+      type: "tool_execution_end",
+      toolCallId: "call-code",
+      toolName: "codemode",
+      entry: {
+        id: 32,
+        conversationId: 12,
+        kind: "pi.toolResult",
+        model: [
+          {
+            role: "toolResult",
+            toolCallId: "call-code",
+            toolName: "codemode",
+            content: [{ type: "text", text: "codemode returned notes" }],
+            isError: false,
+            timestamp: Date.now(),
+            durationMs: 9,
+          },
+        ],
+      },
+    });
+    live({
+      type: "tool_execution_start",
+      toolCallId: "call-lost",
+      toolName: "bash",
+      args: { command: "sleep 600" },
+    });
+    live({
+      type: "tool_execution_end",
+      toolCallId: "call-lost",
+      toolName: "bash",
+    });
+    await terminal.waitFor("orphaned");
+    unsubscribe();
+    assert.deepEqual(
+      piEnds.map((event) => event.type === "tool_execution_end" && event),
+      [
+        {
+          type: "tool_execution_end",
+          toolCallId: "call-code/1",
+          toolName: "read",
+          parentToolCallId: "call-code",
+          result: {
+            content: [{ type: "text", text: "nested notes contents" }],
+            details: undefined,
+          },
+          isError: false,
+          durationMs: 4,
+        },
+        {
+          type: "tool_execution_end",
+          toolCallId: "call-code",
+          toolName: "codemode",
+          result: {
+            content: [{ type: "text", text: "codemode returned notes" }],
+            details: undefined,
+          },
+          isError: false,
+          durationMs: 9,
+        },
+        {
+          type: "tool_execution_end",
+          toolCallId: "call-lost",
+          toolName: "bash",
+          result: {
+            content: [
+              {
+                type: "text",
+                text: "Tool call ended without a result: its task faulted or was orphaned, or its run ended first.",
+              },
+            ],
+          },
+          isError: true,
+        },
+      ],
+    );
+    const tools = stripTerminalSequences(terminal.output).replace(/\s+/g, " ");
+    assert.match(tools, /codemode returned notes/);
+    assert.match(tools, /sleep 600/);
+    assert.match(tools, /its task faulted or was orphaned/);
   } finally {
     await remote.dispose();
     transport.close();
@@ -498,6 +615,7 @@ test("pinned upstream InteractiveMode starts over the Durable workspace projecti
 class CapturingTerminal implements Terminal {
   output = "";
   input?: (data: string) => void;
+  private writes = new Set<() => void>();
   start(input: (data: string) => void) {
     this.input = input;
   }
@@ -505,6 +623,23 @@ class CapturingTerminal implements Terminal {
   async drainInput() {}
   write(data: string) {
     this.output += data;
+    for (const check of this.writes) check();
+  }
+  waitFor(text: string) {
+    return new Promise<void>((resolve) => {
+      const check = () => {
+        if (
+          stripTerminalSequences(this.output)
+            .replace(/\s+/g, " ")
+            .includes(text)
+        ) {
+          this.writes.delete(check);
+          resolve();
+        }
+      };
+      this.writes.add(check);
+      check();
+    });
   }
   get columns() {
     return 100;

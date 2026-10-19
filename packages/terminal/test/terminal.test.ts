@@ -1357,3 +1357,259 @@ test(
     }
   },
 );
+
+test(
+  "an attached native terminal stays up through live tool success, failure, and abort",
+  { timeout: 30000 },
+  async () => {
+    const stateDirectory = await mkdtemp(
+      join(tmpdir(), "adm-terminal-live-tools-"),
+    );
+    const runner = spawn(
+      process.execPath,
+      [
+        fileURLToPath(new URL("../../runner/src/main.ts", import.meta.url)),
+        "--port",
+        "0",
+        "--state-dir",
+        stateDirectory,
+        "--provider",
+        "faux",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, HOME: stateDirectory },
+      },
+    );
+    let runnerErrors = "";
+    runner.stderr.on("data", (chunk) => (runnerErrors += chunk));
+    const runnerExit = once(runner, "exit");
+    const runnerLines = createInterface({ input: runner.stdout });
+    const watchController = new AbortController();
+    let terminal: ReturnType<typeof spawn> | undefined;
+    let proxy: ReturnType<typeof createServer> | undefined;
+    let observer: WorkspaceTerminal | undefined;
+    try {
+      const runnerUrl = await new Promise<string>((resolve, reject) => {
+        runner.once("error", reject);
+        runner.once("exit", (code) =>
+          reject(new Error(`Runner exited ${code}: ${runnerErrors}`)),
+        );
+        runnerLines.on("line", (line) => {
+          try {
+            const value = JSON.parse(line);
+            if (value.ready) resolve(value.url);
+          } catch {
+            // Runner diagnostics may share stdout with its ready record.
+          }
+        });
+      });
+      const id = "terminal-live-tools";
+      const root = join(stateDirectory, "repo");
+      await mkdir(root);
+      const registered = await fetch(`${runnerUrl}/v1/workspaces/${id}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          id,
+          name: "live tools",
+          role: "coding",
+          environment: "local",
+          localRoot: root,
+          model: { provider: "faux", id: "faux-1" },
+        }),
+      });
+      assert.equal(registered.status, 200);
+
+      // Pi ignores submissions until startup ends with its model refresh.
+      let readyResolve = () => {};
+      const ready = new Promise<void>((resolve) => {
+        readyResolve = resolve;
+      });
+      proxy = createServer((req, res) => {
+        if (req.url?.includes("/models?refresh=true")) readyResolve();
+        const upstream = httpRequest(
+          new URL(req.url!, runnerUrl),
+          { method: req.method, headers: req.headers },
+          (incoming) => {
+            res.writeHead(incoming.statusCode!, incoming.headers);
+            incoming.pipe(res);
+          },
+        );
+        upstream.on("error", (error) => res.destroy(error));
+        res.on("close", () => upstream.destroy());
+        req.pipe(upstream);
+      });
+      proxy.listen(0, "127.0.0.1");
+      await once(proxy, "listening");
+      const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`;
+      const args = [
+        process.execPath,
+        "--import",
+        "tsx",
+        fileURLToPath(new URL("../src/main.ts", import.meta.url)),
+        "--url",
+        `http://127.0.0.1:${(proxy.address() as { port: number }).port}`,
+        "--workspace",
+        id,
+      ];
+      const child = spawn(
+        "script",
+        [
+          "--quiet",
+          "--return",
+          "--command",
+          args.map(quote).join(" "),
+          "/dev/null",
+        ],
+        {
+          stdio: ["pipe", "pipe", "pipe"],
+          detached: true,
+          env: {
+            ...process.env,
+            HOME: stateDirectory,
+            XDG_CONFIG_HOME: join(stateDirectory, "client-config"),
+          },
+        },
+      );
+      terminal = child;
+      let output = "";
+      let exited: number | null | undefined;
+      child.stdout!.on("data", (data) => (output += data));
+      child.stderr!.on("data", (data) => (output += data));
+      child.once("exit", (code) => (exited = code));
+      // Wait on PTY output; the attached terminal crashing fails immediately.
+      const waitOutput = (text: string) =>
+        new Promise<void>((resolve, reject) => {
+          const check = () => {
+            if (visibleTerminalText(output).includes(text)) done(resolve);
+            else if (exited !== undefined)
+              done(() =>
+                reject(
+                  new Error(
+                    `Terminal exited (${exited}) before showing ${text}: ${visibleTerminalText(output)}; runner=${runnerErrors}`,
+                  ),
+                ),
+              );
+          };
+          const timer = setTimeout(
+            () =>
+              done(() =>
+                reject(
+                  new Error(
+                    `Missing native output ${text}: ${visibleTerminalText(output)}; runner=${runnerErrors}`,
+                  ),
+                ),
+              ),
+            10000,
+          );
+          const done = (settle: () => void) => {
+            clearTimeout(timer);
+            child.stdout!.off("data", check);
+            child.off("exit", check);
+            settle();
+          };
+          child.stdout!.on("data", check);
+          child.on("exit", check);
+          check();
+        });
+      const submit = async (prompt: string) => {
+        child.stdin!.write(`\x1b[200~${prompt}\x1b[201~`);
+        await waitOutput(prompt.slice(-24));
+        child.stdin!.write("\r");
+      };
+      await ready;
+      // The runner's own history says when each run is over.
+      const historyObserver = new WorkspaceTerminal({
+        url: runnerUrl,
+        workspaceId: id,
+        autoModelSelector: false,
+      });
+      observer = historyObserver;
+      await historyObserver.connect();
+      const history = (match: (event: WorkspaceEvent) => boolean) =>
+        new Promise<WorkspaceEvent>((resolve) =>
+          historyObserver.subscribeWorkspaceEvents((event) => {
+            if (match(event)) resolve(event);
+          }),
+        );
+
+      const answered = history(
+        (event) =>
+          event.kind === "assistant" &&
+          event.data.text === "Both tools finished while attached",
+      );
+      await submit(
+        "/faux " +
+          JSON.stringify({
+            calls: [
+              {
+                tool: "bash",
+                args: { command: "printf 'tool-ok-%s' $((6*7))" },
+              },
+              {
+                tool: "bash",
+                args: { command: "printf 'tool-bad-%s' $((6*7)) >&2; exit 7" },
+              },
+            ],
+            answer: "Both tools finished while attached",
+          }),
+      );
+      // Only the final tool result carries Durable's exit diagnostic.
+      await waitOutput("Command exited with code 7");
+      await answered;
+      const settled = visibleTerminalText(output);
+      assert.match(settled, /tool-ok-42 Took \d/);
+      assert.match(settled, /tool-bad-42/);
+
+      const fifo = join(stateDirectory, "release");
+      const marker = join(stateDirectory, "abort-tool-started");
+      assert.equal((await once(spawn("mkfifo", [fifo]), "exit"))[0], 0);
+      const changes = watch(stateDirectory, {
+        signal: watchController.signal,
+      });
+      const started = (async () => {
+        for await (const event of changes)
+          if (event.filename === "abort-tool-started") return;
+      })();
+      const abortedResult = history(
+        (event) =>
+          event.kind === "tool" &&
+          event.data.text.includes("Tool bash was aborted"),
+      );
+      await submit(
+        "/faux " +
+          JSON.stringify({
+            calls: [
+              {
+                tool: "bash",
+                args: { command: `touch ${marker}; cat ${fifo}` },
+              },
+            ],
+            answer: "Not reached after abort",
+          }),
+      );
+      await started;
+      child.stdin!.write("\x1b");
+      assert.equal((await abortedResult).data.isError, true);
+      await waitOutput("Tool bash was aborted");
+      assert.equal(exited, undefined, visibleTerminalText(output));
+
+      const detached = once(child, "exit");
+      child.stdin!.write("\x03");
+      assert.equal((await detached)[0], 0);
+      assert.doesNotMatch(visibleTerminalText(output), /TypeError/);
+    } finally {
+      watchController.abort();
+      observer?.close();
+      if (terminal) stopProcessGroup(terminal);
+      if (proxy) {
+        proxy.closeAllConnections();
+        await new Promise<void>((resolve) => proxy!.close(() => resolve()));
+      }
+      runner.kill("SIGTERM");
+      await runnerExit;
+      runnerLines.close();
+    }
+  },
+);
