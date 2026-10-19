@@ -21,8 +21,16 @@ import {
   type SessionEntry,
   type SessionInfo,
   type SessionTreeNode,
+  type ExtensionUIContext,
+  type ResolvedCommand,
+  type ExtensionShortcut,
 } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
+import {
+  exportDurableSessionHtml,
+  exportDurableSessionJsonl,
+} from "./native-export.ts";
 import {
   importedPiSession,
   WorkspaceTerminal,
@@ -30,6 +38,137 @@ import {
 } from "./terminal.ts";
 
 type SessionModel = Model<Api>;
+type WorkspaceSettings = {
+  thinkingLevel: ThinkingLevel;
+  steeringMode: "all" | "one-at-a-time";
+  followUpMode: "all" | "one-at-a-time";
+  autoCompact: boolean;
+  scopedModels: string[];
+  cacheWarmingMode: "off" | "streaming" | "idle";
+  sessionName?: string;
+};
+type WorkspaceQueue = { steering: string[]; followUp: string[] };
+type RemoteExtensions = {
+  extensions: {
+    name: string;
+    path: string;
+    active: boolean;
+    commands: { name: string; path: string; description?: string }[];
+    shortcuts: { name: string; key: string; description?: string }[];
+  }[];
+  diagnostics: { type: string; message: string; path?: string }[];
+};
+type ExtensionOperationEvent = {
+  seq: number;
+  type:
+    | "ui_request"
+    | "notification"
+    | "status"
+    | "title"
+    | "editor_text"
+    | "working_message"
+    | "working_visible"
+    | "result"
+    | "error";
+  requestId?: string;
+  method?: "select" | "confirm" | "input" | "editor" | "getEditorText";
+  title?: string;
+  message?: string;
+  options?: string[];
+  placeholder?: string;
+  prefill?: string;
+  timeout?: number;
+  level?: "info" | "warning" | "error";
+  key?: string;
+  text?: string;
+  visible?: boolean;
+  command?: string;
+  code?: string;
+};
+const workspaceThinkingLevels = new Set<ThinkingLevel>([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+function parseWorkspaceSettings(value: Partial<WorkspaceSettings>) {
+  const settings: Partial<WorkspaceSettings> = {};
+  if (value.thinkingLevel !== undefined) {
+    if (!workspaceThinkingLevels.has(value.thinkingLevel))
+      throw new Error("Runner returned an unsupported thinking level");
+    settings.thinkingLevel = value.thinkingLevel;
+  }
+  if (value.steeringMode !== undefined) {
+    if (!isQueueMode(value.steeringMode))
+      throw new Error("Runner returned an unsupported steering mode");
+    settings.steeringMode = value.steeringMode;
+  }
+  if (value.followUpMode !== undefined) {
+    if (!isQueueMode(value.followUpMode))
+      throw new Error("Runner returned an unsupported follow-up mode");
+    settings.followUpMode = value.followUpMode;
+  }
+  if (value.autoCompact !== undefined) {
+    if (typeof value.autoCompact !== "boolean")
+      throw new Error("Runner returned an invalid auto-compaction setting");
+    settings.autoCompact = value.autoCompact;
+  }
+  if (value.scopedModels !== undefined) {
+    if (
+      !Array.isArray(value.scopedModels) ||
+      value.scopedModels.some((model) => typeof model !== "string")
+    )
+      throw new Error("Runner returned invalid scoped model settings");
+    settings.scopedModels = [...value.scopedModels];
+  }
+  if (value.cacheWarmingMode !== undefined) {
+    if (!["off", "streaming", "idle"].includes(value.cacheWarmingMode))
+      throw new Error("Runner returned an unsupported cache warming mode");
+    settings.cacheWarmingMode = value.cacheWarmingMode;
+  }
+  if (value.sessionName !== undefined) {
+    if (typeof value.sessionName !== "string")
+      throw new Error("Runner returned an invalid session name");
+    settings.sessionName = value.sessionName;
+  }
+  return settings;
+}
+function parseWorkspaceQueue(value: Partial<WorkspaceQueue>): WorkspaceQueue {
+  const steering = value.steering;
+  const followUp = value.followUp;
+  if (
+    !Array.isArray(steering) ||
+    steering.some((message) => typeof message !== "string") ||
+    !Array.isArray(followUp) ||
+    followUp.some((message) => typeof message !== "string")
+  )
+    throw new Error("Runner returned an invalid queued-message projection");
+  return { steering: [...steering], followUp: [...followUp] };
+}
+const shortcutBases = new Set([
+  ..."abcdefghijklmnopqrstuvwxyz0123456789`-=[]\\;',./!@#$%^&*()_+|~{}:?<>".split(""),
+  "escape", "esc", "enter", "return", "tab", "space", "backspace",
+  "delete", "insert", "clear", "home", "end", "pageUp", "pageDown",
+  "up", "down", "left", "right", ...Array.from({ length: 12 }, (_, i) => `f${i + 1}`),
+]);
+function isKeyId(value: string): value is KeyId {
+  const parts = value.split("+");
+  const base = parts.pop();
+  const modifiers = parts;
+  return Boolean(
+    base &&
+      shortcutBases.has(base) &&
+      modifiers.length <= 3 &&
+      new Set(modifiers).size === modifiers.length &&
+      modifiers.every((modifier) => ["ctrl", "shift", "alt", "super"].includes(modifier)),
+  );
+}
+function isQueueMode(value: string): value is "all" | "one-at-a-time" {
+  return value === "all" || value === "one-at-a-time";
+}
 type WorkspaceSnapshot = ReturnType<WorkspaceTerminal["getRemoteSnapshot"]>;
 type DurablePiEventListener = (
   event: AgentSessionEvent,
@@ -110,7 +249,7 @@ const entryMessages = (snapshot: WorkspaceSnapshot): SessionEntry[] => {
     const visibleMessage = publicBotMessage ?? message;
     if (
       !visibleMessage ||
-      !["user", "assistant", "toolResult", "custom"].includes(
+      !["user", "assistant", "toolResult", "custom", "bashExecution"].includes(
         visibleMessage.role,
       )
     )
@@ -134,7 +273,7 @@ class DurableSessionManagerProjection {
     return this.runtime.snapshot().cwd;
   }
   getSessionName() {
-    return this.runtime.snapshot().workspaceName;
+    return this.runtime.sessionName();
   }
   getSessionFile(): undefined {
     return undefined;
@@ -146,7 +285,8 @@ class DurableSessionManagerProjection {
     return false;
   }
   getSessionId() {
-    return `workspace-${this.runtime.snapshot().conversationId ?? "pending"}`;
+    const snapshot = this.runtime.snapshot();
+    return `${snapshot.workspaceId}:${snapshot.conversationId ?? "pending"}`;
   }
   getSessionNameValue() {
     return this.getSessionName();
@@ -287,6 +427,7 @@ export class DurableInteractiveRuntime {
   readonly session: ReturnType<DurableInteractiveRuntime["sessionProjection"]>;
   readonly remotePorts = {
     isRemote: true as const,
+    supportsBash: false,
     projectTrust: {
       get: (_cwd: string): ProjectTrustDecision =>
         this.resources?.trust.trusted ?? null,
@@ -335,7 +476,19 @@ export class DurableInteractiveRuntime {
   private current: WorkspaceSnapshot;
   private catalog?: ModelCatalog;
   private resources?: WorkspaceResourceSnapshot;
-  private settings: { thinkingLevel: ThinkingLevel } = { thinkingLevel: "off" };
+  private settings: WorkspaceSettings = {
+    thinkingLevel: "off",
+    steeringMode: "one-at-a-time",
+    followUpMode: "one-at-a-time",
+    autoCompact: true,
+    scopedModels: [],
+    cacheWarmingMode: "off",
+  };
+  private queue: WorkspaceQueue = { steering: [], followUp: [] };
+  private extensions: RemoteExtensions = { extensions: [], diagnostics: [] };
+  private extensionUi?: ExtensionUIContext;
+  private remoteCommands: ResolvedCommand[] = [];
+  private remoteShortcuts = new Map<string, ExtensionShortcut>();
   private listeners = new Set<DurablePiEventListener>();
   private unlisten: () => void;
   private settingsManager: SettingsManager;
@@ -352,10 +505,12 @@ export class DurableInteractiveRuntime {
   private lastUsage?: Record<string, number>;
   private activeBashOperationId?: string;
   private extensionRunner = {
-    getRegisteredCommands: () => [],
-    getShortcuts: () => new Map(),
-    getCommandDiagnostics: () => [],
-    getShortcutDiagnostics: () => [],
+    getRegisteredCommands: () => this.remoteCommands,
+    getCommand: (name: string) =>
+      this.remoteCommands.find((command) => command.name === name),
+    getShortcuts: () => this.remoteShortcuts,
+    getCommandDiagnostics: () => this.extensions.diagnostics,
+    getShortcutDiagnostics: () => this.extensions.diagnostics,
     getMarkdownTransformers: () => [],
     resolveToolRenderers: (_name: string, fallback: () => unknown) =>
       fallback(),
@@ -455,6 +610,10 @@ export class DurableInteractiveRuntime {
 
   constructor(readonly transport: WorkspaceTerminal) {
     this.current = transport.getRemoteSnapshot();
+    Object.defineProperty(this.remotePorts, "supportsBash", {
+      enumerable: true,
+      get: () => this.snapshot().role === "coding",
+    });
     this.settingsManager = SettingsManager.create(
       process.cwd(),
       this.services.agentDir,
@@ -474,9 +633,11 @@ export class DurableInteractiveRuntime {
       throw new Error(
         `Connect to the workspace before starting Pi InteractiveMode: ${this.current.status}`,
       );
-    const settingsRequest = this.transport.request<{ thinkingLevel?: string }>(
-      "/settings",
-    );
+    const settingsRequest = this.transport.request<Partial<WorkspaceSettings>>("/settings");
+    const queueRequest = this.transport.request<Partial<WorkspaceQueue>>("/queue");
+    const extensionsRequest = this.current.role === "coding"
+      ? this.transport.request<RemoteExtensions>("/extensions")
+      : Promise.resolve<RemoteExtensions>({ extensions: [], diagnostics: [] });
     const resourcesRequest =
       this.current.role === "bot"
         ? Promise.resolve<WorkspaceResourceSnapshot>({
@@ -491,13 +652,19 @@ export class DurableInteractiveRuntime {
             appendSystemPrompt: [],
           })
         : this.transport.request<WorkspaceResourceSnapshot>("/resources");
-    const [data, resources] = await Promise.all([
+    const [data, queue, extensions, resources] = await Promise.all([
       settingsRequest,
+      queueRequest,
+      extensionsRequest,
       resourcesRequest,
     ]);
     this.resources = resources;
-    if (typeof data.thinkingLevel === "string")
-      this.settings.thinkingLevel = data.thinkingLevel as ThinkingLevel;
+    this.settings = {
+      ...this.settings,
+      ...parseWorkspaceSettings(data),
+    };
+    this.queue = parseWorkspaceQueue(queue);
+    this.configureExtensions(extensions);
     this.current = this.transport.getRemoteSnapshot();
     this.modelRuntime.refreshSnapshot();
   }
@@ -506,8 +673,122 @@ export class DurableInteractiveRuntime {
     this.current = this.transport.getRemoteSnapshot();
     return { ...this.current, catalog: this.catalog };
   }
+  settingsValue() {
+    return this.settings;
+  }
+  sessionName() {
+    return this.settings.sessionName || undefined;
+  }
+  isBashRunning() {
+    return Boolean(this.activeBashOperationId || this.snapshot().activeBash.length);
+  }
   updateCatalog(catalog: ModelCatalog) {
     this.catalog = catalog;
+  }
+  private configureExtensions(catalog: RemoteExtensions) {
+    this.extensions = catalog;
+    const commands: ResolvedCommand[] = [];
+    const shortcuts = new Map<string, ExtensionShortcut>();
+    for (const extension of catalog.extensions) {
+      if (!extension.active) continue;
+      for (const command of extension.commands) {
+        commands.push({
+          name: command.name,
+          invocationName: command.name,
+          sourceInfo: {
+            path: command.path,
+            source: extension.name,
+            scope: "project",
+            origin: "package",
+            baseDir: extension.path,
+          },
+          ...(command.description ? { description: command.description } : {}),
+          handler: async (args) =>
+            this.runExtensionOperation("command", command.name, args),
+        });
+      }
+      for (const shortcut of extension.shortcuts) {
+        if (!isKeyId(shortcut.key))
+          throw new Error(`Runner returned invalid extension shortcut key ${shortcut.key}`);
+        shortcuts.set(shortcut.key, {
+          shortcut: shortcut.key,
+          extensionPath: extension.path,
+          ...(shortcut.description ? { description: shortcut.description } : {}),
+          handler: async () =>
+            this.runExtensionOperation("shortcut", shortcut.name, ""),
+        });
+      }
+    }
+    this.remoteCommands = commands;
+    this.remoteShortcuts = shortcuts;
+  }
+  private async runExtensionOperation(
+    kind: "command" | "shortcut",
+    name: string,
+    args: string,
+  ) {
+    const ui = this.extensionUi;
+    if (!ui)
+      throw new Error("Pi extension UI is not ready for this workspace command");
+    const requestId = randomUUID();
+    const route =
+      kind === "command" ? "/extensions/commands" : "/extensions/shortcuts";
+    const admission = await this.transport.request<{ operationId: string }>(
+      route,
+      kind === "command"
+        ? { name, args, requestId }
+        : { name, requestId },
+    );
+    let after = 0;
+    for await (const event of this.transport.subscribeOperationEvents<ExtensionOperationEvent>(
+      `/extensions/commands/${encodeURIComponent(admission.operationId)}/events?after=${after}`,
+    )) {
+      if (!Number.isSafeInteger(event.seq) || event.seq <= after)
+        throw new Error("Runner returned an invalid extension operation sequence");
+      after = event.seq;
+      if (event.type === "ui_request") {
+        if (!event.requestId || !event.method)
+          throw new Error("Runner returned an invalid extension UI request");
+        const options = event.timeout === undefined ? undefined : { timeout: event.timeout };
+        let result: string | boolean | null;
+        if (event.method === "select")
+          result =
+            (await ui.select(event.title ?? "Select", event.options ?? [], options)) ??
+            null;
+        else if (event.method === "confirm")
+          result = await ui.confirm(event.title ?? "Confirm", event.message ?? "", options);
+        else if (event.method === "input")
+          result =
+            (await ui.input(event.title ?? "Input", event.placeholder, options)) ??
+            null;
+        else if (event.method === "editor")
+          result = (await ui.editor(event.title ?? "Edit", event.prefill)) ?? null;
+        else result = ui.getEditorText();
+        await this.transport.request(
+          `/extensions/commands/${encodeURIComponent(admission.operationId)}/ui`,
+          { requestId: event.requestId, result },
+        );
+      } else if (event.type === "notification") {
+        if (event.message) ui.notify(event.message, event.level ?? "info");
+      } else if (event.type === "status") {
+        if (event.key) ui.setStatus(event.key, event.text);
+      } else if (event.type === "title") {
+        if (event.title) ui.setTitle(event.title);
+      } else if (event.type === "editor_text") {
+        ui.setEditorText(event.text ?? "");
+      } else if (event.type === "working_message") {
+        ui.setWorkingMessage(event.message);
+      } else if (event.type === "working_visible") {
+        ui.setWorkingVisible(event.visible === true);
+      } else if (event.type === "error") {
+        throw new Error(event.message ?? `Extension ${kind} failed (${event.code ?? "unknown"})`);
+      } else if (event.type === "result") {
+        return;
+      } else {
+        throw new Error(`Runner returned unsupported extension event ${event.type}`);
+      }
+    }
+    throw new Error("Extension operation stream ended before a result");
   }
   agentState() {
     const model = this.session.model;
@@ -543,7 +824,17 @@ export class DurableInteractiveRuntime {
       get promptTemplates() {
         return resources.getPrompts().prompts;
       },
-      scopedModels: [],
+      get scopedModels() {
+        const available = modelRuntime.getAvailableSnapshot();
+        return runtime
+          .settingsValue()
+          .scopedModels.flatMap((id) => {
+            const model = available.find(
+              (candidate) => `${candidate.provider}/${candidate.id}` === id,
+            );
+            return model ? [{ model }] : [];
+          });
+      },
       get state() {
         return agent.state;
       },
@@ -564,10 +855,10 @@ export class DurableInteractiveRuntime {
         return runtime.settings.thinkingLevel;
       },
       get steeringMode() {
-        return "all";
+        return runtime.settings.steeringMode;
       },
       get followUpMode() {
-        return "all";
+        return runtime.settings.followUpMode;
       },
       get isStreaming() {
         return runtime.streaming;
@@ -579,10 +870,10 @@ export class DurableInteractiveRuntime {
         return runtime.compacting;
       },
       get isBashRunning() {
-        return false;
+        return runtime.isBashRunning();
       },
       get autoCompactionEnabled() {
-        return true;
+        return runtime.settings.autoCompact;
       },
       get retryAttempt() {
         return 0;
@@ -597,21 +888,21 @@ export class DurableInteractiveRuntime {
         return runtime.resourceLoader.getSystemPrompt() ?? "";
       },
       get cacheWarmingStatus() {
-        return undefined;
+        return runtime.snapshot().cacheWarming;
       },
       get sessionId() {
         return manager.getSessionId();
       },
       get sessionName() {
-        return manager.getSessionName();
+        return runtime.sessionName();
       },
       getAvailableThinkingLevels: () => runtime.availableThinkingLevels(),
       getContextUsage: () => runtime.contextUsage(),
       getSessionStats: () => runtime.sessionStats(),
       getLastAssistantText: () => runtime.lastAssistantText(),
       getUserMessagesForForking: () => runtime.userMessagesForForking(),
-      getSteeringMessages: () => [],
-      getFollowUpMessages: () => [],
+      getSteeringMessages: () => [...runtime.queue.steering],
+      getFollowUpMessages: () => [...runtime.queue.followUp],
       getToolDefinition: () => undefined,
       getToolDefinitions: () => [],
       executeBash: (
@@ -622,21 +913,39 @@ export class DurableInteractiveRuntime {
       recordBashResult: () => {
         /* The workspace executor persists the result before its SSE event. */
       },
-      exportToHtml: async () => {
-        throw new Error(
-          "Pi HTML export is not available for remote Durable conversations",
-        );
-      },
-      exportToJsonl: () => {
-        throw new Error(
-          "Pi JSONL export is not available for remote Durable conversations",
-        );
-      },
-      clearQueue: () => {
-        throw new Error(
-          "Queue editing requires the workspace conversation-control API",
-        );
-      },
+      exportToHtml: async (
+        outputPath?: string,
+        options?: { themeName?: string },
+      ) =>
+        exportDurableSessionHtml(
+          {
+            role: runtime.snapshot().role,
+            id: manager.getSessionId(),
+            cwd: manager.getCwd(),
+            name: runtime.sessionName(),
+            entries: manager.getBranch(),
+            ...(runtime.snapshot().role === "coding"
+              ? { systemPrompt: resources.getSystemPrompt() ?? "" }
+              : {}),
+          },
+          outputPath,
+          options,
+        ),
+      exportToJsonl: (outputPath?: string) =>
+        exportDurableSessionJsonl(
+          {
+            role: runtime.snapshot().role,
+            id: manager.getSessionId(),
+            cwd: manager.getCwd(),
+            name: runtime.sessionName(),
+            entries: manager.getBranch(),
+            ...(runtime.snapshot().role === "coding"
+              ? { systemPrompt: resources.getSystemPrompt() ?? "" }
+              : {}),
+          },
+          outputPath,
+        ),
+      clearQueue: () => runtime.clearQueue(),
       followUp: async (message: string) =>
         runtime.prompt(message, { streamingBehavior: "followUp" }),
       steer: async (message: string) =>
@@ -652,16 +961,12 @@ export class DurableInteractiveRuntime {
           "Branch summaries are not active in this remote Durable runtime",
         );
       },
-      setScopedModels: () => {
-        throw new Error(
-          "Scoped model settings require the workspace runtime API",
-        );
-      },
-      setCacheWarmingMode: () => {
-        throw new Error(
-          "Cache warming settings are not exposed by the workspace runtime API",
-        );
-      },
+      setScopedModels: (models: { model: SessionModel }[]) =>
+        runtime.updateSettings({
+          scopedModels: models.map(({ model }) => `${model.provider}/${model.id}`),
+        }),
+      setCacheWarmingMode: (mode: "off" | "streaming" | "idle") =>
+        runtime.updateSettings({ cacheWarmingMode: mode }),
       subscribe: (listener: DurablePiEventListener) =>
         runtime.subscribe(listener),
       prompt: (
@@ -680,34 +985,18 @@ export class DurableInteractiveRuntime {
       setThinkingLevel: (level: ThinkingLevel) =>
         runtime.setThinkingLevel(level),
       cycleThinkingLevel: () => runtime.cycleThinkingLevel(),
-      setAutoCompactionEnabled: () => {
-        throw new Error(
-          "Auto-compaction configuration is not exposed by the Durable runtime yet",
-        );
-      },
-      setSteeringMode: () => {
-        throw new Error(
-          "Steering mode is not exposed by the Durable runtime yet",
-        );
-      },
-      setFollowUpMode: () => {
-        throw new Error(
-          "Follow-up mode is not exposed by the Durable runtime yet",
-        );
-      },
-      setSessionName: () => {
-        throw new Error(
-          "Workspace naming is managed by ADM, not a local Pi session",
-        );
-      },
+      setAutoCompactionEnabled: (enabled: boolean) =>
+        runtime.updateSettings({ autoCompact: enabled }),
+      setSteeringMode: (mode: "all" | "one-at-a-time") =>
+        runtime.updateSettings({ steeringMode: mode }),
+      setFollowUpMode: (mode: "all" | "one-at-a-time") =>
+        runtime.updateSettings({ followUpMode: mode }),
+      setSessionName: (name: string) => runtime.updateSettings({ sessionName: name }),
       compact: (instructions?: string) => runtime.compact(instructions),
       reset: (handoff?: string) => runtime.reset(handoff),
       navigateTree: (entryId: string) => runtime.forkEntry(entryId),
-      bindExtensions: async () => {
-        if (runtime.snapshotResources().extensions.length)
-          throw new Error(
-            "Workspace extensions are discovered but cannot be activated until the Durable extension bridge is available",
-          );
+      bindExtensions: async (options?: { uiContext?: ExtensionUIContext }) => {
+        runtime.extensionUi = options?.uiContext;
       },
       getAvailableTools: () => [],
       getActiveToolNames: () => [],
@@ -832,6 +1121,16 @@ export class DurableInteractiveRuntime {
     message: string,
     options?: { images?: unknown[]; streamingBehavior?: "steer" | "followUp" },
   ) {
+    if (message.startsWith("/")) {
+      const [invocation, ...rest] = message.slice(1).split(/\s+/);
+      const command = this.remoteCommands.find(
+        (candidate) => candidate.invocationName === invocation,
+      );
+      if (command) {
+        await this.runExtensionOperation("command", command.name, rest.join(" "));
+        return;
+      }
+    }
     const images = options?.images;
     await this.transport.request("/input", {
       message,
@@ -840,6 +1139,22 @@ export class DurableInteractiveRuntime {
       whenBusy:
         options?.streamingBehavior === "followUp" ? "followUp" : "steer",
     });
+    await this.refreshQueue();
+  }
+  private async refreshQueue() {
+    this.queue = parseWorkspaceQueue(
+      await this.transport.request<WorkspaceQueue>("/queue"),
+    );
+  }
+  private async clearQueue() {
+    const withdrawn = await this.transport.request<WorkspaceQueue>(
+      "/queue/clear",
+      {},
+      undefined,
+      "POST",
+    );
+    this.queue = parseWorkspaceQueue(withdrawn);
+    return this.queue;
   }
   private async abort() {
     await this.transport.request("/abort", { background: false });
@@ -863,7 +1178,8 @@ export class DurableInteractiveRuntime {
     }
   }
   private async abortBash() {
-    const operationId = this.activeBashOperationId;
+    const operationId =
+      this.activeBashOperationId ?? this.snapshot().activeBash[0]?.operationId;
     if (!operationId) return;
     await this.transport.abortBash(operationId);
   }
@@ -895,17 +1211,20 @@ export class DurableInteractiveRuntime {
     return {
       model: next,
       thinkingLevel: this.settings.thinkingLevel,
-      isScoped: false,
+      isScoped: this.settings.scopedModels.includes(`${next.provider}/${next.id}`),
     };
   }
   private async setThinkingLevel(level: ThinkingLevel) {
-    await this.transport.request(
+    await this.updateSettings({ thinkingLevel: level });
+  }
+  private async updateSettings(patch: Partial<WorkspaceSettings>) {
+    const saved = await this.transport.request<Partial<WorkspaceSettings>>(
       "/settings",
-      { thinkingLevel: level },
+      patch,
       undefined,
       "PUT",
     );
-    this.settings.thinkingLevel = level;
+    this.settings = { ...this.settings, ...parseWorkspaceSettings(saved) };
   }
   async listSessions(): Promise<SessionInfo[]> {
     const navigation = await this.transport.request<{
@@ -1040,6 +1359,8 @@ export class DurableInteractiveRuntime {
       this.promptCount++;
       void this.emit({ type: "message_start", message } as AgentSessionEvent);
     } else if (event.kind === "tool" && message?.role === "toolResult") {
+      void this.emit({ type: "message_end", message } as AgentSessionEvent);
+    } else if (event.kind === "message" && message?.role === "bashExecution") {
       void this.emit({ type: "message_end", message } as AgentSessionEvent);
     } else if (event.kind === "message" && this.snapshot().role === "bot") {
       const publicMessage: AgentMessage = {

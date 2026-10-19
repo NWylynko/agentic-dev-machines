@@ -54,6 +54,33 @@ export type WorkspaceEvent = {
   data: any;
   timestamp: number;
 };
+type WorkspaceCacheWarming = {
+  state: "inactive" | "scheduled" | "refreshing";
+  reason?: string;
+  nextWarmAt?: number;
+  decision?: {
+    phase: "streaming" | "idle";
+    warmCost: number;
+    missCost: number;
+    continuationProbability: number;
+    expectedSavings: number;
+    economicsAvailable: boolean;
+    action: "warm" | "stop";
+  };
+  extensionOverride?: boolean;
+  lastUsage?: {
+    provider: string;
+    model: string;
+    usage: unknown;
+    timestamp: string;
+  };
+};
+type ActiveBashOperation = {
+  operationId: string;
+  requestId: string;
+  command: string;
+  excludeFromContext: boolean;
+};
 type TerminalOptions = {
   url: string;
   workspaceId: string;
@@ -252,10 +279,12 @@ export class WorkspaceTerminal extends Container {
   private transcript = new Container();
   private statusLine = new Text("");
   private records: WorkspaceEvent[] = [];
-  private role = "";
+  private role: "coding" | "bot" = "coding";
   private workspaceName = "";
   private workingDirectory = "/workspace";
   private conversationId?: number;
+  private activeBash: ActiveBashOperation[] = [];
+  private cacheWarming?: WorkspaceCacheWarming;
   private cursor = 0;
   private controller?: AbortController;
   private closed = false;
@@ -516,6 +545,47 @@ export class WorkspaceTerminal extends Container {
     }
     return response.json() as Promise<T>;
   }
+  async *subscribeOperationEvents<T extends { seq: number }>(
+    path: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<T> {
+    const response = await fetch(this.endpoint(path), {
+      headers: {
+        ...(await this.authorizationHeaders()),
+        accept: "text/event-stream",
+      },
+      signal,
+    });
+    if (!response.ok || !response.body)
+      throw new Error(`Runner returned HTTP ${response.status} for operation stream`);
+    if (!response.headers.get("content-type")?.includes("text/event-stream"))
+      throw new Error("Runner returned a non-event-stream operation response");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let dataLines: string[] = [];
+    try {
+      for (;;) {
+        const part = await reader.read();
+        if (part.done) break;
+        buffer += decoder.decode(part.value, { stream: true });
+        let newline: number;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, newline).replace(/\r$/, "");
+          buffer = buffer.slice(newline + 1);
+          if (line === "") {
+            if (dataLines.length) yield JSON.parse(dataLines.join("\n")) as T;
+            dataLines = [];
+          } else if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        }
+      }
+    } finally {
+      await reader.cancel();
+    }
+    if (dataLines.length) yield JSON.parse(dataLines.join("\n")) as T;
+  }
   /** Observe the same authorized, cursor-replayed stream used by the terminal UI. */
   subscribeWorkspaceEvents(listener: (event: WorkspaceEvent) => void) {
     this.workspaceEventListeners.add(listener);
@@ -523,6 +593,7 @@ export class WorkspaceTerminal extends Container {
   }
   getRemoteSnapshot() {
     return {
+      workspaceId: this.options.workspaceId,
       connected: this.connected,
       diagnostics: this.options.diagnostics === true,
       status: this.status,
@@ -530,6 +601,8 @@ export class WorkspaceTerminal extends Container {
       role: this.role,
       cwd: this.workingDirectory,
       conversationId: this.conversationId,
+      activeBash: [...this.activeBash],
+      cacheWarming: this.cacheWarming,
       cursor: this.cursor,
       events: this.records.slice(),
       models: this.modelRuntime?.getAvailableSnapshot() ?? [],
@@ -671,6 +744,10 @@ export class WorkspaceTerminal extends Container {
         this.contextText = "context unavailable";
       }
       this.conversationId = conversationId;
+      this.activeBash = Array.isArray(workspace.activeBash)
+        ? workspace.activeBash
+        : [];
+      this.cacheWarming = workspace.cacheWarming;
       this.role = workspace.role;
       this.workspaceName = workspace.name;
       if (typeof workspace.cwd === "string" && workspace.cwd.trim())

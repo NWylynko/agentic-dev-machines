@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { cp, mkdir } from "node:fs/promises";
+import { cp, mkdir, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { stripTerminalSequences, type Terminal } from "@earendil-works/pi-tui";
@@ -15,6 +15,8 @@ test("upstream session projection sends prompts to Durable and replays streamed 
   let accepted: unknown;
   let trustUpdates: unknown;
   let bashRequest: unknown;
+  let savedQueue = { steering: ["steer me"], followUp: ["then do this"] };
+  const savedSettings = { thinkingLevel: "off", steeringMode: "one-at-a-time", followUpMode: "one-at-a-time", autoCompact: true, scopedModels: ["faux/faux-1"], cacheWarmingMode: "idle", sessionName: "saved name" };
   const server = createServer(async (request, response) => {
     const url = new URL(request.url!, "http://localhost");
     response.setHeader("content-type", "application/json");
@@ -42,8 +44,26 @@ test("upstream session projection sends prompts to Durable and replays streamed 
     } else if (url.pathname.endsWith("/history")) {
       response.end(
         JSON.stringify({
-          events: [],
-          nextAfter: 0,
+          events: [
+            {
+              seq: 1,
+              workspaceId: "work",
+              kind: "message",
+              timestamp: Date.now(),
+              data: {
+                message: {
+                  role: "bashExecution",
+                  command: "printf history",
+                  output: "history output",
+                  exitCode: 0,
+                  cancelled: false,
+                  truncated: false,
+                  timestamp: Date.now(),
+                },
+              },
+            },
+          ],
+          nextAfter: 1,
           hasMore: false,
           activeConversationId: 12,
         }),
@@ -70,7 +90,17 @@ test("upstream session projection sends prompts to Durable and replays streamed 
         }),
       );
     } else if (url.pathname.endsWith("/settings")) {
-      response.end(JSON.stringify({ thinkingLevel: "off" }));
+      if (request.method === "PUT") {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        Object.assign(savedSettings, JSON.parse(body));
+      }
+      response.end(JSON.stringify(savedSettings));
+    } else if (url.pathname.endsWith("/queue/clear")) {
+      savedQueue = { steering: [], followUp: [] };
+      response.end(JSON.stringify(savedQueue));
+    } else if (url.pathname.endsWith("/queue")) {
+      response.end(JSON.stringify(savedQueue));
     } else if (url.pathname.endsWith("/resources")) {
       response.end(
         JSON.stringify({
@@ -85,6 +115,8 @@ test("upstream session projection sends prompts to Durable and replays streamed 
           appendSystemPrompt: [],
         }),
       );
+    } else if (url.pathname.endsWith("/extensions")) {
+      response.end(JSON.stringify({ extensions: [], diagnostics: [] }));
     } else if (url.pathname.endsWith("/trust")) {
       let body = "";
       for await (const chunk of request) body += chunk;
@@ -175,7 +207,39 @@ test("upstream session projection sends prompts to Durable and replays streamed 
     );
     await remote.initialize();
     assert.equal(remote.session.sessionManager.getCwd(), "/repos/demo");
+    assert.equal(remote.session.sessionName, "saved name");
+    assert.deepEqual(remote.session.getSteeringMessages(), ["steer me"]);
+    assert.deepEqual(remote.session.getFollowUpMessages(), ["then do this"]);
+    assert.deepEqual(
+      remote.session.scopedModels.map(({ model }) => `${model.provider}/${model.id}`),
+      ["faux/faux-1"],
+    );
     assert.equal(remote.session.model?.provider, "faux");
+    assert.ok(
+      remote.session.sessionManager
+        .getEntries()
+        .some((entry) => entry.type === "message" && entry.message.role === "bashExecution"),
+      "Durable history preserves Pi bash execution messages",
+    );
+    assert.equal(remote.session.steeringMode, "one-at-a-time");
+    assert.equal(remote.session.followUpMode, "one-at-a-time");
+    assert.equal(remote.session.autoCompactionEnabled, true);
+    await remote.session.setSteeringMode("all");
+    await remote.session.setFollowUpMode("all");
+    await remote.session.setAutoCompactionEnabled(false);
+    await remote.session.setScopedModels([]);
+    await remote.session.setCacheWarmingMode("streaming");
+    await remote.session.setSessionName("new name");
+    assert.deepEqual(await remote.session.clearQueue(), {
+      steering: [],
+      followUp: [],
+    });
+    assert.deepEqual(savedSettings.scopedModels, []);
+    assert.equal(savedSettings.cacheWarmingMode, "streaming");
+    assert.equal(savedSettings.sessionName, "new name");
+    assert.equal(remote.session.steeringMode, "all");
+    assert.equal(remote.session.followUpMode, "all");
+    assert.equal(remote.session.autoCompactionEnabled, false);
     assert.equal(remote.session.sessionManager.getSessionFile(), undefined);
     assert.equal(remote.session.resourceLoader.getSkills().skills.length, 0);
     const sessions = await remote.listSessions();
@@ -295,6 +359,15 @@ test("pinned upstream InteractiveMode starts over the Durable workspace projecti
   await import(
     pathToFileURL(join(projectRoot, "scripts/patch-pi-interactive.mjs")).href
   );
+  const patchedInteractiveMode = await readFile(
+    join(stagedPi, "dist/modes/interactive/interactive-mode.js"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    patchedInteractiveMode,
+    /this\.settingsManager\.isProjectTrusted\(\)/,
+    "remote trust checks must never read the client's Pi settings",
+  );
   const { InteractiveMode } = await import(
     pathToFileURL(join(stagedPi, "dist/index.js")).href
   );
@@ -338,6 +411,10 @@ test("pinned upstream InteractiveMode starts over the Durable workspace projecti
       );
     } else if (url.pathname.endsWith("/settings")) {
       response.end(JSON.stringify({ thinkingLevel: "off" }));
+    } else if (url.pathname.endsWith("/queue")) {
+      response.end(JSON.stringify({ steering: [], followUp: [] }));
+    } else if (url.pathname.endsWith("/extensions")) {
+      response.end(JSON.stringify({ extensions: [], diagnostics: [] }));
     } else if (url.pathname.endsWith("/resources")) {
       response.end(
         JSON.stringify({
@@ -386,7 +463,7 @@ test("pinned upstream InteractiveMode starts over the Durable workspace projecti
     assert.match(screen, /v1\.2\.0/);
     assert.match(screen, /faux-1/);
     assert.match(screen, /\/repos\/demo/);
-    assert.doesNotMatch(screen, /bash/);
+    assert.match(screen, /bash/);
     assert.equal(remote.session.sessionManager.getSessionFile(), undefined);
     assert.ok(
       terminal.input,
