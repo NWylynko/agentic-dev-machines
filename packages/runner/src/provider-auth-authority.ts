@@ -99,32 +99,60 @@ async function createGuardedCredentialStore(
     new URL("./core/auth-storage.js", packageEntry).href
   );
   const backend = new storageModule.FileAuthStorageBackend(authPath);
+  let closed = false;
+  const pendingCredentialOperations = new Set<Promise<unknown>>();
+  const assertCredentialStoreOpen = () => {
+    if (closed) throw new Error("Provider credential store is closed");
+  };
   const guardedBackend = {
     withLock<T>(
       update: (content: string | undefined) => { result: T; next?: string },
     ): T {
+      assertCredentialStoreOpen();
       return backend.withLock((content: string | undefined) => {
         const result = update(content);
         if (result.next !== undefined)
-          throw new Error("Synchronous provider credential writes are not allowed");
+          throw new Error(
+            "Synchronous provider credential writes are not allowed",
+          );
         return result;
       });
     },
-    withLockAsync<T>(
+    async withLockAsync<T>(
       update: (
         content: string | undefined,
       ) => Promise<{ result: T; next?: string }>,
       options?: { signal?: AbortSignal },
     ): Promise<T> {
-      return backend.withLockAsync(async (content: string | undefined) => {
-        const result = await update(content);
-        if (result.next !== undefined && !(await ownerGuard()))
-          throw new Error("Lifecycle provider-auth owner fence is not current");
-        return result;
-      }, options);
+      assertCredentialStoreOpen();
+      const operation = backend.withLockAsync(
+        async (content: string | undefined) => {
+          const result = await update(content);
+          if (result.next !== undefined && !(await ownerGuard()))
+            throw new Error(
+              "Lifecycle provider-auth owner fence is not current",
+            );
+          return result;
+        },
+        options,
+      );
+      pendingCredentialOperations.add(operation);
+      try {
+        return await operation;
+      } finally {
+        pendingCredentialOperations.delete(operation);
+      }
     },
   };
-  return storageModule.AuthStorage.fromStorage(guardedBackend);
+  return {
+    credentials: storageModule.AuthStorage.fromStorage(guardedBackend),
+    close: async () => {
+      // Pi's background catalog reads can outlive the HTTP server. Fence new
+      // storage work, then wait for admitted operations to release their locks.
+      closed = true;
+      await Promise.allSettled(pendingCredentialOperations);
+    },
+  };
 }
 
 export async function createProviderAuthAuthority({
@@ -147,12 +175,12 @@ export async function createProviderAuthAuthority({
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
-  const credentials = ownerGuard
+  const credentialStore = ownerGuard
     ? await createGuardedCredentialStore(authPath, ownerGuard)
     : undefined;
   const runtime = await ModelRuntime.create({
     authPath,
-    ...(credentials ? { credentials } : {}),
+    ...(credentialStore ? { credentials: credentialStore.credentials } : {}),
     allowModelNetwork: false,
     refreshOnCreate: false,
   });
@@ -430,6 +458,7 @@ export async function createProviderAuthAuthority({
         await new Promise<void>((resolve, reject) =>
           server.close((error) => (error ? reject(error) : resolve())),
         );
+      await credentialStore?.close();
     },
   };
 }

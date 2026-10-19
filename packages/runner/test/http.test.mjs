@@ -2254,7 +2254,8 @@ test(
   { timeout: 15000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-cache-warming-"));
-    let runner = await startRunner(directory);
+    const env = { HOME: directory };
+    let runner = await startRunner(directory, env);
     t.after(() => runner.stop());
     const id = "cache-warming-coder";
     const path = `/v1/workspaces/${id}`;
@@ -2284,7 +2285,11 @@ test(
       (
         await runner.request(path + "/input", "POST", {
           requestId: "cache-warming-turn",
-          message: '/faux {"answer":"real harness turn"}',
+          // Supply the cacheable context explicitly, independent of host AGENTS.md files.
+          message: `/faux ${JSON.stringify({
+            answer: "real harness turn",
+            context: "synthetic cacheable context ".repeat(1000),
+          })}`,
         })
       ).status,
       202,
@@ -2322,7 +2327,7 @@ test(
     durable.close();
     assert.ok(records.some((record) => record.kind === "adm.cache_warm"));
     await runner.stop("SIGKILL");
-    runner = await startRunner(directory);
+    runner = await startRunner(directory, env);
     status = (await runner.request(path)).body;
     assert.equal(
       status.cacheWarming.lastUsage?.provider,
