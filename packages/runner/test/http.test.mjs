@@ -540,6 +540,87 @@ test(
   },
 );
 
+test("ownership loss during input admission rejects promptly and closes the workspace", async (t) => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "adm-runner-admission-fence-"),
+  );
+  const tokenFile = join(directory, "token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  const id = "workspace-admission-fence";
+  await writeFile(tokenFile, "pod-token");
+  await writeFile(
+    workspaceConfigFile,
+    JSON.stringify({
+      id,
+      name: "admission-fence",
+      role: "bot",
+      environment: "pod",
+    }),
+  );
+  let armed = false;
+  let checks = 0;
+  const control = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    // Allow the route and serialized request checks, then revoke at admission.
+    const denied = request.url.endsWith("/check") && armed && ++checks >= 3;
+    response.writeHead(denied ? 410 : 200, {
+      "content-type": "application/json",
+    });
+    response.end(
+      JSON.stringify(
+        denied
+          ? {
+              error: {
+                code: "WORKSPACE_DELETED",
+                message: "Workspace is deleting",
+              },
+            }
+          : request.url.endsWith("/lease")
+            ? {
+                workspaceId: id,
+                holder: body.holder,
+                fencingToken: 7,
+                expiresAt: Math.floor(Date.now() / 1000) + 30,
+              }
+            : { valid: true, allowed: true },
+      ),
+    );
+  });
+  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => control.close(resolve)));
+  const runner = await startRunner(
+    directory,
+    {},
+    {
+      defaultModel: false,
+      tokenFile,
+      workspaceConfigFile,
+      lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+      podUid: "a1b2c3d4-e5f6-47a8-9012-123456789abc",
+    },
+  );
+  // This test must also clean up a runtime deadlocked during shutdown.
+  t.after(() => runner.stop("SIGKILL"));
+  armed = true;
+  const rejected = await runner.request(
+    `/v1/workspaces/${id}/input`,
+    "POST",
+    {
+      message: "Must not be admitted",
+      requestId: "fenced-admission",
+    },
+    AbortSignal.timeout(3000),
+    "pod-token",
+  );
+  assert.equal(checks, 3, "ownership is revoked inside the admission check");
+  assert.equal(rejected.status, 503);
+  assert.equal(rejected.body.error.code, "RUNTIME_OWNERSHIP_LOST");
+  assert.equal((await runner.request("/health")).status, 503);
+  await runner.stop();
+});
+
 test("workspace requests are authorized by lifecycle against the caller's projected identity", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "adm-runner-lifecycle-auth-"));
   const tokenFile = join(directory, "service-account-token");

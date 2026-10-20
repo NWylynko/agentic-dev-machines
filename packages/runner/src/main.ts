@@ -282,7 +282,9 @@ async function assertActive(id: string, signal?: AbortSignal) {
           continue;
         }
         const message = error instanceof Error ? error.message : String(error);
-        await fenceLost(error);
+        // Shutdown drains admissions and Durable work, which may be waiting
+        // on this check. Publish the fence loss now, then let the caller unwind.
+        void fenceLost(error);
         throw new ApiError(503, "RUNTIME_OWNERSHIP_LOST", message);
       }
     }
