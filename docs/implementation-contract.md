@@ -43,6 +43,8 @@ The API uses non-2xx JSON errors. Deleted workspaces reject new admissions; unkn
 
 Bots create and destroy coding workspaces through durable lifecycle operations. `POST /v1/runtime/operations` accepts a stable `operationId` plus a create spec or an immutable target ID for delete. `GET /v1/runtime/operations/:operationId` returns that operation's persisted status and failure details. Repeating the identical request replays its receipt; reusing the ID with a different request is rejected. Names may be reused only after deletion, and a reused name receives a new immutable ID.
 
+The coding create spec accepts optional `repository` (`OWNER/REPO`), `branch`, and `base`. Bot `createAgent` exposes the same choices. `branch` requires `repository`; `base` requires both. An existing remote branch is checked out with tracking; a new branch starts at the remote's advertised default or the explicit base Git ref. Branch names are validated with Git in the owning Pod. Preparation finishes in staging before publication at `/repos/OWNER/REPO`, which remains the agent cwd. Workspace specs and lifecycle operation requests retain branch/base for retry matching; replaying the original operation preserves published files and Git state.
+
 New bot conversations durably admit one onboarding turn after model selection. The profile stores confirmed identity and purpose; bots publish user-facing text only through `sendMessage`. Bot runtime and schedule state live on the bot's private persistent volume and continue without a connected terminal or management-host process.
 
 ## Release, persistence, and verification limits

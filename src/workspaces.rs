@@ -88,6 +88,10 @@ pub struct Workspace {
     pub catalog: Value,
     #[serde(default)]
     pub repository: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub base: Option<String>,
     #[serde(default = "default_workspace_cwd")]
     pub cwd: String,
     pub model: Option<Value>,
@@ -146,6 +150,12 @@ pub struct CreateOptions {
     /// Clone one public GitHub repository into this workspace.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Check out an existing remote branch or create it from the remote default.
+    #[arg(long, requires = "repo")]
+    pub branch: Option<String>,
+    /// Starting Git ref for a new branch; defaults to the remote default branch.
+    #[arg(long, requires_all = ["repo", "branch"])]
+    pub base: Option<String>,
     /// Provider/model-id; overrides the model chosen in adm setup.
     #[arg(long)]
     pub model: Option<String>,
@@ -193,6 +203,30 @@ pub fn validate_repository_ref(repository: &str) -> Result<(&str, &str)> {
         "invalid repository name: {name}"
     );
     Ok((owner, name))
+}
+
+pub fn validate_repository_selection(
+    repository: Option<&str>,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        branch.is_none() || repository.is_some(),
+        "branch requires repository (--repo)"
+    );
+    ensure!(
+        base.is_none() || (repository.is_some() && branch.is_some()),
+        "base requires repository (--repo) and branch (--branch)"
+    );
+    ensure!(
+        branch.is_none_or(|value| !value.is_empty()),
+        "repository branch must be non-empty"
+    );
+    ensure!(
+        base.is_none_or(|value| !value.is_empty()),
+        "repository base must be non-empty"
+    );
+    Ok(())
 }
 
 fn valid_repository_component(component: &str) -> bool {
@@ -246,6 +280,11 @@ fn parse_credential_env_ref(reference: &str) -> Result<CredentialEnvRef> {
 impl CreateOptions {
     pub fn workspace(&self) -> Result<Workspace> {
         validate_name(&self.name)?;
+        validate_repository_selection(
+            self.repo.as_deref(),
+            self.branch.as_deref(),
+            self.base.as_deref(),
+        )?;
         if let Some(repository) = &self.repo {
             validate_repository_ref(repository)?;
         }
@@ -338,6 +377,8 @@ impl CreateOptions {
             repositories: self.catalog.is_some() && !self.no_repositories && self.role == "coding",
             catalog,
             repository: self.repo.clone(),
+            branch: self.branch.clone(),
+            base: self.base.clone(),
             cwd,
             model,
             credential_env,
@@ -1899,6 +1940,11 @@ fn prepare_repository(cli: &Cli, workspace: &Workspace, repository: &str) -> Res
 owner="$1"
 name="$2"
 workspace_id="$3"
+branch="$4"
+base="$5"
+if [ -n "$branch" ]; then
+  git check-ref-format --branch "$branch" >/dev/null || { echo "invalid repository branch: $branch" >&2; exit 1; }
+fi
 target="$owner/$name"
 staging="$owner/.adm-clone-$workspace_id"
 remote="https://github.com/$owner/$name.git"
@@ -1919,6 +1965,15 @@ fi
 git clone -- "$remote" "$staging"
 git -C "$staging" rev-parse --verify HEAD >/dev/null
 test "$(git -C "$staging" config --get remote.origin.url)" = "$remote"
+if [ -n "$branch" ]; then
+  if git -C "$staging" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git -C "$staging" switch --force-create "$branch" --track "refs/remotes/origin/$branch"
+  else
+    if [ -z "$base" ]; then base=refs/remotes/origin/HEAD; fi
+    start=$(git -C "$staging" rev-parse --verify --end-of-options "$base^{commit}") || { echo "repository base ref does not resolve to a commit: $base" >&2; exit 1; }
+    git -C "$staging" switch --no-track -c "$branch" "$start"
+  fi
+fi
 git -C "$staging" config --local adm.preparedWorkspaceId "$workspace_id"
 mv -- "$staging" "$target"
 "#;
@@ -1946,6 +2001,8 @@ mv -- "$staging" "$target"
                 owner,
                 name,
                 &workspace.id,
+                workspace.branch.as_deref().unwrap_or(""),
+                workspace.base.as_deref().unwrap_or(""),
             ],
             None,
         )
@@ -1971,6 +2028,8 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.repositories == requested.repositories
         && existing.catalog == requested.catalog
         && existing.repository == requested.repository
+        && existing.branch == requested.branch
+        && existing.base == requested.base
         && existing.cwd == requested.cwd
         && existing.model == requested.model
         && existing.credential_env == requested.credential_env

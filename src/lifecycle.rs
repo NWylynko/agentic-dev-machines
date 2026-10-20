@@ -75,6 +75,10 @@ pub struct CreateIntent {
     pub catalog: Value,
     #[serde(default)]
     pub repository: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub base: Option<String>,
     #[serde(default = "default_cwd")]
     pub cwd: String,
     pub model: Option<Value>,
@@ -105,6 +109,8 @@ impl CreateIntent {
             repositories: workspace.repositories,
             catalog: workspace.catalog.clone(),
             repository: workspace.repository.clone(),
+            branch: workspace.branch.clone(),
+            base: workspace.base.clone(),
             cwd: workspace.cwd.clone(),
             model: workspace.model.clone(),
             credential_env: workspace.credential_env.clone(),
@@ -130,6 +136,11 @@ impl CreateIntent {
             );
             crate::workspaces::validate_repository_ref(repository)?;
         }
+        crate::workspaces::validate_repository_selection(
+            self.repository.as_deref(),
+            self.branch.as_deref(),
+            self.base.as_deref(),
+        )?;
         let mut credential_names = std::collections::HashSet::new();
         for reference in &self.credential_env {
             ensure!(
@@ -232,6 +243,8 @@ impl CreateIntent {
             repositories: self.repositories,
             catalog: self.catalog,
             repository: self.repository,
+            branch: self.branch,
+            base: self.base,
             cwd: self.cwd,
             model: self.model,
             credential_env: self.credential_env,

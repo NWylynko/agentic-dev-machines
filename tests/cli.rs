@@ -525,6 +525,9 @@ elif args[0] == 'wait':
     failure = pathlib.Path(__file__).parent / 'fail-wait-once'
     if failure.exists():
         failure.unlink(); print('deployment did not become available',file=sys.stderr); sys.exit(1)
+    ready_failure = pathlib.Path(__file__).parent / 'fail-ready-once'
+    if ready_failure.exists() and '--for=condition=available' in args:
+        ready_failure.unlink(); print('deployment did not become available',file=sys.stderr); sys.exit(1)
     print('condition met')
 elif args and args[0] == 'exec':
     (pathlib.Path(__file__).parent / 'exec-args.json').write_text(json.dumps(args))
@@ -1175,6 +1178,406 @@ fn create_prepares_a_private_public_repository_inside_each_workspace_pod() {
         matches!(host_runner.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "repository preparation and agent registration must not contact a host runner"
     );
+}
+
+fn repository_branch_fixture() -> TestFixture {
+    let root = fixture();
+    let upstreams = root.path().join("upstreams");
+    let upstream = upstreams.join("owner/project.git");
+    let seed = root.path().join("seed");
+    fs::create_dir_all(upstream.parent().unwrap()).unwrap();
+    fs::create_dir(&seed).unwrap();
+    repository_git(
+        root.path(),
+        &[
+            "init",
+            "--bare",
+            "--initial-branch=trunk",
+            upstream.to_str().unwrap(),
+        ],
+    );
+    repository_git(&seed, &["init", "--initial-branch=trunk"]);
+    repository_git(&seed, &["config", "user.name", "Fixture User"]);
+    repository_git(&seed, &["config", "user.email", "fixture@example.invalid"]);
+    fs::write(seed.join("README.md"), "default branch\n").unwrap();
+    repository_git(&seed, &["add", "README.md"]);
+    repository_git(&seed, &["commit", "-m", "default"]);
+    repository_git(
+        &seed,
+        &["remote", "add", "origin", upstream.to_str().unwrap()],
+    );
+    repository_git(&seed, &["push", "origin", "trunk"]);
+    repository_git(&seed, &["switch", "-c", "existing-feature"]);
+    fs::write(seed.join("README.md"), "existing feature\n").unwrap();
+    repository_git(&seed, &["commit", "-am", "feature"]);
+    repository_git(&seed, &["push", "origin", "existing-feature"]);
+    fs::write(
+        root.path().join("git-rewrite"),
+        format!("url.file://{}/.insteadOf", upstreams.display()),
+    )
+    .unwrap();
+    root
+}
+
+fn repository_git(checkout: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn repository_checkout(root: &Path, workspace: &Value) -> PathBuf {
+    root.join("pv")
+        .join(workspace["namespace"].as_str().unwrap())
+        .join("repos/owner/project")
+}
+
+#[test]
+fn create_checks_out_an_existing_remote_repository_branch() {
+    let root = repository_branch_fixture();
+    for (name, branch, readme) in [
+        ("existing-branch", "existing-feature", "existing feature\n"),
+        ("default-branch", "trunk", "default branch\n"),
+    ] {
+        let workspace = assert_ok(adm(
+            root.path(),
+            &[
+                "create",
+                name,
+                "--repo",
+                "owner/project",
+                "--branch",
+                branch,
+            ],
+        ));
+        let checkout = repository_checkout(root.path(), &workspace);
+        assert_eq!(workspace["branch"], branch);
+        assert_eq!(workspace["cwd"], "/repos/owner/project");
+        assert_eq!(
+            repository_git(&checkout, &["branch", "--show-current"]),
+            branch
+        );
+        assert_eq!(
+            repository_git(&checkout, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+            format!("origin/{branch}")
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("README.md")).unwrap(),
+            readme
+        );
+    }
+}
+
+#[test]
+fn create_starts_a_new_repository_branch_from_the_remote_default() {
+    let root = repository_branch_fixture();
+    let workspace = assert_ok(adm(
+        root.path(),
+        &[
+            "create",
+            "new-branch",
+            "--repo",
+            "owner/project",
+            "--branch",
+            "feature/new-work",
+        ],
+    ));
+    let checkout = repository_checkout(root.path(), &workspace);
+    assert_eq!(
+        repository_git(&checkout, &["branch", "--show-current"]),
+        "feature/new-work"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("README.md")).unwrap(),
+        "default branch\n"
+    );
+    assert_eq!(
+        repository_git(&checkout, &["rev-parse", "HEAD"]),
+        repository_git(&root.path().join("seed"), &["rev-parse", "trunk"])
+    );
+    assert_eq!(
+        repository_git(
+            &checkout,
+            &[
+                "for-each-ref",
+                "--format=%(upstream)",
+                "refs/heads/feature/new-work"
+            ]
+        ),
+        ""
+    );
+    assert_eq!(
+        repository_git(
+            &root.path().join("upstreams/owner/project.git"),
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/feature/new-work"
+            ]
+        ),
+        ""
+    );
+}
+
+#[test]
+fn create_starts_a_new_repository_branch_from_an_explicit_base() {
+    let root = repository_branch_fixture();
+    let workspace = assert_ok(adm(
+        root.path(),
+        &[
+            "create",
+            "based-branch",
+            "--repo",
+            "owner/project",
+            "--branch",
+            "feature/based",
+            "--base",
+            "origin/existing-feature",
+        ],
+    ));
+    let checkout = repository_checkout(root.path(), &workspace);
+    assert_eq!(workspace["base"], "origin/existing-feature");
+    assert_eq!(
+        repository_git(&checkout, &["branch", "--show-current"]),
+        "feature/based"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("README.md")).unwrap(),
+        "existing feature\n"
+    );
+    assert_eq!(
+        repository_git(&checkout, &["rev-parse", "HEAD"]),
+        repository_git(
+            &root.path().join("seed"),
+            &["rev-parse", "existing-feature"]
+        )
+    );
+    assert_eq!(
+        repository_git(
+            &checkout,
+            &[
+                "for-each-ref",
+                "--format=%(upstream)",
+                "refs/heads/feature/based"
+            ]
+        ),
+        ""
+    );
+}
+
+#[test]
+fn create_rejects_invalid_repository_branches_without_publishing_a_checkout() {
+    let root = repository_branch_fixture();
+    for (name, branch) in [("invalid-branch", "broken..branch"), ("empty-branch", "")] {
+        let output = adm(
+            root.path(),
+            &[
+                "create",
+                name,
+                "--repo",
+                "owner/project",
+                "--branch",
+                branch,
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "invalid branch {branch:?} was accepted"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("branch"), "{error}");
+    }
+    for workspace in assert_ok(adm(root.path(), &["list", "--json"]))
+        .as_array()
+        .unwrap()
+    {
+        assert!(
+            !repository_checkout(root.path(), workspace).exists(),
+            "invalid branches must never publish a checkout"
+        );
+    }
+}
+
+#[test]
+fn create_rejects_a_missing_repository_base_without_publishing_on_retry() {
+    let root = repository_branch_fixture();
+    let mut args = vec![
+        "create",
+        "missing-base",
+        "--repo",
+        "owner/project",
+        "--branch",
+        "feature/missing",
+        "--base",
+        "origin/does-not-exist",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    for attempt in 0..2 {
+        let arguments = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = adm(root.path(), &arguments);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("base ref does not resolve to a commit"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let workspaces = assert_ok(adm(root.path(), &["list", "--json"]));
+        assert_eq!(workspaces.as_array().unwrap().len(), 1);
+        assert_eq!(workspaces[0]["phase"], "failed");
+        assert_eq!(workspaces[0]["base"], "origin/does-not-exist");
+        assert!(!repository_checkout(root.path(), &workspaces[0]).exists());
+        if attempt == 0 {
+            args.extend([
+                "--operation-id".to_owned(),
+                workspaces[0]["creation_operation_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ]);
+        }
+    }
+}
+
+#[test]
+fn repository_branch_retries_preserve_identity_edits_and_reject_changed_choices() {
+    let root = repository_branch_fixture();
+    fs::write(root.path().join("fail-ready-once"), "fail").unwrap();
+    let args = [
+        "create",
+        "branch-retry",
+        "--repo",
+        "owner/project",
+        "--branch",
+        "feature/retry",
+        "--base",
+        "origin/existing-feature",
+    ];
+    assert!(!adm(root.path(), &args).status.success());
+    let failed = assert_ok(adm(root.path(), &["list", "--json"]));
+    let original = &failed[0];
+    let checkout = repository_checkout(root.path(), original);
+    assert_eq!(
+        repository_git(&checkout, &["branch", "--show-current"]),
+        "feature/retry"
+    );
+    fs::write(checkout.join("README.md"), "private local edits\n").unwrap();
+    fs::write(checkout.join("untracked.txt"), "unfinished work\n").unwrap();
+    repository_git(&checkout, &["switch", "-c", "user-progress"]);
+    for (branch, base) in [
+        ("feature/different", "origin/existing-feature"),
+        ("feature/retry", "trunk"),
+    ] {
+        let output = adm(
+            root.path(),
+            &[
+                "create",
+                "branch-retry",
+                "--repo",
+                "owner/project",
+                "--branch",
+                branch,
+                "--base",
+                base,
+            ],
+        );
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("different options"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Replay the original durable operation; fresh-operation retries are tracked in TASK-73.
+    let mut replay = args.to_vec();
+    replay.extend([
+        "--operation-id",
+        original["creation_operation_id"].as_str().unwrap(),
+    ]);
+    let retried = assert_ok(adm(root.path(), &replay));
+    assert_eq!(retried["id"], original["id"]);
+    assert_eq!(retried["namespace"], original["namespace"]);
+    assert_eq!(retried["phase"], "ready");
+    assert_eq!(retried["branch"], "feature/retry");
+    assert_eq!(retried["base"], "origin/existing-feature");
+    assert_eq!(retried["cwd"], "/repos/owner/project");
+    assert_eq!(
+        repository_git(&checkout, &["branch", "--show-current"]),
+        "user-progress"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("README.md")).unwrap(),
+        "private local edits\n"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("untracked.txt")).unwrap(),
+        "unfinished work\n"
+    );
+}
+
+#[test]
+fn repository_branch_and_base_flags_require_repository_and_branch() {
+    let root = fixture();
+    for (args, expected) in [
+        (
+            vec!["create", "branch-only", "--branch", "feature/work"],
+            "--repo",
+        ),
+        (vec!["create", "base-only", "--base", "trunk"], "--repo"),
+        (
+            vec![
+                "create",
+                "base-no-branch",
+                "--repo",
+                "owner/project",
+                "--base",
+                "trunk",
+            ],
+            "--branch",
+        ),
+        (
+            vec![
+                "create",
+                "empty-base",
+                "--repo",
+                "owner/project",
+                "--branch",
+                "feature/work",
+                "--base",
+                "",
+            ],
+            "base must be non-empty",
+        ),
+    ] {
+        let output = adm(root.path(), &args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        assert_ok(adm(root.path(), &["list", "--json"]))
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let help = adm(root.path(), &["create", "--help"]);
+    assert!(help.status.success());
+    for flag in ["--branch <BRANCH>", "--base <BASE>"] {
+        assert!(String::from_utf8_lossy(&help.stdout).contains(flag));
+    }
 }
 
 #[test]
@@ -3544,6 +3947,8 @@ fn zsh_completions_load_and_complete_cli_commands_and_flags_offline() {
     let script = String::from_utf8(output.stdout).unwrap();
     assert!(script.contains("_adm"), "{script}");
     assert!(script.contains("herdr"), "{script}");
+    assert!(script.contains("--branch"), "{script}");
+    assert!(script.contains("--base"), "{script}");
     assert!(!root.path().join("data/adm").exists());
     assert!(!root.path().join("state").exists());
 
@@ -3565,7 +3970,7 @@ zpty adm-completion zsh -f -i
 zpty -w adm-completion $'stty -echo\nfpath=("$ADM_TEST_INSECURE_COMPLETIONS" $fpath)\nautoload -Uz compinit\ncompinit -D -i\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() { print -r -- "__ADM_RESULT__:$*"; }\nprint __ADM_READY__\n'
 zpty -r -m adm-completion output '*__ADM_READY__*'
 print -r -- "$output"
-for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t'; do
+for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t' $'adm create complete --br\t' $'adm create complete --ba\t'; do
   zpty -w adm-completion "$input"
   zpty -r -m adm-completion output '*__ADM_RESULT__*'
   print -r -- "$output"
@@ -3594,6 +3999,8 @@ zpty -d adm-completion
         "adm herdr bind",
         "adm list --json",
         "adm --state-dir",
+        "adm create complete --branch",
+        "adm create complete --base",
     ] {
         assert!(
             candidates.contains(candidate),

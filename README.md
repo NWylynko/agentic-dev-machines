@@ -33,7 +33,7 @@ Setup asks for the image, storage class, and optional default model, then offers
 
 Every workspace starts with its durable agent. Choose a default model during setup or pass `--model PROVIDER/MODEL_ID` when creating a workspace; otherwise select one in `adm attach` with `/model`. Authenticate a provider once for the installation with `adm login [PROVIDER]`; use `adm logout PROVIDER` to revoke that shared login. Refresh credentials stay on the lifecycle persistent volume and are never copied into workspace Pods.
 
-Work inside `/repos`. A plain workspace starts empty; clone there, or use `adm create my-project --repo OWNER/REPO` to prepare a checkout and start the shell and agent in it. See [repository navigation](docs/operations.md#find-your-repositories) for plain and lazy-catalog examples.
+Work inside `/repos`. A plain workspace starts empty; clone there, or use `adm create my-project --repo OWNER/REPO` to prepare a checkout and start the shell and agent in it. Add `--branch feature/work` to check out a remote branch or create a local one from the remote default; `--base origin/release` selects another starting ref for a new branch. See [repository navigation](docs/operations.md#find-your-repositories) for plain and lazy-catalog examples.
 
 In an interactive terminal, `adm create` attaches to the new workspace's durable agent when it is ready. Noninteractive use returns workspace JSON; pass `--no-attach` to force creation-only behavior. Use `adm create my-project --herdr` inside a Herdr session to create and bind a new Herdr space, then start one attach in its initial pane. This option works in scripts too and reports the current close-event delivery health without starting a watcher.
 

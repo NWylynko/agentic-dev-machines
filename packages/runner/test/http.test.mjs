@@ -3599,12 +3599,21 @@ test(
             cpu: "2",
             memory: "4Gi",
             model: { provider: "faux", id: "faux-1" },
+            repository: "owner/project",
+            branch: "feature/bot-work",
+            base: "origin/release",
           },
           "create",
         )
       ).text,
     );
     assert.equal(created.status, "accepted");
+    const createSpec = lifecycle.operations.get(created.operationId).request
+      .spec;
+    assert.equal(createSpec.repository, "owner/project");
+    assert.equal(createSpec.branch, "feature/bot-work");
+    assert.equal(createSpec.base, "origin/release");
+    assert.equal(createSpec.cwd, "/repos/owner/project");
     const operation = JSON.parse(
       (
         await call(

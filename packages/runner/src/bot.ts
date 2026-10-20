@@ -337,6 +337,20 @@ export function botExtension(
             }),
           ),
           repository: Type.Optional(Type.String({ minLength: 1 })),
+          branch: Type.Optional(
+            Type.String({
+              minLength: 1,
+              description:
+                "Existing remote branch or new local branch; requires repository.",
+            }),
+          ),
+          base: Type.Optional(
+            Type.String({
+              minLength: 1,
+              description:
+                "Git ref for a new branch, such as origin/release; requires repository and branch. Existing remote branches take precedence.",
+            }),
+          ),
         }),
         replay: "safe",
         execute: async (args, api, context: Context) => {
@@ -359,6 +373,8 @@ export function botExtension(
             repositories: false,
             catalog: {},
             repository: args.repository,
+            branch: args.branch,
+            base: args.base,
             cwd: args.repository ? `/repos/${args.repository}` : "/repos",
             model: args.model,
             credential_env: [],
