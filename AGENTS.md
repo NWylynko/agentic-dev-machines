@@ -2,6 +2,7 @@ keep this file up to date
 
 # Project notes
 
+- Lifecycle fake kubectl (2026-10-19): `FAKE_KUBECTL` in `tests/lifecycle.rs` is shared by concurrent processes (service plus test). Every shared fixture file (`cluster.json`, `lease.json`, `applied`, `current-deployment.json`, `pod-list-requests`, ...) is written by atomic rename via `put()`, and each read-modify-write holds the `locked()` flock on `fixture.lock`; never hold that lock across blocking waits or the service callback in `rollout status`. `fake_kubectl_concurrent_processes_never_tear_or_lose_shared_state` stresses it (it reproduced the CI `JSONDecodeError` and lost namespace updates before the fix).
 - CI lint diagnosis (2026-10-19): CI's stable Rust is 1.99.0; local 1.97.1 missed `clippy::useless_format` inside a setup-connection assertion. Reproduce CI lint failures with its compiler (`cargo +1.99.0 clippy --all-targets -- -D warnings`); constant expected strings need no `format!`.
 - CI fixture isolation (2026-10-19): the idle cache-warming HTTP test uses an empty HOME and explicit cacheable context so host AGENTS.md files cannot determine whether Pi's savings threshold is met. Provider-auth authority shutdown closes its guarded credential store and drains admitted storage operations; Pi's background catalog reads must not recreate auth files after shutdown.
 

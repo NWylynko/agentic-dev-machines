@@ -221,21 +221,26 @@ fn wait_for<T>(mut read: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-#[test]
-fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() {
-    let root = tempfile::tempdir().unwrap();
-    let (runner_url, runner_port, runner_server) = start_runner_stub();
-    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
-    fs::write(
-        root.path().join("kubectl"),
-        r##"#!/usr/bin/env python3
-import datetime, fcntl, json, pathlib, re, sys, time, urllib.request, uuid
+const FAKE_KUBECTL: &str = r##"#!/usr/bin/env python3
+import contextlib, datetime, fcntl, json, os, pathlib, re, sys, time, urllib.request, uuid
 root=pathlib.Path(__file__).parent
 args=sys.argv[1:]
 args=[arg for arg in args if not arg.startswith('--request-timeout=')]
 state_path=root/'cluster.json'
-state=json.loads(state_path.read_text()) if state_path.exists() else {}
 lease_path=root/'lease.json'
+# Every fixture file shared between concurrent kubectl processes (and the Rust test) is replaced by atomic rename,
+# and each read-modify-write holds this exclusive lock for its whole duration so updates are never lost.
+@contextlib.contextmanager
+def locked():
+    with (root/'fixture.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+def put(path, text):
+    scratch=path.with_name(path.name+'.'+str(os.getpid())+'.tmp')
+    scratch.write_text(text)
+    os.replace(scratch, path)
+def load_state():
+    return json.loads(state_path.read_text()) if state_path.exists() else {}
 def validate_lease_microtime(doc):
     for field in ['acquireTime','renewTime']:
         value=doc['spec'].get(field,'')
@@ -249,9 +254,10 @@ if args[:2] == ['get','lease']:
         counter.seek(0)
         count=int(counter.read() or '0')
         counter.seek(0); counter.truncate(); counter.write(str(count+1)); counter.flush()
-    if not lease_path.exists():
-        print('Error from server (NotFound): leases not found',file=sys.stderr); sys.exit(1)
-    print(lease_path.read_text())
+    with locked():
+        if not lease_path.exists():
+            print('Error from server (NotFound): leases not found',file=sys.stderr); sys.exit(1)
+        print(lease_path.read_text())
 elif args[:3] == ['create','--raw','/apis/authentication.k8s.io/v1/tokenreviews']:
     request=json.load(sys.stdin)
     expected_namespace=(root/'expected-namespace').read_text()
@@ -294,8 +300,10 @@ elif args[:2] == ['get','storageclass']:
     print(json.dumps({'provisioner':'test.csi','metadata':{'name':args[2]}}))
 elif args[:2] == ['get','pods']:
     count_path=root/'pod-list-requests'
-    count=int(count_path.read_text()) if count_path.exists() else 0
-    count_path.write_text(str(count+1))
+    with locked():
+        count=int(count_path.read_text()) if count_path.exists() else 0
+        put(count_path, str(count+1))
+        state=load_state()
     items=[]
     selected_workspace=None
     if '-l' in args:
@@ -323,6 +331,7 @@ elif args[:2] == ['get','pvc'] and args[2] == 'work':
     labels={'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id,'adm.dev/role':'coding'}
     print(json.dumps({'kind':'PersistentVolumeClaim','metadata':{'name':'work','namespace':namespace,'labels':labels}}))
 elif args[:2] == ['get','namespace']:
+    with locked(): state=load_state()
     if args[2] not in state:
         print('Error from server (NotFound): namespaces not found',file=sys.stderr); sys.exit(1)
     doc=json.loads(json.dumps(state[args[2]]))
@@ -335,41 +344,45 @@ elif args[0] == 'apply':
         if (root/'fail-apply').exists():
             print('injected deployment admission failure',file=sys.stderr); sys.exit(1)
     doc=json.load(sys.stdin)
-    (root/'applied').write_text(json.dumps(doc))
-    if doc.get('kind') == 'Deployment' and doc['metadata'].get('name') == 'workspace':
-        (root/'current-deployment.json').write_text(json.dumps(doc))
-    for item in doc.get('items',[]):
-        if item['kind']=='Namespace': state[item['metadata']['name']]=item
-        if item['kind']=='Deployment' and item['metadata'].get('name') == 'workspace':
-            (root/'current-deployment.json').write_text(json.dumps(item))
-    state_path.write_text(json.dumps(state))
+    with locked():
+        state=load_state()
+        put(root/'applied', json.dumps(doc))
+        if doc.get('kind') == 'Deployment' and doc['metadata'].get('name') == 'workspace':
+            put(root/'current-deployment.json', json.dumps(doc))
+        for item in doc.get('items',[]):
+            if item['kind']=='Namespace': state[item['metadata']['name']]=item
+            if item['kind']=='Deployment' and item['metadata'].get('name') == 'workspace':
+                put(root/'current-deployment.json', json.dumps(item))
+        put(state_path, json.dumps(state))
 elif args[:2] == ['create','-f']:
     doc=json.load(sys.stdin)
     validate_lease_microtime(doc)
     doc['metadata']['resourceVersion']='1'
-    lease_path.write_text(json.dumps(doc))
-    (root/'lease-initial.json').write_text(json.dumps(doc))
+    with locked():
+        put(lease_path, json.dumps(doc))
+        put(root/'lease-initial.json', json.dumps(doc))
     print(json.dumps(doc))
 elif args[:2] == ['replace','-f']:
     doc=json.load(sys.stdin)
     validate_lease_microtime(doc)
-    current=json.loads(lease_path.read_text())
-    if doc['metadata'].get('resourceVersion') != current['metadata']['resourceVersion']:
-        print('Error from server (Conflict): resourceVersion conflict',file=sys.stderr); sys.exit(1)
-    doc['metadata']['resourceVersion']=str(int(current['metadata']['resourceVersion'])+1)
-    lease_path.write_text(json.dumps(doc))
+    with locked():
+        current=json.loads(lease_path.read_text())
+        if doc['metadata'].get('resourceVersion') != current['metadata']['resourceVersion']:
+            print('Error from server (Conflict): resourceVersion conflict',file=sys.stderr); sys.exit(1)
+        doc['metadata']['resourceVersion']=str(int(current['metadata']['resourceVersion'])+1)
+        put(lease_path, json.dumps(doc))
     if doc['spec']['holderIdentity']==current['spec']['holderIdentity']:
         (root/'lease-renewed').write_text('yes')
     print(json.dumps(doc))
 elif args[:3] == ['rollout','status','deployment/workspace']:
     if (root/'fail-wait').exists() and 'deployment/workspace' in args:
         print('injected workspace rollout readiness failure',file=sys.stderr); sys.exit(1)
-    deployment=json.loads((root/'current-deployment.json').read_text())
+    with locked(): deployment=json.loads((root/'current-deployment.json').read_text())
     namespace=args[args.index('-n')+1]
     workspace_id=deployment['metadata']['labels']['adm.dev/workspace-id']
-    (root/'pod-image').write_text(next(container['image'] for container in deployment['spec']['template']['spec']['containers'] if container['name']=='dev'))
+    put(root/'pod-image', next(container['image'] for container in deployment['spec']['template']['spec']['containers'] if container['name']=='dev'))
     pod_uid=str(uuid.uuid4())
-    (root/'expected-pod-uid').write_text(pod_uid)
+    put(root/'expected-pod-uid', pod_uid)
     payload=json.dumps({'holder':pod_uid}).encode()
     target_token='target-token:'+namespace+':'+pod_uid
     request=urllib.request.Request((root/'lifecycle-url').read_text().strip()+'/v1/workspaces/'+workspace_id+'/runtime/lease',data=payload,headers={'Authorization':'Bearer '+target_token,'Content-Type':'application/json'},method='POST')
@@ -385,14 +398,134 @@ elif args[0] == 'wait':
 elif args[:2] == ['delete','namespace']:
     if (root/'hold-delete').exists():
         (root/'deleting-entered').write_text('yes')
-        (root/'delete-process').write_text(str(__import__('os').getpid()))
+        put(root/'delete-process', str(os.getpid()))
         while not (root/'delete-release').exists(): time.sleep(.01)
-    state.pop(args[2],None); state_path.write_text(json.dumps(state))
+    with locked():
+        state=load_state(); state.pop(args[2],None); put(state_path, json.dumps(state))
 else:
     print('unexpected kubectl command: '+repr(args), file=sys.stderr); sys.exit(1)
-"##,
-    )
-    .unwrap();
+"##;
+
+fn run_fake_kubectl(root: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(root.join("kubectl"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = child.stdin.take().unwrap();
+    if let Some(input) = stdin {
+        pipe.write_all(input.as_bytes()).unwrap();
+    }
+    drop(pipe);
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn fake_kubectl_concurrent_processes_never_tear_or_lose_shared_state() {
+    use std::os::unix::fs::PermissionsExt;
+    const WRITERS: usize = 6;
+    const READERS: usize = 4;
+    const ROUNDS: usize = 60;
+    let root = tempfile::tempdir().unwrap();
+    let kubectl = root.path().join("kubectl");
+    fs::write(&kubectl, FAKE_KUBECTL).unwrap();
+    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let lease = |version: &str| {
+        json!({
+            "metadata": {"resourceVersion": version},
+            "spec": {
+                "holderIdentity": "stress",
+                "acquireTime": "2026-01-01T00:00:00.000000Z",
+                "renewTime": "2026-01-01T00:00:00.000000Z"
+            }
+        })
+        .to_string()
+    };
+    let created = run_fake_kubectl(root.path(), &["create", "-f", "-"], Some(&lease("0")));
+    assert!(created.status.success());
+    let failures = std::sync::Mutex::new(Vec::<String>::new());
+    let record = |what: &str, output: &std::process::Output| {
+        if !output.status.success() {
+            failures.lock().unwrap().push(format!(
+                "{what}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    };
+    thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let (root, record) = (root.path(), &record);
+            scope.spawn(move || {
+                for round in 0..ROUNDS {
+                    let name = format!("stress-{writer}-{round}");
+                    let doc = json!({"kind": "List", "items": [{
+                        "kind": "Namespace",
+                        "metadata": {"name": name, "labels": {"adm.dev/workspace-id": name}}
+                    }]})
+                    .to_string();
+                    record(
+                        "apply",
+                        &run_fake_kubectl(root, &["apply", "-f", "-"], Some(&doc)),
+                    );
+                }
+            });
+        }
+        for _ in 0..READERS {
+            let (root, record) = (root.path(), &record);
+            scope.spawn(move || {
+                for _ in 0..ROUNDS {
+                    record("get pods", &run_fake_kubectl(root, &["get", "pods"], None));
+                    let lease = run_fake_kubectl(root, &["get", "lease"], None);
+                    record("get lease", &lease);
+                    if lease.status.success() {
+                        serde_json::from_slice::<Value>(&lease.stdout)
+                            .expect("lease read must be a whole document");
+                    }
+                }
+            });
+        }
+        let (root, record) = (root.path(), &record);
+        scope.spawn(move || {
+            for round in 1..=ROUNDS {
+                let replaced = run_fake_kubectl(
+                    root,
+                    &["replace", "-f", "-"],
+                    Some(&lease(&round.to_string())),
+                );
+                record("replace lease", &replaced);
+            }
+        });
+    });
+    assert_eq!(*failures.lock().unwrap(), Vec::<String>::new());
+    let cluster: Value =
+        serde_json::from_slice(&fs::read(root.path().join("cluster.json")).unwrap()).unwrap();
+    assert_eq!(
+        cluster.as_object().unwrap().len(),
+        WRITERS * ROUNDS,
+        "concurrent applies must not overwrite each other's namespaces"
+    );
+    let lease: Value =
+        serde_json::from_slice(&fs::read(root.path().join("lease.json")).unwrap()).unwrap();
+    assert_eq!(
+        lease["metadata"]["resourceVersion"],
+        (ROUNDS + 1).to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("pod-list-requests")).unwrap(),
+        (READERS * ROUNDS).to_string(),
+        "concurrent request counting must not lose increments"
+    );
+}
+
+#[test]
+fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner_server) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
     fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
     let (status_port, status_server) = start_runtime_status_server();
     fs::write(
