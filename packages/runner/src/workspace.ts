@@ -748,6 +748,15 @@ export class Workspace {
     });
   }
 
+  // The conversation's own model; reads no catalogue and makes no provider
+  // requests, so runtime status stays fast while the catalogue is slow.
+  async conversationSelectedModel() {
+    const selected = (await this.conversation.agent(context)).model;
+    return selected
+      ? { provider: selected.provider, id: selected.modelId }
+      : undefined;
+  }
+
   async modelCatalog(signal?: AbortSignal, refresh = false) {
     if (signal?.aborted) throw signal.reason;
     const refreshResult = refresh
@@ -755,11 +764,8 @@ export class Workspace {
       : undefined;
     const available = await this.models.getAvailable(undefined, { signal });
     const providers = await workspaceProviderMetadata(this.models, signal);
-    const selected = (await this.conversation.agent(context)).model;
     return {
-      selected: selected
-        ? { provider: selected.provider, id: selected.modelId }
-        : undefined,
+      selected: await this.conversationSelectedModel(),
       providers,
       models: available.map((model) => ({
         provider: model.provider,

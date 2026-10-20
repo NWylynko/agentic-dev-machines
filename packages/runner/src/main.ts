@@ -1435,10 +1435,7 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && action === "runtime-status") {
       const status = await workspace.status();
-      const catalog = await workspace.modelCatalog(
-        new AbortController().signal,
-        false,
-      );
+      const selectedModel = await workspace.conversationSelectedModel();
       const activity = ["needs_model", "running", "error", "idle"].includes(
         status.status,
       )
@@ -1450,7 +1447,7 @@ const server = createServer(async (request, response) => {
           : undefined;
       return json(response, 200, {
         activity: { status: activity, ...(error ? { error } : {}) },
-        ...(catalog.selected ? { selectedModel: catalog.selected } : {}),
+        ...(selectedModel ? { selectedModel } : {}),
       });
     }
     if (request.method === "GET" && action === "history") {

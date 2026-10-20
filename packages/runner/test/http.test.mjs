@@ -173,7 +173,7 @@ async function startPodRunner(
 async function startBotLifecycle(
   directory,
   workspaces,
-  { holdDirectory = false } = {},
+  { holdDirectory = false, holdProviderCatalog = false } = {},
   testContext,
 ) {
   await mkdir(directory, { recursive: true });
@@ -182,6 +182,8 @@ async function startBotLifecycle(
   const authorizations = [];
   const operations = new Map();
   const tokens = new Map([["fixture-runtime-token", "fixture-source"]]);
+  const providerCatalogRequests = [];
+  const heldProviderCatalogResponses = [];
   let signalDirectoryRequest;
   let signalDirectoryAbort;
   const directoryRequest = new Promise((resolve) => {
@@ -204,6 +206,16 @@ async function startBotLifecycle(
     let body = "";
     for await (const chunk of request) body += chunk;
     const value = body ? JSON.parse(body) : {};
+    if (
+      holdProviderCatalog &&
+      request.method === "POST" &&
+      request.url === "/v1/provider-auth/catalog"
+    ) {
+      // A deliberately slow provider catalogue: it answers only at close.
+      providerCatalogRequests.push(sourceId);
+      heldProviderCatalogResponses.push(response);
+      return;
+    }
     if (request.method === "GET" && request.url === "/v1/runtime/workspaces") {
       if (holdDirectory) {
         signalDirectoryRequest();
@@ -336,12 +348,15 @@ async function startBotLifecycle(
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
   });
-  const close = () =>
-    server.listening
+  const close = () => {
+    for (const response of heldProviderCatalogResponses.splice(0))
+      response.writeHead(503).end();
+    return server.listening
       ? new Promise((resolve, reject) =>
           server.close((error) => (error ? reject(error) : resolve())),
         )
       : Promise.resolve();
+  };
   testContext?.after(close);
   return {
     url: `http://127.0.0.1:${server.address().port}`,
@@ -360,6 +375,7 @@ async function startBotLifecycle(
     },
     authorizations,
     operations,
+    providerCatalogRequests,
     directoryRequest,
     directoryAbort,
     close,
@@ -446,6 +462,83 @@ test("a mounted bot runtime keeps its identity when the Pod restarts", async (t)
     200,
   );
 });
+
+test(
+  "runtime status answers with activity and the selected model while the shared provider catalogue is slow",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "adm-runner-runtime-status-slow-catalogue-"),
+    );
+    const lifecycle = await startBotLifecycle(
+      join(directory, "management"),
+      [],
+      { holdProviderCatalog: true },
+      t,
+    );
+    const id = "runtime-status-slow-catalogue";
+    const token = "token-runtime-status-slow-catalogue";
+    const tokenFile = await lifecycle.addWorkspace(
+      { id, name: "slow-catalogue", role: "coding", phase: "ready" },
+      token,
+    );
+    const workspaceConfigFile = join(directory, "workspace.json");
+    await writeFile(
+      workspaceConfigFile,
+      JSON.stringify({
+        id,
+        name: "slow-catalogue",
+        role: "coding",
+        environment: "pod",
+        localRoot: join(directory, "repos"),
+        model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+      }),
+      { mode: 0o600 },
+    );
+    const runner = await startRunner(
+      join(directory, "runner"),
+      {
+        ADM_LIFECYCLE_URL: lifecycle.url,
+        ADM_LIFECYCLE_IDENTITY_TOKEN_FILE: tokenFile,
+      },
+      {
+        useFaux: false,
+        tokenFile,
+        workspaceConfigFile,
+        lifecycleUrl: lifecycle.url,
+        podUid: "44444444-4444-4444-8444-444444444444",
+      },
+    );
+    t.after(async () => {
+      await runner.stop();
+      await lifecycle.close();
+    });
+    const catalogueRequestsBefore = lifecycle.providerCatalogRequests.length;
+    const statuses = await Promise.all(
+      [1, 2, 3].map(() =>
+        runner.request(
+          `/v1/workspaces/${id}/runtime-status`,
+          "GET",
+          undefined,
+          undefined,
+          token,
+        ),
+      ),
+    );
+    for (const status of statuses) {
+      assert.equal(status.status, 200);
+      assert.deepEqual(status.body, {
+        activity: { status: "idle" },
+        selectedModel: { provider: "anthropic", id: "claude-sonnet-4-5" },
+      });
+    }
+    assert.equal(
+      lifecycle.providerCatalogRequests.length,
+      catalogueRequestsBefore,
+      "runtime status makes no shared provider catalogue requests",
+    );
+  },
+);
 
 test("workspace requests are authorized by lifecycle against the caller's projected identity", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "adm-runner-lifecycle-auth-"));
