@@ -926,6 +926,18 @@ test(
       publicAbort.abort();
       diagnosticAbort.abort();
     });
+    const initialActivity = await publicEvents.waitFor(
+      (frame) => frame.type === "live" && frame.data.data.type === "activity",
+    );
+    assert.deepEqual(
+      initialActivity.data,
+      {
+        workspaceId: "private-bot",
+        kind: "live",
+        data: { type: "activity", active: false },
+      },
+      "public bot attachment must receive a content-free current activity snapshot",
+    );
 
     const published = publicEvents.waitFor(
       (frame) =>
@@ -956,17 +968,40 @@ test(
     assert.ok(
       publicEvents.frames.every(
         (frame) =>
-          frame.type === "message" &&
-          ["user", "message", "status"].includes(frame.data.kind),
+          (frame.type === "message" &&
+            ["user", "message", "status"].includes(frame.data.kind)) ||
+          (frame.type === "live" &&
+            frame.data.data.type === "activity" &&
+            Object.keys(frame.data.data).sort().join(",") === "active,type"),
       ),
     );
-    const publicBranch = (await runner.request(path + "/branches")).body.branches[0];
-    assert.match(publicBranch.sessionInfo.allMessagesText, /What identity and purpose would you like me to have/);
-    assert.doesNotMatch(publicBranch.sessionInfo.allMessagesText, /I am ready for setup details\./);
+    const publicBranch = (await runner.request(path + "/branches")).body
+      .branches[0];
+    assert.match(
+      publicBranch.sessionInfo.allMessagesText,
+      /What identity and purpose would you like me to have/,
+    );
+    assert.doesNotMatch(
+      publicBranch.sessionInfo.allMessagesText,
+      /I am ready for setup details\./,
+    );
     const diagnosticFrames = JSON.stringify(diagnosticEvents.frames);
     assert.match(diagnosticFrames, /I am ready for setup details\./);
     await diagnosticEvents.waitFor(
       (frame) => frame.type === "live" && frame.data.data.type === "run_end",
+    );
+    await publicEvents.waitForAfter(
+      1,
+      (frame) =>
+        frame.type === "live" &&
+        frame.data.data.type === "activity" &&
+        !frame.data.data.active,
+    );
+    assert.deepEqual(
+      publicEvents.frames
+        .filter((frame) => frame.type === "live")
+        .map((frame) => frame.data.data.active),
+      [false, true, false],
     );
 
     const nextRun = diagnosticEvents.waitForAfter(
@@ -1089,8 +1124,11 @@ test(
     assert.ok(
       newPublicClient.frames.every(
         (frame) =>
-          frame.type === "message" &&
-          !["assistant", "tool"].includes(frame.data.kind),
+          (frame.type === "message" &&
+            !["assistant", "tool"].includes(frame.data.kind)) ||
+          (frame.type === "live" &&
+            frame.data.data.type === "activity" &&
+            Object.keys(frame.data.data).sort().join(",") === "active,type"),
       ),
       "bot streams may publish explicit messages only",
     );

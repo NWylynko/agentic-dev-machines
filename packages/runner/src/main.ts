@@ -30,7 +30,7 @@ import {
 } from "./lifecycle-availability.ts";
 import { botAgentManagementFromEnvironment } from "./bot-management.ts";
 import { ApiError, workspaceIdPattern, type WorkspaceConfig } from "./types.ts";
-import { watchEvents } from "@earendil-works/pi-durable";
+import { watchEvents, type AgentEvent } from "@earendil-works/pi-durable";
 import type { Message } from "@earendil-works/pi-ai";
 import {
   BACKGROUND_CONTEXT,
@@ -2105,9 +2105,7 @@ const server = createServer(async (request, response) => {
         dirty = false,
         ended = false;
       const includeLiveEvents = workspace.config.role !== "bot" || diagnostics;
-      const watcherController = includeLiveEvents
-        ? new AbortController()
-        : undefined;
+      const watcherController = new AbortController();
       let watcher: Awaited<ReturnType<typeof watchEvents>> | undefined;
       let pump = () => {};
       const notify = () => {
@@ -2116,7 +2114,7 @@ const server = createServer(async (request, response) => {
       const close = () => {
         if (ended) return;
         ended = true;
-        watcherController?.abort();
+        watcherController.abort();
         if (watcher) void watcher.stop();
         workspace.events.off("change", notify);
         workspace.events.off("branch", close);
@@ -2127,34 +2125,41 @@ const server = createServer(async (request, response) => {
       workspace.events.once("branch", close);
       workspace.events.once("close", close);
       response.once("close", close);
-      if (watcherController) {
-        const watcherContext = withAbortSignal(
-          watcherController.signal,
-          BACKGROUND_CONTEXT,
-        );
-        watcher = await watchEvents(
-          workspace.harness,
-          streamConversation.id,
-          watcherContext,
-        );
-        if (ended) {
-          watcherController.abort();
-          void watcher.stop();
-          return;
+      const watcherContext = withAbortSignal(
+        watcherController.signal,
+        BACKGROUND_CONTEXT,
+      );
+      watcher = await watchEvents(
+        workspace.harness,
+        streamConversation.id,
+        watcherContext,
+      );
+      if (ended) {
+        watcherController.abort();
+        void watcher.stop();
+        return;
+      }
+      const writeLive = (event: AgentEvent) => {
+        const write = (data: unknown) => {
+          if (!ended && !response.destroyed)
+            response.write(
+              `event: live\ndata: ${JSON.stringify({ workspaceId: id, kind: "live", data })}\n\n`,
+            );
+        };
+        // Bot activity spans the whole run, including private tools and retries.
+        // Publish only this boolean; never redact a copy of a private event.
+        if (workspace.config.role === "bot") {
+          if (event.type === "snapshot")
+            write({ type: "activity", active: !!event.run });
+          else if (event.type === "run_start" || event.type === "run_end")
+            write({ type: "activity", active: event.type === "run_start" });
         }
-      }
-      const writeLive = (event: unknown) => {
-        if (!ended && !response.destroyed)
-          response.write(
-            `event: live\ndata: ${JSON.stringify({ workspaceId: id, kind: "live", data: event })}\n\n`,
-          );
+        if (includeLiveEvents) write(event);
       };
-      if (watcher) {
-        writeLive(watcher.snapshot);
-        watcher.start(async (batch) => {
-          for (const event of batch) writeLive(event);
-        });
-      }
+      writeLive(watcher.snapshot);
+      watcher.start(async (batch) => {
+        for (const event of batch) writeLive(event);
+      });
       pump = async () => {
         dirty = true;
         if (pumping || ended) return;

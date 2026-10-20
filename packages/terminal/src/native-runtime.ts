@@ -1516,11 +1516,36 @@ export class DurableInteractiveRuntime {
   }
   private subscribe(listener: DurablePiEventListener) {
     this.listeners.add(listener);
+    // The activity snapshot can arrive before InteractiveMode subscribes.
+    if (this.snapshot().role === "bot" && this.streaming) {
+      void listener({ type: "agent_start" } as AgentSessionEvent);
+      void listener({ type: "turn_start" } as AgentSessionEvent);
+    }
     return () => this.listeners.delete(listener);
   }
   private onWorkspaceEvent(event: WorkspaceEvent) {
     const snapshot = this.snapshot();
     if (snapshot.role === "bot") {
+      if (event.kind === "live" && event.data?.type === "activity") {
+        const active = event.data.active === true;
+        if (active === this.streaming) return;
+        this.streaming = active;
+        if (active) {
+          void this.emit({ type: "agent_start" } as AgentSessionEvent);
+          void this.emit({ type: "turn_start" } as AgentSessionEvent);
+        } else {
+          void this.emit({
+            type: "agent_end",
+            messages: this.session.messages,
+            willRetry: false,
+          } as AgentSessionEvent);
+          void this.emit({
+            type: "agent_settled",
+            aborted: false,
+          } as AgentSessionEvent);
+        }
+        return;
+      }
       const allowed =
         event.kind === "user" ||
         event.kind === "message" ||
@@ -1624,6 +1649,10 @@ export class DurableInteractiveRuntime {
         details: event.data,
         timestamp: event.timestamp,
       };
+      void this.emit({
+        type: "message_start",
+        message: publicMessage,
+      } as AgentSessionEvent);
       void this.emit({
         type: "message_end",
         message: publicMessage,
