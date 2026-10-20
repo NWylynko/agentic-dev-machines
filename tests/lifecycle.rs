@@ -528,6 +528,115 @@ fn fake_kubectl_concurrent_processes_never_tear_or_lose_shared_state() {
 }
 
 #[test]
+fn create_retries_recover_only_the_latest_failed_attempt_after_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner_server) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("fail-wait"), "fail").unwrap();
+    fs::write(root.path().join("storage-release"), "continue").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let mut service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    let attempts = [
+        "67b5d167-9ffa-4831-90c2-b333e4384548",
+        "33c1e40a-9210-4523-b704-850dcfc571f5",
+    ];
+    let mut workspace_id = None;
+    for operation_id in attempts {
+        let body = json!({"operationId":operation_id,"kind":"create","spec":workspace_spec("restart-retry")});
+        let receipt: Value = request_with_token(
+            &url,
+            "POST",
+            "/v1/operations",
+            Some(&body),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+        if let Some(workspace_id) = &workspace_id {
+            assert_eq!(&receipt["workspaceId"], workspace_id);
+        } else {
+            workspace_id = Some(receipt["workspaceId"].clone());
+        }
+        wait_for(|| {
+            request_with_token(
+                &url,
+                "GET",
+                &format!("/v1/operations/{operation_id}"),
+                None,
+                Some("synthetic-lifecycle-token"),
+            )
+            .ok()?
+            .json::<Value>()
+            .ok()
+            .filter(|receipt| receipt["status"] == "failed")
+        });
+    }
+    let earlier_failure: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/operations/{}", attempts[0]),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    service.kill().unwrap();
+    service.wait().unwrap();
+    fs::remove_file(root.path().join("fail-wait")).unwrap();
+    let lease_path = root.path().join("lease.json");
+    let mut lease: Value = serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
+    lease["metadata"]["annotations"]["adm.dev/renew-unix"] = "0".into();
+    fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+    let mut restarted = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    let recovered: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{}", attempts[1]),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()?
+        .json::<Value>()
+        .ok()
+        .filter(|receipt| receipt["status"] == "completed")
+    });
+    assert_eq!(&recovered["workspaceId"], workspace_id.as_ref().unwrap());
+    let earlier: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/operations/{}", attempts[0]),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(
+        earlier, earlier_failure,
+        "restart must not run superseded create attempts"
+    );
+    restarted.kill().unwrap();
+    restarted.wait().unwrap();
+    stop_http_stub(runner_port, runner_server);
+}
+
+#[test]
 fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() {
     let root = tempfile::tempdir().unwrap();
     let (runner_url, runner_port, runner_server) = start_runner_stub();

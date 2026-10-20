@@ -1409,7 +1409,7 @@ fn create_rejects_invalid_repository_branches_without_publishing_a_checkout() {
 #[test]
 fn create_rejects_a_missing_repository_base_without_publishing_on_retry() {
     let root = repository_branch_fixture();
-    let mut args = vec![
+    let args = [
         "create",
         "missing-base",
         "--repo",
@@ -1418,13 +1418,10 @@ fn create_rejects_a_missing_repository_base_without_publishing_on_retry() {
         "feature/missing",
         "--base",
         "origin/does-not-exist",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
-    for attempt in 0..2 {
-        let arguments = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = adm(root.path(), &arguments);
+    ];
+    let mut original = None;
+    for _ in 0..2 {
+        let output = adm(root.path(), &args);
         assert!(!output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stderr)
@@ -1437,14 +1434,10 @@ fn create_rejects_a_missing_repository_base_without_publishing_on_retry() {
         assert_eq!(workspaces[0]["phase"], "failed");
         assert_eq!(workspaces[0]["base"], "origin/does-not-exist");
         assert!(!repository_checkout(root.path(), &workspaces[0]).exists());
-        if attempt == 0 {
-            args.extend([
-                "--operation-id".to_owned(),
-                workspaces[0]["creation_operation_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            ]);
+        if let Some(original) = &original {
+            assert_eq!(&workspaces[0], original);
+        } else {
+            original = Some(workspaces[0].clone());
         }
     }
 }
@@ -1498,13 +1491,19 @@ fn repository_branch_retries_preserve_identity_edits_and_reject_changed_choices(
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    // Replay the original durable operation; fresh-operation retries are tracked in TASK-73.
+    let retried = assert_ok(adm(root.path(), &args));
+    assert_eq!(
+        retried["creation_operation_id"],
+        original["creation_operation_id"]
+    );
+    // Explicit replay still addresses the same durable identity after an ordinary retry.
     let mut replay = args.to_vec();
     replay.extend([
         "--operation-id",
         original["creation_operation_id"].as_str().unwrap(),
     ]);
-    let retried = assert_ok(adm(root.path(), &replay));
+    let replayed = assert_ok(adm(root.path(), &replay));
+    assert_eq!(replayed["id"], original["id"]);
     assert_eq!(retried["id"], original["id"]);
     assert_eq!(retried["namespace"], original["namespace"]);
     assert_eq!(retried["phase"], "ready");
@@ -2530,6 +2529,103 @@ fn retrying_a_partially_applied_creation_resumes_the_same_workspace() {
         assert_ok(adm(root.path(), &["list", "--json"]))[0]["id"],
         original_id
     );
+}
+
+#[test]
+fn overlapping_create_retries_report_the_in_progress_operation() {
+    let root = fixture();
+    let args = ["create", "retry-overlap", "--no-repositories"];
+    fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
+    assert!(!adm(root.path(), &args).status.success());
+    let original = assert_ok(adm(root.path(), &["list", "--json"]))[0].clone();
+    let mut spec = original.clone();
+    for field in [
+        "id",
+        "namespace",
+        "phase",
+        "creation_operation_id",
+        "deletion_operation_id",
+        "created_at",
+        "last_error",
+        "runtime_status",
+        "activity",
+        "effective_model",
+        "requested_model",
+    ] {
+        spec.as_object_mut().unwrap().remove(field);
+    }
+    let url = fs::read_to_string(root.path().join("lifecycle-url")).unwrap();
+    fs::write(root.path().join("delay-readiness"), "hold").unwrap();
+    let active_operation = "bc4626e1-b651-4272-9754-c2f8f9df1d5f";
+    let responses = std::thread::scope(|scope| {
+        let retry = scope.spawn(|| {
+            let mut retry = args.to_vec();
+            retry.extend(["--operation-id", active_operation]);
+            adm(root.path(), &retry)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !root.path().join("entered-readiness").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retry never reached readiness"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let responses = [
+            "8ef19bae-74ac-4d30-9c7b-d781d84486b7",
+            original["creation_operation_id"].as_str().unwrap(),
+        ]
+        .map(|operation_id| {
+            let response = reqwest::blocking::Client::new()
+                .post(format!("{url}/v1/operations"))
+                .bearer_auth("fixture-lifecycle-token")
+                .json(&serde_json::json!({"operationId":operation_id,"kind":"create","spec":spec}))
+                .send()
+                .unwrap();
+            (response.status(), response.text().unwrap())
+        });
+        fs::write(root.path().join("release-readiness"), "continue").unwrap();
+        let ready = assert_ok(retry.join().unwrap());
+        assert_eq!(ready["id"], original["id"]);
+        responses
+    });
+    for (status, body) in responses {
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("creation is already in progress"), "{body}");
+        assert!(body.contains(active_operation), "{body}");
+    }
+    let workspaces = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(workspaces.as_array().unwrap().len(), 1);
+    assert_eq!(workspaces[0]["id"], original["id"]);
+    assert_eq!(workspaces[0]["phase"], "ready");
+}
+
+#[test]
+fn stale_failed_create_replay_cannot_resume_a_replacement_with_the_same_name() {
+    let root = fixture();
+    let args = ["create", "retry-deleted", "--no-repositories"];
+    fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
+    assert!(!adm(root.path(), &args).status.success());
+    let original = assert_ok(adm(root.path(), &["list", "--json"]))[0].clone();
+    assert_ok(adm(root.path(), &["destroy", "retry-deleted", "--wait"]));
+
+    fs::write(root.path().join("fail-wait-once"), "fail").unwrap();
+    assert!(!adm(root.path(), &args).status.success());
+    let replacement = assert_ok(adm(root.path(), &["list", "--json"]))[0].clone();
+    assert_ne!(replacement["id"], original["id"]);
+    assert_eq!(replacement["phase"], "failed");
+
+    let mut replay = args.to_vec();
+    replay.extend([
+        "--operation-id",
+        original["creation_operation_id"].as_str().unwrap(),
+    ]);
+    let stale = adm(root.path(), &replay);
+    assert!(!stale.status.success());
+    let workspaces = assert_ok(adm(root.path(), &["list", "--json"]));
+    assert_eq!(workspaces.as_array().unwrap().len(), 1);
+    assert_eq!(workspaces[0], replacement);
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("deleted"));
 }
 
 #[test]

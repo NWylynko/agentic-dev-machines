@@ -431,6 +431,22 @@ fn ensure_store_fence(connection: &Connection, fencing_token: u64) -> Result<()>
     Ok(())
 }
 
+fn ensure_creation_not_running(
+    connection: &Connection,
+    workspace_id: &str,
+    operation_id: &str,
+) -> Result<()> {
+    let active: Option<String> = connection.query_row(
+        "SELECT operation_id FROM lifecycle_operations WHERE workspace_id=?1 AND kind='create' AND status IN ('accepted','running') AND operation_id!=?2 LIMIT 1",
+        params![workspace_id, operation_id],
+        |row| row.get(0),
+    ).optional()?;
+    if let Some(active) = active {
+        bail!("workspace creation is already in progress; inspect operation {active}");
+    }
+    Ok(())
+}
+
 impl WorkspaceStore {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_fenced(path, 0)
@@ -474,6 +490,9 @@ impl WorkspaceStore {
             );
             let receipt = lifecycle_receipt(&transaction, operation_id)?;
             if receipt.status == "failed" {
+                if receipt.kind == "create" {
+                    ensure_creation_not_running(&transaction, &receipt.workspace_id, operation_id)?;
+                }
                 transaction.execute(
                     "UPDATE lifecycle_operations SET status='accepted',stage='accepted',last_error=NULL,updated_at=?2,timings='{}',fencing_token=?3 WHERE operation_id=?1 AND fencing_token<=?3",
                     params![operation_id, now() as i64, self.fencing_token as i64],
@@ -516,6 +535,7 @@ impl WorkspaceStore {
                             "workspace {} has an unfinished creation with different options; destroy it before changing its configuration",
                             requested.name
                         );
+                        ensure_creation_not_running(&transaction, &existing.id, operation_id)?;
                         Some(existing)
                     }
                     Some(_) => bail!(
@@ -541,7 +561,7 @@ impl WorkspaceStore {
                     .as_ref()
                     .expect("create workspace was allocated");
                 transaction.execute(
-                    "INSERT INTO workspaces(id,name,phase,spec,fencing_token) VALUES(?1,?2,?3,?4,?5)",
+                    "INSERT INTO workspaces(id,name,phase,spec,fencing_token) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
                     params![spec.id, spec.name, spec.phase, serde_json::to_string(spec)?, self.fencing_token as i64],
                 ).with_context(|| format!(
                     "workspace name {} already exists; inspect it and deliberately destroy it before recreating",
@@ -1076,8 +1096,17 @@ impl WorkspaceStore {
         Ok(())
     }
     pub fn pending_lifecycle_operations(&self) -> Result<Vec<(String, String)>> {
+        // Older failed create attempts retain their receipts, but only the latest
+        // attempt may recover automatically or provisioning would race on restart.
         let mut statement = self.connection.prepare(
-            "SELECT operation_id,request FROM lifecycle_operations WHERE status IN ('accepted','running','failed') ORDER BY accepted_at,operation_id",
+            "SELECT operation_id,request FROM lifecycle_operations AS operation
+             WHERE status IN ('accepted','running') OR (status='failed' AND
+                 (kind!='create' OR NOT EXISTS (
+                     SELECT 1 FROM lifecycle_operations AS other
+                     WHERE other.workspace_id=operation.workspace_id AND other.kind='create'
+                     AND (other.rowid>operation.rowid OR other.status IN ('accepted','running'))
+                 )))
+             ORDER BY accepted_at,operation_id",
         )?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|row| Ok(row?)).collect()
@@ -1560,6 +1589,12 @@ pub fn navigation_guidance(workspace: &Workspace, opening_shell: bool) -> String
 }
 
 pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
+    ensure!(
+        requested.phase != "deleting" && requested.phase != "deleted",
+        "workspace {} is {}; cannot resume creation",
+        requested.name,
+        requested.phase
+    );
     let allow_node_local_storage = requested.allow_node_local_storage;
     let started = Instant::now();
     let mut store = cli.store()?;
@@ -1567,6 +1602,14 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
         .list(false)?
         .into_iter()
         .find(|existing| existing.name == requested.name);
+    ensure!(
+        existing
+            .as_ref()
+            .is_none_or(|existing| existing.id == requested.id),
+        "workspace {} was replaced; cannot resume creation of {}",
+        requested.name,
+        requested.id
+    );
     let resuming = existing.is_some();
     let mut w = match existing {
         Some(existing) if existing.phase == "failed" || existing.phase == "provisioning" => {
