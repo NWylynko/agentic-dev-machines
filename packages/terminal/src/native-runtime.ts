@@ -617,6 +617,12 @@ export class DurableInteractiveRuntime {
   private beforeSessionInvalidate?: () => void;
   private rebindSession?: (session: RemoteDurableSession) => Promise<void>;
   private streaming = false;
+  // Pi has a streaming assistant component: a live partial it was given.
+  private piStreamingAssistant = false;
+  // Saved entries shown in Pi's chat by an event since Pi last rendered the
+  // session's records. Live `message_end` and history both carry each saved
+  // message, in no guaranteed order; whichever arrives first shows it.
+  private savedEntriesShown = new Set<number>();
   private compacting = false;
   private promptCount = 0;
   private tokens = 0;
@@ -1526,20 +1532,39 @@ export class DurableInteractiveRuntime {
       if (data?.type === "snapshot") {
         this.streaming = !!data.generation;
         const message = data.generation?.message;
-        if (message)
+        if (message) {
+          this.piStreamingAssistant = true;
           void this.emit({
             type: "message_start",
             message,
           } as AgentSessionEvent);
+        }
         if (this.streaming)
           void this.emit({ type: "agent_start" } as AgentSessionEvent);
       } else if (data?.type === "message_start") {
         this.streaming = true;
         void this.emit({ type: "agent_start" } as AgentSessionEvent);
-        void this.emit({
-          type: "message_start",
-          message: data.message,
-        } as AgentSessionEvent);
+        // Durable also starts each saved message it did not stream, directly
+        // before its `message_end`; those are shown from their entry.
+        if (
+          data.message?.role === "assistant" &&
+          !this.savedMessageShown(data.message)
+        ) {
+          this.piStreamingAssistant = true;
+          void this.emit({
+            type: "message_start",
+            message: data.message,
+          } as AgentSessionEvent);
+        }
+      } else if (data?.type === "message_end") {
+        const message = data.entry?.model?.[0] as AgentMessage | undefined;
+        const entryId = Number(data.entry?.id);
+        // An entry already among the session's records is already shown.
+        if (
+          (message?.role === "assistant" || message?.role === "user") &&
+          !this.snapshot().events.some((record) => record.seq === entryId)
+        )
+          this.showSavedMessage(entryId, message);
       } else if (data?.type === "message_update") {
         const message = this.snapshot().liveMessage;
         if (message)
@@ -1564,6 +1589,9 @@ export class DurableInteractiveRuntime {
         void this.emit({ type: "turn_start" } as AgentSessionEvent);
       } else if (data?.type === "turn_end") {
         this.streaming = false;
+        // Pi drops a streaming component its turn did not finish; a saved
+        // reply still on its way is shown from its entry.
+        this.piStreamingAssistant = false;
         void this.emit({
           type: "agent_end",
           messages: this.session.messages,
@@ -1579,10 +1607,10 @@ export class DurableInteractiveRuntime {
     const message = event.data?.message as AgentMessage | undefined;
     if (event.kind === "assistant" && message?.role === "assistant") {
       this.accumulateUsage(message);
-      void this.emit({ type: "message_end", message } as AgentSessionEvent);
+      this.showSavedMessage(event.seq!, message);
     } else if (event.kind === "user" && message?.role === "user") {
       this.promptCount++;
-      void this.emit({ type: "message_start", message } as AgentSessionEvent);
+      this.showSavedMessage(event.seq!, message);
     } else if (event.kind === "tool" && message?.role === "toolResult") {
       void this.emit({ type: "message_end", message } as AgentSessionEvent);
     } else if (event.kind === "message" && message?.role === "bashExecution") {
@@ -1613,6 +1641,28 @@ export class DurableInteractiveRuntime {
         },
       } as AgentSessionEvent);
     }
+  }
+  // Show a saved message once, whichever of live and history brings it first.
+  // It finishes Pi's streaming assistant component when there is one: that is
+  // this message, because live events arrive in order and a later partial only
+  // starts after this message's live `message_end`. Otherwise it starts its own
+  // component, e.g. after Pi's `agent_end` dropped the streamed one.
+  private showSavedMessage(entryId: number, message: AgentMessage) {
+    if (this.savedEntriesShown.has(entryId)) return;
+    this.savedEntriesShown.add(entryId);
+    if (!(message.role === "assistant" && this.piStreamingAssistant))
+      void this.emit({ type: "message_start", message } as AgentSessionEvent);
+    void this.emit({ type: "message_end", message } as AgentSessionEvent);
+    if (message.role === "assistant") this.piStreamingAssistant = false;
+  }
+  // A saved assistant message already among the session's records, so shown.
+  private savedMessageShown(message: AgentMessage) {
+    const saved = JSON.stringify(message);
+    return this.snapshot().events.some(
+      (record) =>
+        record.kind === "assistant" &&
+        JSON.stringify(record.data?.message) === saved,
+    );
   }
   private accumulateUsage(message: AgentMessage) {
     if (message.role !== "assistant" || !message.usage) return;
@@ -1700,6 +1750,10 @@ export class DurableInteractiveRuntime {
     await this.initialize();
     this.current = this.transport.getRemoteSnapshot();
     this.modelRuntime.refreshSnapshot();
+    // Pi synchronously re-renders exactly the session's records when rebound;
+    // live-shown entries not yet among them are shown again from history.
+    this.savedEntriesShown.clear();
+    this.piStreamingAssistant = false;
     await this.rebindSession?.(this.session);
   }
   async dispose() {

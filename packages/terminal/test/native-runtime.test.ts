@@ -358,7 +358,7 @@ test("upstream session projection sends prompts to Durable and replays streamed 
   }
 });
 
-test("pinned upstream InteractiveMode starts over the Durable workspace projection and renders live tool ends", async () => {
+test("pinned upstream InteractiveMode starts over the Durable workspace projection and renders live tool ends and saved messages once", async () => {
   const projectRoot = process.cwd();
   const stagedPi = join(
     projectRoot,
@@ -603,6 +603,169 @@ test("pinned upstream InteractiveMode starts over the Durable workspace projecti
     assert.match(tools, /codemode returned notes/);
     assert.match(tools, /sleep 600/);
     assert.match(tools, /its task faulted or was orphaned/);
+
+    // Durable's live channel and the runner's history channel each deliver
+    // every saved message, in no guaranteed order relative to each other.
+    // Pi's chat must show each exactly once, and keep a reply its turn ended.
+    const assistant = (
+      text: string,
+      stopReason = "stop",
+      errorMessage?: string,
+    ) => ({
+      role: "assistant",
+      content: text ? [{ type: "text", text }] : [],
+      api: "openai-completions",
+      provider: "faux",
+      model: "faux-1",
+      usage: {
+        input: 1,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason,
+      ...(errorMessage ? { errorMessage } : {}),
+      timestamp: Date.now(),
+    });
+    const user = (text: string) => ({
+      role: "user",
+      content: text,
+      timestamp: Date.now(),
+    });
+    const entry = (id: number, message: { role: string }) => ({
+      id,
+      conversationId: 12,
+      kind: `pi.${message.role}`,
+      model: [message],
+    });
+    const history = (seq: number, message: { role: string }) =>
+      stream!.write(
+        `id: ${seq}\ndata: ${JSON.stringify({
+          seq,
+          workspaceId: "work",
+          kind: message.role,
+          timestamp: new Date().toISOString(),
+          data: { message },
+        })}\n\n`,
+      );
+    const streamed = (text: string) => {
+      live({ type: "turn_start" });
+      live({ type: "message_start", message: assistant("") });
+      live({
+        type: "message_update",
+        changes: [
+          {
+            type: "text_start",
+            contentIndex: 0,
+            block: { type: "text", text },
+          },
+        ],
+      });
+    };
+    const chat = () =>
+      stripTerminalSequences(
+        (
+          mode as unknown as {
+            chatContainer: { render(width: number): string[] };
+          }
+        ).chatContainer
+          .render(100)
+          .join("\n"),
+      ).replace(/\s+/g, " ");
+    const occurrences = (text: string, part: string) =>
+      text.split(part).length - 1;
+
+    // The prompt's saved entry is also streamed live.
+    const prompt = user("prompt shown once");
+    live({ type: "message_start", message: prompt });
+    live({ type: "message_end", entry: entry(101, prompt) });
+    history(101, prompt);
+    // Live ends the reply before its turn ends; history follows.
+    const liveFirst = assistant("live ends reply first");
+    streamed("live ends reply first");
+    live({ type: "message_end", entry: entry(102, liveFirst) });
+    live({ type: "turn_end" });
+    history(102, liveFirst);
+    // The turn ends before the saved reply arrives at all (TASK-71).
+    const afterTurn = assistant("history after the turn ended");
+    streamed("history after the turn ended");
+    live({ type: "turn_end" });
+    history(103, afterTurn);
+    live({ type: "message_end", entry: entry(103, afterTurn) });
+    // History is ahead of live within the turn.
+    const historyFirst = assistant("history ahead of live");
+    streamed("history ahead of live");
+    history(104, historyFirst);
+    live({ type: "message_end", entry: entry(104, historyFirst) });
+    live({ type: "turn_end" });
+    // An errored reply is never streamed; history is ahead of its live start,
+    // and the next streamed message follows before any turn end.
+    const errored = assistant("", "error", "provider failed visibly");
+    live({ type: "turn_start" });
+    history(105, errored);
+    live({ type: "message_start", message: errored });
+    live({ type: "message_end", entry: entry(105, errored) });
+    // An aborted reply is saved after its turn ended.
+    const aborted = assistant("partial before abort", "aborted");
+    streamed("partial before abort");
+    live({ type: "turn_end" });
+    history(106, aborted);
+    // Ordered after all the above on both channels.
+    const last = assistant("last reply rendered");
+    streamed("last reply rendered");
+    live({ type: "message_end", entry: entry(107, last) });
+    live({ type: "turn_end" });
+    history(107, last);
+    const replies = [
+      "prompt shown once",
+      "live ends reply first",
+      "history after the turn ended",
+      "history ahead of live",
+      "provider failed visibly",
+      "partial before abort",
+      "Operation aborted",
+      "last reply rendered",
+    ];
+    // Events are handled in order, so once a later prompt saved only in
+    // history is rendered, everything before it is too.
+    const expectOnce = async (seq: number, handled: string) => {
+      history(seq, user(handled));
+      await terminal.waitFor(handled);
+      const shown = chat();
+      for (const reply of [...replies, handled])
+        assert.equal(occurrences(shown, reply), 1, `${reply} in ${shown}`);
+    };
+    await expectOnce(108, "all attached events handled");
+
+    // A reply shown live whose saved entry is still on its way when the
+    // terminal reconnects.
+    const beforeReconnect = assistant("shown live before reconnecting");
+    streamed("shown live before reconnecting");
+    live({ type: "message_end", entry: entry(109, beforeReconnect) });
+    live({ type: "turn_end" });
+    await terminal.waitFor("shown live before reconnecting");
+
+    // Reconnecting re-renders the saved session, which lacks that reply until
+    // history brings it; a live end for an entry already in the session must
+    // not add it again.
+    terminal.output = "";
+    await remote.remotePorts.reconnect();
+    history(109, beforeReconnect);
+    live({ type: "message_end", entry: entry(102, liveFirst) });
+    live({ type: "message_end", entry: entry(107, last) });
+    const reconnected = assistant("reply after reconnecting");
+    streamed("reply after reconnecting");
+    live({ type: "message_end", entry: entry(110, reconnected) });
+    live({ type: "turn_end" });
+    history(110, reconnected);
+    replies.push(
+      "all attached events handled",
+      "shown live before reconnecting",
+      "reply after reconnecting",
+    );
+    await expectOnce(111, "all reconnected events handled");
   } finally {
     await remote.dispose();
     transport.close();

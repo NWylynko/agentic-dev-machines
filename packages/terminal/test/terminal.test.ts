@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WorkspaceTerminal, type WorkspaceEvent } from "../src/terminal.ts";
+import xterm from "@xterm/headless";
 import {
   ProcessTerminal,
   stripTerminalSequences,
@@ -1453,13 +1454,17 @@ test(
         "--workspace",
         id,
       ];
+      // A fixed PTY size, emulated below, so the test reads what is on screen
+      // rather than everything ever written: Pi removes components it drew.
+      // Pi redraws its chat inside the viewport, so the viewport is tall
+      // enough to hold the whole session.
       const child = spawn(
         "script",
         [
           "--quiet",
           "--return",
           "--command",
-          args.map(quote).join(" "),
+          `stty cols 120 rows 200 && exec ${args.map(quote).join(" ")}`,
           "/dev/null",
         ],
         {
@@ -1475,8 +1480,28 @@ test(
       terminal = child;
       let output = "";
       let exited: number | null | undefined;
-      child.stdout!.on("data", (data) => (output += data));
+      const emulator = new xterm.Terminal({
+        cols: 120,
+        rows: 200,
+        allowProposedApi: true,
+      });
+      let emulated = Promise.resolve();
+      child.stdout!.on("data", (data) => {
+        output += data;
+        emulated = new Promise((resolve) => emulator.write(data, resolve));
+      });
       child.stderr!.on("data", (data) => (output += data));
+      // Everything currently in the emulated terminal.
+      const screen = async () => {
+        await emulated;
+        const buffer = emulator.buffer.active;
+        const lines: string[] = [];
+        for (let row = 0; row < buffer.length; row++)
+          lines.push(buffer.getLine(row)!.translateToString(true));
+        return lines.join("\n");
+      };
+      const occurrences = (text: string, part: string) =>
+        text.split(part).length - 1;
       child.once("exit", (code) => (exited = code));
       // Wait on PTY output; the attached terminal crashing fails immediately.
       const waitOutput = (text: string) =>
@@ -1513,6 +1538,62 @@ test(
           child.on("exit", check);
           check();
         });
+      // Wait until the emulated screen satisfies `ready`; a crashed terminal
+      // or a timeout fails with the screen as it is.
+      const waitScreen = (
+        description: string,
+        ready: (text: string) => boolean,
+      ) =>
+        new Promise<string>((resolve, reject) => {
+          let settled = false;
+          const check = async () => {
+            const text = await screen();
+            if (settled) return;
+            if (ready(text)) done(() => resolve(text));
+            else if (exited !== undefined)
+              done(() =>
+                reject(
+                  new Error(
+                    `Terminal exited (${exited}) before ${description}:\n${text}\nrunner=${runnerErrors}`,
+                  ),
+                ),
+              );
+          };
+          const timer = setTimeout(
+            () =>
+              void screen().then((text) =>
+                done(() =>
+                  reject(
+                    new Error(
+                      `Screen never showed ${description}:\n${text}\nrunner=${runnerErrors}`,
+                    ),
+                  ),
+                ),
+              ),
+            10000,
+          );
+          const done = (settle: () => void) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            child.stdout!.off("data", check);
+            child.off("exit", check);
+            settle();
+          };
+          child.stdout!.on("data", check);
+          child.on("exit", check);
+          void check();
+        });
+      // A turn has settled once Pi stops showing its working indicator; its
+      // reply must then still be on screen, exactly once.
+      const settledReply = async (reply: string) => {
+        const text = await waitScreen(
+          `the settled reply ${reply}`,
+          (text) => text.includes(reply) && !text.includes("Working"),
+        );
+        assert.equal(occurrences(text, reply), 1, text);
+        return text;
+      };
       const submit = async (prompt: string) => {
         child.stdin!.write(`\x1b[200~${prompt}\x1b[201~`);
         await waitOutput(prompt.slice(-24));
@@ -1534,33 +1615,56 @@ test(
           }),
         );
 
+      // The prompt spells the answer's spaces as JSON escapes, so the reply
+      // text appears on screen only where Pi renders the reply itself.
+      const fauxPrompt = (plan: {
+        calls?: { tool: string; args: Record<string, string> }[];
+        answer: string;
+      }) =>
+        "/faux " +
+        JSON.stringify(plan).replace(
+          JSON.stringify(plan.answer),
+          JSON.stringify(plan.answer).replaceAll(" ", "\\u0020"),
+        );
+
+      // A plain prompt: the reply stays after its turn ends, unreconnected.
+      await submit(fauxPrompt({ answer: "Plain reply stays visible" }));
+      await settledReply("Plain reply stays visible");
+
       const answered = history(
         (event) =>
           event.kind === "assistant" &&
           event.data.text === "Both tools finished while attached",
       );
       await submit(
-        "/faux " +
-          JSON.stringify({
-            calls: [
-              {
-                tool: "bash",
-                args: { command: "printf 'tool-ok-%s' $((6*7))" },
-              },
-              {
-                tool: "bash",
-                args: { command: "printf 'tool-bad-%s' $((6*7)) >&2; exit 7" },
-              },
-            ],
-            answer: "Both tools finished while attached",
-          }),
+        fauxPrompt({
+          calls: [
+            {
+              tool: "bash",
+              args: { command: "printf 'tool-ok-%s' $((6*7))" },
+            },
+            {
+              tool: "bash",
+              args: { command: "printf 'tool-bad-%s' $((6*7)) >&2; exit 7" },
+            },
+          ],
+          answer: "Both tools finished while attached",
+        }),
       );
       // Only the final tool result carries Durable's exit diagnostic.
       await waitOutput("Command exited with code 7");
       await answered;
-      const settled = visibleTerminalText(output);
+      const settled = visibleTerminalText(
+        await settledReply("Both tools finished while attached"),
+      );
       assert.match(settled, /tool-ok-42 Took \d/);
       assert.match(settled, /tool-bad-42/);
+
+      // A provider error ends the turn with an errored reply.
+      await submit("/faux-fail-once errored turn");
+      await settledReply(
+        "Authentication credentials are invalid (faux injected failure)",
+      );
 
       const fifo = join(stateDirectory, "release");
       const marker = join(stateDirectory, "abort-tool-started");
@@ -1594,6 +1698,28 @@ test(
       assert.equal((await abortedResult).data.isError, true);
       await waitOutput("Tool bash was aborted");
       assert.equal(exited, undefined, visibleTerminalText(output));
+      // The aborted turn settles with its aborted row, and the next turn's
+      // reply still stays.
+      await settledReply("Tool bash was aborted");
+      await submit(fauxPrompt({ answer: "Reply after the aborted turn" }));
+      await settledReply("Reply after the aborted turn");
+
+      // Ctrl+R reconnects and re-renders the session; a reply after it proves
+      // the reconnect finished. Every reply is then on screen exactly once.
+      child.stdin!.write("\x12");
+      await submit(fauxPrompt({ answer: "Reply after reconnecting" }));
+      const reconnected = await settledReply("Reply after reconnecting");
+      for (const reply of [
+        "Plain reply stays visible",
+        "Both tools finished while attached",
+        "Authentication credentials are invalid (faux injected failure)",
+        "Tool bash was aborted",
+        "Reply after the aborted turn",
+        // Prompts too: Durable streams their saved entries as well.
+        "Plain\\u0020reply\\u0020stays\\u0020visible",
+        "/faux-fail-once errored turn",
+      ])
+        assert.equal(occurrences(reconnected, reply), 1, reconnected);
 
       const detached = once(child, "exit");
       child.stdin!.write("\x03");
