@@ -1308,7 +1308,14 @@ fn collect_runtime_status(
                         .bearer_auth(token)
                         .timeout(remaining)
                         .send()
-                        .map_err(|error| format!("runtime status request failed: {error}"))
+                        // `{:#}` keeps the source chain (timeout, refused, DNS, ...);
+                        // reqwest's own message only says "error sending request".
+                        .map_err(|error| {
+                            format!(
+                                "runtime status request failed: {:#}",
+                                anyhow::Error::new(error)
+                            )
+                        })
                         .and_then(|response| {
                             let status = response.status();
                             if !status.is_success() {
@@ -1319,7 +1326,10 @@ fn collect_runtime_status(
                                 .take(MAX_RUNTIME_STATUS_BYTES + 1)
                                 .read_to_end(&mut body)
                                 .map_err(|error| {
-                                    format!("read runtime status response failed: {error}")
+                                    format!(
+                                        "read runtime status response failed: {:#}",
+                                        anyhow::Error::new(error)
+                                    )
                                 })?;
                             if body.len() as u64 > MAX_RUNTIME_STATUS_BYTES {
                                 return Err("runtime status response exceeded 64 KiB".to_owned());

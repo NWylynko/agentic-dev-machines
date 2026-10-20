@@ -121,10 +121,13 @@ fn stop_http_stub(port: u16, server: thread::JoinHandle<()>) {
     server.join().unwrap();
 }
 
-fn start_runtime_status_server() -> (u16, thread::JoinHandle<()>) {
+/// While `root/runtime-status-hold` exists, the stub never answers: it reads until the
+/// lifecycle gives up on the request, like a runtime whose status read is too slow.
+fn start_runtime_status_server(root: &Path) -> (u16, thread::JoinHandle<()>) {
     use std::io::{Read, Write};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let hold_path = root.join("runtime-status-hold");
     let server = thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let mut request = Vec::new();
@@ -151,6 +154,10 @@ fn start_runtime_status_server() -> (u16, thread::JoinHandle<()>) {
                     .contains("authorization: bearer target-token:"),
                 "{request}"
             );
+            if hold_path.exists() {
+                while stream.read(&mut chunk).is_ok_and(|count| count > 0) {}
+                continue;
+            }
             let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"}}"#;
             write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
         }
@@ -527,7 +534,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     fs::write(root.path().join("runner-url"), &runner_url).unwrap();
     fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
     fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
-    let (status_port, status_server) = start_runtime_status_server();
+    let (status_port, status_server) = start_runtime_status_server(root.path());
     fs::write(
         root.path().join("runtime-status-port"),
         status_port.to_string(),
@@ -1180,6 +1187,29 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     assert_eq!(
         replacement_entry["runtime_status"]["selectedModel"]["id"],
         "gpt-test"
+    );
+    fs::write(root.path().join("runtime-status-hold"), "").unwrap();
+    let held_directory: Vec<Value> = request_with_token(
+        &url,
+        "GET",
+        "/v1/workspaces",
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    fs::remove_file(root.path().join("runtime-status-hold")).unwrap();
+    let held_activity = &held_directory
+        .iter()
+        .find(|item| item["id"] == replacement_id)
+        .unwrap()["runtime_status"]["activity"];
+    assert_eq!(held_activity["status"], "unavailable", "{held_activity}");
+    assert!(
+        held_activity["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "an unavailable cause names the underlying timeout, not only reqwest's top-level message: {held_activity}"
     );
     let failed_delete_id = "30af635c-32af-4b26-a35d-738aa991f90a";
     let failed_delete =
