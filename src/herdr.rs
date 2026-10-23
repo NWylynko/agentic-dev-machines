@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     fs::{self, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, IsTerminal, Write},
     os::fd::AsRawFd,
     os::unix::{
         fs::PermissionsExt,
@@ -448,6 +448,27 @@ fn enable_shell_routing(cli: &Cli) -> Result<()> {
             .context("Herdr config has no parent directory")?,
     )?;
     write_text_atomic(&config_path, &document.to_string())?;
+    reload_running_herdr_config()
+}
+
+/// Stock Herdr reads `config.toml` once at server start, so a changed
+/// `terminal.default_shell` only reaches new panes after an explicit reload.
+fn reload_running_herdr_config() -> Result<()> {
+    let output = Command::new("herdr")
+        .args(["server", "reload-config"])
+        .output()
+        .context("could not run `herdr server reload-config`; install Herdr on this device")?;
+    ensure!(
+        output.status.success(),
+        "`herdr server reload-config` failed, so the running Herdr server still uses its previous pane shell: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)
+        .context("`herdr server reload-config` returned invalid JSON")?;
+    ensure!(
+        response["result"]["status"] == "applied",
+        "`herdr server reload-config` did not apply the ADM pane shell: {response}"
+    );
     Ok(())
 }
 
@@ -490,6 +511,7 @@ fn disable_shell_routing(cli: &Cli) -> Result<()> {
         terminal.remove("default_shell");
     }
     write_text_atomic(&config_path, &document.to_string())?;
+    reload_running_herdr_config()?;
     println!(
         "ADM pane routing is disabled; Herdr's default shell is restored to its normal fallback."
     );
@@ -517,33 +539,20 @@ fn route_shell(cli: &Cli, original_args: &[String]) -> Result<()> {
         })
         .map(|binding| binding.workspace_id);
     if let Some(target_workspace) = target_workspace {
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .env_remove("ADM_HERDR_INITIAL_PANE")
-            .args(["--state-dir"])
-            .arg(cli.state_path())
-            .args(["--kubectl", &cli.kubectl, "--runner-url", &cli.runner_url])
-            .args(["--lifecycle-namespace", &cli.lifecycle_namespace])
-            .args(["--project-dir"])
-            .arg(&cli.project_dir);
-        if let Some(token_file) = &cli.lifecycle_token_file {
-            command.args(["--lifecycle-token-file"]).arg(token_file);
+        let result = run_bound_workspace_shell(cli, &target_workspace).with_context(|| {
+            format!("this Herdr pane is bound to ADM workspace {target_workspace}")
+        });
+        if let Err(error) = &result
+            && io::stdin().is_terminal()
+        {
+            // Herdr closes a pane as soon as its shell exits. Hold the pane so
+            // a routing failure stays readable instead of the pane vanishing.
+            eprintln!("adm: {error:#}");
+            eprintln!("adm: Press Enter to close this pane.");
+            io::stdin().read_line(&mut String::new())?;
+            std::process::exit(1);
         }
-        if cli.lifecycle_url_explicit {
-            command.args(["--lifecycle-url", &cli.lifecycle_url]);
-        }
-        if let Some(kubeconfig) = &cli.kubeconfig {
-            command.args(["--kubeconfig", kubeconfig]);
-        }
-        command.args(["shell", &target_workspace]);
-        let status = command
-            .status()
-            .context("start the bound ADM workspace shell")?;
-        ensure!(
-            status.success(),
-            "bound ADM workspace shell exited with {status}"
-        );
-        return Ok(());
+        return result;
     }
     let (configured, saved_args) = configured_original_shell(cli)?;
     let mut command = Command::new(configured);
@@ -556,6 +565,36 @@ fn route_shell(cli: &Cli, original_args: &[String]) -> Result<()> {
     ensure!(
         status.success(),
         "Herdr's configured shell exited with {status}"
+    );
+    Ok(())
+}
+
+fn run_bound_workspace_shell(cli: &Cli, target_workspace: &str) -> Result<()> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .env_remove("ADM_HERDR_INITIAL_PANE")
+        .args(["--state-dir"])
+        .arg(cli.state_path())
+        .args(["--kubectl", &cli.kubectl, "--runner-url", &cli.runner_url])
+        .args(["--lifecycle-namespace", &cli.lifecycle_namespace])
+        .args(["--project-dir"])
+        .arg(&cli.project_dir);
+    if let Some(token_file) = &cli.lifecycle_token_file {
+        command.args(["--lifecycle-token-file"]).arg(token_file);
+    }
+    if cli.lifecycle_url_explicit {
+        command.args(["--lifecycle-url", &cli.lifecycle_url]);
+    }
+    if let Some(kubeconfig) = &cli.kubeconfig {
+        command.args(["--kubeconfig", kubeconfig]);
+    }
+    command.args(["shell", target_workspace]);
+    let status = command
+        .status()
+        .context("start the bound ADM workspace shell")?;
+    ensure!(
+        status.success(),
+        "bound ADM workspace shell exited with {status}"
     );
     Ok(())
 }

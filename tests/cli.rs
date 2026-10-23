@@ -427,7 +427,7 @@ fn fixture_with_runner(runner_override: Option<&str>) -> TestFixture {
     let herdr = herdr_bin.join("herdr");
     fs::write(
         &herdr,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\nif [ \"$2\" = rename ] && [ -f \"$(dirname \"$0\")/fail-rename\" ]; then exit 1; fi\nprintf '{\"result\":{\"workspace\":{\"workspace_id\":\"%s\"}}}\\n' \"$3\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\nif [ \"$1 $2\" = 'server reload-config' ]; then\n  if [ -f \"$(dirname \"$0\")/fail-reload\" ]; then echo 'error: herdr server is not running' >&2; exit 1; fi\n  cp \"$XDG_CONFIG_HOME/herdr/config.toml\" \"$(dirname \"$0\")/live-config.toml\"\n  printf '{\"id\":\"cli:server:reload-config\",\"result\":{\"diagnostics\":[],\"status\":\"applied\",\"type\":\"config_reload\"}}\\n'\n  exit 0\nfi\nif [ \"$2\" = rename ] && [ -f \"$(dirname \"$0\")/fail-rename\" ]; then exit 1; fi\nprintf '{\"result\":{\"workspace\":{\"workspace_id\":\"%s\"}}}\\n' \"$3\"\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&herdr).unwrap().permissions();
@@ -1909,6 +1909,14 @@ fn create_herdr_opens_and_attaches_by_explicit_ids_without_focusing_other_spaces
             .unwrap();
     assert_eq!(stored[0]["workspace_id"], workspace_id);
     assert_eq!(stored[0]["space_id"], "explicit-space-8");
+    let live_config = fs::read_to_string(root.path().join("herdr-bin/live-config.toml")).unwrap();
+    assert!(
+        live_config.contains(&format!(
+            "default_shell = \"{}\"",
+            root.path().join("state/herdr-shell-router").display()
+        )),
+        "the running Herdr server must route panes opened after create: {live_config}"
+    );
     let herdr_calls = fs::read_to_string(root.path().join("herdr-bin/calls")).unwrap();
     assert!(
         herdr_calls
@@ -3102,12 +3110,16 @@ fn herdr_bind_renames_the_explicit_space_and_scopes_ownership_to_its_session() {
     )
     .unwrap();
     let calls = root.path().join("herdr-calls");
+    // The fixture models the running Herdr server: it only sees config.toml as
+    // of its last `server reload-config`, like stock Herdr 0.9.
+    let live_config = root.path().join("herdr-live-config.toml");
     let herdr = root.path().join("herdr-bin/herdr");
     fs::write(
         &herdr,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'workspace get' ]; then printf '{{\"result\":{{\"workspace\":{{\"workspace_id\":\"%s\"}}}}}}\\n' \"$3\"; fi\n",
-            calls.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'workspace get' ]; then printf '{{\"result\":{{\"workspace\":{{\"workspace_id\":\"%s\"}}}}}}\\n' \"$3\"; fi\nif [ \"$1 $2\" = 'server reload-config' ]; then cp \"$XDG_CONFIG_HOME/herdr/config.toml\" '{}'; printf '{{\"result\":{{\"diagnostics\":[],\"status\":\"applied\",\"type\":\"config_reload\"}}}}\\n'; fi\n",
+            calls.display(),
+            live_config.display()
         ),
     )
     .unwrap();
@@ -3157,6 +3169,11 @@ fn herdr_bind_renames_the_explicit_space_and_scopes_ownership_to_its_session() {
     let config_path = root.path().join("config/herdr/config.toml");
     let enabled = fs::read_to_string(&config_path).unwrap();
     assert!(enabled.contains("herdr-shell-router"), "{enabled}");
+    assert_eq!(
+        fs::read_to_string(&live_config).unwrap(),
+        enabled,
+        "the running Herdr server must load the router before new panes open"
+    );
     assert!(enabled.contains("shell_mode = \"login\""), "{enabled}");
     assert!(enabled.contains("# user setting"), "{enabled}");
     fs::create_dir_all(root.path().join("config/adm")).unwrap();
@@ -3262,6 +3279,11 @@ fn herdr_bind_renames_the_explicit_space_and_scopes_ownership_to_its_session() {
     );
     let restored = fs::read_to_string(&config_path).unwrap();
     assert!(restored.contains(&format!("default_shell = \"{}\"", prior_shell.display())));
+    assert_eq!(
+        fs::read_to_string(&live_config).unwrap(),
+        restored,
+        "disable must make the running Herdr server stop routing new panes"
+    );
     assert!(restored.contains("shell_mode = \"login\""));
     let updated_shell = root.path().join("updated-shell");
     fs::write(
@@ -3598,7 +3620,7 @@ fn herdr_bind_requires_a_live_herdr_workspace_id() {
     let herdr = fake_bin.join("herdr");
     fs::write(
         &herdr,
-        "#!/bin/sh\nif [ \"$1\" = workspace ] && [ \"$2\" = get ] && [ \"$3\" = live-space ]; then\n  printf '%s\\n' '{\"result\":{\"workspace\":{\"workspace_id\":\"live-space\"}}}'\n  exit 0\nfi\nif [ \"$1\" = workspace ] && [ \"$2\" = rename ] && [ \"$3\" = live-space ]; then exit 0; fi\nprintf '%s\\n' '{\"error\":{\"message\":\"workspace not found\"}}' >&2\nexit 1\n",
+        "#!/bin/sh\nif [ \"$1 $2\" = 'server reload-config' ]; then\n  if [ -f \"$(dirname \"$0\")/fail-reload\" ]; then echo 'error: herdr server is not running' >&2; exit 1; fi\n  printf '%s\\n' '{\"result\":{\"diagnostics\":[],\"status\":\"applied\",\"type\":\"config_reload\"}}'\n  exit 0\nfi\nif [ \"$1\" = workspace ] && [ \"$2\" = get ] && [ \"$3\" = live-space ]; then\n  printf '%s\\n' '{\"result\":{\"workspace\":{\"workspace_id\":\"live-space\"}}}'\n  exit 0\nfi\nif [ \"$1\" = workspace ] && [ \"$2\" = rename ] && [ \"$3\" = live-space ]; then exit 0; fi\nprintf '%s\\n' '{\"error\":{\"message\":\"workspace not found\"}}' >&2\nexit 1\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&herdr).unwrap().permissions();
@@ -3634,6 +3656,16 @@ fn herdr_bind_requires_a_live_herdr_workspace_id() {
         "stdout={} stderr={}",
         String::from_utf8_lossy(&valid.stdout),
         String::from_utf8_lossy(&valid.stderr)
+    );
+
+    fs::write(fake_bin.join("fail-reload"), "fail").unwrap();
+    let unreloaded = bind("live-space");
+    assert!(!unreloaded.status.success());
+    let stderr = String::from_utf8_lossy(&unreloaded.stderr);
+    assert!(
+        stderr.contains("herdr server reload-config")
+            && stderr.contains("herdr server is not running"),
+        "routing must fail loudly when the running Herdr cannot load it: {stderr}"
     );
 }
 
@@ -4103,4 +4135,84 @@ zpty -d adm-completion
             "missing {candidate:?}: {candidates}"
         );
     }
+}
+
+#[test]
+fn herdr_bound_pane_failure_stays_visible_until_the_user_closes_it() {
+    use std::io::BufRead;
+    use std::os::fd::{FromRawFd, RawFd};
+
+    let root = fixture();
+    let workspace = assert_ok(adm(
+        root.path(),
+        &["create", "pane-failure", "--no-repositories"],
+    ));
+    let socket = root.path().join("herdr-pane-failure.sock");
+    let bound = adm_in_herdr(
+        root.path(),
+        &["herdr", "bind", "pane-failure", "w31"],
+        &socket,
+    );
+    assert!(
+        bound.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bound.stderr)
+    );
+
+    // Herdr closes a pane as soon as its shell exits, so an immediate exit
+    // would hide the routing error. A real pane has a terminal on stdin.
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
+    command
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .env("HERDR_WORKSPACE_ID", "w31")
+        .env("HERDR_PANE_ID", "w31:p2")
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .args(["--kubectl", "/bin/false"]);
+    configure_lifecycle(&mut command, root.path());
+    let mut child = command
+        .args(["herdr", "route-shell", "--"])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut shown = String::new();
+    while !shown.contains("Press Enter") {
+        let mut line = String::new();
+        if stderr.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        shown.push_str(&line);
+    }
+    assert!(
+        shown.contains("Press Enter to close this pane"),
+        "routing failure must hold the pane open: {shown}"
+    );
+    assert!(
+        shown.contains(workspace["id"].as_str().unwrap()),
+        "failure must name the bound immutable workspace: {shown}"
+    );
+    master.write_all(b"\n").unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success());
 }
