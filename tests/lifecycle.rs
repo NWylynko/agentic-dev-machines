@@ -328,7 +328,8 @@ elif args[:2] == ['get','pods']:
             pod_uid=(root/'expected-bot-pod-uid').read_text()
         image='ghcr.io/example/adm-dev:fixture'
         if (root/'pod-image').exists(): image=(root/'pod-image').read_text()
-        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':'test-node','containers':[{'name':'dev','image':image}]},'status':{'phase':'Running','podIP':runtime_ip,'conditions':[{'type':'Ready','status':'True'}],'containerStatuses':[{'name':'dev','ready':True,'state':{'running':{}}}]}})
+        node_name=(root/('pod-node-'+namespace)).read_text() if (root/('pod-node-'+namespace)).exists() else 'test-node'
+        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':node_name,'containers':[{'name':'dev','image':image}]},'status':{'phase':'Running','podIP':runtime_ip,'conditions':[{'type':'Ready','status':'True'}],'containerStatuses':[{'name':'dev','ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:3] == ['get','deployment','workspace']:
     namespace=args[args.index('-n')+1]
@@ -412,6 +413,12 @@ elif args[:2] == ['delete','namespace']:
         while not (root/'delete-release').exists(): time.sleep(.01)
     with locked():
         state=load_state(); state.pop(args[2],None); put(state_path, json.dumps(state))
+elif args[:2] == ['get','nodes']:
+    nodes=root/'nodes.json'
+    print(nodes.read_text() if nodes.exists() else json.dumps({'kind':'NodeList','items':[{'metadata':{'name':'test-node'},'status':{'conditions':[{'type':'Ready','status':'True','lastTransitionTime':'2026-01-01T00:00:00Z'}]}}]}))
+elif args[:2] == ['delete','pod']:
+    with locked():
+        with (root/'deleted-pods').open('a') as deleted: deleted.write(' '.join(args[2:])+'\n')
 else:
     print('unexpected kubectl command: '+repr(args), file=sys.stderr); sys.exit(1)
 "##;
@@ -2928,4 +2935,88 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     restarted.wait().unwrap();
     stop_runtime_status_server(status_port, status_server);
     stop_http_stub(runner_port, runner_server);
+}
+
+fn kubernetes_time(unix: u64) -> String {
+    let days = unix / 86_400;
+    let (hour, minute, second) = (unix % 86_400 / 3600, unix % 3600 / 60, unix % 60);
+    // Civil-from-days (Howard Hinnant), for fixture timestamps only.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+#[test]
+fn workspace_pods_on_a_node_down_for_three_minutes_are_moved_to_a_healthy_node() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    let namespace = |name: &str, id: &str| {
+        json!({"kind":"Namespace","metadata":{"name":name,"labels":{
+            "app.kubernetes.io/managed-by":"adm","adm.dev/workspace-id":id}}})
+    };
+    fs::write(
+        root.path().join("cluster.json"),
+        json!({
+            "adm-on-dead-node": namespace("adm-on-dead-node", "dead"),
+            "adm-on-flapping-node": namespace("adm-on-flapping-node", "flapping"),
+            "adm-on-healthy-node": namespace("adm-on-healthy-node", "healthy"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(root.path().join("pod-node-adm-on-dead-node"), "dead-node").unwrap();
+    fs::write(
+        root.path().join("pod-node-adm-on-flapping-node"),
+        "flapping-node",
+    )
+    .unwrap();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let node = |name: &str, status: &str, since: u64| {
+        json!({"metadata":{"name":name},"status":{"conditions":[
+            {"type":"Ready","status":status,"lastTransitionTime":kubernetes_time(since)}]}})
+    };
+    fs::write(
+        root.path().join("nodes.json"),
+        json!({"kind":"NodeList","items":[
+            // Down for four minutes: past the three-minute move threshold.
+            node("dead-node", "Unknown", now - 240),
+            // Down for one minute: not moved yet.
+            node("flapping-node", "Unknown", now - 60),
+            node("test-node", "True", now - 86_400),
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let _service = start_service(root.path(), port);
+    let deleted = wait_for(|| fs::read_to_string(root.path().join("deleted-pods")).ok());
+    // A force delete releases the Pod object stuck on the unreachable node so the
+    // workspace Deployment schedules a replacement on a healthy node, where the
+    // replicated volume reattaches. Lease fencing keeps the old runtime from
+    // owning the workspace again if the node returns.
+    assert_eq!(
+        deleted,
+        "workspace-pod -n adm-on-dead-node --grace-period=0 --force --wait=false\n"
+    );
+    stop_http_stub(runner_port, runner);
 }

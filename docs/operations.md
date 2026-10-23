@@ -60,6 +60,8 @@ For local image development, distribute that exact image to the cluster's nodes 
 
 Configure a replicated StorageClass as described in [storage.md](../deploy/storage.md). The default is `adm-replicated`; this repository does not install a storage backend. The filesystem must support the required mount behavior. Include the lifecycle service's SQLite PVC and workspace volumes in the backup plan; SQLite WAL compatibility is required for the lifecycle state volume.
 
+When a node stays not Ready for 3 minutes, the lifecycle moves each workspace Pod on it by force deleting that Pod. Its Deployment then starts a replacement on a healthy node, where the replicated volume reattaches. Any agent turn in progress on the dead node is lost and must be resumed. A node that keeps going down and coming back moves its workspaces each time. Kubernetes holds an RWO volume on an unreachable node for up to 6 more minutes (its force-detach timeout) before the replacement can mount it, so expect roughly 10 minutes from failure to a working workspace. The runtime lease ensures a returning old Pod never owns the workspace again. Nothing moves if the lifecycle Pod itself is on the dead node. Node-local volumes cannot move.
+
 For a deliberately node-local experiment, use `--storage-class local-path --allow-node-local-storage`. This acknowledges that replacement on a different node cannot recover that volume. It is useful for testing Pod replacement on the same node, not evidence of node-failure recovery.
 
 ## Coding workspaces

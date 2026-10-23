@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, TcpListener, TcpStream},
@@ -438,6 +438,8 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
         let worker_active_operations = active_operations.clone();
         thread::spawn(move || lifecycle_worker(worker_cli, worker_work, worker_active_operations));
     }
+    let failover_cli = cli.clone_for_lifecycle();
+    thread::spawn(move || node_failover_loop(failover_cli));
     // Replay interrupted accepted/running work before accepting new requests.
     for (operation_id, _) in cli.store()?.pending_lifecycle_operations()? {
         let _ = wake.send(operation_id);
@@ -457,6 +459,134 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// A workspace whose node has not been Ready for this long is moved: Nick's
+/// TASK-82 decision accepts losing its in-flight turn for that.
+const NODE_DOWN_MOVE_SECONDS: u64 = 180;
+/// How often the lifecycle looks for workspaces stranded on down nodes.
+const NODE_FAILOVER_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+fn node_failover_loop(cli: crate::Cli) {
+    loop {
+        if let Err(error) = move_workspaces_off_down_nodes(&cli) {
+            eprintln!("adm lifecycle node failover sweep failed: {error:#}");
+        }
+        thread::sleep(NODE_FAILOVER_SWEEP_INTERVAL);
+    }
+}
+
+/// Kubernetes leaves a Pod on an unreachable node Terminating until the node
+/// returns, so its Recreate Deployment never starts a replacement. Force
+/// deleting the Pod lets the Deployment schedule it on a healthy node, where its
+/// replicated volume reattaches once Kubernetes detaches it from the dead node.
+/// Every kubectl call here checks this lifecycle's own fence, and the runtime
+/// lease keeps a returning old Pod from owning the workspace again.
+fn move_workspaces_off_down_nodes(cli: &crate::Cli) -> Result<()> {
+    let nodes: Value = serde_json::from_slice(&crate::workspaces::kubectl(
+        cli,
+        &["get", "nodes", "-o", "json"],
+        None,
+    )?)
+    .context("decode node list")?;
+    let now = crate::workspaces::now();
+    let down_nodes = nodes["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let ready = node["status"]["conditions"]
+                .as_array()?
+                .iter()
+                .find(|condition| condition["type"] == "Ready")?;
+            let since = kubernetes_time_unix(ready["lastTransitionTime"].as_str()?)?;
+            let name = node["metadata"]["name"].as_str()?.to_owned();
+            (ready["status"] != "True" && now.saturating_sub(since) >= NODE_DOWN_MOVE_SECONDS)
+                .then_some((name, since))
+        })
+        .collect::<HashMap<_, _>>();
+    if down_nodes.is_empty() {
+        return Ok(());
+    }
+    let pods: Value = serde_json::from_slice(&crate::workspaces::kubectl(
+        cli,
+        &[
+            "get",
+            "pods",
+            "--all-namespaces",
+            "-l",
+            "app.kubernetes.io/managed-by=adm",
+            "-o",
+            "json",
+        ],
+        None,
+    )?)
+    .context("decode workspace Pod list")?;
+    for pod in pods["items"].as_array().into_iter().flatten() {
+        let (Some(node), Some(namespace), Some(name), Some(workspace_id)) = (
+            pod["spec"]["nodeName"].as_str(),
+            pod["metadata"]["namespace"].as_str(),
+            pod["metadata"]["name"].as_str(),
+            pod["metadata"]["labels"]["adm.dev/workspace-id"].as_str(),
+        ) else {
+            continue;
+        };
+        let Some(since) = down_nodes.get(node) else {
+            continue;
+        };
+        eprintln!(
+            "adm lifecycle: node {node} has not been Ready for {}s; moving workspace {workspace_id} by force deleting Pod {namespace}/{name}",
+            now.saturating_sub(*since)
+        );
+        if let Err(error) = crate::workspaces::kubectl(
+            cli,
+            &[
+                "delete",
+                "pod",
+                name,
+                "-n",
+                namespace,
+                "--grace-period=0",
+                "--force",
+                "--wait=false",
+            ],
+            None,
+        ) {
+            eprintln!(
+                "adm lifecycle: moving workspace {workspace_id} off node {node} failed: {error:#}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parses a Kubernetes `metav1.Time` (`2026-10-22T15:35:17Z`) as Unix seconds.
+fn kubernetes_time_unix(value: &str) -> Option<u64> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date = date.splitn(3, '-').map(|part| part.parse::<i64>().ok());
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let mut time = time.splitn(3, ':').map(|part| part.parse::<u64>().ok());
+    let (hour, minute, second) = (time.next()??, time.next()??, time.next()??);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    // Days-from-civil (Howard Hinnant).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days)
+        .ok()
+        .map(|days| days * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
 fn lifecycle_worker(

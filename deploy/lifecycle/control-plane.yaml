@@ -26,6 +26,10 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Node readiness only: workspaces on a node down for 3 minutes are moved.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     resourceNames: ["adm-runtime"]

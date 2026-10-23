@@ -58,6 +58,14 @@ test("lifecycle may request tokens only for workspace runtime service accounts",
     ),
     "the lifecycle controller must not mint additional RBAC grants",
   );
+  const nodeRules = role.rules.filter((rule) =>
+    rule.resources.includes("nodes"),
+  );
+  assert.deepEqual(
+    nodeRules.map((rule) => [rule.apiGroups, rule.resources, rule.verbs]),
+    [[[""], ["nodes"], ["get", "list"]]],
+    "moving workspaces off down nodes (TASK-82) reads node readiness and never changes nodes",
+  );
 });
 
 test("provider auth authority shares the lifecycle image and persistent state without a public port", async () => {
