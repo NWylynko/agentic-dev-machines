@@ -5,13 +5,14 @@ import {
 } from "node:http";
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   AuthCheck,
   AuthEvent,
   AuthPrompt,
   AuthType,
 } from "@earendil-works/pi-ai";
+import { createConnectorAuthority } from "./connector-authority.ts";
 
 export type SharedProviderCatalog = Record<
   string,
@@ -185,6 +186,10 @@ export async function createProviderAuthAuthority({
     refreshOnCreate: false,
   });
   configure?.(runtime);
+  const connectors = await createConnectorAuthority({
+    statePath: join(authDirectory, "connectors.json"),
+    ownerGuard,
+  });
   const operations = new Map<string, LoginOperation>();
 
   function publish(operation: LoginOperation, value: unknown) {
@@ -221,6 +226,7 @@ export async function createProviderAuthAuthority({
         return send(response, 503, { status: "unavailable" });
       if (request.method === "GET" && url.pathname === "/health")
         return send(response, 200, { status: "ok" });
+      if (await connectors.handle(request, response, url)) return;
       if (
         request.method === "POST" &&
         url.pathname === "/v1/provider-auth/catalog"
@@ -458,6 +464,7 @@ export async function createProviderAuthAuthority({
         await new Promise<void>((resolve, reject) =>
           server.close((error) => (error ? reject(error) : resolve())),
         );
+      await connectors.close();
       await credentialStore?.close();
     },
   };
