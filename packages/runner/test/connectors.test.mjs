@@ -326,10 +326,17 @@ test(
       requestId: "reconnect",
     });
     assert.equal((await mcpTools(coding)).length, 2);
+    // Delete between turns: deletion during a turn is a separate concern.
+    await coding.event(
+      (event) =>
+        event.kind === "assistant" && event.data.text === "Echo: reconnect",
+      again.seq,
+    );
     const closedBefore = fixture.events.filter(
       (event) => event.type === "session-closed",
     ).length;
-    assert.equal((await coding.request("", "DELETE")).status, 200);
+    const deleted = await coding.request("", "DELETE");
+    assert.equal(deleted.status, 200, JSON.stringify(deleted.body));
     assert.ok(
       fixture.events.filter((event) => event.type === "session-closed").length >
         closedBefore,
