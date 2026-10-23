@@ -516,13 +516,7 @@ test(
     const catalogueRequestsBefore = lifecycle.providerCatalogRequests.length;
     const statuses = await Promise.all(
       [1, 2, 3].map(() =>
-        runner.request(
-          `/v1/workspaces/${id}/runtime-status`,
-          "GET",
-          undefined,
-          undefined,
-          token,
-        ),
+        runner.request(`/v1/workspaces/${id}/runtime-status`),
       ),
     );
     for (const status of statuses) {
@@ -734,26 +728,34 @@ test("workspace requests are authorized by lifecycle against the caller's projec
     authorizations.some((entry) => entry.path.endsWith("/runtime/check")),
     "Durable commits and requests must check the lifecycle fence",
   );
+  // Runtime status (activity + selected model) needs no token and no lifecycle
+  // authorize round trip: the workspace NetworkPolicy admits only the
+  // lifecycle and bots, and `adm list` reads every Pod (TASK-67).
+  const authorizationsBeforeStatus = authorizations.filter((entry) =>
+    entry.path.endsWith("/authorize"),
+  ).length;
   const projectedStatus = await fetch(
     `${runner.url}/v1/workspaces/workspace-lifecycle-auth/runtime-status`,
-    { headers: { authorization: "Bearer rotating-pod-identity-token" } },
   );
   assert.equal(projectedStatus.status, 200);
+  assert.equal(
+    authorizations.filter((entry) => entry.path.endsWith("/authorize")).length,
+    authorizationsBeforeStatus,
+    "runtime status makes no lifecycle authorize request",
+  );
+  assert.equal(
+    (
+      await fetch(`${runner.url}/v1/workspaces/someone-else/runtime-status`)
+    ).status,
+    404,
+    "unauthenticated runtime status serves only this runtime's own workspace",
+  );
   const projectedBody = await projectedStatus.json();
   assert.ok(["idle", "running"].includes(projectedBody.activity.status));
   assert.deepEqual(projectedBody.selectedModel, {
     provider: "faux",
     id: "faux-1",
   });
-  assert.ok(
-    authorizations.some(
-      (entry) =>
-        entry.path.endsWith("/authorize") &&
-        entry.authorization === "Bearer rotating-pod-identity-token" &&
-        entry.body.action === "read",
-    ),
-    "runtime status is available only to an identity scoped to this workspace Pod",
-  );
   assert.ok(
     !authorizations.some(
       (entry) => entry.authorization === "Bearer lifecycle-controller-token",

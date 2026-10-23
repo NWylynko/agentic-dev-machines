@@ -14,8 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const RUNTIME_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-const RUNTIME_STATUS_PARALLELISM: usize = 4;
+/// Bound on collecting every runtime's activity for one directory read. Healthy
+/// reads take ~0.25 s live, so one hung runtime delays a list by at most this.
+const RUNTIME_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_RUNTIME_STATUS_BYTES: u64 = 64 * 1024;
 const UPDATE_MAINTENANCE_SECONDS: u64 = 300;
 const UPDATE_MAINTENANCE_ACK_TIMEOUT: Duration = Duration::from_secs(25);
@@ -379,9 +380,6 @@ struct RuntimeAuthorizeRequest {
 struct RuntimeStatusTarget {
     index: usize,
     workspace_id: String,
-    namespace: String,
-    pod_name: String,
-    pod_uid: String,
     ip: IpAddr,
 }
 
@@ -1207,22 +1205,11 @@ fn enrich_runtime_status(cli: &crate::Cli, workspaces: &mut [Workspace]) -> Resu
                         .as_str()
                         .and_then(|ip| ip.parse::<IpAddr>().ok())
                     {
-                        Some(ip) => {
-                            let pod_name = matches[0]["metadata"]["name"].as_str();
-                            let pod_uid = matches[0]["metadata"]["uid"].as_str();
-                            if let (Some(pod_name), Some(pod_uid)) = (pod_name, pod_uid) {
-                                requests.push(RuntimeStatusTarget {
-                                    index,
-                                    workspace_id: workspace.id.clone(),
-                                    namespace: workspace.namespace.clone(),
-                                    pod_name: pod_name.to_owned(),
-                                    pod_uid: pod_uid.to_owned(),
-                                    ip,
-                                });
-                            } else {
-                                status["activity"] = serde_json::json!({"status":"unavailable","error":"workspace Pod identity is incomplete"});
-                            }
-                        }
+                        Some(ip) => requests.push(RuntimeStatusTarget {
+                            index,
+                            workspace_id: workspace.id.clone(),
+                            ip,
+                        }),
                         None => {
                             status["activity"] = serde_json::json!({"status":"unavailable","error":"workspace Pod has no valid IP address"});
                         }
@@ -1274,112 +1261,90 @@ fn collect_runtime_status(
             return;
         }
     };
-    for (batch_index, batch) in requests.chunks(RUNTIME_STATUS_PARALLELISM).enumerate() {
-        if Instant::now() >= deadline {
-            mark_runtime_status_unavailable(
-                workspaces,
-                &requests[batch_index * RUNTIME_STATUS_PARALLELISM..],
-                "runtime status collection exceeded its 5-second deadline",
-            );
-            return;
-        }
-        let (sender, receiver) = mpsc::channel();
-        thread::scope(|scope| {
-            for target in batch.iter().cloned() {
-                let sender = sender.clone();
-                let client = client.clone();
-                scope.spawn(move || {
-                    let host = match target.ip {
-                        IpAddr::V4(ip) => ip.to_string(),
-                        IpAddr::V6(ip) => format!("[{ip}]"),
-                    };
-                    let token = match runtime_status_token(cli, &target) {
-                        Ok(token) => token,
-                        Err(error) => {
-                            let _ = sender.send((
-                                target.index,
-                                Err(format!("mint target runtime token failed: {error:#}")),
-                            ));
-                            return;
-                        }
-                    };
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        let _ = sender.send((
-                            target.index,
-                            Err("runtime status collection exceeded its 5-second deadline"
-                                .to_owned()),
-                        ));
-                        return;
-                    }
-                    let endpoint = format!(
-                        "http://{host}:{}/v1/workspaces/{}/runtime-status",
-                        cli.runtime_status_port, target.workspace_id
-                    );
-                    let result = client
-                        .get(endpoint)
-                        .bearer_auth(token)
-                        .timeout(remaining)
-                        .send()
-                        // `{:#}` keeps the source chain (timeout, refused, DNS, ...);
-                        // reqwest's own message only says "error sending request".
-                        .map_err(|error| {
-                            format!(
-                                "runtime status request failed: {:#}",
-                                anyhow::Error::new(error)
-                            )
-                        })
-                        .and_then(|response| {
-                            let status = response.status();
-                            if !status.is_success() {
-                                return Err(format!("runtime status returned HTTP {status}"));
-                            }
-                            let mut body = Vec::new();
-                            response
-                                .take(MAX_RUNTIME_STATUS_BYTES + 1)
-                                .read_to_end(&mut body)
-                                .map_err(|error| {
-                                    format!(
-                                        "read runtime status response failed: {:#}",
-                                        anyhow::Error::new(error)
-                                    )
-                                })?;
-                            if body.len() as u64 > MAX_RUNTIME_STATUS_BYTES {
-                                return Err("runtime status response exceeded 64 KiB".to_owned());
-                            }
-                            serde_json::from_slice::<Value>(&body)
-                                .map_err(|_| "runtime status response is invalid JSON".to_owned())
-                        });
-                    let _ = sender.send((target.index, result));
-                });
-            }
-            drop(sender);
-            for (index, result) in receiver {
-                match result {
-                    Ok(report) if valid_runtime_status_report(&report) => {
-                        if let Some(status) = workspaces[index].runtime_status.as_mut() {
-                            let mut activity =
-                                serde_json::json!({"status":report["activity"]["status"]});
-                            if let Some(error) = report["activity"]["error"].as_str() {
-                                activity["error"] =
-                                    Value::String(error.chars().take(2000).collect());
-                            }
-                            status["activity"] = activity;
-                            status["selectedModel"] = report.get("selectedModel")
-                                .filter(|model| !model.is_null())
-                                .map(|model| serde_json::json!({"provider":model["provider"],"id":model["id"]}))
-                                .unwrap_or(Value::Null);
-                        }
-                    }
-                    Ok(_) => set_runtime_activity_unavailable(
-                        &mut workspaces[index],
-                        "runtime returned an invalid status report",
-                    ),
-                    Err(error) => set_runtime_activity_unavailable(&mut workspaces[index], &error),
+    // Every runtime is read at once so a list costs one runtime round trip.
+    let (sender, receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        for target in requests.iter().cloned() {
+            let sender = sender.clone();
+            let client = client.clone();
+            scope.spawn(move || {
+                let host = match target.ip {
+                    IpAddr::V4(ip) => ip.to_string(),
+                    IpAddr::V6(ip) => format!("[{ip}]"),
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    let _ = sender.send((
+                        target.index,
+                        Err("runtime status collection exceeded its 1-second deadline".to_owned()),
+                    ));
+                    return;
                 }
+                let endpoint = format!(
+                    "http://{host}:{}/v1/workspaces/{}/runtime-status",
+                    cli.runtime_status_port, target.workspace_id
+                );
+                let result = client
+                    .get(endpoint)
+                    .timeout(remaining)
+                    .send()
+                    // `{:#}` keeps the source chain (timeout, refused, DNS, ...);
+                    // reqwest's own message only says "error sending request".
+                    .map_err(|error| {
+                        format!(
+                            "runtime status request failed: {:#}",
+                            anyhow::Error::new(error)
+                        )
+                    })
+                    .and_then(|response| {
+                        let status = response.status();
+                        if !status.is_success() {
+                            return Err(format!("runtime status returned HTTP {status}"));
+                        }
+                        let mut body = Vec::new();
+                        response
+                            .take(MAX_RUNTIME_STATUS_BYTES + 1)
+                            .read_to_end(&mut body)
+                            .map_err(|error| {
+                                format!(
+                                    "read runtime status response failed: {:#}",
+                                    anyhow::Error::new(error)
+                                )
+                            })?;
+                        if body.len() as u64 > MAX_RUNTIME_STATUS_BYTES {
+                            return Err("runtime status response exceeded 64 KiB".to_owned());
+                        }
+                        serde_json::from_slice::<Value>(&body)
+                            .map_err(|_| "runtime status response is invalid JSON".to_owned())
+                    });
+                let _ = sender.send((target.index, result));
+            });
+        }
+        drop(sender);
+        for (index, result) in receiver {
+            match result {
+                Ok(report) if valid_runtime_status_report(&report) => {
+                    if let Some(status) = workspaces[index].runtime_status.as_mut() {
+                        let mut activity =
+                            serde_json::json!({"status":report["activity"]["status"]});
+                        if let Some(error) = report["activity"]["error"].as_str() {
+                            activity["error"] = Value::String(error.chars().take(2000).collect());
+                        }
+                        status["activity"] = activity;
+                        status["selectedModel"] = report.get("selectedModel")
+                            .filter(|model| !model.is_null())
+                            .map(|model| serde_json::json!({"provider":model["provider"],"id":model["id"]}))
+                            .unwrap_or(Value::Null);
+                    }
+                }
+                Ok(_) => set_runtime_activity_unavailable(
+                    &mut workspaces[index],
+                    "runtime returned an invalid status report",
+                ),
+                Err(error) => set_runtime_activity_unavailable(&mut workspaces[index], &error),
             }
-        });
-    }
+        }
+    });
 }
 
 fn valid_runtime_status_report(report: &Value) -> bool {
@@ -1413,45 +1378,6 @@ fn valid_runtime_status_report(report: &Value) -> bool {
         return false;
     }
     true
-}
-
-fn runtime_status_token(cli: &crate::Cli, target: &RuntimeStatusTarget) -> Result<String> {
-    ensure!(
-        uuid::Uuid::parse_str(&target.pod_uid).is_ok(),
-        "workspace Pod UID is invalid"
-    );
-    let path = format!(
-        "/api/v1/namespaces/{}/serviceaccounts/adm-runtime/token",
-        target.namespace
-    );
-    let request = serde_json::json!({
-        "apiVersion":"authentication.k8s.io/v1",
-        "kind":"TokenRequest",
-        "spec":{
-            "audiences":["adm-lifecycle"],
-            "expirationSeconds":600,
-            "boundObjectRef":{
-                "apiVersion":"v1",
-                "kind":"Pod",
-                "name":target.pod_name,
-                "uid":target.pod_uid
-            }
-        }
-    });
-    let response = crate::workspaces::kubectl_bounded(
-        cli,
-        &["create", "--raw", &path, "-f", "-"],
-        Some(&serde_json::to_vec(&request)?),
-    )?;
-    let token = serde_json::from_slice::<Value>(&response)?["status"]["token"]
-        .as_str()
-        .context("Kubernetes TokenRequest omitted its token")?
-        .to_owned();
-    ensure!(
-        !token.is_empty() && !token.contains('\n'),
-        "Kubernetes TokenRequest returned an invalid token"
-    );
-    Ok(token)
 }
 
 fn mark_runtime_status_unavailable(

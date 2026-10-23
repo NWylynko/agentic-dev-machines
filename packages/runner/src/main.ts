@@ -1124,6 +1124,21 @@ function importedPiTree(value: unknown, selectedLeafId: unknown) {
   });
   return { branches, selectedLeafId };
 }
+async function runtimeStatusReport(workspace: Workspace) {
+  const status = await workspace.status();
+  const selectedModel = await workspace.conversationSelectedModel();
+  const activity = ["needs_model", "running", "error", "idle"].includes(
+    status.status,
+  )
+    ? status.status
+    : "unavailable";
+  const error =
+    typeof status.error === "string" ? status.error.slice(0, 2000) : undefined;
+  return {
+    activity: { status: activity, ...(error ? { error } : {}) },
+    ...(selectedModel ? { selectedModel } : {}),
+  };
+}
 function json(response: ServerResponse, status: number, value: unknown) {
   response.writeHead(status, {
     "content-type": "application/json",
@@ -1171,6 +1186,19 @@ const server = createServer(async (request, response) => {
         });
       return json(response, 200, { status: "ok", version: "0.1.0" });
     }
+    // Runtime status (activity + selected model) is unauthenticated: the
+    // workspace NetworkPolicy admits only the lifecycle and bots, and a token
+    // mint plus lifecycle authorize round trip per Pod made `adm list` slow.
+    const runtimeStatusId =
+      request.method === "GET"
+        ? /^\/v1\/workspaces\/([^/]+)\/runtime-status$/.exec(url.pathname)?.[1]
+        : undefined;
+    if (runtimeStatusId !== undefined) {
+      const workspace = workspaces.get(runtimeStatusId);
+      if (!workspace)
+        throw new ApiError(404, "WORKSPACE_NOT_FOUND", "Unknown workspace");
+      return json(response, 200, await runtimeStatusReport(workspace));
+    }
     await authorizeRuntimeRequest(request, url.pathname, requestSignal);
     if (url.pathname === "/v1/workspaces" && request.method === "GET")
       return json(response, 200, {
@@ -1183,7 +1211,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|runtime-status|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|tools|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|tools|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1433,23 +1461,6 @@ const server = createServer(async (request, response) => {
             },
           ),
         );
-      });
-    }
-    if (request.method === "GET" && action === "runtime-status") {
-      const status = await workspace.status();
-      const selectedModel = await workspace.conversationSelectedModel();
-      const activity = ["needs_model", "running", "error", "idle"].includes(
-        status.status,
-      )
-        ? status.status
-        : "unavailable";
-      const error =
-        typeof status.error === "string"
-          ? status.error.slice(0, 2000)
-          : undefined;
-      return json(response, 200, {
-        activity: { status: activity, ...(error ? { error } : {}) },
-        ...(selectedModel ? { selectedModel } : {}),
       });
     }
     if (request.method === "GET" && action === "history") {

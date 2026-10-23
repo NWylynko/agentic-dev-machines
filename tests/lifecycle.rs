@@ -148,10 +148,10 @@ fn start_runtime_status_server(root: &Path) -> (u16, thread::JoinHandle<()>) {
             }
             assert!(request.starts_with("GET /v1/workspaces/"), "{request}");
             assert!(request.contains("/runtime-status HTTP/1.1"), "{request}");
+            // Runtime status is unauthenticated (TASK-67): the workspace NetworkPolicy
+            // admits only the lifecycle (and bots), and the report is activity + model.
             assert!(
-                request
-                    .to_ascii_lowercase()
-                    .contains("authorization: bearer target-token:"),
+                !request.to_ascii_lowercase().contains("authorization:"),
                 "{request}"
             );
             if hold_path.exists() {
@@ -293,14 +293,7 @@ elif args[:3] == ['create','--raw','/apis/authentication.k8s.io/v1/tokenreviews'
     else:
         print(json.dumps({'status':{'authenticated':False,'audiences':['adm-lifecycle']}}))
 elif args[:2] == ['create','--raw'] and args[2].endswith('/serviceaccounts/adm-runtime/token'):
-    request=json.load(sys.stdin)
-    expected_uid=(root/'expected-pod-uid').read_text() if (root/'expected-pod-uid').exists() else '4b53eaa6-4e4d-42dd-9a02-4702a842155a'
-    namespace=args[2].split('/')[4]
-    assert args[2] == '/api/v1/namespaces/'+namespace+'/serviceaccounts/adm-runtime/token'
-    assert request['spec']['audiences'] == ['adm-lifecycle']
-    assert request['spec']['expirationSeconds'] == 600
-    assert request['spec']['boundObjectRef'] == {'apiVersion':'v1','kind':'Pod','name':'workspace-pod','uid':expected_uid}
-    print(json.dumps({'status':{'token':'target-token:'+namespace+':'+expected_uid}}))
+    sys.exit('runtime status collection must not mint a Pod token per workspace')
 elif args[:2] == ['get','storageclass']:
     entered=root/'storage-entered'; entered.write_text('yes')
     while not (root/'storage-release').exists(): time.sleep(.01)
@@ -1298,6 +1291,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         "gpt-test"
     );
     fs::write(root.path().join("runtime-status-hold"), "").unwrap();
+    let held_started = Instant::now();
     let held_directory: Vec<Value> = request_with_token(
         &url,
         "GET",
@@ -1308,7 +1302,12 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     .unwrap()
     .json()
     .unwrap();
+    let held_elapsed = held_started.elapsed();
     fs::remove_file(root.path().join("runtime-status-hold")).unwrap();
+    assert!(
+        held_elapsed < Duration::from_millis(1800),
+        "one hung runtime holds the directory only for the 1 s collection bound, took {held_elapsed:?}"
+    );
     let held_activity = &held_directory
         .iter()
         .find(|item| item["id"] == replacement_id)
