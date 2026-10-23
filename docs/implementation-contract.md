@@ -1,6 +1,6 @@
 # Implementation contract
 
-ADM keeps agent execution in workspace Pods. The management host is an access plane: it runs the CLI and Kubernetes client, connects terminal and shell clients, and submits lifecycle requests. The lifecycle service is the durable owner of workspace identity, provisioning, and deletion. Coding and bot Pods own their runner, model requests, tools, MCP processes, conversations, profiles, goals, loops, schedules, and private files. Closing a client does not stop the Pod or its work.
+ADM keeps agent execution in workspace Pods. The management host is an access plane: it runs the CLI and Kubernetes client, connects terminal and shell clients, and submits lifecycle requests. The lifecycle service is the durable owner of workspace identity, provisioning, and deletion. Coding and bot Pods own their runner, model requests, tools, MCP connector sessions, conversations, profiles, goals, loops, schedules, and private files. Closing a client does not stop the Pod or its work.
 
 This describes the fresh-workspace design. Old host sessions and old workspace records are not imported; no legacy migration or automatic local-runtime fallback is provided.
 

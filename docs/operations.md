@@ -181,29 +181,29 @@ Bots execute their model and tools in their own workspace Pod. They can discover
 
 New bot conversations start one durable setup turn. The bot asks for an identity and purpose and publishes the setup question through `sendMessage`; its saved profile appears in future model instructions and survives Pod replacement. Ordinary model output remains private in diagnostics.
 
-MCP access is configured at workspace creation with a nonsecret JSON file that grants exact stdio server tools. Environment values are looked up by reference inside the workspace runtime and passed only to that MCP server; the runtime does not pass its other environment through.
-
-```json
-[
-  {
-    "id": "notes",
-    "command": "/usr/bin/node",
-    "args": ["/opt/notes-mcp.mjs"],
-    "tools": ["search_notes"],
-    "secretEnv": { "NOTES_TOKEN": "MCP_NOTES_TOKEN" }
-  }
-]
-```
-
-```sh
-adm create supervisor --role bot --model PROVIDER/MODEL_ID --mcp-config /etc/adm/supervisor-mcp.json
-```
-
-The config stores only the environment reference name, never its value. Only listed tools are registered for the bot and Code Mode. Read-only MCP tools may replay after recovery when the server marks them read-only; other calls are not replayed after interruption. Unsupported transports or malformed grants fail registration, while connection failures remain visible in status.
+Bots and coding agents get external tools from the installation's MCP connectors (see [MCP connectors](#mcp-connectors)).
 
 Bots discover all live coding agents with `listAgents` and address them by immutable workspace ID. They can inspect status and paginated history (including tool events), prompt, steer or follow up, resume or abort foreground/background work, manage goals and loops, change models, and admit create/delete operations. Operation IDs provide durable receipts; `monitorAgentOperation` reads completion and failure after admission. Every target call is authorized against the caller's current Pod identity and lease. A deleted target's receipt remains tied to its immutable ID if a name is reused. Bots have no coding filesystem, shell, or development browser, including through Code Mode. `adm attach supervisor --diagnostics` explicitly opts in to seeing diagnostics.
 
 `adm list` shows persisted workspace phase alongside live Pod readiness and agent activity. The lifecycle service makes one bounded Pod-directory request and reads every Pod's runtime status at once under a 1-second collection bound, so one hung runtime delays a list by at most about a second. Runtime status (activity and selected model only) needs no token: the workspace NetworkPolicy admits port 7432 only from the lifecycle Pod and, for coding workspaces, bot Pods. A failed status read stays `unavailable` with its cause. `adm list --json` includes an `activity` object; add `--all` to include deleted workspaces. `adm status NAME` reports namespace, requested and selected model, resources, Pod readiness/node, activity, and available failure causes. `adm inspect NAME` provides the same labeled diagnostics, and JSON modes preserve the full payload. Deleted state takes precedence over any stale Pod/runtime report.
+
+## MCP connectors
+
+An MCP connector is a remote MCP server shared by every coding agent and bot in the installation. Add one and sign in with the browser:
+
+```sh
+adm mcp add linear https://mcp.linear.app/mcp
+adm mcp list
+adm mcp login linear    # sign in again, for example after the grant was revoked
+adm mcp logout linear   # every agent loses its tools until the next sign-in
+adm mcp remove linear
+```
+
+`adm mcp add` registers the server with the cluster authority (the lifecycle deployment's provider-auth container), prints the authorization URL and opens it in a browser when it can. The authority discovers the server's OAuth metadata, registers a client dynamically and uses PKCE; the browser returns to a loopback port on the device running `adm`, which passes only the one-time code to the authority. The browser therefore has to run on the same device as the CLI. The authority stores the grant on its persistent volume beside provider credentials, refreshes it centrally, and gives workspace Pods only access tokens after validating their projected identity. Refresh tokens never reach a Pod, and no token is written to ADM config, workspace files, logs or chat.
+
+Running agents pick up connector changes at their next turn without being recreated. Their tools are named `mcp_<connector>_<tool>`, are available to bot Code Mode scripts, and each call fetches a current access token, so a removed or signed-out connector fails visibly even before its tools are withdrawn. The agent's prompt lists each connector's state and the `adm mcp login NAME` command when one needs sign-in. `adm status NAME` prints `MCP connector NAME unavailable for ...` with the cause. Aborting a turn cancels its in-flight MCP call, and closing or deleting a workspace closes its MCP sessions. Read-only MCP tools may replay after recovery when the server marks them read-only; other calls are not replayed after interruption.
+
+Only remote Streamable HTTP servers with OAuth sign-in are supported. Every agent receives every connector; choosing which agents get which connectors is not available yet. The per-workspace `--mcp-config` stdio grants were removed.
 
 ## Errors and recovery
 
