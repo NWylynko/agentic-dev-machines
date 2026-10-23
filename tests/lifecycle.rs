@@ -123,11 +123,14 @@ fn stop_http_stub(port: u16, server: thread::JoinHandle<()>) {
 
 /// While `root/runtime-status-hold` exists, the stub never answers: it reads until the
 /// lifecycle gives up on the request, like a runtime whose status read is too slow.
+/// While `root/runtime-status-starting` exists, it answers like a runner still
+/// waiting for its lifecycle lease.
 fn start_runtime_status_server(root: &Path) -> (u16, thread::JoinHandle<()>) {
     use std::io::{Read, Write};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let hold_path = root.join("runtime-status-hold");
+    let starting_path = root.join("runtime-status-starting");
     let server = thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let mut request = Vec::new();
@@ -156,6 +159,11 @@ fn start_runtime_status_server(root: &Path) -> (u16, thread::JoinHandle<()>) {
             );
             if hold_path.exists() {
                 while stream.read(&mut chunk).is_ok_and(|count| count > 0) {}
+                continue;
+            }
+            if starting_path.exists() {
+                let body = r#"{"error":{"code":"RUNTIME_STARTING","message":"Workspace runtime is waiting for its lifecycle lease: Workspace lifecycle lease request failed: The operation was aborted due to timeout"}}"#;
+                write!(stream, "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
                 continue;
             }
             let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"}}"#;
@@ -267,6 +275,8 @@ if args[:2] == ['get','lease']:
         print(lease_path.read_text())
 elif args[:3] == ['create','--raw','/apis/authentication.k8s.io/v1/tokenreviews']:
     request=json.load(sys.stdin)
+    if (root/'tokenreview-unavailable').exists():
+        print('Unable to connect to the server: net/http: TLS handshake timeout',file=sys.stderr); sys.exit(1)
     expected_namespace=(root/'expected-namespace').read_text()
     pod_uid=(root/'expected-pod-uid').read_text()
     if request['spec']['token']=='runtime-token':
@@ -1319,6 +1329,28 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             .is_some_and(|error| error.contains("timed out")),
         "an unavailable cause names the underlying timeout, not only reqwest's top-level message: {held_activity}"
     );
+    fs::write(root.path().join("runtime-status-starting"), "").unwrap();
+    let starting_directory: Vec<Value> = request_with_token(
+        &url,
+        "GET",
+        "/v1/workspaces",
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    fs::remove_file(root.path().join("runtime-status-starting")).unwrap();
+    let starting_activity = &starting_directory
+        .iter()
+        .find(|item| item["id"] == replacement_id)
+        .unwrap()["runtime_status"]["activity"];
+    assert_eq!(starting_activity["status"], "unavailable");
+    assert_eq!(
+        starting_activity["error"],
+        "runtime status returned HTTP 503 Service Unavailable: RUNTIME_STARTING: Workspace runtime is waiting for its lifecycle lease: Workspace lifecycle lease request failed: The operation was aborted due to timeout",
+        "the runner's reported cause distinguishes a lifecycle it cannot reach from an unavailable agent"
+    );
     let failed_delete_id = "30af635c-32af-4b26-a35d-738aa991f90a";
     let failed_delete =
         json!({"operationId":failed_delete_id,"kind":"delete","workspaceId":replacement_id});
@@ -1777,6 +1809,30 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         .status(),
         200
     );
+    // A Kubernetes API outage during TokenReview is lifecycle unavailability,
+    // which runners wait out, not a rejection that fences them.
+    fs::write(root.path().join("tokenreview-unavailable"), "").unwrap();
+    let unavailable_check = request_with_token(
+        &url,
+        "POST",
+        &check_path,
+        Some(&check_body),
+        Some("runtime-token"),
+    )
+    .unwrap();
+    assert_eq!(unavailable_check.status(), 503);
+    let unavailable_check: Value = unavailable_check.json().unwrap();
+    assert_eq!(
+        unavailable_check["error"]["code"], "KUBERNETES_API_UNAVAILABLE",
+        "{unavailable_check}"
+    );
+    assert!(
+        unavailable_check["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("TLS handshake timeout")),
+        "{unavailable_check}"
+    );
+    fs::remove_file(root.path().join("tokenreview-unavailable")).unwrap();
     let update_operation = "35a7bb46-d770-4cb1-b1cc-5ebdb5fdf734";
     fs::write(
         root.path().join("private-file.marker"),

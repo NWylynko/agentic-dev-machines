@@ -27,7 +27,7 @@ The runner exposes its HTTP/SSE API on the workspace Pod. The CLI validates the 
 
 Important runner endpoints include:
 
-- `GET /health` reports runner health and lease-loss errors.
+- `GET /health` is the liveness probe: it reports runner health, `starting` (with the cause) while the runner waits for its lifecycle lease, and fails only on lease loss. `GET /ready` is the readiness probe: it succeeds only once the lease is held and the workspace is open. Until then every workspace route answers `503 RUNTIME_STARTING`. That includes the unauthenticated `GET /v1/workspaces/:id/runtime-status`, and `adm list` shows that cause.
 - `GET /v1/workspaces/:id` returns workspace status, model, goals, and loops. `GET /v1/workspaces` returns the runner's local directory; it is not the global workspace directory.
 - `GET /v1/workspaces/:id/models` returns model and authentication metadata without credential values. `PUT /v1/workspaces/:id/model` changes the selected model on the existing conversation.
 - `POST /v1/workspaces/:id/input`, `/abort`, `/resume`, and `/retry` admit or stop work. Input request IDs deduplicate submissions. Resume is explicit and rejects retries after tool effects until the caller inspects and follows up.

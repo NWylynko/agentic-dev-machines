@@ -744,9 +744,8 @@ test("workspace requests are authorized by lifecycle against the caller's projec
     "runtime status makes no lifecycle authorize request",
   );
   assert.equal(
-    (
-      await fetch(`${runner.url}/v1/workspaces/someone-else/runtime-status`)
-    ).status,
+    (await fetch(`${runner.url}/v1/workspaces/someone-else/runtime-status`))
+      .status,
     404,
     "unauthenticated runtime status serves only this runtime's own workspace",
   );
@@ -4250,5 +4249,115 @@ test(
     assert.equal(rejectedTool.data.isError, true);
     const status = await runner.request(path);
     assert.deepEqual(status.body.loops, []);
+  },
+);
+
+async function writeLifecycleWorkspace(directory, id) {
+  const tokenFile = join(directory, "service-account-token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  await writeFile(tokenFile, "pod-token\n", { mode: 0o600 });
+  await writeFile(
+    workspaceConfigFile,
+    JSON.stringify({
+      id,
+      name: "outage",
+      role: "coding",
+      environment: "pod",
+      localRoot: directory,
+      model: { provider: "faux", id: "faux-1" },
+    }),
+  );
+  return { tokenFile, workspaceConfigFile };
+}
+
+test(
+  "a runner started while its lifecycle is too slow waits unready and retries the lease instead of exiting",
+  { timeout: 30_000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-lease-wait-"));
+    const id = "workspace-lease-wait";
+    const { tokenFile, workspaceConfigFile } = await writeLifecycleWorkspace(
+      directory,
+      id,
+    );
+    const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+    // Lease requests are held unanswered, like the lifecycle that answered only
+    // after runners had given up on it (TASK-82).
+    const heldLeases = [];
+    let leaseArrived;
+    let nextLease = new Promise((resolve) => (leaseArrived = resolve));
+    const control = createServer(async (request, response) => {
+      for await (const _chunk of request) {
+      }
+      if (request.url.endsWith("/runtime/lease")) {
+        heldLeases.push(response);
+        leaseArrived();
+        nextLease = new Promise((resolve) => (leaseArrived = resolve));
+        return;
+      }
+      response
+        .writeHead(200, { "content-type": "application/json" })
+        .end('{"allowed":true,"valid":true}');
+    });
+    await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+    t.after(async () => {
+      control.closeAllConnections();
+      await new Promise((resolve) => control.close(resolve));
+    });
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}`;
+    const starting = startRunner(
+      join(directory, "state"),
+      {},
+      {
+        port,
+        tokenFile,
+        workspaceConfigFile,
+        lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+        podUid: holder,
+      },
+    );
+    starting.catch(() => {});
+    await nextLease;
+    const retried = nextLease;
+    // The first request times out on the runner's side; it must try again.
+    await Promise.race([retried, starting]);
+    assert.equal(heldLeases.length, 2, "the runner retried its lease");
+
+    const health = await fetch(`${url}/health`);
+    assert.equal(health.status, 200, "liveness holds while waiting");
+    const healthBody = await health.json();
+    assert.equal(healthBody.status, "starting");
+    assert.match(healthBody.reason, /lease request failed: .*timeout/);
+    const ready = await fetch(`${url}/ready`);
+    assert.equal(ready.status, 503, "readiness fails without a lease");
+    assert.equal((await ready.json()).error.code, "RUNTIME_STARTING");
+    const early = await fetch(`${url}/v1/workspaces/${id}/runtime-status`);
+    assert.equal(early.status, 503, "no work is served without a lease");
+    const earlyBody = await early.json();
+    assert.equal(earlyBody.error.code, "RUNTIME_STARTING");
+    assert.match(
+      earlyBody.error.message,
+      /waiting for its lifecycle lease: .*timeout/,
+    );
+
+    heldLeases[1].writeHead(200, { "content-type": "application/json" }).end(
+      JSON.stringify({
+        workspaceId: id,
+        holder,
+        fencingToken: 3,
+        expiresAt: Math.floor(Date.now() / 1000) + 60,
+      }),
+    );
+    const runner = await starting;
+    t.after(() => runner.stop());
+    assert.match(
+      runner.errors,
+      /Waiting for workspace lifecycle lease: .*aborted due to timeout/,
+    );
+    assert.equal((await fetch(`${url}/ready`)).status, 200);
+    const status = await runner.request(`/v1/workspaces/${id}/runtime-status`);
+    assert.equal(status.status, 200);
+    assert.equal(status.body.activity.status, "idle");
   },
 );

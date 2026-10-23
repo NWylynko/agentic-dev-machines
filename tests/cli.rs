@@ -3761,8 +3761,11 @@ fn repository_sidecar_runs_as_the_development_user_and_catalog_is_the_repos_view
     let pod = &deployment["spec"]["template"]["spec"];
     let dev = &pod["containers"][0];
     assert_eq!(dev["workingDir"], "/repos");
-    assert_eq!(dev["readinessProbe"]["httpGet"]["path"], "/health");
+    // Readiness requires the runtime lease; liveness only requires a live,
+    // unfenced runner, so waiting out a slow lifecycle does not restart it.
+    assert_eq!(dev["readinessProbe"]["httpGet"]["path"], "/ready");
     assert_eq!(dev["readinessProbe"]["httpGet"]["port"], 7432);
+    assert_eq!(dev["livenessProbe"]["httpGet"]["path"], "/health");
     let sidecar = pod["containers"]
         .as_array()
         .unwrap()

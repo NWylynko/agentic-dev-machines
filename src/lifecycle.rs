@@ -634,6 +634,8 @@ fn handle_http(
 fn runtime_http_error_status(error: &anyhow::Error, message: &str) -> (u16, &'static str) {
     if error.is::<ProviderAuthUnavailable>() {
         (503, "PROVIDER_AUTH_UNAVAILABLE")
+    } else if error.is::<KubernetesApiUnavailable>() {
+        (503, "KUBERNETES_API_UNAVAILABLE")
     } else if message.contains("operationId was already used") {
         (409, "OPERATION_CONFLICT")
     } else if message.contains("not authorized for workspace")
@@ -1098,6 +1100,19 @@ fn route(
     Ok((404, serde_json::json!({"error":{"code":"NOT_FOUND"}})))
 }
 
+/// The lifecycle could not ask Kubernetes to review a runtime token. Runners treat
+/// this 503 as lifecycle unavailability and wait, rather than as a fence rejection.
+#[derive(Debug)]
+struct KubernetesApiUnavailable(String);
+
+impl std::fmt::Display for KubernetesApiUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KubernetesApiUnavailable {}
+
 #[derive(Debug)]
 struct ProviderAuthUnavailable;
 
@@ -1299,7 +1314,21 @@ fn collect_runtime_status(
                     .and_then(|response| {
                         let status = response.status();
                         if !status.is_success() {
-                            return Err(format!("runtime status returned HTTP {status}"));
+                            // A runner waiting for its lease says why in its error
+                            // body; keep that cause instead of a bare status.
+                            let mut body = Vec::new();
+                            let _ = response
+                                .take(MAX_RUNTIME_STATUS_BYTES)
+                                .read_to_end(&mut body);
+                            let reported = serde_json::from_slice::<Value>(&body)
+                                .ok()
+                                .and_then(|value| {
+                                    let code = value["error"]["code"].as_str()?.to_owned();
+                                    let message = value["error"]["message"].as_str()?.to_owned();
+                                    Some(format!(": {code}: {message}"))
+                                })
+                                .unwrap_or_default();
+                            return Err(format!("runtime status returned HTTP {status}{reported}"));
                         }
                         let mut body = Vec::new();
                         response
@@ -1461,7 +1490,12 @@ fn review_runtime_token(cli: &crate::Cli, authorization: &str) -> Result<(String
             "-",
         ],
         Some(&serde_json::to_vec(&review_request)?),
-    )?;
+    )
+    .map_err(|error| {
+        anyhow::Error::new(KubernetesApiUnavailable(format!(
+            "TokenReview failed: {error:#}"
+        )))
+    })?;
     let review: Value = serde_json::from_slice(&response)?;
     ensure!(
         review["status"]["authenticated"] == true,

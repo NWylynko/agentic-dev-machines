@@ -18,6 +18,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
 import { parseArgs } from "node:util";
+import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { Workspace } from "./workspace.ts";
 import { WorkspaceResources } from "./resources.ts";
@@ -535,37 +536,69 @@ if (values["workspace-config"]) {
     await atomicJson(registryPath, [...configs.values()]);
   }
 }
+const runtimeLeaseHolder = lifecycleUrl
+  ? (values["pod-uid"] ?? process.env.ADM_POD_UID)
+  : undefined;
 if (lifecycleUrl) {
-  const config = [...configs.values()][0];
-  if (!config || configs.size !== 1)
+  if (configs.size !== 1)
     throw new Error(
       "A lifecycle-owned Pod runtime must open exactly one workspace",
     );
-  const holder = values["pod-uid"] ?? process.env.ADM_POD_UID;
-  if (!holder || !/^[0-9a-f-]{36}$/i.test(holder))
+  if (!runtimeLeaseHolder || !/^[0-9a-f-]{36}$/i.test(runtimeLeaseHolder))
     throw new Error(
       "Lifecycle-owned Pod runtime requires its Kubernetes Pod UID",
     );
-  const acquired = await lifecycleRuntimeCall(config.id, "lease", { holder });
-  if (
-    acquired.holder !== holder ||
-    !Number.isSafeInteger(acquired.fencingToken) ||
-    acquired.fencingToken! < 1 ||
-    leaseExpiryDelay(acquired.expiresAt!) === undefined
-  )
-    throw new Error("Lifecycle returned an invalid workspace runtime lease");
-  runtimeLease = {
-    workspaceId: config.id,
-    holder,
-    fencingToken: acquired.fencingToken!,
-    expiresAt: acquired.expiresAt!,
-  };
-  scheduleLeaseExpiry(runtimeLease.expiresAt);
 }
-for (const config of configs.values())
-  await openWorkspace(config, await isDeleted(config.id));
-
-if (lifecycleUrl) {
+// The runtime serves health while it waits for its lease, but no workspace
+// work until the lease is held and its workspaces are open.
+let runtimeServing = false;
+let runtimeLeaseWait: Error | undefined;
+function runtimeStartingError() {
+  return new ApiError(
+    503,
+    "RUNTIME_STARTING",
+    runtimeLeaseWait
+      ? `Workspace runtime is waiting for its lifecycle lease: ${runtimeLeaseWait.message}`
+      : "Workspace runtime is starting",
+  );
+}
+// A slow or unreachable lifecycle at startup is waited out, as renewal does,
+// rather than exiting into Kubernetes restart backoff. Rejections still exit.
+async function acquireStartupRuntimeLease() {
+  const workspaceId = [...configs.keys()][0]!;
+  const holder = runtimeLeaseHolder!;
+  while (!stopping) {
+    let acquired: Awaited<ReturnType<typeof lifecycleRuntimeCall>>;
+    try {
+      acquired = await lifecycleRuntimeCall(workspaceId, "lease", { holder });
+    } catch (error) {
+      if (!isLifecycleUnavailable(error)) throw error;
+      runtimeLeaseWait = error as Error;
+      process.stderr.write(
+        `Waiting for workspace lifecycle lease: ${runtimeLeaseWait.message}\n`,
+      );
+      await sleep(1_000);
+      continue;
+    }
+    if (
+      acquired.holder !== holder ||
+      !Number.isSafeInteger(acquired.fencingToken) ||
+      acquired.fencingToken! < 1 ||
+      leaseExpiryDelay(acquired.expiresAt!) === undefined
+    )
+      throw new Error("Lifecycle returned an invalid workspace runtime lease");
+    runtimeLease = {
+      workspaceId,
+      holder,
+      fencingToken: acquired.fencingToken!,
+      expiresAt: acquired.expiresAt!,
+    };
+    runtimeLeaseWait = undefined;
+    scheduleLeaseExpiry(runtimeLease.expiresAt);
+    return;
+  }
+}
+function startRuntimeLeaseRenewal() {
   const { workspaceId, holder } = runtimeLease!;
   let renewing = false;
   const renewal = setInterval(async () => {
@@ -1177,6 +1210,12 @@ const server = createServer(async (request, response) => {
           status: "error",
           error: runtimeLeaseError.message,
         });
+      if (!runtimeServing)
+        return json(response, 200, {
+          status: "starting",
+          version: "0.1.0",
+          ...(runtimeLeaseWait ? { reason: runtimeLeaseWait.message } : {}),
+        });
       if (lifecycleAvailabilityError() && !runtimeLeaseError)
         return json(response, 200, {
           status: "degraded",
@@ -1186,6 +1225,19 @@ const server = createServer(async (request, response) => {
         });
       return json(response, 200, { status: "ok", version: "0.1.0" });
     }
+    // Readiness: /health stays the liveness probe, so waiting for a lease
+    // keeps the Pod alive but out of service.
+    if (url.pathname === "/ready" && request.method === "GET") {
+      if (runtimeLeaseError)
+        throw new ApiError(
+          503,
+          "RUNTIME_OWNERSHIP_LOST",
+          runtimeLeaseError.message,
+        );
+      if (!runtimeServing) throw runtimeStartingError();
+      return json(response, 200, { status: "ready" });
+    }
+    if (!runtimeServing) throw runtimeStartingError();
     // Runtime status (activity + selected model) is unauthenticated: the
     // workspace NetworkPolicy admits only the lifecycle and bots, and a token
     // mint plus lifecycle authorize round trip per Pod made `adm list` slow.
@@ -2239,17 +2291,6 @@ const server = createServer(async (request, response) => {
     else response.end();
   }
 });
-server.listen(port, host, () => {
-  const address = server.address();
-  if (address && typeof address !== "string")
-    console.log(
-      JSON.stringify({
-        ready: true,
-        url: `http://${host === "::1" ? "[::1]" : host}:${address.port}`,
-        pid: process.pid,
-      }),
-    );
-});
 let stopping = false;
 async function shutdown() {
   if (stopping) return;
@@ -2310,3 +2351,24 @@ process.on("unhandledRejection", (reason) => {
   }
   throw reason;
 });
+
+await new Promise<void>((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(port, host, resolve);
+});
+if (lifecycleUrl) await acquireStartupRuntimeLease();
+if (!stopping) {
+  for (const config of configs.values())
+    await openWorkspace(config, await isDeleted(config.id));
+  if (lifecycleUrl) startRuntimeLeaseRenewal();
+  runtimeServing = true;
+  const address = server.address();
+  if (address && typeof address !== "string")
+    console.log(
+      JSON.stringify({
+        ready: true,
+        url: `http://${host === "::1" ? "[::1]" : host}:${address.port}`,
+        pid: process.pid,
+      }),
+    );
+}
