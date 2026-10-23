@@ -129,7 +129,7 @@ fn prompt(label: &str, default: &str) -> Result<String> {
     Ok(if answer.is_empty() { default } else { answer }.to_owned())
 }
 
-fn save_config(config: &Config) -> Result<PathBuf> {
+pub fn save_config(config: &Config) -> Result<PathBuf> {
     let path = config_home()?.join("adm/config.json");
     fs::create_dir_all(path.parent().expect("config parent"))?;
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));

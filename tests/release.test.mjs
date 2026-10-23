@@ -390,6 +390,51 @@ esac
       (await execute(adm, ["--version"], { cwd: unrelated, env: environment })).stdout,
       "adm 0.1.0\n",
     );
+    const configPath = join(environment.XDG_CONFIG_HOME, "adm", "config.json");
+    const savedConfig = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(
+      savedConfig.image,
+      "ghcr.io/example/adm-dev:stale-workspace-image",
+      "an image from another repository is the user's own choice and survives updates",
+    );
+    // `adm setup` saves the release's own image as an explicit reference. An
+    // update must advance it, or every new workspace keeps the setup-time runner
+    // (TASK-62: fixes shipped, but fresh workspaces still ran the old release).
+    await writeFile(
+      configPath,
+      JSON.stringify({ ...savedConfig, image: "ghcr.io/example/adm:sha-setup-time-release" }),
+    );
+    await execute(
+      adm,
+      [
+        "update",
+        "--version",
+        "v9.8.7",
+        "--base-url",
+        `http://127.0.0.1:${releaseServer.address().port}`,
+        "--lifecycle-token-file",
+        lifecycleTokenFile,
+        "--kubectl",
+        fakeKubectl,
+      ],
+      { cwd: unrelated, env: updateEnvironment, maxBuffer: 1024 * 1024 },
+    );
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), {
+      ...savedConfig,
+      image: targetImage,
+    });
+    const freshManifest = await execute(adm, ["manifest", "fresh-after-update"], {
+      cwd: unrelated,
+      env: environment,
+    });
+    assert.equal(
+      JSON.parse(freshManifest.stdout)
+        .items.find((resource) => resource.kind === "Deployment")
+        .spec.template.spec.containers[0].image,
+      targetImage,
+      "a workspace created after `adm update` runs the updated release",
+    );
+    await writeFile(configPath, JSON.stringify(savedConfig));
     const selectedUpdate = await execute(
       adm,
       [

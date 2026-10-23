@@ -1,4 +1,4 @@
-use crate::{Cli, lifecycle, setup_connection, setup_control_plane, workspaces};
+use crate::{Cli, lifecycle, setup, setup_connection, setup_control_plane, workspaces};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -234,6 +234,7 @@ pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str
                 "controller is healthy, but planned workspace lease window {maintenance_id} could not be released (expires at {maintenance_expires_at})"
             )
         })?;
+    advance_saved_release_image(&target_image)?;
     if !selected.is_empty() {
         upgrade_selected(
             &connected,
@@ -245,6 +246,32 @@ pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str
     }
     drop(connection);
     Ok(())
+}
+
+/// `adm setup` saves the release's own image as an explicit reference, so new
+/// workspaces would keep the setup-time runner forever. A saved image from the
+/// release's repository follows the update; an image from any other repository
+/// is the user's own choice and is kept.
+fn advance_saved_release_image(target_image: &str) -> Result<()> {
+    let mut config = setup::read_config()?;
+    let Some(saved) = config.image.as_deref() else {
+        return Ok(());
+    };
+    if saved == target_image || image_repository(saved) != image_repository(target_image) {
+        return Ok(());
+    }
+    eprintln!("adm: update: new workspaces now use {target_image} (was {saved})");
+    config.image = Some(target_image.to_owned());
+    setup::save_config(&config).context("save the updated workspace image default")?;
+    Ok(())
+}
+
+fn image_repository(image: &str) -> &str {
+    let image = image.split_once('@').map_or(image, |(name, _)| name);
+    match (image.rfind(':'), image.rfind('/')) {
+        (Some(tag), slash) if slash.is_none_or(|slash| tag > slash) => &image[..tag],
+        _ => image,
+    }
 }
 
 fn packaged_value(cli: &Cli, filename: &str) -> Result<String> {
