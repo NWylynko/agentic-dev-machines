@@ -30,6 +30,7 @@ import {
   waitForLifecycleAvailability,
 } from "./lifecycle-availability.ts";
 import { botAgentManagementFromEnvironment } from "./bot-management.ts";
+import { connectorLifecycleFromEnvironment } from "./connectors.ts";
 import { ApiError, workspaceIdPattern, type WorkspaceConfig } from "./types.ts";
 import { watchEvents, type AgentEvent } from "@earendil-works/pi-durable";
 import type { Message } from "@earendil-works/pi-ai";
@@ -515,6 +516,7 @@ async function openWorkspace(
           suspend: suspendLifecycleAvailability,
         }
       : undefined,
+    connectorLifecycleFromEnvironment({ lifecycleUrl, tokenFile }),
   );
   workspaces.set(config.id, workspace);
   return workspace;
@@ -687,111 +689,12 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
       "BOT_ENVIRONMENT_FORBIDDEN",
       "Bots cannot have coding filesystems or runtime namespaces",
     );
-  if (config.mcpServers !== undefined) {
-    if (config.role !== "bot" || !Array.isArray(config.mcpServers))
-      throw new ApiError(
-        400,
-        "INVALID_MCP_SERVERS",
-        "MCP servers can only be configured for bots",
-      );
-    const serverIds = new Set<string>();
-    for (const server of config.mcpServers) {
-      const keys = Object.keys(server ?? {})
-        .sort()
-        .join(",");
-      if (
-        ![
-          "command,id,tools",
-          "args,command,id,tools",
-          "command,id,secretEnv,tools",
-          "args,command,id,secretEnv,tools",
-        ].includes(keys)
-      )
-        throw new ApiError(
-          400,
-          "INVALID_MCP_SERVER",
-          "MCP config supports only id, stdio command, args, exact tool grants, and secretEnv references",
-        );
-      if (
-        typeof server.id !== "string" ||
-        !/^[A-Za-z][A-Za-z0-9_-]{0,39}$/.test(server.id) ||
-        serverIds.has(server.id)
-      )
-        throw new ApiError(
-          400,
-          "INVALID_MCP_SERVER_ID",
-          "Invalid or duplicate MCP server id",
-        );
-      serverIds.add(server.id);
-      if (
-        typeof server.command !== "string" ||
-        !/^(?:[A-Za-z0-9_.+-]+|\/[A-Za-z0-9_./+-]+)$/.test(server.command) ||
-        server.command.includes("..")
-      )
-        throw new ApiError(
-          400,
-          "INVALID_MCP_COMMAND",
-          "MCP servers require a command name or absolute executable path",
-        );
-      if (
-        server.args !== undefined &&
-        (!Array.isArray(server.args) ||
-          server.args.length > 64 ||
-          server.args.some(
-            (arg) => typeof arg !== "string" || arg.length > 4096,
-          ))
-      )
-        throw new ApiError(
-          400,
-          "INVALID_MCP_ARGS",
-          "MCP args must be up to 64 strings of at most 4096 characters",
-        );
-      if (
-        !Array.isArray(server.tools) ||
-        server.tools.length === 0 ||
-        server.tools.length > 128 ||
-        server.tools.some(
-          (tool) =>
-            typeof tool !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(tool),
-        ) ||
-        new Set(server.tools).size !== server.tools.length
-      )
-        throw new ApiError(
-          400,
-          "INVALID_MCP_TOOLS",
-          "MCP config requires exact, unique tool names",
-        );
-      if (server.secretEnv !== undefined) {
-        if (
-          !server.secretEnv ||
-          typeof server.secretEnv !== "object" ||
-          Array.isArray(server.secretEnv)
-        )
-          throw new ApiError(
-            400,
-            "INVALID_MCP_ENV",
-            "secretEnv must map MCP variable names to runner environment references",
-          );
-        for (const [name, reference] of Object.entries(server.secretEnv))
-          if (
-            !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ||
-            typeof reference !== "string" ||
-            !/^[A-Za-z_][A-Za-z0-9_]*$/.test(reference)
-          )
-            throw new ApiError(
-              400,
-              "INVALID_MCP_ENV",
-              "MCP env names and references must be environment variable identifiers",
-            );
-          else if (process.env[reference] === undefined)
-            throw new ApiError(
-              400,
-              "MCP_SECRET_NOT_INJECTED",
-              `MCP environment reference ${reference} is not injected into the runner`,
-            );
-      }
-    }
-  }
+  if (Object.hasOwn(config, "mcpServers"))
+    throw new ApiError(
+      400,
+      "MCP_SERVERS_REMOVED",
+      "Per-workspace MCP servers are replaced by installation connectors; add one with adm mcp add NAME URL",
+    );
   if (
     config.role === "coding" &&
     ["local", "pod"].includes(config.environment) &&
@@ -1177,6 +1080,15 @@ async function runtimeStatusReport(workspace: Workspace) {
   return {
     activity: { status: activity, ...(error ? { error } : {}) },
     ...(selectedModel ? { selectedModel } : {}),
+    ...(status.connectors.length
+      ? {
+          connectors: status.connectors.map(({ name, status, error }) => ({
+            name,
+            status,
+            ...(error ? { error } : {}),
+          })),
+        }
+      : {}),
   };
 }
 function json(response: ServerResponse, status: number, value: unknown) {

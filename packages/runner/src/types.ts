@@ -13,13 +13,6 @@ export type WorkspaceConfig = {
   model?: { provider: string; id: string };
   /** Runner-managed flag persisted only for newly registered bot conversations. */
   onboardingRequired?: boolean;
-  mcpServers?: {
-    id: string;
-    command: string;
-    args?: string[];
-    tools: string[];
-    secretEnv?: Record<string, string>;
-  }[];
 };
 export type RunnerEvent = {
   seq: number;

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createProviderAuthAuthority } from "../src/provider-auth-authority.ts";
-import { startMcpOAuthServer } from "./mcp-oauth-fixture.mjs";
+import { startMcpOAuthServer } from "./mcp-oauth-fixture.ts";
 
 async function startAuthority(authPath) {
   const authority = await createProviderAuthAuthority({ authPath });

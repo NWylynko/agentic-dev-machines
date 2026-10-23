@@ -2,14 +2,22 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer, request as httpRequest } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
 import test from "node:test";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { WorkspaceTerminal } from "../src/terminal.ts";
 import { DurableInteractiveRuntime } from "../src/native-runtime.ts";
+import { createProviderAuthAuthority } from "../../runner/src/provider-auth-authority.ts";
+import {
+  signInConnector,
+  startMcpOAuthServer,
+} from "../../runner/test/mcp-oauth-fixture.ts";
+import {
+  startPodLifecycle,
+  startPodRunner,
+} from "../../runner/test/pod-fixture.ts";
 
 // Interpret Pi's main-screen CSI cursor moves/erases and skip SGR/mode/OSC codes.
 // Assertions use the current screen, so a stale spinner or duplicate row fails.
@@ -102,110 +110,54 @@ test(
   { timeout: 40000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-bot-live-"));
-    const runner = spawn(
-      process.execPath,
-      [
-        new URL("../../runner/src/main.ts", import.meta.url).pathname,
-        "--port",
-        "0",
-        "--state-dir",
-        join(directory, "state"),
-        "--provider",
-        "faux",
-      ],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, HOME: directory },
-      },
-    );
-    let errors = "";
-    runner.stderr.on("data", (chunk) => (errors += chunk));
-    const runnerExit = once(runner, "exit");
-    const lines = createInterface({ input: runner.stdout });
-    t.after(async () => {
-      if (runner.exitCode === null && runner.signalCode === null) {
-        runner.kill("SIGTERM");
-        await runnerExit;
-      }
-      lines.close();
-      await rm(directory, { recursive: true });
-    });
-    const url = await new Promise<string>((resolve, reject) => {
-      runner.once("error", reject);
-      runner.once("exit", (code) =>
-        reject(new Error(`Runner exited ${code}: ${errors}`)),
-      );
-      lines.on("line", (line) => {
-        try {
-          const value = JSON.parse(line);
-          if (value.ready) resolve(value.url);
-        } catch {}
-      });
-    });
-    const path = "/v1/workspaces/live-bot";
-    const request = async (suffix: string, method = "GET", body?: unknown) => {
-      const response = await fetch(url + path + suffix, {
-        method,
-        headers: { "content-type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      assert.ok(
-        response.ok,
-        `${method} ${suffix}: ${response.status} ${await response.clone().text()}`,
-      );
-      return response.json();
-    };
-    let release: import("node:http").ServerResponse | undefined;
+    // A private, gated tool round comes from an installation MCP connector,
+    // so the bot runs as a lifecycle-owned Pod runtime.
+    let release: ((text: string) => void) | undefined;
     let started = () => {};
     let toolStarted = new Promise<void>((resolve) => (started = resolve));
-    const gate = createServer((_req, res) => {
-      release = res;
-      started();
+    const gate = await startMcpOAuthServer({
+      onWait: (reply) => {
+        release = reply;
+        started();
+      },
     });
-    gate.listen(0, "127.0.0.1");
-    await once(gate, "listening");
-    t.after(async () => {
-      gate.closeAllConnections();
-      await new Promise<void>((resolve) => gate.close(() => resolve()));
+    const authority = await createProviderAuthAuthority({
+      authPath: join(directory, "authority", "auth.json"),
     });
-    const mcp = join(directory, "gate.mjs");
-    await writeFile(
-      mcp,
-      `import { createInterface } from "node:readline";
-const lines = createInterface({ input: process.stdin });
-lines.on("line", async (line) => {
-  const message = JSON.parse(line);
-  if (!("id" in message)) return;
-  let result;
-  if (message.method === "initialize") {
-    result = {
-      protocolVersion: "2025-11-25",
-      capabilities: { tools: {} },
-      serverInfo: { name: "gate", version: "1" },
-    };
-  } else if (message.method === "tools/list") {
-    result = { tools: [{
-      name: "wait",
-      description: "Wait for fixture release",
-      inputSchema: { type: "object", properties: {} },
-    }] };
-  } else if (message.method === "tools/call") {
-    await fetch("http://127.0.0.1:${(gate.address() as { port: number }).port}");
-    result = { content: [{ type: "text", text: "PRIVATE_GATE_TOOL_RESULT" }] };
-  } else throw new Error("Unexpected fixture request: " + message.method);
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
-});
-`,
+    await new Promise<void>((resolve) =>
+      authority.server.listen(0, "127.0.0.1", () => resolve()),
     );
-    await request("", "PUT", {
+    const authorityUrl = `http://127.0.0.1:${(authority.server.address() as { port: number }).port}`;
+    await fetch(`${authorityUrl}/v1/connectors`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "gate", url: gate.url }),
+    });
+    await signInConnector(authorityUrl, gate, "gate");
+    const lifecycle = await startPodLifecycle({ authorityUrl });
+    const bot = await startPodRunner(directory, lifecycle, {
       id: "live-bot",
       name: "Live bot",
       role: "bot",
-      environment: "local",
-      mcpServers: [
-        { id: "gate", command: process.execPath, args: [mcp], tools: ["wait"] },
-      ],
+      model: false,
     });
+    t.after(async () => {
+      await bot.stop();
+      await lifecycle.close();
+      await authority.close();
+      await gate.close();
+      await rm(directory, { recursive: true });
+    });
+    const url = bot.url;
+    const errors = () => bot.errors;
+    const request = async (suffix: string, method = "GET", body?: unknown) => {
+      const response = await bot.request(suffix, method, body);
+      assert.ok(
+        response.status < 300,
+        `${method} ${suffix}: ${response.status} ${JSON.stringify(response.body)}`,
+      );
+      return response.body;
+    };
     let ready = () => {};
     let startup = new Promise<void>((resolve) => (ready = resolve));
     const proxy = createServer((req, res) => {
@@ -240,6 +192,8 @@ lines.on("line", async (line) => {
         `http://127.0.0.1:${(proxy.address() as { port: number }).port}`,
         "--workspace",
         "live-bot",
+        "--token-file",
+        bot.tokenFile,
       ];
       const child = spawn(
         "script",
@@ -286,7 +240,7 @@ lines.on("line", async (line) => {
             () =>
               reject(
                 new Error(
-                  `Missing bot screen ${description}: ${screen.text()}; output=${text()}; runner=${errors}`,
+                  `Missing bot screen ${description}: ${screen.text()}; output=${text()}; runner=${errors()}`,
                 ),
               ),
             5000,
@@ -329,6 +283,7 @@ lines.on("line", async (line) => {
       url,
       workspaceId: "live-bot",
       autoModelSelector: false,
+      tokenFile: bot.tokenFile,
     });
     const runtime = new DurableInteractiveRuntime(transport);
     t.after(async () => {
@@ -447,7 +402,7 @@ lines.on("line", async (line) => {
     const third = attach();
     await startup;
     await third.waitFor("Working");
-    release!.end("released");
+    release!("PRIVATE_GATE_TOOL_RESULT");
     await idle;
     await third.waitForIdle();
     assert.equal(runtime.sessionProjection().isStreaming, false);
@@ -471,7 +426,7 @@ lines.on("line", async (line) => {
     });
     await Promise.all([toolStarted, active]);
     await third.waitFor("Working");
-    release!.end("released before failure");
+    release!("PRIVATE_GATE_TOOL_RESULT");
     await idle;
     await third.waitForIdle();
     assert.equal(
@@ -503,7 +458,7 @@ lines.on("line", async (line) => {
       false,
       "explicit abort clears bot activity",
     );
-    release!.end("released after abort");
+    release!("PRIVATE_GATE_TOOL_RESULT");
     assert.doesNotMatch(third.text(), /PRIVATE_GATE_TOOL_RESULT/);
     assert.ok(
       runtime

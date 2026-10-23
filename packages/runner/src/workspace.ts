@@ -62,7 +62,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { BotProfileDocument, botExtension } from "./bot.ts";
 import type { BotAgentManagement } from "./bot-management.ts";
-import { openMcpExtension } from "./mcp.ts";
+import { WorkspaceConnectors, type ConnectorLifecycle } from "./connectors.ts";
 import {
   applyGoal,
   applyLoop,
@@ -185,7 +185,6 @@ export class Workspace {
   closed = false;
   passive = false;
   lastError?: string;
-  mcpError?: string;
   localEnv?: NodeExecutionEnv;
   kubeEnv?: KubernetesExecutionEnv;
   private execution?: ExecutionEnv;
@@ -208,7 +207,7 @@ export class Workspace {
   >["loopTask"];
   private unsubscribe: () => void;
   private sandbox?: CodemodeSandbox;
-  private mcpClose?: () => Promise<void>;
+  private connectors?: WorkspaceConnectors;
   private constructor(
     config: WorkspaceConfig,
     harness: Workspace["harness"],
@@ -219,7 +218,7 @@ export class Workspace {
     registry: ReturnType<typeof createRegistry>,
     assertActive: (signal?: AbortSignal) => Promise<void>,
     loopTask: Workspace["loopTask"],
-    mcpClose?: () => Promise<void>,
+    connectors?: WorkspaceConnectors,
   ) {
     this.config = config;
     this.harness = harness;
@@ -230,7 +229,7 @@ export class Workspace {
     this.registry = registry;
     this.assertActive = assertActive;
     this.loopTask = loopTask;
-    this.mcpClose = mcpClose;
+    this.connectors = connectors;
     this.unsubscribe = harness.subscribeCommits((publication) => {
       this.cacheWarming.observeCommit(publication);
       this.events.emit("change");
@@ -348,6 +347,7 @@ export class Workspace {
     deferActivation = false,
     runtimeProvider?: string,
     availability?: LifecycleAuthorityAvailability,
+    connectorLifecycle?: ConnectorLifecycle,
   ): Promise<Workspace> {
     if (!passive) await assertActive();
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -358,7 +358,6 @@ export class Workspace {
     );
     let openedWorkspace: Workspace | undefined;
     let reportedError: string | undefined;
-    let mcpError: string | undefined;
     const recordError = (error: unknown) => {
       reportedError = (
         error instanceof Error
@@ -366,14 +365,6 @@ export class Workspace {
           : String(error)
       ).slice(0, 2000);
       if (openedWorkspace) openedWorkspace.lastError = reportedError;
-    };
-    const recordMcpError = (error: unknown) => {
-      mcpError = (
-        error instanceof Error
-          ? `${error.name}: ${error.message}`
-          : String(error)
-      ).slice(0, 2000);
-      if (openedWorkspace) openedWorkspace.mcpError = mcpError;
     };
     const registry = createRegistry();
     registry.install(
@@ -428,7 +419,7 @@ export class Workspace {
     let localEnv: NodeExecutionEnv | undefined;
     let kubeEnv: KubernetesExecutionEnv | undefined;
     let sandbox: CodemodeSandbox | undefined;
-    let mcp: Awaited<ReturnType<typeof openMcpExtension>> | undefined;
+    let connectors: WorkspaceConnectors | undefined;
     let closeOpenedState: (() => Promise<void>) | undefined;
     try {
       if (config.role === "coding") {
@@ -449,11 +440,16 @@ export class Workspace {
           });
         }
       }
+      if (connectorLifecycle && !passive) {
+        // Every agent, coding or bot, receives every installation connector.
+        connectors = new WorkspaceConnectors(
+          connectorLifecycle,
+          registry,
+          assertActive,
+        );
+        await connectors.reconcile();
+      }
       if (config.role === "bot") {
-        if (!passive && config.mcpServers?.length) {
-          mcp = await openMcpExtension(config, assertActive, recordMcpError);
-          registry.install(mcp.extension);
-        }
         sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });
         if (!botAgents)
           throw new Error("Bot agent management transport is not configured");
@@ -575,10 +571,6 @@ export class Workspace {
                   conversationId,
                 );
                 profile.state = "collecting";
-                profile.approvedToolGrants = (config.mcpServers ?? []).flatMap(
-                  (server) =>
-                    server.tools.map((tool) => `${server.id}:${tool}`),
-                );
               }
             : undefined,
       });
@@ -607,13 +599,12 @@ export class Workspace {
         registry,
         assertActive,
         schedule.loopTask,
-        mcp?.close,
+        connectors,
       );
       openedWorkspace = workspace;
       workspace.resources = resources;
       if (!passive) workspace.refreshExtensionRegistry();
       workspace.lastError = reportedError;
-      workspace.mcpError = mcpError;
       workspace.localEnv = localEnv;
       workspace.kubeEnv = kubeEnv;
       workspace.execution = localEnv ?? kubeEnv;
@@ -627,7 +618,7 @@ export class Workspace {
       const cleanupErrors: unknown[] = [];
       for (const cleanup of [
         openedWorkspace ? () => openedWorkspace!.close(true) : closeOpenedState,
-        openedWorkspace ? undefined : mcp?.close,
+        openedWorkspace ? undefined : connectors?.close.bind(connectors),
         openedWorkspace ? undefined : sandbox?.close.bind(sandbox),
         openedWorkspace ? undefined : kubeEnv?.cleanup.bind(kubeEnv, context),
         openedWorkspace ? undefined : localEnv?.cleanup.bind(localEnv, context),
@@ -687,7 +678,7 @@ export class Workspace {
       latestAssistant?.role === "assistant" &&
       latestAssistant.stopReason === "error"
         ? (latestAssistant.errorMessage ?? "The provider request failed")
-        : (this.mcpError ?? this.lastError);
+        : this.lastError;
     const profile =
       this.config.role === "bot"
         ? await this.harness.snapshot(
@@ -717,6 +708,7 @@ export class Workspace {
       loops: schedule.loops,
       tasks: inspection.tasks,
       error,
+      connectors: this.connectors?.status() ?? [],
       tools: (await this.conversation.agent(context)).tools.map(
         (tool) => tool.name,
       ),
@@ -728,6 +720,8 @@ export class Workspace {
     requestId?: string,
     whenBusy: "steer" | "followUp" | "reject" = "steer",
   ) {
+    // Connector changes reach running agents at their next turn.
+    await this.connectors?.reconcile();
     return this.withAdmission(async () => {
       if (!this.config.model)
         throw new ApiError(
@@ -947,7 +941,7 @@ export class Workspace {
     );
   }
 
-  admitLoopInput(
+  async admitLoopInput(
     message: string,
     requestId: string,
     loopId: string,
@@ -955,6 +949,7 @@ export class Workspace {
     conversationId: ConversationId,
     call: Context,
   ) {
+    await this.connectors?.reconcile();
     return this.withAdmission(async () => {
       const schedule = await this.harness.snapshot(
         scheduleDocument,
@@ -1098,7 +1093,6 @@ export class Workspace {
               profile.state = botProfile.state;
               profile.identity = botProfile.identity;
               profile.purpose = botProfile.purpose;
-              profile.approvedToolGrants = botProfile.approvedToolGrants;
             }
           : undefined,
       );
@@ -1846,7 +1840,7 @@ export class Workspace {
       () => this.localEnv?.cleanup(context),
       () => this.harness.close(context),
       () => this.sandbox?.close(),
-      () => this.mcpClose?.(),
+      () => this.connectors?.close(),
     ])
       await attempt(async () => {
         await cleanup();

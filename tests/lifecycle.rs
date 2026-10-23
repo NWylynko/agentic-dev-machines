@@ -166,7 +166,7 @@ fn start_runtime_status_server(root: &Path) -> (u16, thread::JoinHandle<()>) {
                 write!(stream, "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
                 continue;
             }
-            let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"}}"#;
+            let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"},"connectors":[{"name":"linear","status":"sign_in_required","error":"MCP connector linear needs sign-in: run adm mcp login linear"}]}"#;
             write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
         }
     });
@@ -217,7 +217,7 @@ fn workspace_spec(name: &str) -> Value {
         "name":name,"role":"coding","image":"test-image","storage_class":"test-storage",
         "storage_size":"1Gi","cpu":"1","memory":"1Gi","agent_enabled":true,
         "repositories":false,"catalog":{"repositories":[]},"repository":null,
-        "cwd":"/repos","model":null,"mcp_servers":null,"herdr_space":null
+        "cwd":"/repos","model":null,"herdr_space":null
     })
 }
 
@@ -719,7 +719,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         "name":"forged","role":"coding","image":"test-image","storage_class":"test-storage",
         "storage_size":"1Gi","cpu":"1","memory":"1Gi","agent_enabled":false,
         "allow_sudo":false,"allow_node_local_storage":false,"repositories":false,"catalog":{"repositories":[]},
-        "repository":null,"cwd":"/repos","model":null,"mcp_servers":null,
+        "repository":null,"cwd":"/repos","model":null,
         "herdr_space":null,"id":"foreign-id","namespace":"somebody-elses-namespace","phase":"ready"
     }});
     let forged_response = request_with_token(
@@ -1307,6 +1307,11 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         replacement_entry["runtime_status"]["selectedModel"]["id"],
         "gpt-test"
     );
+    assert_eq!(
+        replacement_entry["runtime_status"]["connectors"],
+        json!([{"name":"linear","status":"sign_in_required","error":"MCP connector linear needs sign-in: run adm mcp login linear"}]),
+        "connector failures reach adm status"
+    );
     fs::write(root.path().join("runtime-status-hold"), "").unwrap();
     let held_started = Instant::now();
     let held_directory: Vec<Value> = request_with_token(
@@ -1538,32 +1543,73 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         let database =
             rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
         database.execute("UPDATE workspaces SET phase='provisioning',spec=json_set(spec,'$.phase','provisioning') WHERE id=?1", [runtime_id]).unwrap();
-        let responses: Vec<_> = ["catalog", "resolve"]
+        // Pods reach provider auth and the token-free connector catalog and
+        // access tokens only with their own current identity.
+        let runtime_routes = [
+            "/v1/provider-auth/catalog",
+            "/v1/provider-auth/resolve",
+            "/v1/runtime/connectors/catalog",
+            "/v1/runtime/connectors/token",
+        ];
+        let responses: Vec<_> = runtime_routes
             .into_iter()
-            .map(|endpoint| {
+            .map(|path| {
                 request_with_token(
                     &url,
                     "POST",
-                    &format!("/v1/provider-auth/{endpoint}"),
-                    Some(&json!({"provider":"synthetic"})),
+                    path,
+                    Some(&json!({"provider":"synthetic","name":"linear"})),
                     Some("runtime-token"),
                 )
                 .unwrap()
             })
             .collect();
-        let foreign_responses: Vec<_> = ["catalog", "resolve"]
+        let foreign_responses: Vec<_> = runtime_routes
             .into_iter()
-            .map(|endpoint| {
+            .map(|path| {
                 request_with_token(
                     &url,
                     "POST",
-                    &format!("/v1/provider-auth/{endpoint}"),
-                    Some(&json!({"provider":"synthetic"})),
+                    path,
+                    Some(&json!({"provider":"synthetic","name":"linear"})),
                     Some("other-pod-token"),
                 )
                 .unwrap()
             })
             .collect();
+        // Connector administration is a lifecycle-credential operation.
+        let admin_responses: Vec<_> = [
+            ("GET", "/v1/connectors"),
+            ("POST", "/v1/connectors/linear/sign-in"),
+        ]
+        .into_iter()
+        .map(|(method, path)| {
+            request_with_token(
+                &url,
+                method,
+                path,
+                Some(&json!({"redirectUrl":"http://127.0.0.1:1/callback"})),
+                Some("synthetic-lifecycle-token"),
+            )
+            .unwrap()
+        })
+        .collect();
+        let pod_admin = request_with_token(
+            &url,
+            "POST",
+            "/v1/connectors/linear/logout",
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap();
+        let escaped = request_with_token(
+            &url,
+            "POST",
+            "/v1/connectors/linear/unknown",
+            Some(&json!({})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
         database.execute("UPDATE workspaces SET phase='ready',spec=json_set(spec,'$.phase','ready') WHERE id=?1", [runtime_id]).unwrap();
         let mut stop = TcpStream::connect("127.0.0.1:7434").unwrap();
         stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -1584,7 +1630,14 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
                 "a foreign Pod cannot reach the shared authority"
             );
         }
-        assert_eq!(received.len(), 2);
+        for response in admin_responses {
+            assert_eq!(response.status(), 200, "{}", response.text().unwrap());
+        }
+        assert_eq!(pod_admin.status(), 401, "Pods cannot administer connectors");
+        assert_eq!(escaped.status(), 400, "{}", escaped.text().unwrap());
+        assert_eq!(received.len(), 6, "{received:#?}");
+        assert!(received[2].starts_with("POST /v1/runtime/connectors/catalog "));
+        assert!(received[5].starts_with("POST /v1/connectors/linear/sign-in "));
         let unavailable = request_with_token(
             &url,
             "POST",
@@ -2380,7 +2433,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             .iter()
             .all(|entry| entry["role"] == "coding")
     );
-    for private_field in ["credential_env", "mcp_servers", "kubeconfig"] {
+    for private_field in ["credential_env", "kubeconfig"] {
         assert!(
             runtime_directory
                 .as_array()

@@ -1,3 +1,4 @@
+mod connectors;
 mod diagnostics;
 mod herdr;
 mod lease;
@@ -225,6 +226,11 @@ pub enum Action {
     Login { provider: Option<String> },
     /// Revoke the shared provider login.
     Logout { provider: String },
+    /// Manage MCP connectors shared by every agent in this installation.
+    Mcp {
+        #[command(subcommand)]
+        command: connectors::McpAction,
+    },
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
     Herdr {
         #[command(subcommand)]
@@ -316,6 +322,7 @@ impl Cli {
             "connect",
             "login",
             "logout",
+            "mcp",
             "start",
             "serve",
             "lifecycle-serve",
@@ -869,6 +876,20 @@ fn print_summary_errors(status: &Value) {
     } else if activity["status"] == "unavailable" {
         println!("Agent unavailable for {identity}: workspace runtime did not report a cause");
     }
+    for connector in workspace["runtime_status"]["connectors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|connector| connector["status"] != "connected")
+    {
+        println!(
+            "MCP connector {} unavailable for {identity}: {}",
+            connector["name"].as_str().unwrap_or("unknown"),
+            connector["error"]
+                .as_str()
+                .unwrap_or("the runtime did not report a cause")
+        );
+    }
     if let Some(error) = workspace["last_error"].as_str() {
         println!("Workspace failure for {identity}: {error}");
     }
@@ -1339,6 +1360,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Action::Login { provider } => provider_auth::login(cli, provider.as_deref()),
         Action::Logout { provider } => provider_auth::logout(cli, provider),
+        Action::Mcp { command } => connectors::run(cli, command),
         Action::Herdr { command } => {
             herdr::run(cli, command.as_ref().unwrap_or(&herdr::HerdrAction::Hook))
         }

@@ -86,8 +86,6 @@ pub struct CreateIntent {
     #[serde(default)]
     pub credential_env: Vec<crate::workspaces::CredentialEnvRef>,
     #[serde(default)]
-    pub mcp_servers: Option<Value>,
-    #[serde(default)]
     pub herdr_space: Option<String>,
 }
 
@@ -115,7 +113,6 @@ impl CreateIntent {
             cwd: workspace.cwd.clone(),
             model: workspace.model.clone(),
             credential_env: workspace.credential_env.clone(),
-            mcp_servers: workspace.mcp_servers.clone(),
             herdr_space: workspace.herdr_space.clone(),
         }
     }
@@ -220,10 +217,6 @@ impl CreateIntent {
             }),
             "model accepts only provider and id"
         );
-        ensure!(
-            self.mcp_servers.as_ref().is_none_or(Value::is_array),
-            "MCP config must be a JSON array"
-        );
         let id = uuid::Uuid::new_v4().simple().to_string();
         Ok(Workspace {
             id: id.clone(),
@@ -249,7 +242,6 @@ impl CreateIntent {
             cwd: self.cwd,
             model: self.model,
             credential_env: self.credential_env,
-            mcp_servers: self.mcp_servers,
             herdr_space: self.herdr_space,
             created_at: crate::workspaces::now(),
             last_error: None,
@@ -797,7 +789,10 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
         || (method == "POST"
             && matches!(
                 path,
-                "/v1/provider-auth/resolve" | "/v1/provider-auth/catalog"
+                "/v1/provider-auth/resolve"
+                    | "/v1/provider-auth/catalog"
+                    | "/v1/runtime/connectors/catalog"
+                    | "/v1/runtime/connectors/token"
             ))
         || (method == "POST"
             && path
@@ -997,13 +992,20 @@ fn route(
             serde_json::json!({"maintenanceId":request.maintenance_id,"completed":true,"expiresAt":expires_at}),
         ));
     }
-    if path.starts_with("/v1/provider-auth/") {
+    if path.starts_with("/v1/provider-auth/")
+        || path == "/v1/connectors"
+        || path.starts_with("/v1/connectors/")
+        || path.starts_with("/v1/runtime/connectors/")
+    {
         cli.check_lifecycle_fence()?;
     }
     if method == "POST"
         && matches!(
             path,
-            "/v1/provider-auth/resolve" | "/v1/provider-auth/catalog"
+            "/v1/provider-auth/resolve"
+                | "/v1/provider-auth/catalog"
+                | "/v1/runtime/connectors/catalog"
+                | "/v1/runtime/connectors/token"
         )
     {
         let caller = authorize_runtime_caller(cli, &store, authorization)?;
@@ -1013,7 +1015,10 @@ fn route(
         );
         return proxy_provider_auth(method, path, body);
     }
-    if path.starts_with("/v1/provider-auth/") {
+    if path.starts_with("/v1/provider-auth/")
+        || path == "/v1/connectors"
+        || path.starts_with("/v1/connectors/")
+    {
         return proxy_provider_auth(method, path, body);
     }
     if method == "GET" && path == "/v1/runtime/workspaces" {
@@ -1271,7 +1276,8 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
                 | "/v1/provider-auth/logout"
                 | "/v1/provider-auth/resolve"
                 | "/v1/provider-auth/catalog"
-        ) || path.starts_with("/v1/provider-auth/login/") && login_route,
+        ) || path.starts_with("/v1/provider-auth/login/") && login_route
+            || is_connector_route(method, path),
         "unknown provider auth route"
     );
     ensure!(
@@ -1300,6 +1306,41 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
         serde_json::from_slice(&bytes).context("decode provider authentication response")?
     };
     Ok((status, value))
+}
+
+/// Installation MCP connector routes served by the shared authority: the
+/// token-free runtime catalog and access tokens for Pods, and administration
+/// (add, remove, sign-in, logout) for lifecycle-credential callers.
+fn is_connector_route(method: &str, path: &str) -> bool {
+    if method == "POST"
+        && matches!(
+            path,
+            "/v1/runtime/connectors/catalog" | "/v1/runtime/connectors/token"
+        )
+    {
+        return true;
+    }
+    if path == "/v1/connectors" {
+        return matches!(method, "GET" | "POST");
+    }
+    let Some(rest) = path.strip_prefix("/v1/connectors/") else {
+        return false;
+    };
+    let (name, action) = rest.split_once('/').unwrap_or((rest, ""));
+    let valid_name = name.len() <= 32
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    valid_name
+        && matches!(
+            (method, action),
+            ("DELETE", "")
+                | ("POST", "logout")
+                | ("POST", "sign-in")
+                | ("DELETE", "sign-in")
+                | ("POST", "sign-in/complete")
+        )
 }
 
 fn enrich_runtime_status(cli: &crate::Cli, workspaces: &mut [Workspace]) -> Result<()> {
@@ -1494,6 +1535,11 @@ fn collect_runtime_status(
                             .filter(|model| !model.is_null())
                             .map(|model| serde_json::json!({"provider":model["provider"],"id":model["id"]}))
                             .unwrap_or(Value::Null);
+                        // Installation MCP connectors this runtime cannot use.
+                        status["connectors"] = report
+                            .get("connectors")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Array(Vec::new()));
                     }
                 }
                 Ok(_) => set_runtime_activity_unavailable(
@@ -1521,6 +1567,28 @@ fn valid_runtime_status_report(report: &Value) -> bool {
     if activity["error"]
         .as_str()
         .is_some_and(|error| error.len() > 2000)
+    {
+        return false;
+    }
+    if let Some(connectors) = report.get("connectors")
+        && !connectors.as_array().is_some_and(|connectors| {
+            connectors.len() <= 64
+                && connectors.iter().all(|connector| {
+                    connector.as_object().is_some_and(|object| {
+                        object
+                            .keys()
+                            .all(|key| ["name", "status", "error"].contains(&key.as_str()))
+                    }) && connector["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty() && name.len() <= 32)
+                        && connector["status"].as_str().is_some_and(|status| {
+                            ["connected", "sign_in_required", "error"].contains(&status)
+                        })
+                        && connector.get("error").is_none_or(|error| {
+                            error.as_str().is_some_and(|error| error.len() <= 2000)
+                        })
+                })
+        })
     {
         return false;
     }

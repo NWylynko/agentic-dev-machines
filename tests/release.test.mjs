@@ -283,7 +283,6 @@ esac
         cwd: "/repos",
         model: null,
         credential_env: [],
-        mcp_servers: null,
         herdr_space: null,
         created_at: 1,
         last_error: null,

@@ -109,18 +109,28 @@ export async function workspaceModels(
         );
       return fauxAssistantMessage("I am ready for setup details.");
     }
-    if (text === "/faux-inspect-system-prompt")
+    if (text === "/faux-inspect-system-prompt") {
+      // Prompt sections in effect now: later system messages replace or
+      // remove (null) the sections earlier ones declared.
+      const sections: Record<string, string> = {};
+      for (const message of transcript.messages)
+        if (message.role === "system")
+          for (const [key, value] of Object.entries(message.sections ?? {}))
+            if (value === null) delete sections[key];
+            else sections[key] = value;
       return fauxAssistantMessage(
-        JSON.stringify(
-          transcript.messages.map((message) => ({
+        JSON.stringify([
+          ...transcript.messages.map((message) => ({
             role: message.role,
             content:
               typeof message.content === "string"
                 ? message.content
                 : JSON.stringify(message.content),
           })),
-        ),
+          { role: "sections", content: sections },
+        ]),
       );
+    }
     if (failAfterTools && turns > 0) {
       return fauxAssistantMessage([], {
         stopReason: "error",

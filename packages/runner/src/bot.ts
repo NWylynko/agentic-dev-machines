@@ -22,7 +22,6 @@ export type BotProfile = {
   state: "needs_setup" | "collecting" | "ready";
   identity: string;
   purpose: string;
-  approvedToolGrants: string[];
 };
 
 export const BotProfileDocument = defineDoc<BotProfile>({
@@ -35,7 +34,6 @@ export const BotProfileDocument = defineDoc<BotProfile>({
     state: "needs_setup",
     identity: "",
     purpose: "",
-    approvedToolGrants: [],
   }),
 });
 
@@ -57,8 +55,8 @@ export function botExtension(
           );
           if (!profile) return undefined;
           if (profile.state !== "ready")
-            return "You are a bot being set up. Ask the user for your identity and purpose. Publish setup questions and confirmations only by calling sendMessage. Save a confirmed identity and purpose with saveProfile before acting on them. The host controls MCP grants: you may ask the user to grant a tool, but cannot grant it yourself or claim to have access before it is available.";
-          return `You are ${profile.identity}. Your purpose is: ${profile.purpose}\nApproved MCP tools: ${profile.approvedToolGrants.length ? profile.approvedToolGrants.join(", ") : "none"}. The host controls these grants: you may ask the user to grant an additional tool, but cannot grant it yourself or claim to have access before it is available. Publish user-facing messages only with sendMessage.`;
+            return "You are a bot being set up. Ask the user for your identity and purpose. Publish setup questions and confirmations only by calling sendMessage. Save a confirmed identity and purpose with saveProfile before acting on them.";
+          return `You are ${profile.identity}. Your purpose is: ${profile.purpose}\nPublish user-facing messages only with sendMessage.`;
         },
       },
     ],
@@ -378,7 +376,6 @@ export function botExtension(
             cwd: args.repository ? `/repos/${args.repository}` : "/repos",
             model: args.model,
             credential_env: [],
-            mcp_servers: null,
             herdr_space: null,
           };
           const result = await agents.createAgent(

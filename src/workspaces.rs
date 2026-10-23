@@ -97,8 +97,6 @@ pub struct Workspace {
     pub model: Option<Value>,
     #[serde(default)]
     pub credential_env: Vec<CredentialEnvRef>,
-    #[serde(default)]
-    pub mcp_servers: Option<Value>,
     pub herdr_space: Option<String>,
     pub created_at: u64,
     pub last_error: Option<String>,
@@ -166,9 +164,6 @@ pub struct CreateOptions {
     pub allow_node_local_storage: bool,
     #[arg(long, conflicts_with = "herdr")]
     pub herdr_space: Option<String>,
-    /// JSON file containing host-configured stdio MCP servers and exact tool grants.
-    #[arg(long)]
-    pub mcp_config: Option<std::path::PathBuf>,
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -297,10 +292,6 @@ impl CreateOptions {
             "--catalog is only supported for coding workspaces"
         );
         ensure!(
-            self.role == "bot" || self.mcp_config.is_none(),
-            "--mcp-config is only supported for bot workspaces"
-        );
-        ensure!(
             self.repo.is_none() || self.catalog.is_none(),
             "--repo cannot be combined with --catalog"
         );
@@ -340,20 +331,6 @@ impl CreateOptions {
             )?,
             None => json!({"repositories":[]}),
         };
-        let mcp_servers = match &self.mcp_config {
-            Some(path) => {
-                let value: Value = serde_json::from_slice(
-                    &fs::read(path)
-                        .with_context(|| format!("read MCP config {}", path.display()))?,
-                )?;
-                ensure!(
-                    value.is_array(),
-                    "MCP config file must contain a JSON array"
-                );
-                Some(value)
-            }
-            None => None,
-        };
         let cwd = self.repo.as_ref().map_or_else(
             || "/repos".to_owned(),
             |repository| format!("/repos/{repository}"),
@@ -382,7 +359,6 @@ impl CreateOptions {
             cwd,
             model,
             credential_env,
-            mcp_servers,
             herdr_space: self.herdr_space.clone(),
             created_at: now(),
             last_error: None,
@@ -1397,14 +1373,7 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         "role":w.role,
         "environment":"pod",
         "model":w.model,
-        "mcpServers":w.mcp_servers,
     });
-    if workspace_config["mcpServers"].is_null() {
-        workspace_config
-            .as_object_mut()
-            .unwrap()
-            .remove("mcpServers");
-    }
     if w.role == "coding" {
         workspace_config["localRoot"] = json!("/workspace");
         workspace_config["cwd"] = json!(w.cwd);
@@ -2076,7 +2045,6 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.cwd == requested.cwd
         && existing.model == requested.model
         && existing.credential_env == requested.credential_env
-        && existing.mcp_servers == requested.mcp_servers
         && existing.herdr_space == requested.herdr_space
 }
 

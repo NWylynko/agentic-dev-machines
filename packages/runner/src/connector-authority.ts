@@ -322,7 +322,7 @@ export async function createConnectorAuthority({
     }
     // The grant is intact (for example a network failure); a later call retries.
     throw new ConnectorError(
-      502,
+      409,
       "CONNECTOR_REFRESH_FAILED",
       `MCP connector ${name} could not refresh its access token${failure ? `: ${failure}` : ""}`,
     );
