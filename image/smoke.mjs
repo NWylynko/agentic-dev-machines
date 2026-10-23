@@ -219,17 +219,17 @@ server.listen(7433, "127.0.0.1", () => {
     const probe = String.raw`
 const headers = { authorization: "Bearer pod-runtime-smoke-token", "content-type": "application/json" };
 const get = async (path) => fetch("http://127.0.0.1:7432" + path, { headers });
-let health;
-for (let attempt = 0; attempt < 100; attempt++) {
-  try { health = await get("/health"); break; }
-  catch (error) {
-    if (attempt === 99) throw error;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+// /health is liveness and answers 200 while the runtime is still starting;
+// /ready only answers 200 once the runtime holds its lease and serves the API.
+let ready;
+for (let attempt = 0; attempt < 200; attempt++) {
+  try { ready = await get("/ready"); if (ready.ok) break; }
+  catch (error) { if (attempt === 199) throw error; }
+  await new Promise((resolve) => setTimeout(resolve, 50));
 }
-if (!health.ok) throw new Error("workspace runtime did not become ready");
+if (!ready?.ok) throw new Error("workspace runtime did not become ready: " + (ready ? ready.status + " " + await ready.text() : "unreachable"));
 const unauthorized = await fetch("http://127.0.0.1:7432/v1/workspaces");
-if (unauthorized.status !== 401) throw new Error("workspace API accepted unauthenticated access");
+if (unauthorized.status !== 401) throw new Error("workspace API accepted unauthenticated access: " + unauthorized.status + " " + await unauthorized.text());
 const status = await get("/v1/workspaces/image-pod-runtime");
 if (!(await status.json()).id) throw new Error("workspace was not registered by its Pod runtime");
 const input = await fetch("http://127.0.0.1:7432/v1/workspaces/image-pod-runtime/input", {
@@ -265,19 +265,17 @@ for (let attempt = 0; attempt < 100; attempt++) {
     await docker("start", runtimeContainer);
     running = true;
 const recovery = String.raw`
-let response;
-for (let attempt = 0; attempt < 100; attempt++) {
-  try {
-    response = await fetch("http://127.0.0.1:7432/v1/workspaces/image-pod-runtime/history?diagnostics=true", {
-      headers: { authorization: "Bearer pod-runtime-smoke-token" },
-    });
-    break;
-  } catch (error) {
-    if (attempt === 99) throw error;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+let ready;
+for (let attempt = 0; attempt < 200; attempt++) {
+  try { ready = await fetch("http://127.0.0.1:7432/ready"); if (ready.ok) break; }
+  catch (error) { if (attempt === 199) throw error; }
+  await new Promise((resolve) => setTimeout(resolve, 50));
 }
-if (!response.ok) throw new Error("workspace history unavailable after Pod process restart");
+if (!ready?.ok) throw new Error("workspace runtime did not become ready after Pod process restart: " + (ready ? ready.status + " " + await ready.text() : "unreachable"));
+const response = await fetch("http://127.0.0.1:7432/v1/workspaces/image-pod-runtime/history?diagnostics=true", {
+  headers: { authorization: "Bearer pod-runtime-smoke-token" },
+});
+if (!response.ok) throw new Error("workspace history unavailable after Pod process restart: " + response.status + " " + await response.text());
 const history = await response.json();
 if (!history.events.some((event) => event.kind === "assistant")) throw new Error("workspace history did not survive process restart");
 `;
