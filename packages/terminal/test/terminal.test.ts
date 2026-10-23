@@ -145,7 +145,10 @@ async function fixture(
         after: url.searchParams.get("after"),
         diagnostics: url.searchParams.get("diagnostics"),
       });
-      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       res.write(": attached\n\n");
     } else if (req.method === "GET") {
       res.end(
@@ -635,7 +638,10 @@ test(
         );
       } else if (req.url?.includes("/events")) {
         assert.match(req.url, /diagnostics=true/);
-        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "x-adm-events-keepalive-ms": "60000",
+        });
         res.write(": attached\n\n");
       } else if (
         new URL(req.url!, "http://localhost").pathname.endsWith("/models")
@@ -710,7 +716,10 @@ test(
       if (url.pathname.endsWith("/history")) {
         res.end(JSON.stringify({ events: [], nextAfter: 0, hasMore: false }));
       } else if (url.pathname.endsWith("/events")) {
-        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "x-adm-events-keepalive-ms": "60000",
+        });
         res.write(": attached\n\n");
       } else if (url.pathname.endsWith("/models")) {
         res.end(
@@ -1044,7 +1053,10 @@ test("terminal re-reads the verified Pod identity so token rotation keeps status
       return;
     }
     if (request.url?.includes("/events")) {
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
       return;
     }

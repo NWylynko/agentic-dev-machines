@@ -50,12 +50,19 @@ const { values } = parseArgs({
     "workspace-config": { type: "string" },
     "lifecycle-url": { type: "string" },
     "pod-uid": { type: "string" },
+    "events-keepalive-ms": { type: "string", default: "15000" },
   },
 });
 const host = values.host!,
   port = Number(values.port),
   stateDirectory = values["state-dir"]!;
 const tokenFile = values["token-file"];
+// Event streams carry an SSE comment at this interval and declare it in the
+// `x-adm-events-keepalive-ms` header, so a client can tell a silent half-open
+// stream from an idle workspace.
+const eventsKeepaliveMs = Number(values["events-keepalive-ms"]);
+if (!Number.isSafeInteger(eventsKeepaliveMs) || eventsKeepaliveMs < 1)
+  throw new Error("--events-keepalive-ms must be a positive integer");
 const lifecycleUrl = values["lifecycle-url"] ?? process.env.ADM_LIFECYCLE_URL;
 if (!["127.0.0.1", "::1", "localhost"].includes(host) && !lifecycleUrl)
   throw new Error(
@@ -1197,6 +1204,13 @@ const server = createServer(async (request, response) => {
     if (!response.writableEnded) requestController.abort();
   });
   try {
+    // An attached terminal reconnects as soon as shutdown ends its stream.
+    // Refuse it and close its connection, which would otherwise hold the
+    // stopping process open.
+    if (stopping) {
+      response.setHeader("connection", "close");
+      throw new ApiError(503, "RUNNER_STOPPING", "The runner is shutting down");
+    }
     if (request.headers.origin)
       throw new ApiError(
         403,
@@ -2163,8 +2177,13 @@ const server = createServer(async (request, response) => {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
+        "x-adm-events-keepalive-ms": String(eventsKeepaliveMs),
       });
       response.flushHeaders();
+      const streamOpenedAt = Date.now();
+      const eventsKeepalive = setInterval(() => {
+        if (!response.destroyed) response.write(": keepalive\n\n");
+      }, eventsKeepaliveMs);
       const streamConversation = workspace.conversation;
       let pumping = false,
         dirty = false,
@@ -2176,20 +2195,32 @@ const server = createServer(async (request, response) => {
       const notify = () => {
         pump();
       };
-      const close = () => {
+      const close = (cause: "client" | "branch" | "workspace") => {
         if (ended) return;
         ended = true;
+        clearInterval(eventsKeepalive);
+        process.stderr.write(
+          `${JSON.stringify({
+            event: "workspace_events_closed",
+            workspaceId: id,
+            cause,
+            upMs: Date.now() - streamOpenedAt,
+            cursor: after,
+          })}\n`,
+        );
         watcherController.abort();
         if (watcher) void watcher.stop();
         workspace.events.off("change", notify);
-        workspace.events.off("branch", close);
-        workspace.events.off("close", close);
+        workspace.events.off("branch", closeOnBranch);
+        workspace.events.off("close", closeOnWorkspace);
         response.end();
       };
+      const closeOnBranch = () => close("branch"),
+        closeOnWorkspace = () => close("workspace");
       workspace.events.on("change", notify);
-      workspace.events.once("branch", close);
-      workspace.events.once("close", close);
-      response.once("close", close);
+      workspace.events.once("branch", closeOnBranch);
+      workspace.events.once("close", closeOnWorkspace);
+      response.once("close", () => close("client"));
       const watcherContext = withAbortSignal(
         watcherController.signal,
         BACKGROUND_CONTEXT,

@@ -1,14 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import {
+  appendFile,
+  mkdir,
   mkdtemp,
   readFile,
   rm,
   stat as statFile,
   writeFile,
 } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { terminalKeybindings } from "./keybindings.ts";
 import {
@@ -316,6 +318,7 @@ export class WorkspaceTerminal extends Container {
   private activeSelector?: Component & { handleInput(data: string): void };
   private modelRuntime?: RemoteModelRuntime;
   private workspaceEventListeners = new Set<(event: WorkspaceEvent) => void>();
+  private eventStreamDropListeners = new Set<(drop: EventStreamDrop) => void>();
   constructor(options: TerminalOptions) {
     super();
     this.options = options;
@@ -594,6 +597,11 @@ export class WorkspaceTerminal extends Container {
     this.workspaceEventListeners.add(listener);
     return () => this.workspaceEventListeners.delete(listener);
   }
+  /** Learn when the connected event stream ends, errors, or falls silent. */
+  subscribeEventStreamDrops(listener: (drop: EventStreamDrop) => void) {
+    this.eventStreamDropListeners.add(listener);
+    return () => this.eventStreamDropListeners.delete(listener);
+  }
   getRemoteSnapshot() {
     return {
       workspaceId: this.options.workspaceId,
@@ -812,12 +820,17 @@ export class WorkspaceTerminal extends Container {
         throw new Error(`Event stream returned HTTP ${response.status}`);
       if (!response.headers.get("content-type")?.includes("text/event-stream"))
         throw new Error("Runner did not return an event stream");
+      const keepaliveMs = Number(
+        response.headers.get("x-adm-events-keepalive-ms"),
+      );
+      if (!Number.isSafeInteger(keepaliveMs) || keepaliveMs < 1)
+        throw new Error("Runner did not declare its event-stream keepalive");
       this.connected = true;
       this.status = `Connected · ${workspaceStatus}`;
       this.refresh();
       if (!catalog.selected && this.options.autoModelSelector !== false)
         this.openModelSelector();
-      void this.consume(response, controller);
+      void this.consume(response, controller, keepaliveMs);
     } catch (error) {
       if (!controller.signal.aborted) {
         this.status = `Connection unavailable: ${error instanceof Error ? error.message : error}. Press Ctrl+R to retry.`;
@@ -980,10 +993,29 @@ export class WorkspaceTerminal extends Container {
       ? `${((totals.lastContext / contextWindow) * 100).toFixed(1)}%/${Math.round(contextWindow / 1000)}k`
       : `${totals.lastContext} context tokens`;
   }
-  private async consume(response: Response, controller: AbortController) {
+  // Reads the event stream until it ends, errors, or carries nothing for three
+  // of the runner's declared keepalive intervals (a half-open connection).
+  private async consume(
+    response: Response,
+    controller: AbortController,
+    keepaliveMs: number,
+  ) {
+    const openedAt = Date.now();
+    let silenced = false;
+    let silenceDeadline: ReturnType<typeof setTimeout> | undefined;
+    let reason: EventStreamDrop["reason"] = "end";
+    let detail: string | undefined;
     try {
       if (!response.body) throw new Error("Event stream has no response body");
       const reader = response.body.getReader();
+      const armSilenceDeadline = () => {
+        clearTimeout(silenceDeadline);
+        silenceDeadline = setTimeout(() => {
+          silenced = true;
+          void reader.cancel();
+        }, 3 * keepaliveMs);
+      };
+      armSilenceDeadline();
       const decoder = new TextDecoder();
       let buffer = "",
         data: string[] = [],
@@ -991,6 +1023,7 @@ export class WorkspaceTerminal extends Container {
       while (true) {
         const part = await reader.read();
         if (part.done) break;
+        armSilenceDeadline();
         buffer += decoder.decode(part.value, { stream: true });
         if (buffer.length > 4 * 1024 * 1024)
           throw new Error("Runner sent an oversized event");
@@ -1011,19 +1044,35 @@ export class WorkspaceTerminal extends Container {
           else if (line.startsWith("event:")) eventType = line.slice(6).trim();
         }
       }
-      if (!controller.signal.aborted) {
-        this.connected = false;
-        this.status =
-          "Disconnected. Press Ctrl+R to reconnect; agents keep working.";
-        this.refresh();
-      }
+      if (silenced) reason = "silence";
     } catch (error) {
-      if (!controller.signal.aborted) {
-        this.connected = false;
-        this.status = `Disconnected: ${error instanceof Error ? error.message : error}. Press Ctrl+R to reconnect.`;
-        this.refresh();
-      }
+      reason = "error";
+      detail = error instanceof Error ? error.message : String(error);
+    } finally {
+      clearTimeout(silenceDeadline);
     }
+    if (controller.signal.aborted) return;
+    controller.abort();
+    this.connected = false;
+    const drop: EventStreamDrop = {
+      reason,
+      upMs: Date.now() - openedAt,
+      ...(detail ? { detail } : {}),
+    };
+    this.status = `Disconnected (${eventStreamDropText(drop)}). Press Ctrl+R to reconnect; agents keep working.`;
+    this.refresh();
+    try {
+      await logTerminalEvent({
+        event: "event_stream_dropped",
+        workspaceId: this.options.workspaceId,
+        cursor: this.cursor,
+        ...drop,
+      });
+    } catch (error) {
+      this.status = `${this.status} Terminal log unavailable: ${error instanceof Error ? error.message : error}`;
+      this.refresh();
+    }
+    for (const listener of this.eventStreamDropListeners) listener(drop);
   }
   handleInput(data: string) {
     if (this.activeSelector) {
@@ -2117,4 +2166,34 @@ async function projectedPodToken(identityPath: string, workspaceId: string) {
     options,
   );
   return tokenResult.stdout.trim();
+}
+
+export type EventStreamDrop = {
+  reason: "end" | "error" | "silence";
+  upMs: number;
+  detail?: string;
+};
+export function eventStreamDropText(drop: EventStreamDrop) {
+  return drop.reason === "silence"
+    ? "event stream went silent"
+    : drop.reason === "end"
+      ? "event stream ended"
+      : `event stream failed: ${drop.detail}`;
+}
+// JSON lines under $XDG_STATE_HOME/adm/terminal.log: the attached terminal
+// owns the screen, so its diagnostics cannot go to stderr.
+export function terminalLogPath() {
+  return join(
+    process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"),
+    "adm",
+    "terminal.log",
+  );
+}
+async function logTerminalEvent(record: Record<string, unknown>) {
+  const path = terminalLogPath();
+  await mkdir(dirname(path), { recursive: true });
+  await appendFile(
+    path,
+    `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`,
+  );
 }

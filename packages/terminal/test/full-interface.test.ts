@@ -137,7 +137,10 @@ test("Pi command aliases open their Durable-backed controls and hotkey help", as
       );
     } else if (url.pathname.endsWith("/events")) {
       stream = response;
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
     } else if (url.pathname.endsWith("/new")) {
       activeConversationId = 10;
@@ -299,7 +302,10 @@ test("/copy copies the selected assistant reply and only explicit bot messages",
         }),
       );
     } else if (url.pathname.endsWith("/events")) {
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
     } else {
       response.end(
@@ -371,7 +377,10 @@ test("provider login and logout delegate to the host CLI and reconnect the Durab
     else if (url.pathname.endsWith("/events")) {
       eventConnections++;
       stream = response;
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
     } else
       response.end(
@@ -463,7 +472,10 @@ test("/export writes the selected Durable transcript as local Markdown", async (
       );
     } else if (url.pathname.endsWith("/events")) {
       stream = response;
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
     } else if (request.method === "GET")
       response.end(
@@ -611,7 +623,10 @@ test("/import reads native Pi JSONL and selects the Pod-imported Durable convers
       );
     else if (url.pathname.endsWith("/events")) {
       stream = response;
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
     } else if (url.pathname.endsWith("/import")) {
       let text = "";
@@ -779,7 +794,10 @@ test("Pi compact and retry controls call the Durable workspace operations", asyn
     }
     if (url.pathname.endsWith("/events")) {
       stream = response;
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
       return;
     }
@@ -864,7 +882,10 @@ test(
         response.end(JSON.stringify({ thinkingLevel: "off" }));
       } else if (url.pathname.endsWith("/events")) {
         stream = response;
-        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "x-adm-events-keepalive-ms": "60000",
+        });
         response.write(": attached\n\n");
       } else if (request.method === "GET") {
         response.setHeader("content-type", "application/json");
@@ -996,7 +1017,10 @@ test(
         );
       } else if (url.pathname.endsWith("/events")) {
         stream = response;
-        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "x-adm-events-keepalive-ms": "60000",
+        });
         response.write(": attached\n\n");
       } else if (request.method === "GET") {
         response.setHeader("content-type", "application/json");
@@ -1208,7 +1232,10 @@ test(
         for (let index = streamWaiters.length - 1; index >= 0; index--)
           if (streams.length >= streamWaiters[index]!.count)
             streamWaiters.splice(index, 1);
-        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "x-adm-events-keepalive-ms": "60000",
+        });
         for (const waiter of connectedWaiters.filter(
           (item) => streams.length >= item.count,
         ))

@@ -29,7 +29,10 @@ test("upstream session projection sends prompts to Durable and replays streamed 
     const url = new URL(request.url!, "http://localhost");
     response.setHeader("content-type", "application/json");
     if (url.pathname.endsWith("/bash/operation-1/events")) {
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(
         `event: output\ndata: ${JSON.stringify({ operationId: "operation-1", text: "hello ", stream: "stdout" })}\n\n`,
       );
@@ -47,7 +50,10 @@ test("upstream session projection sends prompts to Durable and replays streamed 
       response.end(JSON.stringify({ operationId: "operation-1" }));
     } else if (url.pathname.endsWith("/events")) {
       stream = response;
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
     } else if (url.pathname.endsWith("/history")) {
       response.end(
@@ -392,7 +398,10 @@ test("pinned upstream InteractiveMode starts over the Durable workspace projecti
     response.setHeader("content-type", "application/json");
     if (url.pathname.endsWith("/events")) {
       stream = response;
-      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-adm-events-keepalive-ms": "60000",
+      });
       response.write(": attached\n\n");
     } else if (url.pathname.endsWith("/history")) {
       response.end(

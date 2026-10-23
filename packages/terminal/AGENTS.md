@@ -5,7 +5,7 @@ keep this file up to date
 - Ctrl+C and terminal disconnection detach only. Only explicit abort controls send cancellation requests.
 - Bot chat must suppress ordinary assistant/tool events in both history and live updates unless --diagnostics was explicitly selected.
 - Bot published messages need both native custom `message_start` and `message_end`. The content-free `live/activity` boolean spans the Durable run; retain it before native listener attachment and replay working controls on subscription so reconnect during private tools displays Working.
-- Resume SSE from its durable sequence cursor and preserve request identity across ambiguous input responses. Reconnect is explicit and uses no polling timer.
+- Resume SSE from its durable sequence cursor and preserve request identity across ambiguous input responses. A dropped event stream (end, error, or three silent runner-declared keepalive intervals) is logged to `$XDG_STATE_HOME/adm/terminal.log`, shown in Pi's footer, and reconnected through the same path as Ctrl+R, retrying every 2 s while it fails. Those are the only timers: the silence deadline and the retry pacing.
 - Provider login/logout are host CLI subprocesses that suspend the TUI; never send lifecycle admin credentials or provider secrets to the workspace Pod.
 - Clipboard images travel only through the bounded Durable input API, preserving the request ID across retries. Never execute tools or create a Pi session in the client.
 - `/import PATH.jsonl` may read a bounded native transcript locally, but persistence and selection must happen atomically in the owning Pod's Durable conversation API. Reject unsupported records visibly; never create a client Pi session.

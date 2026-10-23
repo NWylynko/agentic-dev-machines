@@ -42,10 +42,15 @@ import {
   exportDurableSessionJsonl,
 } from "./native-export.ts";
 import {
+  eventStreamDropText,
   importedPiSession,
   WorkspaceTerminal,
+  type EventStreamDrop,
   type WorkspaceEvent,
 } from "./terminal.ts";
+
+// A failed automatic reconnect is retried after this long; Ctrl+R retries at once.
+const eventStreamReconnectRetryMs = 2000;
 
 type SessionModel = Model<Api>;
 type WorkspaceSettings = {
@@ -610,6 +615,12 @@ export class DurableInteractiveRuntime {
   private remoteShortcuts = new Map<string, ExtensionShortcut>();
   private listeners = new Set<DurablePiEventListener>();
   private unlisten: () => void;
+  private unlistenEventStreamDrops: () => void;
+  private disposed = false;
+  private eventStreamReconnectRetry?: {
+    timer: ReturnType<typeof setTimeout>;
+    wake: () => void;
+  };
   private settingsManager: SettingsManager;
   private modelRuntime: DurableModelRuntimeProjection;
   private sessionManager: DurableSessionManagerProjection;
@@ -749,6 +760,9 @@ export class DurableInteractiveRuntime {
     this.session = this.sessionProjection();
     this.unlisten = transport.subscribeWorkspaceEvents((event) =>
       this.onWorkspaceEvent(event),
+    );
+    this.unlistenEventStreamDrops = transport.subscribeEventStreamDrops(
+      (drop) => void this.recoverDroppedEventStream(drop),
     );
   }
 
@@ -1555,7 +1569,10 @@ export class DurableInteractiveRuntime {
     if (event.kind === "live") {
       const data = event.data;
       if (data?.type === "snapshot") {
-        this.streaming = !!data.generation;
+        // A stream's first event. After a reconnect it may find the run that
+        // Pi still shows as working already over.
+        const wasStreaming = this.streaming;
+        this.streaming = !!data.run;
         const message = data.generation?.message;
         if (message) {
           this.piStreamingAssistant = true;
@@ -1566,6 +1583,17 @@ export class DurableInteractiveRuntime {
         }
         if (this.streaming)
           void this.emit({ type: "agent_start" } as AgentSessionEvent);
+        else if (wasStreaming) {
+          void this.emit({
+            type: "agent_end",
+            messages: this.session.messages,
+            willRetry: false,
+          } as AgentSessionEvent);
+          void this.emit({
+            type: "agent_settled",
+            aborted: false,
+          } as AgentSessionEvent);
+        }
       } else if (data?.type === "message_start") {
         this.streaming = true;
         void this.emit({ type: "agent_start" } as AgentSessionEvent);
@@ -1784,8 +1812,49 @@ export class DurableInteractiveRuntime {
     this.savedEntriesShown.clear();
     this.piStreamingAssistant = false;
     await this.rebindSession?.(this.session);
+    this.extensionUi?.setStatus("adm.connection", undefined);
+  }
+  // The event stream dropped: show it in Pi's footer and reconnect, re-rendering
+  // the session from its records exactly as Ctrl+R does, until it is back.
+  private async recoverDroppedEventStream(drop: EventStreamDrop) {
+    const lost = eventStreamDropText(drop);
+    while (!this.disposed && !this.transport.getRemoteSnapshot().connected) {
+      this.extensionUi?.setStatus(
+        "adm.connection",
+        `Disconnected (${lost}) · reconnecting…`,
+      );
+      try {
+        await this.refreshSessionView();
+        return;
+      } catch (error) {
+        const snapshot = this.transport.getRemoteSnapshot();
+        const cause = snapshot.connected
+          ? error instanceof Error
+            ? error.message
+            : String(error)
+          : snapshot.status;
+        this.extensionUi?.setStatus(
+          "adm.connection",
+          `Disconnected (${lost}) · retrying every ${eventStreamReconnectRetryMs / 1000}s · Ctrl+R to retry now · ${cause}`,
+        );
+      }
+      await new Promise<void>((wake) => {
+        this.eventStreamReconnectRetry = {
+          timer: setTimeout(wake, eventStreamReconnectRetryMs),
+          wake,
+        };
+      });
+      this.eventStreamReconnectRetry = undefined;
+    }
   }
   async dispose() {
+    this.disposed = true;
     this.unlisten();
+    this.unlistenEventStreamDrops();
+    const retry = this.eventStreamReconnectRetry;
+    if (retry) {
+      clearTimeout(retry.timer);
+      retry.wake();
+    }
   }
 }
