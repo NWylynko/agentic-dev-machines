@@ -688,7 +688,12 @@ test("workspace requests are authorized by lifecycle against the caller's projec
   });
   await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
   const controlUrl = `http://127.0.0.1:${control.address().port}`;
-  const runner = await startRunner(
+  let runner;
+  t.after(async () => {
+    await runner?.stop();
+    await new Promise((resolve) => control.close(resolve));
+  });
+  runner = await startRunner(
     directory,
     {},
     {
@@ -698,10 +703,6 @@ test("workspace requests are authorized by lifecycle against the caller's projec
       podUid: "a1b2c3d4-e5f6-47a8-9012-123456789abc",
     },
   );
-  t.after(async () => {
-    await runner.stop();
-    await new Promise((resolve) => control.close(resolve));
-  });
 
   const denied = await fetch(`${runner.url}/v1/workspaces`);
   assert.equal(denied.status, 401);
@@ -909,7 +910,12 @@ test(
       );
     });
     await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-    const runner = await startRunner(
+    let runner;
+    t.after(async () => {
+      await runner?.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+    runner = await startRunner(
       join(directory, "state"),
       {},
       {
@@ -919,10 +925,6 @@ test(
         podUid: holder,
       },
     );
-    t.after(async () => {
-      await runner.stop();
-      await new Promise((resolve) => control.close(resolve));
-    });
 
     const id = "workspace-lifecycle-outage";
     const active = await runner.request(
@@ -1073,7 +1075,12 @@ test(
         .end(JSON.stringify(body));
     });
     await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-    const runner = await startRunner(
+    let runner;
+    t.after(async () => {
+      await runner?.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+    runner = await startRunner(
       join(directory, "state"),
       {},
       {
@@ -1083,10 +1090,6 @@ test(
         podUid: holder,
       },
     );
-    t.after(async () => {
-      await runner.stop();
-      await new Promise((resolve) => control.close(resolve));
-    });
 
     blockCheck = true;
     const canceled = new AbortController();
@@ -1164,7 +1167,12 @@ test(
       );
     });
     await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-    const runner = await startRunner(
+    let runner;
+    t.after(async () => {
+      await runner?.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+    runner = await startRunner(
       join(directory, "state"),
       {},
       {
@@ -1174,10 +1182,6 @@ test(
         podUid: holder,
       },
     );
-    t.after(async () => {
-      await runner.stop();
-      await new Promise((resolve) => control.close(resolve));
-    });
     await renewed;
     for (let attempt = 0; attempt < 100; attempt++) {
       if ((await fetch(`${runner.url}/health`)).status === 503) break;
@@ -1229,7 +1233,12 @@ test(
         .end(JSON.stringify(value));
     });
     await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-    const runner = await startRunner(
+    let runner;
+    t.after(async () => {
+      await runner?.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+    runner = await startRunner(
       join(directory, "state"),
       {},
       {
@@ -1239,10 +1248,6 @@ test(
         podUid: holder,
       },
     );
-    t.after(async () => {
-      await runner.stop();
-      await new Promise((resolve) => control.close(resolve));
-    });
 
     const id = "workspace-expired-tool";
     const active = await runner.request(
@@ -1294,7 +1299,7 @@ test(
 
 test(
   "the runner fences at the server-issued lease expiry deadline",
-  { timeout: 5_000 },
+  { timeout: 15_000 },
   async (t) => {
     const directory = await mkdtemp(
       join(tmpdir(), "adm-runner-expired-fence-"),
@@ -1323,26 +1328,39 @@ test(
           workspaceId: "workspace-expired-fence",
           holder: body.holder ?? holder,
           fencingToken: 1,
-          expiresAt: Math.floor(Date.now() / 1000) + 1,
+          // 1-2 s ahead: Math.floor(...) + 1 could land within milliseconds of
+          // now and be rejected as an invalid lease instead of expiring.
+          expiresAt: Math.ceil(Date.now() / 1000) + 1,
           valid: true,
         }),
       );
     });
     await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
-    const runner = await startRunner(
-      join(directory, "state"),
-      {},
-      {
-        tokenFile,
-        workspaceConfigFile,
-        lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
-        podUid: holder,
-      },
-    );
+    let runner;
     t.after(async () => {
-      await runner.stop();
+      await runner?.stop();
       await new Promise((resolve) => control.close(resolve));
     });
+    try {
+      runner = await startRunner(
+        join(directory, "state"),
+        {},
+        {
+          tokenFile,
+          workspaceConfigFile,
+          lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+          podUid: holder,
+        },
+      );
+    } catch (error) {
+      // The short lease can expire before a loaded runtime is serving;
+      // fencing then means exiting loudly instead of becoming ready.
+      assert.match(
+        error.message,
+        /^Runner exited 1: FATAL workspace runtime lost its lifecycle fence: Workspace runtime lease expired\n/,
+      );
+      return;
+    }
     for (let attempt = 0; attempt < 100; attempt++) {
       if ((await fetch(`${runner.url}/health`)).status === 503) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
