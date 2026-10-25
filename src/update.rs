@@ -5,10 +5,14 @@ use std::{
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 const MANAGED_INSTALLER: &str = include_str!("../install.sh");
 const MAINTENANCE_SECONDS: u64 = 300;
+/// How long `adm update` waits for the replaced lifecycle's API after rollout.
+const UPDATED_LIFECYCLE_WAIT: Duration = Duration::from_secs(60);
+const UPDATED_LIFECYCLE_RETRY: Duration = Duration::from_secs(1);
 
 pub fn run(
     cli: &Cli,
@@ -175,7 +179,7 @@ pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str
     } else {
         None
     };
-    let maintenance_id = uuid::Uuid::new_v4().to_string();
+    let maintenance_id = open_update_maintenance_id(cli)?;
     let extension = connected.request_lifecycle(
         "POST",
         "/v1/runtime/maintenance/extend",
@@ -188,52 +192,28 @@ pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str
         .as_u64()
         .context("maintenance extension omitted its authoritative expiry")?;
     eprintln!(
-        "adm: update: extended {} active workspace leases through {}",
+        "adm: update: extended {} active workspace leases through {} (controller maintenance window {maintenance_id})",
         extension["workspaceIds"].as_array().map_or(0, Vec::len),
         maintenance_expires_at,
     );
-    connected.request_lifecycle(
-        "POST",
-        "/v1/runtime/maintenance/await",
-        Some(&json!({"maintenanceId":maintenance_id})),
-    )
-    .context("cannot interrupt the controller until every active workspace runtime acknowledges the planned lease extension")?;
-    drop(maintenance_connection);
-
-    setup_control_plane::install(cli, &target_image, &storage_class)
-        .context("apply the selected release controller and shared provider-auth service")?;
-    let observed = controller_images(cli)?;
-    ensure!(
-        observed.iter().all(|image| image == &target_image),
-        "controller rollout reported ready, but observed images are {} (target {target_image})",
-        observed.join(", ")
+    // From here on every failure releases the window before returning, so the
+    // runtimes that acknowledged it are not left to restart when it expires.
+    let updated = update_controller_during_maintenance(
+        cli,
+        connected,
+        maintenance_connection,
+        &maintenance_id,
+        &target_image,
+        &storage_class,
+        &target_version,
     );
-    eprintln!(
-        "adm: update: controller release {target_version} observed on all owned service containers"
-    );
-    let mut connected = cli.clone_for_lifecycle();
-    let connection = if cli.lifecycle_forward {
-        let connection =
-            setup_connection::connect(cli).context("reconnect to the updated lifecycle service")?;
-        connected.lifecycle_url = connection.url.clone();
-        Some(connection)
-    } else {
-        None
+    let (connected, connection) = match updated {
+        Ok(updated) => updated,
+        Err(error) => {
+            cancel_update_maintenance(cli, &maintenance_id, maintenance_expires_at);
+            return Err(error);
+        }
     };
-    connected
-        .request_lifecycle("GET", "/v1/workspaces", None)
-        .context("verify authenticated lifecycle API after controller update")?;
-    connected
-        .request_lifecycle(
-            "POST",
-            "/v1/runtime/maintenance/complete",
-            Some(&json!({"maintenanceId":maintenance_id})),
-        )
-        .with_context(|| {
-            format!(
-                "controller is healthy, but planned workspace lease window {maintenance_id} could not be released (expires at {maintenance_expires_at})"
-            )
-        })?;
     advance_saved_release_image(&target_image)?;
     if !selected.is_empty() {
         upgrade_selected(
@@ -246,6 +226,206 @@ pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str
     }
     drop(connection);
     Ok(())
+}
+
+/// Waits for every runtime to acknowledge window `maintenance_id`, replaces the
+/// controller, waits for its authenticated API and completes the window.
+/// Returns a client connected to the updated controller.
+fn update_controller_during_maintenance(
+    cli: &Cli,
+    connected: Cli,
+    maintenance_connection: Option<setup_connection::Connection>,
+    maintenance_id: &str,
+    target_image: &str,
+    storage_class: &str,
+    target_version: &str,
+) -> Result<(Cli, Option<setup_connection::Connection>)> {
+    connected.request_lifecycle(
+        "POST",
+        "/v1/runtime/maintenance/await",
+        Some(&json!({"maintenanceId":maintenance_id})),
+    )
+    .context("cannot interrupt the controller until every active workspace runtime acknowledges the planned lease extension")?;
+    drop(maintenance_connection);
+
+    setup_control_plane::install(cli, target_image, storage_class)
+        .context("apply the selected release controller and shared provider-auth service")?;
+    let observed = controller_images(cli)?;
+    ensure!(
+        observed.iter().all(|image| image == target_image),
+        "controller rollout reported ready, but observed images are {} (target {target_image})",
+        observed.join(", ")
+    );
+    eprintln!(
+        "adm: update: controller release {target_version} observed on all owned service containers"
+    );
+    let (connected, connection) = wait_for_updated_lifecycle_api(cli)?;
+    connected
+        .request_lifecycle(
+            "POST",
+            "/v1/runtime/maintenance/complete",
+            Some(&json!({"maintenanceId":maintenance_id})),
+        )
+        .with_context(|| {
+            format!(
+                "controller is healthy, but completing maintenance window {maintenance_id} failed"
+            )
+        })?;
+    forget_update_maintenance_id(cli);
+    eprintln!("adm: update: completed controller maintenance window {maintenance_id}");
+    Ok((connected, connection))
+}
+
+/// A rollout replaces the lifecycle Pod, which always breaks existing
+/// port-forwards, including a separate `adm lifecycle-forward` behind an
+/// explicit URL. Connection failures are retried until `UPDATED_LIFECYCLE_WAIT`
+/// has passed; an answer from the lifecycle, even an error, is final.
+fn wait_for_updated_lifecycle_api(
+    cli: &Cli,
+) -> Result<(Cli, Option<setup_connection::Connection>)> {
+    let rolled_out = Instant::now();
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut connected = cli.clone_for_lifecycle();
+        let connection = if cli.lifecycle_forward {
+            match setup_connection::connect(cli) {
+                Ok(connection) => {
+                    connected.lifecycle_url = connection.url.clone();
+                    Some(connection)
+                }
+                Err(error) => {
+                    retry_updated_lifecycle_api(rolled_out, attempt, error, true)?;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        match connected.request_lifecycle("GET", "/v1/workspaces", None) {
+            Ok(_) => {
+                eprintln!(
+                    "adm: update: updated lifecycle API answered an authenticated request (attempt {attempt}, {:.1}s after rollout)",
+                    rolled_out.elapsed().as_secs_f64()
+                );
+                return Ok((connected, connection));
+            }
+            Err(error) => {
+                let unreachable = error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some());
+                retry_updated_lifecycle_api(rolled_out, attempt, error, unreachable)?;
+            }
+        }
+    }
+}
+
+/// Logs a failed verification attempt and pauses before the next one, or
+/// returns the error once it is final or the wait is over.
+fn retry_updated_lifecycle_api(
+    rolled_out: Instant,
+    attempt: u32,
+    error: anyhow::Error,
+    unreachable: bool,
+) -> Result<()> {
+    let elapsed = rolled_out.elapsed().as_secs_f64();
+    if !unreachable || rolled_out.elapsed() >= UPDATED_LIFECYCLE_WAIT {
+        return Err(error).with_context(|| {
+            format!(
+                "verify authenticated lifecycle API after controller update (attempt {attempt}, {elapsed:.1}s after rollout)"
+            )
+        });
+    }
+    eprintln!(
+        "adm: update: updated lifecycle API not reachable yet (attempt {attempt}, {elapsed:.1}s after rollout): {error:#}"
+    );
+    std::thread::sleep(UPDATED_LIFECYCLE_RETRY);
+    Ok(())
+}
+
+/// The client's record of the controller maintenance window its update opened,
+/// kept until the window is completed or cancelled. A retry reuses the ID, so
+/// `extend` resumes that window instead of being refused because another one is
+/// active (TASK-92).
+fn update_maintenance_state_path(cli: &Cli) -> PathBuf {
+    cli.state_path().join("update-maintenance.json")
+}
+
+fn open_update_maintenance_id(cli: &Cli) -> Result<String> {
+    let path = update_maintenance_state_path(cli);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let saved: Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("decode {}", path.display()))?;
+            let maintenance_id = saved["maintenanceId"]
+                .as_str()
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                .with_context(|| format!("{} has no valid maintenanceId", path.display()))?
+                .to_owned();
+            eprintln!(
+                "adm: update: resuming controller maintenance window {maintenance_id} left open by an earlier update ({})",
+                path.display()
+            );
+            Ok(maintenance_id)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let maintenance_id = uuid::Uuid::new_v4().to_string();
+            std::fs::create_dir_all(cli.state_path())
+                .with_context(|| format!("create {}", cli.state_path().display()))?;
+            std::fs::write(&path, json!({"maintenanceId":maintenance_id}).to_string())
+                .with_context(|| format!("record the maintenance window in {}", path.display()))?;
+            Ok(maintenance_id)
+        }
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn forget_update_maintenance_id(cli: &Cli) {
+    let path = update_maintenance_state_path(cli);
+    if let Err(error) = std::fs::remove_file(&path) {
+        eprintln!(
+            "adm: update: warning: could not remove {}: {error}; the next update resumes an ID whose window has ended, which opens a new window",
+            path.display()
+        );
+    }
+}
+
+/// Releases window `maintenance_id` after a failed update. If that fails too,
+/// the window lasts until `expires_at`, and a retry meanwhile resumes it.
+fn cancel_update_maintenance(cli: &Cli, maintenance_id: &str, expires_at: u64) {
+    let mut connected = cli.clone_for_lifecycle();
+    let cancelled = (|| {
+        let _connection = if cli.lifecycle_forward {
+            let connection = setup_connection::connect(cli)
+                .context("connect to lifecycle service to release the maintenance window")?;
+            connected.lifecycle_url = connection.url.clone();
+            Some(connection)
+        } else {
+            None
+        };
+        connected.request_lifecycle(
+            "POST",
+            "/v1/runtime/maintenance/cancel",
+            Some(&json!({"maintenanceId":maintenance_id})),
+        )
+    })();
+    match cancelled {
+        Ok(_) => {
+            forget_update_maintenance_id(cli);
+            eprintln!(
+                "adm: update: released controller maintenance window {maintenance_id} after the failed update"
+            );
+        }
+        Err(error) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            eprintln!(
+                "adm: update: could not release controller maintenance window {maintenance_id}: {error:#}. It expires at {expires_at} (unix seconds, in {}s). Workspaces that acknowledged it restart then, unless `adm update` is retried first: a retry resumes this window",
+                expires_at.saturating_sub(now)
+            );
+        }
+    }
 }
 
 /// `adm setup` saves the release's own image as an explicit reference, so new

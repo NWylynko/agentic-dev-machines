@@ -298,6 +298,23 @@ if args[:2] == ['get','lease']:
         if not lease_path.exists():
             print('Error from server (NotFound): leases not found',file=sys.stderr); sys.exit(1)
         print(lease_path.read_text())
+# `adm update` reads and replaces the lifecycle control plane itself (adm-system). The applied image lands in
+# `controller-image`, and a rollout replaces the lifecycle Pod, which breaks the client's existing port-forward:
+# the test's lifecycle proxy drops the next connection.
+elif args[:3] == ['get','namespace','adm-system']:
+    print(json.dumps({'metadata':{'name':'adm-system','labels':{'app.kubernetes.io/part-of':'adm'}}}))
+elif args[:3] == ['get','deployment','adm-lifecycle']:
+    image=(root/'controller-image').read_text() if (root/'controller-image').exists() else 'ghcr.io/example/adm:installed'
+    print(json.dumps({'metadata':{'name':'adm-lifecycle','namespace':'adm-system'},'spec':{'selector':{'matchLabels':{'app.kubernetes.io/name':'adm-lifecycle'}},'template':{'spec':{'serviceAccountName':'adm-lifecycle','volumes':[{'name':'state','persistentVolumeClaim':{'claimName':'adm-lifecycle-state'}}],'initContainers':[{'name':'init','image':image}],'containers':[{'name':'lifecycle','image':image}]}}}}))
+elif args[:3] == ['get','pvc','adm-lifecycle-state']:
+    print(json.dumps({'metadata':{'name':'adm-lifecycle-state','namespace':'adm-system'},'spec':{'storageClassName':'lifecycle-storage'}}))
+elif args[:2] == ['create','--dry-run=client']:
+    for item in [{'kind':'Namespace','metadata':{'name':'adm-system'}},{'kind':'PersistentVolumeClaim','metadata':{'name':'adm-lifecycle-state','namespace':'adm-system'},'spec':{}},{'kind':'Deployment','metadata':{'name':'adm-lifecycle','namespace':'adm-system'},'spec':{'template':{'spec':{'initContainers':[{'name':'init','image':'unset'}],'containers':[{'name':'lifecycle','image':'unset'}]}}}}]:
+        print(json.dumps(item))
+elif args[:4] == ['-n','adm-system','get','secret']:
+    print('secret/adm-lifecycle-token' if '--ignore-not-found' in args else (root/'token').read_text().strip())
+elif args[:5] == ['-n','adm-system','rollout','status','deployment/adm-lifecycle']:
+    with locked(): put(root/'proxy-drop-connections', '1')
 elif args[:3] == ['create','--raw','/apis/authentication.k8s.io/v1/tokenreviews']:
     request=json.load(sys.stdin)
     if (root/'tokenreview-unavailable').exists():
@@ -389,6 +406,11 @@ elif args[0] == 'apply':
         if (root/'fail-apply').exists():
             print('injected deployment admission failure',file=sys.stderr); sys.exit(1)
     doc=json.load(sys.stdin)
+    if doc.get('kind') == 'Namespace' and doc['metadata']['name'] == 'adm-system': sys.exit(0)
+    controller=[item for item in doc.get('items',[]) if item['kind']=='Deployment' and item['metadata']['name']=='adm-lifecycle']
+    if controller:
+        with locked(): put(root/'controller-image', controller[0]['spec']['template']['spec']['containers'][0]['image'])
+        sys.exit(0)
     with locked():
         state=load_state()
         put(root/'applied', json.dumps(doc))
@@ -3409,6 +3431,7 @@ fn lifecycle_fences_itself_within_the_lease_duration_when_renewal_hangs() {
 struct MaintenanceFixture {
     root: tempfile::TempDir,
     url: String,
+    port: u16,
     _service: ServiceProcess,
     runner: Option<(u16, thread::JoinHandle<()>)>,
 }
@@ -3441,6 +3464,7 @@ fn start_maintenance_fixture() -> MaintenanceFixture {
     MaintenanceFixture {
         root,
         url,
+        port,
         _service: service,
         runner: Some((runner_port, runner)),
     }
@@ -3612,4 +3636,317 @@ fn a_maintenance_ack_after_the_window_ended_is_answered_without_fencing_a_valid_
         }),
     );
     assert_eq!(status, 403, "{rejected}");
+}
+
+/// Stands in for the client's lifecycle port-forward (`adm lifecycle-forward`,
+/// or the command-scoped one) in front of the service on `upstream`. Each
+/// request line and what happened to it is appended to `proxy.log`. Files in
+/// `root` steer it, per connection:
+/// - `proxy-drop-connections` (a count): close that many next connections
+///   unanswered, like a forward still bound to the replaced lifecycle Pod. The
+///   fake kubectl writes 1 on every controller rollout.
+/// - `proxy-drop-after-extend`: once a maintenance extend is seen, close every
+///   later connection (`proxy-dropping`) until the test removes both files.
+/// - `proxy-reject-workspace-list`: answer `GET /v1/workspaces` with 401.
+fn start_lifecycle_proxy(root: &Path, upstream: u16) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let root = root.to_owned();
+    thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let root = root.clone();
+            thread::spawn(move || proxy_lifecycle_connection(&root, client, upstream));
+        }
+    });
+    port
+}
+
+fn proxy_lifecycle_connection(root: &Path, mut client: std::net::TcpStream, upstream: u16) {
+    use std::io::{Read, Write};
+    let mut head = Vec::new();
+    let mut chunk = [0; 4096];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        match client.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(count) => head.extend_from_slice(&chunk[..count]),
+        }
+    }
+    let request_line = String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let log = |outcome: &str| {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("proxy.log"))
+            .unwrap();
+        writeln!(log, "{request_line} -> {outcome}").unwrap();
+    };
+    let drops = root.join("proxy-drop-connections");
+    let pending = fs::read_to_string(&drops)
+        .ok()
+        .and_then(|count| count.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if pending > 0 {
+        fs::write(&drops, (pending - 1).to_string()).unwrap();
+        return log("dropped (replaced lifecycle Pod)");
+    }
+    if root.join("proxy-dropping").exists() {
+        return log("dropped (lifecycle unreachable)");
+    }
+    if request_line.starts_with("GET /v1/workspaces ")
+        && root.join("proxy-reject-workspace-list").exists()
+    {
+        let body = r#"{"error":{"message":"injected controller verification failure"}}"#;
+        write!(client, "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        return log("rejected 401");
+    }
+    // Set before the extend is answered, so the client's next request finds it.
+    if request_line.contains("/v1/runtime/maintenance/extend ")
+        && root.join("proxy-drop-after-extend").exists()
+    {
+        fs::write(root.join("proxy-dropping"), "").unwrap();
+    }
+    let mut server = std::net::TcpStream::connect(("127.0.0.1", upstream)).unwrap();
+    server.write_all(&head).unwrap();
+    let mut client_reader = client.try_clone().unwrap();
+    let mut server_writer = server.try_clone().unwrap();
+    let upload = thread::spawn(move || {
+        let _ = std::io::copy(&mut client_reader, &mut server_writer);
+        let _ = server_writer.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = std::io::copy(&mut server, &mut client);
+    let _ = client.shutdown(std::net::Shutdown::Both);
+    upload.join().unwrap();
+    log("forwarded");
+}
+
+/// Runs the managed `adm __update-services` step of `adm update` against the
+/// fixture through `proxy`, with the client's own state in `client-state`.
+fn run_adm_update_services(fixture: &MaintenanceFixture, proxy: u16) -> std::process::Output {
+    let root = fixture.root.path();
+    let release = root.join("release");
+    fs::create_dir_all(&release).unwrap();
+    fs::write(release.join("VERSION"), "v9.9.9\n").unwrap();
+    fs::write(release.join("IMAGE"), "ghcr.io/example/adm:v9.9.9\n").unwrap();
+    fs::write(root.join("kubeconfig"), "").unwrap();
+    Command::new(env!("CARGO_BIN_EXE_adm"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .args(["--state-dir"])
+        .arg(root.join("client-state"))
+        .args(["--kubectl"])
+        .arg(root.join("kubectl"))
+        .args(["--kubeconfig"])
+        .arg(root.join("kubeconfig"))
+        .args(["--lifecycle-url", &format!("http://127.0.0.1:{proxy}")])
+        .args(["--lifecycle-token-file"])
+        .arg(root.join("token"))
+        .args(["--project-dir"])
+        .arg(&release)
+        .arg("__update-services")
+        .output()
+        .unwrap()
+}
+
+fn open_maintenance_windows(fixture: &MaintenanceFixture) -> Vec<String> {
+    let database = fixture.database();
+    let mut statement = database
+        .prepare("SELECT maintenance_id FROM runtime_maintenance")
+        .unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn update_report(fixture: &MaintenanceFixture, output: &std::process::Output) -> String {
+    format!(
+        "status: {}\nstderr:\n{}\nproxy.log:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(fixture.root.path().join("proxy.log")).unwrap_or_default()
+    )
+}
+
+/// TASK-92: a controller rollout replaces the lifecycle Pod, which always
+/// breaks existing port-forwards (live: the separate `adm lifecycle-forward`
+/// behind an explicit URL). `adm update` waits for the authenticated API, then
+/// completes the window, and a workspace runtime renewing throughout keeps its
+/// lease.
+#[test]
+fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_window() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fixture = start_maintenance_fixture();
+    let proxy = start_lifecycle_proxy(fixture.root.path(), fixture.port);
+    let (workspace_id, pod_uid, lease) = fixture.leased_workspace("through-update");
+    // The workspace runtime renews and acks directly against the lifecycle
+    // Service, like the runner (its connection is not the client's forward).
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let runtime = {
+        let stop = stop.clone();
+        let url = fixture.url.clone();
+        let lease_body = json!({"holder":pod_uid,"fencingToken":lease["fencingToken"]});
+        thread::spawn(move || {
+            let mut rejections = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let path = format!("/v1/workspaces/{workspace_id}/runtime/lease/renew");
+                let renewed = request_with_token(
+                    &url,
+                    "POST",
+                    &path,
+                    Some(&lease_body),
+                    Some("runtime-token"),
+                )
+                .unwrap();
+                if renewed.status() != 200 {
+                    rejections.push(format!(
+                        "renew {}: {}",
+                        renewed.status(),
+                        renewed.text().unwrap()
+                    ));
+                    break;
+                }
+                let renewed: Value = renewed.json().unwrap();
+                if let Some(maintenance_id) = renewed["maintenanceId"].as_str() {
+                    let ack = json!({"holder":lease_body["holder"],"fencingToken":lease_body["fencingToken"],"maintenanceId":maintenance_id,"expiresAt":renewed["expiresAt"]});
+                    let path = format!("/v1/workspaces/{workspace_id}/runtime/lease/ack");
+                    let acked =
+                        request_with_token(&url, "POST", &path, Some(&ack), Some("runtime-token"))
+                            .unwrap();
+                    if acked.status() != 200 {
+                        rejections.push(format!(
+                            "ack {}: {}",
+                            acked.status(),
+                            acked.text().unwrap()
+                        ));
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            rejections
+        })
+    };
+
+    let output = run_adm_update_services(&fixture, proxy);
+    stop.store(true, Ordering::SeqCst);
+    let rejections = runtime.join().unwrap();
+    let report = update_report(&fixture, &output);
+    assert!(output.status.success(), "{report}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("updated lifecycle API answered"),
+        "{report}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("controller-image")).unwrap(),
+        "ghcr.io/example/adm:v9.9.9"
+    );
+    assert_eq!(
+        open_maintenance_windows(&fixture),
+        Vec::<String>::new(),
+        "{report}"
+    );
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("client-state/update-maintenance.json")
+            .exists(),
+        "a completed window is no longer resumable"
+    );
+    assert!(
+        rejections.is_empty(),
+        "the workspace runtime was rejected: {rejections:#?}"
+    );
+}
+
+/// TASK-92: once `extend` succeeded, a failed controller verification still
+/// releases the window, so acknowledged runtimes are not left to restart when
+/// it expires and a retry is not refused.
+#[test]
+fn adm_update_releases_its_maintenance_window_when_controller_verification_fails() {
+    let fixture = start_maintenance_fixture();
+    let proxy = start_lifecycle_proxy(fixture.root.path(), fixture.port);
+    fs::write(fixture.root.path().join("proxy-reject-workspace-list"), "").unwrap();
+
+    let output = run_adm_update_services(&fixture, proxy);
+    let report = update_report(&fixture, &output);
+    assert!(!output.status.success(), "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("injected controller verification failure"),
+        "{report}"
+    );
+    assert!(
+        stderr.contains("released controller maintenance window"),
+        "{report}"
+    );
+    assert_eq!(
+        open_maintenance_windows(&fixture),
+        Vec::<String>::new(),
+        "{report}"
+    );
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("client-state/update-maintenance.json")
+            .exists()
+    );
+}
+
+/// TASK-92: `await` fails and the lifecycle is unreachable, so not even the
+/// release gets through. The window stays open, and its ID is kept so that an
+/// immediate retry resumes it instead of being refused with `another
+/// controller maintenance window is active`.
+#[test]
+fn adm_update_retry_resumes_the_maintenance_window_a_failed_update_left_open() {
+    let fixture = start_maintenance_fixture();
+    let root = fixture.root.path();
+    let proxy = start_lifecycle_proxy(root, fixture.port);
+    fs::write(root.join("proxy-drop-after-extend"), "").unwrap();
+
+    let failed = run_adm_update_services(&fixture, proxy);
+    let failed_report = update_report(&fixture, &failed);
+    assert!(!failed.status.success(), "{failed_report}");
+    let windows = open_maintenance_windows(&fixture);
+    assert_eq!(windows.len(), 1, "{failed_report}");
+
+    fs::remove_file(root.join("proxy-drop-after-extend")).unwrap();
+    fs::remove_file(root.join("proxy-dropping")).unwrap();
+    let retried = run_adm_update_services(&fixture, proxy);
+    let report = update_report(&fixture, &retried);
+    assert!(
+        retried.status.success(),
+        "{failed_report}\n--- retry ---\n{report}"
+    );
+    let failed_stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        failed_stderr.contains(&format!(
+            "could not release controller maintenance window {}",
+            windows[0]
+        )),
+        "{failed_report}"
+    );
+    assert!(failed_stderr.contains("expires at"), "{failed_report}");
+    assert!(
+        String::from_utf8_lossy(&retried.stderr).contains(&format!(
+            "resuming controller maintenance window {}",
+            windows[0]
+        )),
+        "{report}"
+    );
+    assert_eq!(
+        open_maintenance_windows(&fixture),
+        Vec::<String>::new(),
+        "{report}"
+    );
+    assert!(!root.join("client-state/update-maintenance.json").exists());
 }

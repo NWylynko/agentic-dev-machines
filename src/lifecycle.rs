@@ -992,6 +992,22 @@ fn route(
             serde_json::json!({"maintenanceId":request.maintenance_id,"completed":true,"expiresAt":expires_at}),
         ));
     }
+    // A failed `adm update` releases its window here instead of leaving it to
+    // expire: it no longer needs every runtime's ack (TASK-92).
+    if method == "POST" && path == "/v1/runtime/maintenance/cancel" {
+        cli.check_lifecycle_fence()?;
+        let request: RuntimeMaintenanceRequest = serde_json::from_slice(body)?;
+        let cancelled = store.cancel_runtime_maintenance(&request.maintenance_id)?;
+        notify_runtime_maintenance_changed();
+        eprintln!(
+            "adm lifecycle cancelled controller maintenance window {} (was open: {cancelled})",
+            request.maintenance_id
+        );
+        return Ok((
+            200,
+            serde_json::json!({"maintenanceId":request.maintenance_id,"cancelled":cancelled}),
+        ));
+    }
     if path.starts_with("/v1/provider-auth/")
         || path == "/v1/connectors"
         || path.starts_with("/v1/connectors/")

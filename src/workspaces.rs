@@ -1013,6 +1013,25 @@ impl WorkspaceStore {
         transaction.commit()?;
         Ok(expires_at)
     }
+    /// Ends maintenance window `maintenance_id` whether or not every runtime
+    /// acknowledged it: the update that opened it failed and will not interrupt
+    /// the controller under it. Returns whether the window was still recorded.
+    pub fn cancel_runtime_maintenance(&mut self, maintenance_id: &str) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        transaction.execute(
+            "DELETE FROM runtime_maintenance_leases WHERE maintenance_id=?1",
+            [maintenance_id],
+        )?;
+        let removed = transaction.execute(
+            "DELETE FROM runtime_maintenance WHERE singleton=1 AND maintenance_id=?1",
+            [maintenance_id],
+        )?;
+        transaction.commit()?;
+        Ok(removed == 1)
+    }
     pub fn runtime_maintenance_for_lease(
         &self,
         workspace_id: &str,
