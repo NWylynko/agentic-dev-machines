@@ -1206,7 +1206,7 @@ fn route(
                 let fencing_token = request
                     .fencing_token
                     .context("maintenance acknowledgement needs fencingToken")?;
-                store.acknowledge_runtime_maintenance(
+                let acknowledged = store.acknowledge_runtime_maintenance(
                     id,
                     &request.holder,
                     fencing_token,
@@ -1218,8 +1218,20 @@ fn route(
                         .expires_at
                         .context("maintenance acknowledgement needs expiresAt")?,
                 )?;
-                notify_runtime_maintenance_changed();
-                serde_json::json!({"acknowledged":true})
+                match acknowledged {
+                    crate::workspaces::RuntimeMaintenanceAck::Acknowledged => {
+                        notify_runtime_maintenance_changed();
+                        serde_json::json!({"acknowledged":true})
+                    }
+                    crate::workspaces::RuntimeMaintenanceAck::WindowEnded => {
+                        eprintln!(
+                            "adm lifecycle runtime maintenance ack for ended window {} from workspace {id} holder {} answered window-ended; its lease stays valid",
+                            request.maintenance_id.as_deref().unwrap_or_default(),
+                            request.holder
+                        );
+                        serde_json::json!({"acknowledged":false,"reason":"window-ended"})
+                    }
+                }
             }
             ("POST", "check") => {
                 let fencing_token = request

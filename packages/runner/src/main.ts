@@ -385,6 +385,8 @@ async function lifecycleRuntimeCall(
     expiresAt?: number;
     maintenanceId?: string | null;
     valid?: boolean;
+    acknowledged?: boolean;
+    reason?: string;
   };
   if (!response.ok)
     throw new ApiError(
@@ -630,12 +632,22 @@ function startRuntimeLeaseRenewal() {
       runtimeLease.expiresAt = renewed.expiresAt!;
       scheduleLeaseExpiry(runtimeLease.expiresAt);
       if (renewed.maintenanceId) {
-        await lifecycleRuntimeCall(workspaceId, "lease/ack", {
-          holder,
-          fencingToken: runtimeLease.fencingToken,
-          maintenanceId: renewed.maintenanceId,
-          expiresAt: renewed.expiresAt,
-        });
+        const acknowledgement = await lifecycleRuntimeCall(
+          workspaceId,
+          "lease/ack",
+          {
+            holder,
+            fencingToken: runtimeLease.fencingToken,
+            maintenanceId: renewed.maintenanceId,
+            expiresAt: renewed.expiresAt,
+          },
+        );
+        // The window ended between this renew and the ack. The lifecycle
+        // accepted the lease, so this is not a fencing event (TASK-93).
+        if (acknowledgement.acknowledged === false)
+          process.stderr.write(
+            `Workspace maintenance window ${renewed.maintenanceId} ended before its acknowledgement (${acknowledgement.reason ?? "no reason given"}); the runtime lease is still held\n`,
+          );
       }
       restoreLifecycleAvailability();
     } catch (error) {

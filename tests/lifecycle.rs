@@ -3403,3 +3403,213 @@ fn lifecycle_fences_itself_within_the_lease_duration_when_renewal_hangs() {
     fs::remove_file(root.path().join("hold-lease-get")).unwrap();
     stop_http_stub(runner_port, runner);
 }
+
+/// A lifecycle service on the fake kubectl, for the controller update
+/// maintenance tests. Dropping it stops the service and the runner stub.
+struct MaintenanceFixture {
+    root: tempfile::TempDir,
+    url: String,
+    _service: ServiceProcess,
+    runner: Option<(u16, thread::JoinHandle<()>)>,
+}
+
+impl Drop for MaintenanceFixture {
+    fn drop(&mut self) {
+        if let Some((port, server)) = self.runner.take() {
+            stop_http_stub(port, server);
+        }
+    }
+}
+
+fn start_maintenance_fixture() -> MaintenanceFixture {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("storage-release"), "go").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    MaintenanceFixture {
+        root,
+        url,
+        _service: service,
+        runner: Some((runner_port, runner)),
+    }
+}
+
+impl MaintenanceFixture {
+    fn admin(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+        let response = request_with_token(
+            &self.url,
+            method,
+            path,
+            body,
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().unwrap_or(Value::Null))
+    }
+
+    fn runtime(&self, path: &str, body: &Value) -> (u16, Value) {
+        let response =
+            request_with_token(&self.url, "POST", path, Some(body), Some("runtime-token")).unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().unwrap_or(Value::Null))
+    }
+
+    /// Creates a workspace whose runtime Pod holds its lease; returns the
+    /// workspace ID, the Pod UID and the lease.
+    fn leased_workspace(&self, name: &str) -> (String, String, Value) {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let (status, receipt) = self.admin(
+            "POST",
+            "/v1/operations",
+            Some(&json!({"operationId":operation_id,"kind":"create","spec":workspace_spec(name)})),
+        );
+        assert_eq!(status, 202, "{receipt}");
+        let receipt = wait_for(|| {
+            let (_, receipt) = self.admin("GET", &format!("/v1/operations/{operation_id}"), None);
+            (receipt["status"] == "completed").then_some(receipt)
+        });
+        let workspace_id = receipt["workspaceId"].as_str().unwrap().to_owned();
+        let (_, workspace) = self.admin("GET", &format!("/v1/workspaces/{workspace_id}"), None);
+        let pod_uid = "5f0a4c1e-7d1b-4a8e-9c35-3e2d6b9f0a17".to_owned();
+        let root = self.root.path();
+        fs::write(root.join("expected-workspace-id"), &workspace_id).unwrap();
+        fs::write(
+            root.join("expected-namespace"),
+            workspace["namespace"].as_str().unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("expected-pod-uid"), &pod_uid).unwrap();
+        let (status, lease) = self.runtime(
+            &format!("/v1/workspaces/{workspace_id}/runtime/lease"),
+            &json!({"holder":pod_uid}),
+        );
+        assert_eq!(status, 200, "{lease}");
+        (workspace_id, pod_uid, lease)
+    }
+
+    fn database(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.root.path().join("state/workspaces.sqlite")).unwrap()
+    }
+}
+
+/// TASK-93: a runtime renews during a controller maintenance window and acks
+/// it, but the window ends (expires, or the update completes) before the ack
+/// lands. Its lease is still valid, so that is not a fencing event.
+#[test]
+fn a_maintenance_ack_after_the_window_ended_is_answered_without_fencing_a_valid_lease() {
+    let fixture = start_maintenance_fixture();
+    let (workspace_id, pod_uid, lease) = fixture.leased_workspace("late-ack");
+    let renew_path = format!("/v1/workspaces/{workspace_id}/runtime/lease/renew");
+    let ack_path = format!("/v1/workspaces/{workspace_id}/runtime/lease/ack");
+    let lease_body = json!({"holder":pod_uid,"fencingToken":lease["fencingToken"]});
+    let stale_token = lease["fencingToken"].as_u64().unwrap() + 1;
+
+    // Window 1 expires between the renew that reported it and the runtime's ack.
+    let expired_window = "8f6f2f0e-3b9a-4f43-9d64-6e2b0f1d2a11";
+    let (status, extended) = fixture.admin(
+        "POST",
+        "/v1/runtime/maintenance/extend",
+        Some(&json!({"maintenanceId":expired_window,"durationSeconds":300})),
+    );
+    assert_eq!(status, 200, "{extended}");
+    let (status, renewed) = fixture.runtime(&renew_path, &lease_body);
+    assert_eq!(status, 200, "{renewed}");
+    assert_eq!(renewed["maintenanceId"], expired_window);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fixture
+        .database()
+        .execute(
+            "UPDATE runtime_maintenance SET expires_at=?1",
+            [now as i64 - 1],
+        )
+        .unwrap();
+    let late_ack = json!({
+        "holder":pod_uid,
+        "fencingToken":lease["fencingToken"],
+        "maintenanceId":expired_window,
+        "expiresAt":renewed["expiresAt"],
+    });
+    let (status, answer) = fixture.runtime(&ack_path, &late_ack);
+    assert_eq!(
+        status, 200,
+        "an ack for an expired window is not a fence rejection: {answer}"
+    );
+    assert_eq!(
+        answer,
+        json!({"acknowledged":false,"reason":"window-ended"})
+    );
+    let (status, renewed_after) = fixture.runtime(&renew_path, &lease_body);
+    assert_eq!(status, 200, "{renewed_after}");
+    assert_eq!(renewed_after["maintenanceId"], Value::Null);
+
+    // A stale fencing token is still rejected once the window is gone.
+    let (status, rejected) = fixture.runtime(
+        &ack_path,
+        &json!({
+            "holder":pod_uid,
+            "fencingToken":stale_token,
+            "maintenanceId":expired_window,
+            "expiresAt":renewed_after["expiresAt"],
+        }),
+    );
+    assert_eq!(status, 403, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "RUNTIME_FORBIDDEN");
+
+    // Window 2 completes (its row is deleted) before a repeated ack lands.
+    let completed_window = "0c4d8e2a-6f1b-4a39-8e57-2d9c3b7a1f64";
+    let (status, extended) = fixture.admin(
+        "POST",
+        "/v1/runtime/maintenance/extend",
+        Some(&json!({"maintenanceId":completed_window,"durationSeconds":300})),
+    );
+    assert_eq!(status, 200, "{extended}");
+    let (_, renewed) = fixture.runtime(&renew_path, &lease_body);
+    assert_eq!(renewed["maintenanceId"], completed_window);
+    let ack = json!({
+        "holder":pod_uid,
+        "fencingToken":lease["fencingToken"],
+        "maintenanceId":completed_window,
+        "expiresAt":renewed["expiresAt"],
+    });
+    let (status, answer) = fixture.runtime(&ack_path, &ack);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["acknowledged"], true);
+    let (status, completed) = fixture.admin(
+        "POST",
+        "/v1/runtime/maintenance/complete",
+        Some(&json!({"maintenanceId":completed_window})),
+    );
+    assert_eq!(status, 200, "{completed}");
+    let (status, answer) = fixture.runtime(&ack_path, &ack);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        answer,
+        json!({"acknowledged":false,"reason":"window-ended"})
+    );
+    let (status, rejected) = fixture.runtime(
+        &ack_path,
+        &json!({
+            "holder":pod_uid,
+            "fencingToken":stale_token,
+            "maintenanceId":completed_window,
+            "expiresAt":renewed["expiresAt"],
+        }),
+    );
+    assert_eq!(status, 403, "{rejected}");
+}

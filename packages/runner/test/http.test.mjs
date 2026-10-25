@@ -1193,6 +1193,145 @@ test(
   },
 );
 
+// A Pod runner whose first lease renewal reports controller maintenance
+// window `maintenanceAckWindow`, so it acks; `ack` answers that ack. Later
+// renewals report no window. Resolves `acked` on the ack and `renewedAfterAck`
+// on the next renewal.
+async function startMaintenanceAckRunner(t, name, ack) {
+  const directory = await mkdtemp(join(tmpdir(), `adm-runner-${name}-`));
+  const tokenFile = join(directory, "service-account-token");
+  const workspaceConfigFile = join(directory, "workspace.json");
+  const id = `workspace-${name}`;
+  await writeFile(tokenFile, `${name}-identity\n`, { mode: 0o600 });
+  await writeFile(
+    workspaceConfigFile,
+    JSON.stringify({
+      id,
+      name,
+      role: "coding",
+      environment: "pod",
+      localRoot: directory,
+      model: { provider: "faux", id: "faux-1" },
+    }),
+  );
+  const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+  const fixture = { id, renewals: 0, acks: [] };
+  let ackSeen, renewSeenAfterAck;
+  fixture.acked = new Promise((resolve) => (ackSeen = resolve));
+  fixture.renewedAfterAck = new Promise(
+    (resolve) => (renewSeenAfterAck = resolve),
+  );
+  const control = createServer(async (request, response) => {
+    let text = "";
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    const headers = { "content-type": "application/json" };
+    if (request.headers.authorization !== `Bearer ${name}-identity`) {
+      response
+        .writeHead(401, headers)
+        .end(JSON.stringify({ error: { code: "UNAUTHORIZED" } }));
+      return;
+    }
+    if (request.url?.endsWith("/runtime/lease/ack")) {
+      fixture.acks.push(body);
+      ackSeen();
+      response.writeHead(ack.status, headers).end(JSON.stringify(ack.body));
+      return;
+    }
+    const renewal = request.url?.endsWith("/runtime/lease/renew");
+    if (renewal && ++fixture.renewals > 1 && fixture.acks.length)
+      renewSeenAfterAck();
+    response.writeHead(200, headers).end(
+      JSON.stringify({
+        workspaceId: id,
+        holder: body.holder ?? holder,
+        fencingToken: 1,
+        expiresAt: Math.floor(Date.now() / 1000) + 30,
+        maintenanceId:
+          renewal && fixture.renewals === 1 ? maintenanceAckWindow : null,
+        valid: true,
+        allowed: true,
+      }),
+    );
+  });
+  await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    await fixture.runner?.stop();
+    await new Promise((resolve) => control.close(resolve));
+  });
+  fixture.runner = await startRunner(
+    join(directory, "state"),
+    {},
+    {
+      tokenFile,
+      workspaceConfigFile,
+      lifecycleUrl: `http://127.0.0.1:${control.address().port}`,
+      podUid: holder,
+    },
+  );
+  return fixture;
+}
+const maintenanceAckWindow = "8f6f2f0e-3b9a-4f43-9d64-6e2b0f1d2a11";
+
+test(
+  "a maintenance ack answered window-ended keeps the runtime serving and renewing",
+  { timeout: 40_000 },
+  async (t) => {
+    // TASK-93: the window expired between the renew that reported it and the
+    // ack. The lease is still valid, so the runtime must keep working.
+    const fixture = await startMaintenanceAckRunner(t, "late-ack", {
+      status: 200,
+      body: { acknowledged: false, reason: "window-ended" },
+    });
+    await fixture.acked;
+    assert.equal(fixture.acks[0].maintenanceId, maintenanceAckWindow);
+    await fixture.renewedAfterAck;
+    const health = await fetch(`${fixture.runner.url}/health`);
+    assert.equal(health.status, 200, fixture.runner.errors);
+    const accepted = await fixture.runner.request(
+      `/v1/workspaces/${fixture.id}/input`,
+      "POST",
+      { requestId: "after-window-ended", message: "Still serving." },
+      undefined,
+      "late-ack-identity",
+    );
+    assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
+    assert.doesNotMatch(fixture.runner.errors, /lost its lifecycle fence/);
+    assert.match(
+      fixture.runner.errors,
+      new RegExp(
+        `maintenance window ${maintenanceAckWindow} ended before its acknowledgement \\(window-ended\\)`,
+      ),
+    );
+  },
+);
+
+test(
+  "a maintenance ack rejected for a stale fence still closes the runtime",
+  { timeout: 25_000 },
+  async (t) => {
+    const fixture = await startMaintenanceAckRunner(t, "stale-ack", {
+      status: 403,
+      body: {
+        error: {
+          code: "RUNTIME_FORBIDDEN",
+          message: "runtime lease fencing token is stale",
+        },
+      },
+    });
+    await fixture.acked;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((await fetch(`${fixture.runner.url}/health`)).status === 503) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal((await fetch(`${fixture.runner.url}/health`)).status, 503);
+    assert.match(
+      fixture.runner.errors,
+      /lost its lifecycle fence: runtime lease fencing token is stale/,
+    );
+  },
+);
+
 test(
   "lease expiry closes a running tool even when its durable abort is fenced",
   { timeout: 15_000 },

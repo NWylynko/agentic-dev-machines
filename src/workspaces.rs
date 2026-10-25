@@ -366,6 +366,15 @@ impl CreateOptions {
     }
 }
 
+/// Outcome of a runtime's acknowledgement of a controller maintenance window
+/// that it sent while holding a valid lease.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RuntimeMaintenanceAck {
+    Acknowledged,
+    /// The window expired, completed or was cancelled before the ack arrived.
+    WindowEnded,
+}
+
 pub struct WorkspaceStore {
     connection: Connection,
     fencing_token: u64,
@@ -890,37 +899,48 @@ impl WorkspaceStore {
         fencing_token: u64,
         maintenance_id: &str,
         expires_at: u64,
-    ) -> Result<()> {
+    ) -> Result<RuntimeMaintenanceAck> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure_store_fence(&tx, self.fencing_token)?;
         let current_time = now();
-        let active: (String, u64) = tx.query_row(
-            "SELECT maintenance_id,expires_at FROM runtime_maintenance WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
-        )?;
+        let current: (String, u64, u64) = tx
+            .query_row(
+                "SELECT holder,fencing_token,expires_at FROM runtime_leases WHERE workspace_id=?1",
+                [workspace_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .optional()?
+            .context("runtime lease is not held")?;
         ensure!(
-            active.0 == maintenance_id && active.1 > current_time,
-            "controller maintenance window is no longer active"
+            current.0 == holder && current.1 == fencing_token,
+            "runtime lease fencing token is stale"
         );
-        let current: (String, u64, u64) = tx.query_row(
-            "SELECT holder,fencing_token,expires_at FROM runtime_leases WHERE workspace_id=?1",
-            [workspace_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                ))
-            },
-        )?;
+        ensure!(current.2 > current_time, "runtime lease expired");
+        // The window can end (expire, complete or be cancelled) between the renew
+        // that reported it and this ack. The caller still holds a valid lease, so
+        // that is not a fencing event (TASK-93).
+        let active: Option<(String, u64)> = tx
+            .query_row(
+                "SELECT maintenance_id,expires_at FROM runtime_maintenance WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?;
+        if !active.is_some_and(|(active_id, active_expiry)| {
+            active_id == maintenance_id && active_expiry > current_time
+        }) {
+            return Ok(RuntimeMaintenanceAck::WindowEnded);
+        }
         ensure!(
-            current.0 == holder
-                && current.1 == fencing_token
-                && current.2 == expires_at
-                && current.2 > current_time,
+            current.2 == expires_at,
             "runtime lease changed before maintenance acknowledgement"
         );
         let changed = tx.execute(
@@ -932,7 +952,7 @@ impl WorkspaceStore {
             "runtime lease is not part of the maintenance update"
         );
         tx.commit()?;
-        Ok(())
+        Ok(RuntimeMaintenanceAck::Acknowledged)
     }
     pub fn unacknowledged_runtime_maintenance(&self, maintenance_id: &str) -> Result<Vec<String>> {
         let active: Option<(String, u64)> = self
