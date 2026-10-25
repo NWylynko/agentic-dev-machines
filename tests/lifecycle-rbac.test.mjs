@@ -150,3 +150,25 @@ test("lifecycle Pod probes are kubelet HTTP checks and provider-auth cannot take
     ),
   );
 });
+
+test("the lifecycle container requests CPU so a busy node schedules it fairly (TASK-96)", async () => {
+  const documents = YAML.parseAllDocuments(
+    await readFile(
+      new URL("../deploy/lifecycle/control-plane.yaml", import.meta.url),
+      "utf8",
+    ),
+  ).map((document) => document.toJSON());
+  const controller = documents
+    .find(
+      (document) =>
+        document.kind === "Deployment" &&
+        document.metadata.name === "adm-lifecycle",
+    )
+    .spec.template.spec.containers.find(
+      (container) => container.name === "lifecycle",
+    );
+  assert.ok(
+    controller.resources?.requests?.cpu,
+    "the lifecycle container needs a CPU request",
+  );
+});

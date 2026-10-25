@@ -152,6 +152,10 @@ spec:
           ports:
             - name: http
               containerPort: 7433
+          # A request gives the lifecycle a fair CPU share on a busy node (TASK-96).
+          resources:
+            requests:
+              cpu: 100m
           readinessProbe:
             httpGet:
               path: /health
