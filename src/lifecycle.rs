@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, TcpListener, TcpStream},
@@ -1655,17 +1655,93 @@ fn authorize_runtime(
     holder: &str,
     authorization: &str,
 ) -> Result<()> {
-    let (username, pod_uid) = review_runtime_token(cli, authorization)?;
+    let identity = review_runtime_token(cli, authorization)?;
     let workspace = cli.store()?.find(workspace_id)?;
     let expected_user = format!("system:serviceaccount:{}:adm-runtime", workspace.namespace);
     ensure!(
-        username == expected_user && pod_uid == holder,
+        identity.username == expected_user && identity.pod_uid == holder,
         "runtime caller is not authorized for workspace"
     );
     Ok(())
 }
 
-fn review_runtime_token(cli: &crate::Cli, authorization: &str) -> Result<(String, String)> {
+/// How long a successful runtime TokenReview is reused, at most; never past the
+/// token's own `exp` (TASK-96). Before this every authenticated runtime request
+/// started a `kubectl create --raw` TokenReview.
+const RUNTIME_IDENTITY_CACHE_SECONDS: u64 = 60;
+
+/// A runtime caller's reviewed identity. `owner_pod_confirmed` records that the
+/// Pod named by the token was found in its workspace namespace with the ADM
+/// labels; a Pod-bound token stops reviewing once that Pod is deleted.
+#[derive(Clone)]
+struct RuntimeIdentity {
+    token_digest: [u8; 32],
+    username: String,
+    pod_uid: String,
+    owner_pod_confirmed: bool,
+}
+
+/// Reviewed runtime identities by token SHA-256, each with its expiry.
+static RUNTIME_IDENTITY_CACHE: Mutex<BTreeMap<[u8; 32], (RuntimeIdentity, Instant)>> =
+    Mutex::new(BTreeMap::new());
+
+fn runtime_token_digest(token: &str) -> [u8; 32] {
+    ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 digest is 32 bytes")
+}
+
+/// The `exp` claim of a ServiceAccount JWT. TokenReview has already verified its
+/// signature by the time this is read.
+fn runtime_token_expiry_unix(token: &str) -> Option<u64> {
+    use base64::Engine;
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token.split('.').nth(1)?)
+        .ok()?;
+    serde_json::from_slice::<Value>(&claims).ok()?["exp"].as_u64()
+}
+
+fn cached_runtime_identity(token_digest: &[u8; 32]) -> Option<RuntimeIdentity> {
+    let cache = RUNTIME_IDENTITY_CACHE
+        .lock()
+        .expect("runtime identity cache lock");
+    let (identity, expires_at) = cache.get(token_digest)?;
+    (Instant::now() < *expires_at).then(|| identity.clone())
+}
+
+fn cache_runtime_identity(token: &str, identity: &RuntimeIdentity) {
+    let now_unix = crate::workspaces::now();
+    let lifetime =
+        runtime_token_expiry_unix(token).map_or(RUNTIME_IDENTITY_CACHE_SECONDS, |expiry| {
+            expiry
+                .saturating_sub(now_unix)
+                .min(RUNTIME_IDENTITY_CACHE_SECONDS)
+        });
+    let now = Instant::now();
+    let mut cache = RUNTIME_IDENTITY_CACHE
+        .lock()
+        .expect("runtime identity cache lock");
+    cache.retain(|_, (_, expires_at)| now < *expires_at);
+    if lifetime > 0 {
+        cache.insert(
+            identity.token_digest,
+            (identity.clone(), now + Duration::from_secs(lifetime)),
+        );
+    }
+}
+
+fn confirm_runtime_owner_pod(token_digest: &[u8; 32]) {
+    if let Some((identity, _)) = RUNTIME_IDENTITY_CACHE
+        .lock()
+        .expect("runtime identity cache lock")
+        .get_mut(token_digest)
+    {
+        identity.owner_pod_confirmed = true;
+    }
+}
+
+fn review_runtime_token(cli: &crate::Cli, authorization: &str) -> Result<RuntimeIdentity> {
     let token = authorization
         .strip_prefix("Bearer ")
         .context("runtime bearer token required")?;
@@ -1673,6 +1749,10 @@ fn review_runtime_token(cli: &crate::Cli, authorization: &str) -> Result<(String
         !token.is_empty() && !token.contains('\n'),
         "invalid runtime bearer token"
     );
+    let token_digest = runtime_token_digest(token);
+    if let Some(identity) = cached_runtime_identity(&token_digest) {
+        return Ok(identity);
+    }
     let review_request = serde_json::json!({
         "apiVersion":"authentication.k8s.io/v1",
         "kind":"TokenReview",
@@ -1717,7 +1797,14 @@ fn review_runtime_token(cli: &crate::Cli, authorization: &str) -> Result<(String
         uuid::Uuid::parse_str(&pod_uid).is_ok(),
         "runtime ServiceAccount token is not bound to a Pod"
     );
-    Ok((username, pod_uid))
+    let identity = RuntimeIdentity {
+        token_digest,
+        username,
+        pod_uid,
+        owner_pod_confirmed: false,
+    };
+    cache_runtime_identity(token, &identity);
+    Ok(identity)
 }
 
 fn authorize_workspace_action(
@@ -1782,8 +1869,10 @@ pub(crate) fn authorize_runtime_caller(
     store: &WorkspaceStore,
     authorization: &str,
 ) -> Result<Workspace> {
-    let (username, pod_uid) = review_runtime_token(cli, authorization)?;
-    let (service_account, name) = username
+    let identity = review_runtime_token(cli, authorization)?;
+    let pod_uid = &identity.pod_uid;
+    let (service_account, name) = identity
+        .username
         .rsplit_once(':')
         .context("runtime identity is invalid")?;
     ensure!(
@@ -1806,36 +1895,42 @@ pub(crate) fn authorize_runtime_caller(
         source.phase != "deleting" && source.phase != "deleted",
         "runtime caller is not authorized for workspace"
     );
-    let pods = crate::workspaces::kubectl(
-        cli,
-        &[
-            "get",
-            "pods",
-            "--all-namespaces",
-            "-l",
-            "app.kubernetes.io/managed-by=adm",
-            "-o",
-            "json",
-        ],
-        None,
-    )?;
-    let pods: Value = serde_json::from_slice(&pods).context("decode runtime owner Pod list")?;
-    let live_owner_pods = pods["items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|pod| {
-            pod["metadata"]["namespace"] == source.namespace
-                && pod["metadata"]["uid"] == pod_uid
-                && pod["metadata"]["labels"]["adm.dev/workspace-id"] == source.id
-                && pod["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "adm"
-        })
-        .count();
-    ensure!(
-        live_owner_pods == 1,
-        "runtime caller is not authorized for workspace"
-    );
-    store.check_runtime_owner(&source.id, &pod_uid)?;
+    // A token's Pod and the workspace owning its namespace never change, so one
+    // lookup per reviewed token is enough (TASK-96).
+    if !identity.owner_pod_confirmed {
+        let pods = crate::workspaces::kubectl(
+            cli,
+            &[
+                "get",
+                "pods",
+                "-n",
+                &source.namespace,
+                "-l",
+                "app.kubernetes.io/managed-by=adm",
+                "-o",
+                "json",
+            ],
+            None,
+        )?;
+        let pods: Value = serde_json::from_slice(&pods).context("decode runtime owner Pod list")?;
+        let live_owner_pods = pods["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|pod| {
+                pod["metadata"]["namespace"] == source.namespace
+                    && pod["metadata"]["uid"] == pod_uid.as_str()
+                    && pod["metadata"]["labels"]["adm.dev/workspace-id"] == source.id
+                    && pod["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "adm"
+            })
+            .count();
+        ensure!(
+            live_owner_pods == 1,
+            "runtime caller is not authorized for workspace"
+        );
+        confirm_runtime_owner_pod(&identity.token_digest);
+    }
+    store.check_runtime_owner(&source.id, pod_uid)?;
     Ok(source)
 }
 

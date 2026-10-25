@@ -258,7 +258,7 @@ fn wait_for<T>(mut read: impl FnMut() -> Option<T>) -> T {
 }
 
 const FAKE_KUBECTL: &str = r##"#!/usr/bin/env python3
-import contextlib, datetime, fcntl, json, os, pathlib, re, sys, time, urllib.request, uuid
+import base64, contextlib, datetime, fcntl, json, os, pathlib, re, sys, time, urllib.request, uuid
 root=pathlib.Path(__file__).parent
 args=sys.argv[1:]
 args=[arg for arg in args if not arg.startswith('--request-timeout=')]
@@ -310,6 +310,13 @@ elif args[:3] == ['create','--raw','/apis/authentication.k8s.io/v1/tokenreviews'
     elif request['spec']['token'].startswith('target-token:'):
         _,namespace,uid=request['spec']['token'].split(':')
         user={'username':'system:serviceaccount:'+namespace+':adm-runtime','extra':{'authentication.kubernetes.io/pod-uid':[uid]}}
+        print(json.dumps({'status':{'authenticated':True,'audiences':['adm-lifecycle'],'user':user}}))
+    elif request['spec']['token'].count('.')==2:
+        # A JWT-shaped token: its payload names the Pod it is bound to, like a real projected ServiceAccount token.
+        payload=request['spec']['token'].split('.')[1]
+        claims=json.loads(base64.urlsafe_b64decode(payload+'='*(-len(payload)%4)))
+        pod=claims['adm-test-pod']
+        user={'username':'system:serviceaccount:'+pod['namespace']+':adm-runtime','extra':{'authentication.kubernetes.io/pod-uid':[pod['uid']]}}
         print(json.dumps({'status':{'authenticated':True,'audiences':['adm-lifecycle'],'user':user}}))
     elif request['spec']['token']=='bot-token':
         namespace=(root/'expected-bot-namespace').read_text()
@@ -885,9 +892,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     fs::write(&lease_path, serde_json::to_vec(&stale_lease).unwrap()).unwrap();
     // The owner fences from memory (TASK-96): its renewal loop, which runs every
     // 5 s, is what reads the Lease and sees it expired.
-    wait_for(|| {
-        (request(&url, "GET", "/health", None).ok()?.status() == 503).then_some(())
-    });
+    wait_for(|| (request(&url, "GET", "/health", None).ok()?.status() == 503).then_some(()));
     let expired_request = json!({"operationId":"64f88d94-b96e-4fbb-a752-83dc912cecee","kind":"create","spec":workspace_spec("expired-owner-must-not-admit")});
     assert_eq!(
         request_with_token(
@@ -1908,12 +1913,31 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     // A Kubernetes API outage during TokenReview is lifecycle unavailability,
     // which runners wait out, not a rejection that fences them.
     fs::write(root.path().join("tokenreview-unavailable"), "").unwrap();
-    let unavailable_check = request_with_token(
+    // `runtime-token` was just reviewed and is reused for up to 60 s (TASK-96),
+    // so the outage is met by a not-yet-reviewed token for the same Pod.
+    let unreviewed_token = format!(
+        "target-token:{}:{runtime_pod_uid}",
+        runtime_workspace["namespace"].as_str().unwrap()
+    );
+    let reviewed_check = request_with_token(
         &url,
         "POST",
         &check_path,
         Some(&check_body),
         Some("runtime-token"),
+    )
+    .unwrap();
+    assert_eq!(
+        reviewed_check.status(),
+        200,
+        "a reviewed token keeps working through a short API outage"
+    );
+    let unavailable_check = request_with_token(
+        &url,
+        "POST",
+        &check_path,
+        Some(&check_body),
+        Some(&unreviewed_token),
     )
     .unwrap();
     assert_eq!(unavailable_check.status(), 503);
@@ -2925,13 +2949,19 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     .unwrap();
     let pod_uid = "4b53eaa6-4e4d-42dd-9a02-4702a842155a";
     fs::write(root.path().join("expected-pod-uid"), pod_uid).unwrap();
+    // A real token names one Pod for its lifetime, and reviewed tokens are
+    // reused (TASK-96), so this workspace's Pod gets its own token.
+    let failing_pod_token = format!(
+        "target-token:{}:{pod_uid}",
+        detail["namespace"].as_str().unwrap()
+    );
     let runtime_path = format!("/v1/workspaces/{failing_workspace_id}/runtime/lease");
     request_with_token(
         &url,
         "POST",
         &runtime_path,
         Some(&json!({"holder":pod_uid})),
-        Some("runtime-token"),
+        Some(&failing_pod_token),
     )
     .unwrap()
     .error_for_status()
@@ -2961,7 +2991,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             "POST",
             &runtime_check,
             Some(&check_body),
-            Some("runtime-token")
+            Some(&failing_pod_token)
         )
         .unwrap()
         .status(),
@@ -3000,7 +3030,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             "POST",
             &runtime_check,
             Some(&check_body),
-            Some("runtime-token")
+            Some(&failing_pod_token)
         )
         .unwrap()
         .status(),
@@ -3256,12 +3286,19 @@ fn authenticated_runtime_requests_and_health_start_a_constant_number_of_kubectl_
         };
         let response =
             request_with_token(&url, "POST", &path, Some(&body), Some("runtime-token")).unwrap();
-        assert_eq!(response.status(), 200, "{path}: {}", response.text().unwrap());
+        assert_eq!(
+            response.status(),
+            200,
+            "{path}: {}",
+            response.text().unwrap()
+        );
     }
     let runtime_kubectl = kubectl_invocations(root.path())[before_runtime..].to_vec();
     let mut by_command = std::collections::BTreeMap::<String, usize>::new();
     for args in &runtime_kubectl {
-        *by_command.entry(args[..2.min(args.len())].join(" ")).or_default() += 1;
+        *by_command
+            .entry(args[..2.min(args.len())].join(" "))
+            .or_default() += 1;
     }
     // One TokenReview and one Pod lookup for the token, plus whatever the
     // background loops happened to run meanwhile.
@@ -3270,6 +3307,35 @@ fn authenticated_runtime_requests_and_health_start_a_constant_number_of_kubectl_
         "100 authenticated runtime requests started {} kubectl processes: {by_command:#?}",
         runtime_kubectl.len()
     );
+
+    // A reviewed token is reused only until its own `exp`: one that has already
+    // expired is reviewed by Kubernetes on every request.
+    use base64::Engine;
+    let claims = json!({
+        "exp": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+        "adm-test-pod": {"namespace": workspace["namespace"], "uid": pod_uid},
+    });
+    let expiring_token = format!(
+        "e30.{}.signature",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let before_expiring = kubectl_invocations(root.path()).len();
+    for _ in 0..3 {
+        let response = request_with_token(
+            &url,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/runtime/check"),
+            Some(&lease_body),
+            Some(&expiring_token),
+        )
+        .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().unwrap());
+    }
+    let expiring_reviews = kubectl_invocations(root.path())[before_expiring..]
+        .iter()
+        .filter(|args| args.starts_with(&["create".into(), "--raw".into()]))
+        .count();
+    assert_eq!(expiring_reviews, 3, "an expired token must not be reused");
 
     let mut stop = std::net::TcpStream::connect("127.0.0.1:7434").unwrap();
     stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
