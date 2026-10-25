@@ -1282,11 +1282,7 @@ fn kubectl_with_timeout(
     input: Option<&[u8]>,
     bounded: bool,
 ) -> Result<Vec<u8>> {
-    if bounded {
-        cli.check_lifecycle_fence_bounded()?;
-    } else {
-        cli.check_lifecycle_fence()?;
-    }
+    cli.check_lifecycle_fence()?;
     let mut command = cli.kubectl_command()?;
     command.args(args);
     if bounded
@@ -1326,11 +1322,7 @@ fn kubectl_with_timeout(
         display_args,
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    if bounded {
-        cli.check_lifecycle_fence_bounded()?;
-    } else {
-        cli.check_lifecycle_fence()?;
-    }
+    cli.check_lifecycle_fence()?;
     Ok(output.stdout)
 }
 

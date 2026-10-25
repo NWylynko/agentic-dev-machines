@@ -941,7 +941,7 @@ fn route(
     authorization: &str,
 ) -> Result<(u16, Value)> {
     if method == "GET" && path == "/health" {
-        if let Err(error) = cli.check_lifecycle_fence_bounded() {
+        if let Err(error) = cli.check_lifecycle_fence() {
             return Ok((
                 503,
                 serde_json::json!({"status":"unavailable","service":"adm-lifecycle","error":format!("lifecycle Lease ownership lost: {error:#}")}),

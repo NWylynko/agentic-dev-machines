@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-struct ServiceProcess(Child);
+/// A lifecycle service whose stderr is appended to `service.log` in the fixture
+/// root (shared by every service a test starts) so tests can wait on its log
+/// lines. A panicking test prints that log.
+struct ServiceProcess(Child, std::path::PathBuf);
 
 impl std::ops::Deref for ServiceProcess {
     type Target = Child;
@@ -31,7 +34,18 @@ impl Drop for ServiceProcess {
             }
             let _ = self.0.wait();
         }
+        if thread::panicking() {
+            eprintln!(
+                "--- lifecycle service log {} ---\n{}",
+                self.1.display(),
+                fs::read_to_string(&self.1).unwrap_or_default()
+            );
+        }
     }
+}
+
+fn service_log(root: &Path) -> String {
+    fs::read_to_string(root.join("service.log")).unwrap_or_default()
 }
 
 fn start_service(root: &Path, port: u16) -> ServiceProcess {
@@ -39,6 +53,12 @@ fn start_service(root: &Path, port: u16) -> ServiceProcess {
     let status_port =
         fs::read_to_string(root.join("runtime-status-port")).unwrap_or_else(|_| "7432".into());
     let runner_url = fs::read_to_string(root.join("runner-url")).unwrap();
+    let log_path = root.join("service.log");
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
     ServiceProcess(
         Command::new(env!("CARGO_BIN_EXE_adm"))
             .process_group(0)
@@ -54,9 +74,10 @@ fn start_service(root: &Path, port: u16) -> ServiceProcess {
             .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
             .arg(port.to_string())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(log)
             .spawn()
             .expect("start lifecycle service"),
+        log_path,
     )
 }
 
@@ -862,6 +883,11 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     let mut stale_lease: Value = serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
     stale_lease["metadata"]["annotations"]["adm.dev/renew-unix"] = "0".into();
     fs::write(&lease_path, serde_json::to_vec(&stale_lease).unwrap()).unwrap();
+    // The owner fences from memory (TASK-96): its renewal loop, which runs every
+    // 5 s, is what reads the Lease and sees it expired.
+    wait_for(|| {
+        (request(&url, "GET", "/health", None).ok()?.status() == 503).then_some(())
+    });
     let expired_request = json!({"operationId":"64f88d94-b96e-4fbb-a752-83dc912cecee","kind":"create","spec":workspace_spec("expired-owner-must-not-admit")});
     assert_eq!(
         request_with_token(
@@ -930,14 +956,15 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     assert_eq!(
         request(&url, "GET", "/health", None).unwrap().status(),
         503,
-        "liveness must fail immediately when the Kubernetes Lease changes owners"
+        "liveness stays failed once the Kubernetes Lease is lost"
     );
     fs::write(root.path().join("storage-release"), "go").unwrap();
+    // The in-flight create resumes, its next fence check fails, and the
+    // worker gives the operation up.
     wait_for(|| {
-        fs::read_to_string(root.path().join("lease-gets"))
-            .ok()
-            .and_then(|n| n.parse::<u32>().ok())
-            .filter(|n| *n >= 3)
+        service_log(root.path())
+            .contains(&format!("adm lifecycle operation {operation_id} failed"))
+            .then_some(())
     });
     assert!(
         !root.path().join("applied").exists(),

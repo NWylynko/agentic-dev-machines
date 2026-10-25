@@ -601,13 +601,7 @@ impl Cli {
     }
     pub fn check_lifecycle_fence(&self) -> Result<()> {
         if let Some(fence) = &self.lifecycle_fence {
-            lease::verify(self, fence)?;
-        }
-        Ok(())
-    }
-    pub fn check_lifecycle_fence_bounded(&self) -> Result<()> {
-        if let Some(fence) = &self.lifecycle_fence {
-            lease::verify_bounded(self, fence)?;
+            lease::verify(fence)?;
         }
         Ok(())
     }

@@ -1,24 +1,37 @@
 use crate::Cli;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const NAME: &str = "adm-lifecycle-owner";
 const DURATION_SECONDS: u64 = 15;
+/// The owner stops acting this long before a competing lifecycle could treat its
+/// Lease as expired. It covers the whole-second `adm.dev/renew-unix` stamp and
+/// clock skew between nodes.
+const LEASE_FENCE_MARGIN: Duration = Duration::from_secs(3);
 
+/// The lifecycle's Kubernetes Lease ownership, held in memory (TASK-96). Only the
+/// renewal loop reads the Lease. `verify` checks `owned` and `valid_until` (start
+/// of the last successful renewal + Lease duration - margin), so fencing starts
+/// no kubectl process.
 #[derive(Clone)]
 pub struct LeaseFence {
     holder: String,
     epoch: u64,
     owned: Arc<AtomicBool>,
+    valid_until: Arc<Mutex<Instant>>,
+}
+
+fn lease_fence_deadline(renewal_started: Instant) -> Instant {
+    renewal_started + Duration::from_secs(DURATION_SECONDS) - LEASE_FENCE_MARGIN
 }
 
 impl LeaseFence {
@@ -81,20 +94,6 @@ fn get(cli: &Cli) -> Result<Value> {
     )?)?)
 }
 
-fn get_bounded(cli: &Cli) -> Result<Value> {
-    let mut args = vec![
-        "get",
-        "lease",
-        NAME,
-        "-n",
-        &cli.lifecycle_namespace,
-        "-o",
-        "json",
-    ];
-    args.push("--request-timeout=1s");
-    Ok(serde_json::from_slice(&run(cli, &args, None)?)?)
-}
-
 fn timestamp() -> String {
     let seconds = unix_now() as libc::time_t;
     let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
@@ -146,6 +145,7 @@ fn lease_is_fresh(lease: &Value) -> bool {
 
 pub fn acquire(cli: &Cli) -> Result<LeaseFence> {
     let holder = uuid::Uuid::new_v4().to_string();
+    let acquisition_started = Instant::now();
     let current = get(cli);
     let epoch = match current {
         Ok(mut lease) => {
@@ -178,6 +178,7 @@ pub fn acquire(cli: &Cli) -> Result<LeaseFence> {
         holder: holder.clone(),
         epoch,
         owned: Arc::new(AtomicBool::new(true)),
+        valid_until: Arc::new(Mutex::new(lease_fence_deadline(acquisition_started))),
     };
     let renew_cli = cli.clone_for_lifecycle();
     let renew_fence = fence.clone();
@@ -187,6 +188,7 @@ pub fn acquire(cli: &Cli) -> Result<LeaseFence> {
             if !renew_fence.is_owned() {
                 break;
             }
+            let renewal_started = Instant::now();
             let result = get(&renew_cli).and_then(|lease| {
                 ensure!(
                     lease["spec"]["holderIdentity"] == renew_fence.holder
@@ -204,45 +206,35 @@ pub fn acquire(cli: &Cli) -> Result<LeaseFence> {
                 renew_fence.owned.store(false, Ordering::Release);
                 break;
             }
+            *renew_fence
+                .valid_until
+                .lock()
+                .expect("lifecycle Lease deadline lock") = lease_fence_deadline(renewal_started);
         }
     });
     Ok(fence)
 }
 
-pub fn verify(cli: &Cli, fence: &LeaseFence) -> Result<()> {
-    verify_with(cli, fence, get)
-}
-
-pub fn verify_bounded(cli: &Cli, fence: &LeaseFence) -> Result<()> {
-    verify_with(cli, fence, get_bounded)
-}
-
-fn verify_with(
-    cli: &Cli,
-    fence: &LeaseFence,
-    read_lease: impl FnOnce(&Cli) -> Result<Value>,
-) -> Result<()> {
+/// Fails once the renewal loop saw the Lease change hands, or once the last
+/// successful renewal is too old to rule out another owner. Either is final.
+pub fn verify(fence: &LeaseFence) -> Result<()> {
     ensure!(
         fence.is_owned(),
         "lifecycle service lost its Kubernetes Lease"
     );
-    let result = read_lease(cli).and_then(|lease| {
-        ensure!(
-            lease["spec"]["holderIdentity"] == fence.holder
-                && lease["metadata"]["annotations"]["adm.dev/fencing-token"]
-                    .as_str()
-                    .and_then(|token| token.parse::<u64>().ok())
-                    == Some(fence.epoch)
-                && lease_is_fresh(&lease),
-            "lifecycle service lost or expired its Kubernetes Lease fencing token"
+    let valid_until = *fence
+        .valid_until
+        .lock()
+        .expect("lifecycle Lease deadline lock");
+    if Instant::now() >= valid_until {
+        let error = format!(
+            "lifecycle service has not renewed its Kubernetes Lease within {DURATION_SECONDS}s minus a {}s margin",
+            LEASE_FENCE_MARGIN.as_secs()
         );
-        Ok(())
-    });
-    if let Err(error) = result {
         if fence.owned.swap(false, Ordering::AcqRel) {
-            eprintln!("adm lifecycle lost Kubernetes Lease ownership: {error:#}");
+            eprintln!("adm lifecycle lost Kubernetes Lease ownership: {error}");
         }
-        return Err(error);
+        bail!(error);
     }
     Ok(())
 }
