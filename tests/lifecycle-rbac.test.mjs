@@ -98,8 +98,8 @@ test("provider auth authority shares the lifecycle image and persistent state wi
     "shared credentials must use the lifecycle persistent volume",
   );
   assert.ok(
-    authority.readinessProbe.exec,
-    "a loopback-bound sidecar needs an in-container readiness probe",
+    authority.args.includes("--probe-port"),
+    "the loopback-bound authority needs a Pod-IP liveness listener for kubelet",
   );
   const service = documents.find(
     (document) =>
@@ -109,5 +109,44 @@ test("provider auth authority shares the lifecycle image and persistent state wi
   assert.ok(
     service.spec.ports.every((port) => port.port !== 7434),
     "the provider authority must not be exposed as a Service port",
+  );
+});
+
+test("lifecycle Pod probes are kubelet HTTP checks and provider-auth cannot take the Service offline (TASK-94)", async () => {
+  const documents = YAML.parseAllDocuments(
+    await readFile(
+      new URL("../deploy/lifecycle/control-plane.yaml", import.meta.url),
+      "utf8",
+    ),
+  ).map((document) => document.toJSON());
+  const pod = documents.find(
+    (document) =>
+      document.kind === "Deployment" &&
+      document.metadata.name === "adm-lifecycle",
+  ).spec.template.spec;
+  for (const container of [...(pod.initContainers ?? []), ...pod.containers])
+    for (const probe of ["readinessProbe", "livenessProbe", "startupProbe"])
+      assert.equal(
+        container[probe]?.exec,
+        undefined,
+        `${container.name} ${probe} must not start a process per check`,
+      );
+  const authority = pod.containers.find(
+    (container) => container.name === "provider-auth",
+  );
+  assert.equal(
+    authority.readinessProbe,
+    undefined,
+    "provider-auth readiness must not gate the lifecycle Service endpoints",
+  );
+  assert.deepEqual(authority.livenessProbe.httpGet, {
+    path: "/health",
+    port: "auth-liveness",
+  });
+  assert.equal(authority.livenessProbe.timeoutSeconds, 3);
+  assert.ok(
+    authority.ports.some(
+      (port) => port.name === "auth-liveness" && port.containerPort === 7435,
+    ),
   );
 });

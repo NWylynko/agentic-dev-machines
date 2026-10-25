@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer } from "node:http";
+import { networkInterfaces } from "node:os";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1056,4 +1059,57 @@ test("shared auth retries a controller transport failure only after its lease ga
     await authority.close();
     await rm(directory, { recursive: true });
   }
+});
+
+test("provider-auth answers kubelet liveness on the Pod IP while credentials stay loopback-only (TASK-94)", async (t) => {
+  const podIp = Object.values(networkInterfaces())
+    .flat()
+    .find((address) => address.family === "IPv4" && !address.internal)?.address;
+  assert.ok(podIp, "the test needs a non-loopback IPv4 address to stand in for the Pod IP");
+  const freePort = () =>
+    new Promise((resolve) => {
+      const server = createServer().listen(0, "0.0.0.0", () => {
+        const { port } = server.address();
+        server.close(() => resolve(port));
+      });
+    });
+  const port = await freePort();
+  const probePort = await freePort();
+  const directory = await mkdtemp(join(tmpdir(), "adm-provider-auth-probe-"));
+  const child = spawn(
+    process.execPath,
+    [
+      new URL("../src/provider-auth-main.ts", import.meta.url).pathname,
+      "--port", String(port),
+      "--probe-port", String(probePort),
+      "--auth-path", join(directory, "auth.json"),
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  t.after(async () => {
+    child.kill("SIGKILL");
+    await rm(directory, { recursive: true });
+  });
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  while (!output.includes("provider-auth liveness listening")) {
+    const [chunk] = await Promise.race([
+      once(child.stdout, "data"),
+      once(child, "exit").then(([code]) => {
+        throw new Error(`provider-auth exited ${code} before listening: ${output}`);
+      }),
+    ]);
+    output += chunk;
+  }
+  const reachable = async (url) => {
+    try {
+      return (await fetch(url)).status;
+    } catch {
+      return "refused";
+    }
+  };
+  assert.equal(await reachable(`http://${podIp}:${probePort}/health`), 200);
+  assert.equal(await reachable(`http://${podIp}:${probePort}/v1/provider-auth/providers`), 404);
+  assert.equal(await reachable(`http://${podIp}:${port}/health`), "refused");
+  assert.equal(await reachable(`http://127.0.0.1:${port}/v1/provider-auth/providers`), 200);
 });

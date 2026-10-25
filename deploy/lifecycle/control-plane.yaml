@@ -185,15 +185,20 @@ spec:
           image: ghcr.io/nwylynko/agentic-dev-machines:latest
           imagePullPolicy: IfNotPresent
           command: ["node", "/opt/adm/provider-auth.mjs"]
+          args: ["--probe-port", "7435"]
           ports:
             - name: provider-auth
               containerPort: 7434
-          readinessProbe:
-            exec:
-              command: ["node", "-e", "fetch('http://127.0.0.1:7434/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+            - name: auth-liveness
+              containerPort: 7435
+          # No readinessProbe: provider-auth must not take the lifecycle Service
+          # offline (TASK-94). The authority itself stays loopback-only; 7435
+          # answers only liveness on the Pod IP for kubelet.
           livenessProbe:
-            exec:
-              command: ["node", "-e", "fetch('http://127.0.0.1:7434/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+            httpGet:
+              path: /health
+              port: auth-liveness
+            timeoutSeconds: 3
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
