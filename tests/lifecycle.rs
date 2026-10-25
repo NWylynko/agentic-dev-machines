@@ -256,6 +256,9 @@ def put(path, text):
     os.replace(scratch, path)
 def load_state():
     return json.loads(state_path.read_text()) if state_path.exists() else {}
+# Every invocation is recorded so tests can bound how many kubectl processes the lifecycle starts (TASK-96).
+with locked():
+    with (root/'kubectl-invocations').open('a') as invocations: invocations.write(json.dumps(sys.argv[1:])+'\n')
 def validate_lease_microtime(doc):
     for field in ['acquireTime','renewTime']:
         value=doc['spec'].get(field,'')
@@ -263,6 +266,7 @@ def validate_lease_microtime(doc):
             print('Error from server (BadRequest): Lease '+field+' requires Kubernetes MicroTime with six fractional digits',file=sys.stderr); sys.exit(1)
         datetime.datetime.strptime(value,'%Y-%m-%dT%H:%M:%S.%fZ')
 if args[:2] == ['get','lease']:
+    while (root/'hold-lease-get').exists(): time.sleep(.01)
     count_path=root/'lease-gets'
     with count_path.open('a+') as counter:
         fcntl.flock(counter, fcntl.LOCK_EX)
@@ -320,7 +324,9 @@ elif args[:2] == ['get','pods']:
         selector=args[args.index('-l')+1]
         if selector.startswith('adm.dev/workspace-id='): selected_workspace=selector.split('=',1)[1]
     runtime_ip=(root/'runtime-ip').read_text() if (root/'runtime-ip').exists() else None
+    selected_namespace=args[args.index('-n')+1] if '-n' in args else None
     for namespace, resource in state.items():
+        if selected_namespace and namespace != selected_namespace: continue
         workspace_id=resource['metadata']['labels'].get('adm.dev/workspace-id')
         if selected_workspace and workspace_id != selected_workspace: continue
         pod_uid=(root/'expected-pod-uid').read_text() if (root/'expected-pod-uid').exists() else '4b53eaa6-4e4d-42dd-9a02-4702a842155a'
@@ -1515,6 +1521,9 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     {
         use std::io::{Read, Write};
         use std::net::TcpStream;
+        let _authority_port = PROVIDER_AUTHORITY_PORT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let authority = TcpListener::bind("127.0.0.1:7434").unwrap();
         let authority_thread = thread::spawn(move || {
             let mut received = Vec::new();
@@ -3071,5 +3080,233 @@ fn workspace_pods_on_a_node_down_for_three_minutes_are_moved_to_a_healthy_node()
         deleted,
         "workspace-pod -n adm-on-dead-node --grace-period=0 --force --wait=false\n"
     );
+    stop_http_stub(runner_port, runner);
+}
+
+/// Tests that serve a fake provider authority on the lifecycle's fixed loopback
+/// port (127.0.0.1:7434) hold this so they never receive each other's requests.
+static PROVIDER_AUTHORITY_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn kubectl_invocations(root: &Path) -> Vec<Vec<String>> {
+    fs::read_to_string(root.join("kubectl-invocations"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The lease renewal loop and the node failover loop run kubectl on their own
+/// schedule, whatever requests arrive.
+fn is_background_kubectl(args: &[String]) -> bool {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    matches!(
+        args.as_slice(),
+        ["get", "lease", "adm-lifecycle-owner", "-n", _, "-o", "json"]
+            | ["replace", "-f", "-"]
+            | ["get", "nodes", "-o", "json"]
+    )
+}
+
+#[test]
+fn authenticated_runtime_requests_and_health_start_a_constant_number_of_kubectl_processes() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("storage-release"), "go").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let _service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+
+    let operation_id = "0b8b8f4e-3f5c-4d55-9d2a-8a2b3f6a1c96";
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&json!({"operationId":operation_id,"kind":"create","spec":workspace_spec("kubectl-budget")})),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap();
+    let receipt: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{operation_id}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "completed")
+    });
+    let workspace_id = receipt["workspaceId"].as_str().unwrap();
+    let workspace: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}"),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    let pod_uid = "5f0a4c1e-7d1b-4a8e-9c35-3e2d6b9f0a17";
+    fs::write(root.path().join("expected-workspace-id"), workspace_id).unwrap();
+    fs::write(
+        root.path().join("expected-namespace"),
+        workspace["namespace"].as_str().unwrap(),
+    )
+    .unwrap();
+    fs::write(root.path().join("expected-pod-uid"), pod_uid).unwrap();
+    let lease: Value = request_with_token(
+        &url,
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/runtime/lease"),
+        Some(&json!({"holder":pod_uid})),
+        Some("runtime-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    let lease_body = json!({"holder":pod_uid,"fencingToken":lease["fencingToken"]});
+
+    let _authority_port = PROVIDER_AUTHORITY_PORT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let authority = TcpListener::bind("127.0.0.1:7434").unwrap();
+    let authority_thread = thread::spawn(move || {
+        for mut stream in authority.incoming().flatten() {
+            let mut bytes = [0; 4096];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            if request.starts_with(b"GET /stop ") {
+                break;
+            }
+            let body = r#"{"revision":1,"connectors":[]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+
+    let before_health = kubectl_invocations(root.path()).len();
+    for _ in 0..100 {
+        assert_eq!(request(&url, "GET", "/health", None).unwrap().status(), 200);
+    }
+    let health_kubectl: Vec<_> = kubectl_invocations(root.path())[before_health..]
+        .iter()
+        .filter(|args| !is_background_kubectl(args))
+        .cloned()
+        .collect();
+    assert!(
+        health_kubectl.is_empty(),
+        "/health must not start kubectl: {health_kubectl:#?}"
+    );
+
+    let before_runtime = kubectl_invocations(root.path()).len();
+    for index in 0..100 {
+        let (path, body) = match index % 3 {
+            0 => (
+                format!("/v1/workspaces/{workspace_id}/runtime/lease/renew"),
+                lease_body.clone(),
+            ),
+            1 => (
+                format!("/v1/workspaces/{workspace_id}/runtime/check"),
+                lease_body.clone(),
+            ),
+            _ => ("/v1/runtime/connectors/catalog".to_owned(), json!({})),
+        };
+        let response =
+            request_with_token(&url, "POST", &path, Some(&body), Some("runtime-token")).unwrap();
+        assert_eq!(response.status(), 200, "{path}: {}", response.text().unwrap());
+    }
+    let runtime_kubectl = kubectl_invocations(root.path())[before_runtime..].to_vec();
+    let mut by_command = std::collections::BTreeMap::<String, usize>::new();
+    for args in &runtime_kubectl {
+        *by_command.entry(args[..2.min(args.len())].join(" ")).or_default() += 1;
+    }
+    // One TokenReview and one Pod lookup for the token, plus whatever the
+    // background loops happened to run meanwhile.
+    assert!(
+        runtime_kubectl.len() <= 10,
+        "100 authenticated runtime requests started {} kubectl processes: {by_command:#?}",
+        runtime_kubectl.len()
+    );
+
+    let mut stop = std::net::TcpStream::connect("127.0.0.1:7434").unwrap();
+    stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    authority_thread.join().unwrap();
+    stop_http_stub(runner_port, runner);
+}
+
+#[test]
+fn lifecycle_fences_itself_within_the_lease_duration_when_renewal_hangs() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let _service = start_service(root.path(), port);
+    assert_eq!(
+        wait_for(|| request(&url, "GET", "/health", None).ok()).status(),
+        200
+    );
+    // The API server stops answering: the renewal loop's `get lease` never
+    // returns, so the owner can no longer prove it still holds the Lease. A
+    // replacement may acquire it once the last renewal is 15 s old.
+    let hung = Instant::now();
+    fs::write(root.path().join("hold-lease-get"), "").unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    loop {
+        let status = client
+            .get(format!("{url}/health"))
+            .send()
+            .map(|response| response.status().as_u16());
+        if status.as_ref().is_ok_and(|status| *status == 503) {
+            break;
+        }
+        assert!(
+            hung.elapsed() < Duration::from_secs(15),
+            "the lifecycle must fence itself before its Lease can expire for others (last /health: {status:?})"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/operations",
+            Some(&json!({"operationId":"9c0f3c52-5e7e-4b0a-a4f1-2a8f0b6d7e31","kind":"create","spec":workspace_spec("after-expiry")})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .status(),
+        400,
+        "a fenced owner must not admit work"
+    );
+    fs::remove_file(root.path().join("hold-lease-get")).unwrap();
     stop_http_stub(runner_port, runner);
 }
