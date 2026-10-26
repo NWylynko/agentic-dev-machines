@@ -1075,6 +1075,14 @@ test("provider-auth answers kubelet liveness on the Pod IP while credentials sta
     });
   const port = await freePort();
   const probePort = await freePort();
+  // The authority serves only while a lifecycle owner answers; stand one in
+  // so the test does not depend on a real lifecycle holding 7433.
+  const lifecycle = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ status: "ok", ownerEpoch: 1 }));
+  });
+  await new Promise((resolve) => lifecycle.listen(0, "127.0.0.1", resolve));
+  t.after(() => lifecycle.close());
   const directory = await mkdtemp(join(tmpdir(), "adm-provider-auth-probe-"));
   const child = spawn(
     process.execPath,
@@ -1083,6 +1091,7 @@ test("provider-auth answers kubelet liveness on the Pod IP while credentials sta
       "--port", String(port),
       "--probe-port", String(probePort),
       "--auth-path", join(directory, "auth.json"),
+      "--lifecycle-url", `http://127.0.0.1:${lifecycle.address().port}`,
     ],
     { stdio: ["ignore", "pipe", "inherit"] },
   );

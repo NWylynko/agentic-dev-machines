@@ -10,6 +10,7 @@ const { values } = parseArgs({
     host: { type: "string", default: "127.0.0.1" },
     port: { type: "string", default: "7434" },
     "probe-port": { type: "string", default: "7435" },
+    "lifecycle-url": { type: "string", default: "http://127.0.0.1:7433" },
     "auth-path": {
       type: "string",
       default: "/var/lib/adm/provider-auth/auth.json",
@@ -20,7 +21,7 @@ const authority = await createProviderAuthAuthority({
   authPath: values["auth-path"]!,
   ownerGuard: createOwnerEpochGuard(async () => {
     try {
-      const response = await fetch("http://127.0.0.1:7433/health");
+      const response = await fetch(`${values["lifecycle-url"]}/health`);
       if (!response.ok) return undefined;
       const health = (await response.json()) as { ownerEpoch?: unknown };
       return typeof health.ownerEpoch === "number" ? health.ownerEpoch : undefined;
