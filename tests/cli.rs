@@ -2995,7 +2995,8 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     let stdout = String::from_utf8_lossy(&recovered_cleanup.stdout);
     assert!(stdout.contains("\"status\":\"accepted\""), "{stdout}");
     assert!(!first_receipt.exists());
-    let remaining = assert_ok(adm(root.path(), &["list", "--json"]));
+    // --all: a delete that already finished drops out of the default listing.
+    let remaining = assert_ok(adm(root.path(), &["list", "--json", "--all"]));
     for workspace in [&workspace, &other_workspace] {
         let entry = remaining
             .as_array()
