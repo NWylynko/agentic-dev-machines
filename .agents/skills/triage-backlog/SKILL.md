@@ -97,7 +97,7 @@ A ticket moves Backlog → **Todo** only when the work needed is 100% understood
 - No open product decisions.
 - No Unknown section. The cause is found and the fix is decided.
 - Acceptance / tests first is concrete enough to write the failing tests straight away.
-- Not blocked by unfinished work (or `blockedBy` is set and the blocker is also in Todo, earlier in the bundle order).
+- Waiting on other work is fine: set `blockedBy` and it still goes to Todo. Linear marks it blocked.
 - If it's in a bundle, the lead's bundle comment gives its place in the order.
 
 ## Grooming the existing backlog

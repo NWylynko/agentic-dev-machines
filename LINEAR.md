@@ -27,7 +27,7 @@ The `Personal` team holds other projects too. Always filter by `project: "P-TASK
 | Duplicate   | Set `duplicateOf` first, then this status.                                                                                                                |
 | Canceled    | Won't do. Leave a comment saying why.                                                                                                                     |
 
-Backlog holds both untriaged and triaged-but-blocked tickets. Tell them apart by the triage header (see [the `triage-backlog` skill](.agents/skills/triage-backlog/SKILL.md)): no header and no label means untriaged.
+Backlog holds both untriaged tickets and triaged tickets waiting on Nick. Tell them apart by the triage header (see [the `triage-backlog` skill](.agents/skills/triage-backlog/SKILL.md)): no header and no label means untriaged.
 
 ## Labels and priority
 
@@ -42,7 +42,7 @@ An imperative sentence that states the product outcome, not the mechanism: "Show
 
 - **Bundles.** Related tickets that should ship together become sub-issues (`parentId`) of a lead ticket. Put a `**Bundle X: <theme> (DATE grooming).**` comment on the lead that gives the order and says why they belong together.
 - **Duplicates.** `save_issue` with `duplicateOf`, then set status `Duplicate`. The surviving ticket absorbs anything the duplicate added.
-- **Related / blocking.** Use `relatedTo`, `blocks`, `blockedBy`. A ticket blocked by unfinished work is not ready.
+- **Related / blocking.** Use `relatedTo`, `blocks`, `blockedBy`. A fully understood ticket goes to Todo even while it waits on other work: set `blockedBy` so Linear marks it blocked. Before starting a Todo ticket, check its blockers are done (In Review or Done).
 - Mention other tickets as `TASK-<n>`. Linear turns them into links.
 
 ## Writing to Linear through the MCP
