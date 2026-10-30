@@ -1,6 +1,6 @@
 keep this file up to date
 
-Tickets live in Linear (team `TASK`, project `P-TASK-2`). Read [LINEAR.md](LINEAR.md) before touching Linear through the MCP, and [TRIAGE.md](TRIAGE.md) before triaging or grooming the backlog.
+Tickets live in Linear (team `TASK`, project `P-TASK-2`). Read [LINEAR.md](LINEAR.md) before touching Linear through the MCP, and the `triage-backlog` skill ([`.agents/skills/triage-backlog/SKILL.md`](.agents/skills/triage-backlog/SKILL.md)) before triaging or grooming the backlog.
 
 # Project notes
 

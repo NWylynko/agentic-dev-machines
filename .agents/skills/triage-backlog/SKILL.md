@@ -1,8 +1,13 @@
-# TRIAGE.md
+---
+name: triage-backlog
+description: Triage or groom this project's Linear backlog (team TASK, project P-TASK-2) — turn Nick's raw Backlog notes into evidence-backed, test-first tickets and decide what is ready for Todo. Use when asked to triage, groom, or review the backlog or a TASK-<n> ticket. Overrides the generic `triage` skill in this repo.
+---
+
+# Triage the backlog
 
 keep this file up to date
 
-What triaging a backlog ticket means in this project, the steps, and when a ticket counts as triaged and as ready to work on. Linear mechanics (IDs, statuses, labels, MCP gotchas) are in [LINEAR.md](LINEAR.md).
+What triaging a backlog ticket means in this project, the steps, and when a ticket counts as triaged and as ready to work on. Read [LINEAR.md](../../../LINEAR.md) first for Linear mechanics (IDs, statuses, labels, MCP gotchas).
 
 This replaces the generic `triage` skill's GitHub label states. Its roles map onto Linear like this:
 
@@ -25,16 +30,16 @@ Nick files raw notes into Backlog: a one-line title, maybe a screenshot. Triage 
 ## Steps
 
 1. **Read everything.** Description, images (`extract_images`), comments, relations. Read prior triage notes so you don't redo settled work.
-2. **Check for overlap.** Search the project for the same problem by concept, not wording (include Done and Canceled). Check [AGENTS.md](AGENTS.md) project notes and the code. If it already exists, say where. If it duplicates a ticket, mark it Duplicate. If it fits an existing bundle, attach it there.
+2. **Check for overlap.** Search the project for the same problem by concept, not wording (include Done and Canceled). Check [AGENTS.md](../../../AGENTS.md) project notes and the code. If it already exists, say where. If it duplicates a ticket, mark it Duplicate. If it fits an existing bundle, attach it there.
 3. **Reproduce.** Prove the problem is real before writing it up.
    - Live, read-only, against the homelab cluster where possible (`KUBECONFIG=~/.cluster.yaml`, run a freshly built `adm` with temporary `XDG_*` dirs). Creating and destroying throwaway test workspaces is fine. Don't touch workspaces Nick is using, and don't spend his credentials (e.g. refresh tokens).
    - Otherwise reproduce in a test or locally.
    - If you could only read the code, say so plainly in the ticket.
-4. **Find the cause.** Trace it to the code, with permalinks at a pushed commit. If the cause is still unknown, write an **Unknown** section saying what's missing and why you stopped.
+4. **Find the cause.** Trace it to the code, with permalinks at a pushed commit. If the cause is still unknown, write an **Unknown** section saying what's missing and why you stopped. The ticket then stays in Backlog.
 5. **Decide the shape of the fix.** Describe the behaviour wanted, not file-by-file edits. List what's out of scope if there's an obvious adjacent temptation.
 6. **Write acceptance as tests.** "Acceptance / tests first": end-to-end checks that get as close to real use as possible (real `adm` binary, real lifecycle service, PTY for the terminal). Each one must fail today and pass after the fix.
 7. **Surface product decisions.** Anything only Nick can decide goes under **Product decisions (open)**, each with options and what each means for the user. Lead with the option that gives the better experience and state its build cost.
-8. **Classify.** Imperative title, one label, a priority (see [LINEAR.md](LINEAR.md)).
+8. **Classify.** Imperative title, one label, a priority (see [LINEAR.md](../../../LINEAR.md)).
 9. **Write it into the ticket** (format below) and set the status.
 10. **Report back** to Nick: what moved to Todo, what stayed in Backlog and the decisions blocking each, what you couldn't reproduce.
 
@@ -71,7 +76,7 @@ Related: TASK-n (why), TASK-m (why).
 <Nick's original text and images, untouched>
 ```
 
-The readiness word in the header is one of `ready`, `ready (<caveat>)`, `needs decision`, `needs info`, or `parked`.
+The readiness word in the header is one of `ready`, `needs decision`, `needs info`, or `parked`. Only `ready` tickets go to Todo.
 
 ## Triaged
 
@@ -87,11 +92,11 @@ Triaged does not mean ready. A triaged ticket can sit in Backlog waiting on Nick
 
 ## Ready to work
 
-A ticket moves Backlog → **Todo** only when an agent could start it now without asking anything:
+A ticket moves Backlog → **Todo** only when the work needed is 100% understood, so an agent could start it now without asking anything. Anything less stays in Backlog:
 
-- No open product decisions. If there are any, it stays in Backlog.
+- No open product decisions.
+- No Unknown section. The cause is found and the fix is decided.
 - Acceptance / tests first is concrete enough to write the failing tests straight away.
-- The cause is known, or an Unknown section bounds the investigation and says what to do once it's found.
 - Not blocked by unfinished work (or `blockedBy` is set and the blocker is also in Todo, earlier in the bundle order).
 - If it's in a bundle, the lead's bundle comment gives its place in the order.
 

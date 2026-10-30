@@ -2,7 +2,7 @@
 
 keep this file up to date
 
-How this project uses Linear through the `linear-server` MCP. For what triaging a ticket means, see [TRIAGE.md](TRIAGE.md).
+How this project uses Linear through the `linear-server` MCP. For what triaging a ticket means, see [the `triage-backlog` skill](.agents/skills/triage-backlog/SKILL.md).
 
 ## Where the tickets live
 
@@ -17,17 +17,17 @@ The `Personal` team holds other projects too. Always filter by `project: "P-TASK
 
 ## Statuses
 
-| Status      | Meaning here                                                                                            |
-| ----------- | ------------------------------------------------------------------------------------------------------- |
-| Backlog     | Raw reports from Nick, untriaged tickets, tickets waiting on a product decision, and `PARKED:` tickets. |
-| Todo        | Triaged and ready to implement. See "Ready to work" in [TRIAGE.md](TRIAGE.md).                          |
-| In Progress | An agent or Nick is implementing it now.                                                                |
-| In Review   | Not used so far. Ask Nick before using it.                                                              |
-| Done        | Merged to local `main` with its tests passing. Pushing is a separate step (see below).                  |
-| Duplicate   | Set `duplicateOf` first, then this status.                                                              |
-| Canceled    | Won't do. Leave a comment saying why.                                                                   |
+| Status      | Meaning here                                                                                                                                              |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Backlog     | Raw reports from Nick, untriaged tickets, tickets waiting on a product decision, and `PARKED:` tickets.                                                   |
+| Todo        | Triaged and ready to implement. The work is 100% understood. See "Ready to work" in [the `triage-backlog` skill](.agents/skills/triage-backlog/SKILL.md). |
+| In Progress | An agent or Nick is implementing it now.                                                                                                                  |
+| In Review   | Implemented, tested and merged to local `main` by an agent. Waiting for Nick to verify.                                                                   |
+| Done        | **Nick only.** He pushes `main`, updates the cluster, tests the ticket live, then moves it here.                                                          |
+| Duplicate   | Set `duplicateOf` first, then this status.                                                                                                                |
+| Canceled    | Won't do. Leave a comment saying why.                                                                                                                     |
 
-Backlog holds both untriaged and triaged-but-blocked tickets. Tell them apart by the triage header (see [TRIAGE.md](TRIAGE.md)): no header and no label means untriaged.
+Backlog holds both untriaged and triaged-but-blocked tickets. Tell them apart by the triage header (see [the `triage-backlog` skill](.agents/skills/triage-backlog/SKILL.md)): no header and no label means untriaged.
 
 ## Labels and priority
 
@@ -60,8 +60,8 @@ An imperative sentence that states the product outcome, not the mechanism: "Show
 2. Implement test first, against the ticket's "Acceptance / tests first" list.
 3. Cite the ticket ID in the commit body, e.g. `(TASK-92, live 2026-10-25)`.
 4. Record what you learned in the project notes in [AGENTS.md](AGENTS.md), tagged with the ticket ID.
-5. When it is merged to local `main` with tests passing, move it to `Done`. If you fanned tickets out to worktree subagents, the coordinator fast-forward merges each finished branch and moves its ticket.
+5. When it is merged to local `main` with tests passing, move it to `In Review`. Never move a ticket to `Done`: Nick does that after he pushes `main`, updates the cluster and tests the ticket live. If you fanned tickets out to worktree subagents, the coordinator fast-forward merges each finished branch and moves its ticket to `In Review`.
 6. **Don't push `main` without Nick saying so.** A push to `main` publishes a release (see `.github/workflows`).
-7. Anything still unverified live (e.g. needs a release first) goes in a comment on the ticket under "Still to verify live".
+7. Put what Nick should check live in a comment when moving to `In Review`. Anything still unverified live (e.g. needs a release first) goes in a comment on the ticket under "Still to verify live".
 
 If you find a new bug while working, file it as a new Backlog ticket in `P-TASK-2` with evidence rather than growing the current ticket's scope.
