@@ -97,7 +97,9 @@ RUN git init /opt/adm/oh-my-zsh \
  && git -C /opt/adm/oh-my-zsh fetch --depth=1 origin "$OH_MY_ZSH_REVISION" \
  && git -C /opt/adm/oh-my-zsh checkout --detach FETCH_HEAD
 # Template only: adm-init-workspace copies it to /workspace/.adm/zsh/.zshrc on first start.
+# ~/.zshrc in the image is a symlink to that persistent file.
 COPY image/zshrc /usr/local/share/adm/zshrc
+COPY image/zsh-identity.zsh /usr/local/share/adm/zsh-identity.zsh
 COPY --from=go-build /out/adm-repositories /usr/local/bin/adm-repositories
 COPY --from=go-build /go/bin/artifact-fs /usr/local/bin/artifact-fs
 COPY --from=js-build /out/runner.mjs /opt/adm/runner.mjs
@@ -124,6 +126,7 @@ RUN chown root:root \
       /usr/local/bin/adm-init-workspace \
       /usr/local/lib/adm-repositories/git \
       /usr/local/share/adm/zshrc \
+      /usr/local/share/adm/zsh-identity.zsh \
  && chmod 755 \
       /usr/local/bin/adm-repositories \
       /usr/local/bin/artifact-fs \
@@ -131,7 +134,11 @@ RUN chown root:root \
       /usr/local/bin/adm-init-workspace \
       /usr/local/lib/adm-repositories/git \
       /usr/local/share/adm/zshrc \
- && ln -sfn /workspace/.adm/catalog /repos
+      /usr/local/share/adm/zsh-identity.zsh \
+ && ln -sfn /workspace/.adm/catalog /repos \
+ && ln -sfn /workspace/.adm/zsh/.zshrc /home/node/.zshrc \
+ && usermod -s /usr/bin/zsh node \
+ && printf '\n# ADM interactive workspace shells: SHELL, USER, and ~/.local/bin.\n. /usr/local/share/adm/zsh-identity.zsh\n' >> /etc/zsh/zshrc
 # Lets the bundles (built with --packages=external) resolve their dependencies.
 ENV NODE_PATH=/opt/adm/node_modules
 WORKDIR /

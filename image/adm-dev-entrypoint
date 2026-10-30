@@ -16,6 +16,11 @@ if [ "${1:-}" = "--check" ]; then
   test -x /usr/local/lib/adm-repositories/git
   test -x /usr/bin/zsh
   test -f /usr/local/share/adm/zshrc
+  test -f /usr/local/share/adm/zsh-identity.zsh
+  test -L /home/node/.zshrc
+  test "$(readlink /home/node/.zshrc)" = /workspace/.adm/zsh/.zshrc
+  test "$(getent passwd node | cut -d: -f7)" = /usr/bin/zsh
+  grep -q '/usr/local/share/adm/zsh-identity.zsh' /etc/zsh/zshrc
   test -f /opt/adm/oh-my-zsh/oh-my-zsh.sh
   exit 0
 fi

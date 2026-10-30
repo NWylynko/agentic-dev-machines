@@ -963,7 +963,7 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
         .take()
         .unwrap()
         .write_all(
-            b"printf 'PWD=%s\\n' \"$PWD\"; printf 'pwd=%s\\n' \"$(pwd)\"; printf 'physical=%s\\n' \"$(pwd -P)\"; PS1='%~'; printf 'prompt=%s\\n' \"${(%)PS1}\"\n",
+            b"printf 'PWD=%s\\n' \"$PWD\"; printf 'pwd=%s\\n' \"$(pwd)\"; printf 'physical=%s\\n' \"$(pwd -P)\"; printf 'SHELL=%s\\n' \"$SHELL\"; PS1='%~'; printf 'prompt=%s\\n' \"${(%)PS1}\"\n",
         )
         .unwrap();
     let runtime = runtime.wait_with_output().unwrap();
@@ -981,6 +981,10 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
     assert!(output.contains(&format!("prompt={public}\n")), "{output}");
     assert!(
         output.contains(&format!("physical={backing}\n")),
+        "{output}"
+    );
+    assert!(
+        output.contains("SHELL=/usr/bin/zsh\n"),
         "{output}"
     );
 
