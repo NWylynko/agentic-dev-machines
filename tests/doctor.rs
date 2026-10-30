@@ -218,12 +218,18 @@ else: sys.exit(2)
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
                 let received = stream.read(&mut request).unwrap();
                 assert!(received > 0, "doctor must send a lifecycle health request");
-                assert!(String::from_utf8_lossy(&request[..received]).starts_with("GET /health "));
+                let headers = String::from_utf8_lossy(&request[..received]);
+                if headers.starts_with("GET /v1/provider-auth/providers ") {
+                    let body = "[]";
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    continue;
+                }
+                assert!(headers.starts_with("GET /health "), "{headers}");
                 let (status, body) = if missing_lifecycle_status {
                     ("200 OK", json!({}).to_string())
                 } else if healthy_lifecycle {
@@ -384,4 +390,107 @@ else: sys.exit(2)
         assert!(kubectl_calls.lines().all(|call| call.starts_with("get ")));
         server.join().unwrap();
     }
+}
+
+#[test]
+fn doctor_reports_an_expired_unrefreshable_provider_login() {
+    let root = tempfile::tempdir().unwrap();
+    let kubectl = root.path().join("kubectl");
+    fs::write(
+        &kubectl,
+        r#"#!/usr/bin/python3
+import json,sys
+if sys.argv[1:3]==['get','nodes']:
+ print(json.dumps({'items':[{'metadata':{'name':'node-a'},'status':{'conditions':[{'type':'Ready','status':'True'}]}}]}))
+elif sys.argv[1:3]==['get','storageclass']:
+ print(json.dumps({'metadata':{'name':'adm-replicated'},'provisioner':'driver.longhorn.io'}))
+else: sys.exit(2)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let received = stream.read(&mut request).unwrap();
+            let headers = String::from_utf8_lossy(&request[..received]).into_owned();
+            requests.push(headers.clone());
+            let (status, body) = if headers.starts_with("GET /health ") {
+                (
+                    "200 OK",
+                    json!({"status":"ok","service":"adm-lifecycle"}).to_string(),
+                )
+            } else if headers.starts_with("GET /v1/provider-auth/providers ") {
+                (
+                    "200 OK",
+                    json!([{
+                        "provider": "xai",
+                        "name": "xAI",
+                        "status": "login_expired",
+                        "authenticated": "oauth",
+                        "cause": "xAI OAuth token refresh failed (HTTP 400): invalid_grant"
+                    }])
+                    .to_string(),
+                )
+            } else if headers.starts_with("GET /v1/workspaces ") {
+                ("200 OK", json!([]).to_string())
+            } else {
+                (
+                    "404 Not Found",
+                    json!({"error":{"message":"unexpected doctor request"}}).to_string(),
+                )
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+        requests
+    });
+    let invoke = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_adm"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
+            .args(["--state-dir"])
+            .arg(root.path().join("state"))
+            .args(["--kubectl"])
+            .arg(&kubectl)
+            .args(["--lifecycle-url", &url, "--lifecycle-namespace", "adm-test"])
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let output = invoke(&["doctor"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        report.contains("xai: login expired"),
+        "{report}"
+    );
+    assert!(report.contains("adm login xai"), "{report}");
+    let json_output = invoke(&["doctor", "--json"]);
+    assert!(json_output.status.success());
+    let json_report: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let providers = json_report["providers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("providers missing: {json_report}"));
+    assert_eq!(providers[0]["provider"], "xai");
+    assert_eq!(providers[0]["status"], "login_expired");
+
+    let list = invoke(&["list"]);
+    assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
+    let list = String::from_utf8(list.stdout).unwrap();
+    assert!(list.contains("xai: login expired"), "{list}");
+    assert!(list.contains("adm login xai"), "{list}");
+    drop(server);
 }

@@ -44,10 +44,15 @@ async function fixture(
   {
     needsModel = false,
     holdRefresh = false,
-  }: { needsModel?: boolean; holdRefresh?: boolean } = {},
+    modelsError,
+  }: { needsModel?: boolean; holdRefresh?: boolean; modelsError?: string } = {},
 ) {
   const requests: any[] = [];
   let stream: any;
+  let connectedResolve = (_at: number) => {};
+  const connected = new Promise<number>((resolve) => {
+    connectedResolve = resolve;
+  });
   let refreshStartedResolve = () => {};
   let refreshClosedResolve = () => {};
   const refreshStarted = new Promise<void>((resolve) => {
@@ -111,6 +116,18 @@ async function fixture(
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ extensions: [], diagnostics: [] }));
     } else if (url.pathname.endsWith("/models")) {
+      if (modelsError) {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            providers: [{ id: "xai", name: "xAI", authenticated: false }],
+            models: [],
+            error: modelsError,
+            providerErrors: [{ provider: "xai", message: modelsError }],
+          }),
+        );
+        return;
+      }
       if (url.searchParams.get("refresh") === "true") {
         refreshStartedResolve();
         if (holdRefresh) {
@@ -151,6 +168,7 @@ async function fixture(
       });
       res.write(": attached\n\n");
     } else if (req.method === "GET") {
+      connectedResolve(Date.now());
       res.end(
         JSON.stringify({
           id: "work",
@@ -194,6 +212,7 @@ async function fixture(
   return {
     url: `http://127.0.0.1:${address.port}`,
     requests,
+    connected,
     admission,
     refreshStarted,
     refreshClosed,
@@ -776,6 +795,76 @@ test(
 );
 
 test(
+  "attach shows a provider catalog error within 2s instead of a blank screen (TASK-97)",
+  { timeout: 10000 },
+  async () => {
+    const modelsError =
+      "xai: token refresh failed (HTTP 400 invalid_grant): run adm login xai";
+    const service = await fixture("coding", [], { modelsError });
+    const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`;
+    const args = [
+      process.execPath,
+      "--import",
+      "tsx",
+      fileURLToPath(new URL("../src/main.ts", import.meta.url)),
+      "--url",
+      service.url,
+      "--workspace",
+      "work",
+    ];
+    const child = spawn(
+      "script",
+      ["--quiet", "--return", "--command", args.map(quote).join(" "), "/dev/null"],
+      { stdio: ["pipe", "pipe", "pipe"], detached: true },
+    );
+    let output = "";
+    const connected = service.connected;
+    let showed = false;
+    try {
+      await Promise.race([
+        new Promise<void>((resolve, reject) => {
+          const check = () => {
+            const text = visibleTerminalText(output);
+            if (text.includes(modelsError) && text.includes("Loading models")) {
+              showed = true;
+              resolve();
+            }
+          };
+          child.stdout.on("data", (chunk) => {
+            output += chunk;
+            check();
+          });
+          child.stderr.on("data", (chunk) => {
+            output += chunk;
+            check();
+          });
+          child.once("error", reject);
+          child.once("exit", (code) =>
+            reject(
+              new Error(
+                `Terminal exited before the model error (${code}): ${visibleTerminalText(output)}`,
+              ),
+            ),
+          );
+        }),
+        (async () => {
+          const connectedAt = await connected;
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+          if (showed) return;
+          throw new Error(
+            `Model error was not on screen within 2s of connecting (${Date.now() - connectedAt}ms): ${visibleTerminalText(output)}`,
+          );
+        })(),
+      ]);
+      assert.equal(showed, true, visibleTerminalText(output));
+    } finally {
+      stopProcessGroup(child);
+      await service.close();
+    }
+  },
+);
+
+test(
   "attach selects a model through Pi's actual selector in a PTY and persists it over HTTP",
   { timeout: 10000 },
   async () => {
@@ -843,7 +932,18 @@ test(
           ),
         ),
       ]);
-      child.stdin.write("/model\r");
+      if (!visibleTerminalText(output).includes("Faux 1")) {
+        const appeared = await Promise.race([
+          new Promise<boolean>((resolve) => {
+            const check = () => {
+              if (visibleTerminalText(output).includes("Faux 1")) resolve(true);
+            };
+            child.stdout.on("data", () => check());
+            setTimeout(() => resolve(false), 1500);
+          }),
+        ]);
+        if (!appeared) child.stdin.write("/model\r");
+      }
       await Promise.race([
         new Promise<void>((resolve, reject) => {
           const check = () => {

@@ -503,6 +503,127 @@ test("a request-path refresh rechecks the owner fence before spending the refres
   assert.equal((await fixture.stored()).refresh, "fake-refresh-old-secret");
 });
 
+test("a hung provider refresh does not block the rest of the catalog (TASK-97)", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-provider-catalog-isolation-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const authPath = join(directory, "auth.json");
+  const hung = "adm-catalog-hung";
+  const ok = "adm-catalog-ok";
+  await writeFile(
+    authPath,
+    JSON.stringify({
+      [hung]: {
+        type: "oauth",
+        access: "fake-access-hung-secret",
+        refresh: "fake-refresh-hung-secret",
+        expires: Date.now() - 60_000,
+      },
+    }),
+  );
+  const model = (provider, id) => ({
+    id,
+    provider,
+    name: id,
+    api: "openai-completions",
+    baseUrl: "https://provider.invalid",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1000,
+    maxTokens: 100,
+  });
+  const logs = [];
+  const authority = await createProviderAuthAuthority({
+    authPath,
+    // The scheduled refresh must not fire on its own; the catalog calls it.
+    refreshScheduler: createManualRefreshScheduler(),
+    catalogProviderTimeoutMs: 300,
+    log: (line) => logs.push(line),
+    configure(runtime) {
+      runtime.registerNativeProvider({
+        id: hung,
+        name: "Hung OAuth provider",
+        auth: {
+          oauth: {
+            name: "Hung OAuth",
+            login: async () => {
+              throw new Error("not used");
+            },
+            // Hangs until the caller aborts. Pi only aborts the lock wait;
+            // once refresh starts it passes its own 15s signal, which this
+            // honors so shutdown can finish. The catalog must still return
+            // on its own shorter timeout.
+            refresh: (_credential, signal) =>
+              new Promise((_resolve, reject) => {
+                const abort = () =>
+                  reject(new Error("token refresh timed out"));
+                if (signal?.aborted) abort();
+                else signal?.addEventListener("abort", abort, { once: true });
+              }),
+            toAuth: async (credential) => ({ apiKey: credential.access }),
+          },
+        },
+        getModels: () => [model(hung, "hung-model")],
+        stream: () => {
+          throw new Error("not used");
+        },
+        streamSimple: () => {
+          throw new Error("not used");
+        },
+      });
+      runtime.registerNativeProvider({
+        id: ok,
+        name: "Working provider",
+        auth: {
+          apiKey: {
+            name: "Working key",
+            check: async () => ({ source: "API key", type: "api_key" }),
+            resolve: async () => ({ auth: { apiKey: "ok-key" } }),
+          },
+        },
+        getModels: () => [model(ok, "ok-model")],
+        stream: () => {
+          throw new Error("not used");
+        },
+        streamSimple: () => {
+          throw new Error("not used");
+        },
+      });
+    },
+  });
+  t.after(() => authority.close());
+  await new Promise((resolve) =>
+    authority.server.listen(0, "127.0.0.1", resolve),
+  );
+  const started = Date.now();
+  const response = await fetch(
+    `http://127.0.0.1:${authority.server.address().port}/v1/provider-auth/catalog`,
+    { method: "POST", signal: AbortSignal.timeout(2_000) },
+  );
+  const elapsed = Date.now() - started;
+  assert.equal(response.status, 200);
+  const catalog = await response.json();
+  assert.ok(
+    elapsed < 2_000,
+    `catalog took ${elapsed}ms; a hung provider must not hold the others`,
+  );
+  assert.deepEqual(catalog[ok].models, ["ok-model"]);
+  assert.equal(catalog[ok].error, undefined);
+  assert.equal(typeof catalog[hung].error, "string", JSON.stringify(catalog[hung]));
+  assert.match(catalog[hung].error, new RegExp(hung));
+  assert.doesNotMatch(catalog[hung].error, /fake-(access|refresh)-hung-secret/);
+  const failure = logs
+    .map((line) => JSON.parse(line))
+    .find(
+      (entry) =>
+        entry.provider === hung &&
+        entry.operation &&
+        (Array.isArray(entry.cause) ? entry.cause.length > 0 : entry.cause),
+    );
+  assert.ok(failure, `no failure log named ${hung}: ${logs.join("\n")}`);
+  assert.doesNotMatch(logs.join("\n"), /fake-(access|refresh)-hung-secret/);
+});
+
 test("a refresh whose write is fenced out logs that the rotated refresh token was lost (TASK-109)", async (t) => {
   const scheduler = createManualRefreshScheduler();
   const fixture = await startProviderAuthFixture(t, {

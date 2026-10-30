@@ -1845,18 +1845,35 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && action === "models") {
       const controller = new AbortController();
+      let deadlineReached = false;
+      const deadline = setTimeout(() => {
+        deadlineReached = true;
+        controller.abort();
+      }, 15_000);
       request.once("aborted", () => controller.abort());
       response.once("close", () => {
         if (!response.writableEnded) controller.abort();
       });
-      return json(
-        response,
-        200,
-        await workspace.modelCatalog(
-          controller.signal,
-          url.searchParams.get("refresh") === "true",
-        ),
-      );
+      try {
+        return json(
+          response,
+          200,
+          await workspace.modelCatalog(
+            controller.signal,
+            url.searchParams.get("refresh") === "true",
+          ),
+        );
+      } catch (error) {
+        if (!deadlineReached || response.writableEnded) throw error;
+        return json(response, 200, {
+          models: [],
+          providers: [],
+          providerErrors: [],
+          error: "Model catalog timed out",
+        });
+      } finally {
+        clearTimeout(deadline);
+      }
     }
     if (request.method === "PUT" && action === "model") {
       const data = await body(request);

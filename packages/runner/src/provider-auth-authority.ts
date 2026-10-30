@@ -20,6 +20,8 @@ export type SharedProviderCatalog = Record<
     auth?: AuthCheck;
     models: string[];
     allModels: string[];
+    /** Safe to show to the user. Other providers are unaffected. */
+    error?: string;
   }
 >;
 
@@ -31,6 +33,8 @@ type AuthorityOptions = {
   log?: (line: string) => void;
   /** Clock and timers for scheduled refreshes; injectable for tests. */
   refreshScheduler?: ProviderRefreshScheduler;
+  /** Per-provider catalog budget. Tests use a short one; production is 10s. */
+  catalogProviderTimeoutMs?: number;
 };
 
 export type ProviderRefreshScheduler = {
@@ -155,6 +159,8 @@ function rotatedRefreshTokenProviders(
 }
 
 const PI_OAUTH_REFRESH_WINDOW_MS = 5 * 60 * 1000;
+// One provider's token endpoint must not hold the catalog. Agreed as 10s (TASK-97).
+const CATALOG_PROVIDER_TIMEOUT_MS = 10_000;
 
 type LoginOperation = {
   controller: AbortController;
@@ -327,6 +333,7 @@ export async function createProviderAuthAuthority({
   ownerGuard,
   log: writeLog,
   refreshScheduler = systemProviderRefreshScheduler,
+  catalogProviderTimeoutMs = CATALOG_PROVIDER_TIMEOUT_MS,
 }: AuthorityOptions) {
   const log = createProviderAuthLog(writeLog);
   const authDirectory = dirname(authPath);
@@ -380,6 +387,7 @@ export async function createProviderAuthAuthority({
     providerId: string,
     trigger: "request" | "scheduled",
     minOAuthValidityMs?: number,
+    signal?: AbortSignal,
   ) {
     const pending = providerRefreshesInFlight.get(providerId);
     if (pending) return pending;
@@ -387,10 +395,10 @@ export async function createProviderAuthAuthority({
       const startedAt = Date.now();
       log("info", "refresh_started", { provider: providerId, trigger });
       try {
-        await runtime.getAuth(
-          providerId,
-          minOAuthValidityMs === undefined ? {} : { minOAuthValidityMs },
-        );
+        await runtime.getAuth(providerId, {
+          ...(minOAuthValidityMs === undefined ? {} : { minOAuthValidityMs }),
+          ...(signal ? { signal } : {}),
+        });
         const credential = await readStoredCredential(providerId);
         log("info", "refresh_succeeded", {
           provider: providerId,
@@ -429,7 +437,10 @@ export async function createProviderAuthAuthority({
     })();
     providerRefreshesInFlight.set(providerId, refresh);
     void refresh
-      .finally(() => providerRefreshesInFlight.delete(providerId))
+      .finally(() => {
+        if (providerRefreshesInFlight.get(providerId) === refresh)
+          providerRefreshesInFlight.delete(providerId);
+      })
       .catch(() => {});
     return refresh;
   }
@@ -577,6 +588,135 @@ export async function createProviderAuthAuthority({
     });
   }
 
+  function credentialNeedsRefresh(credential: {
+    type?: string;
+    expires?: number;
+  } | undefined) {
+    return (
+      credential?.type === "oauth" &&
+      typeof credential.expires === "number" &&
+      Date.now() + PI_OAUTH_REFRESH_WINDOW_MS >= credential.expires
+    );
+  }
+
+  async function bounded<T>(promise: Promise<T>, message: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(message)),
+            catalogProviderTimeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function catalogProvider(
+    id: string,
+    refreshFirst: boolean,
+  ): Promise<[string, SharedProviderCatalog[string]]> {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      catalogProviderTimeoutMs,
+    );
+    try {
+      if (refreshFirst) {
+        const pending = refreshProviderCredential(
+          id,
+          "request",
+          undefined,
+          controller.signal,
+        );
+        try {
+          await bounded(pending, `${id}: token refresh timed out`);
+        } catch (error) {
+          // Stop waiting. A refresh that ignores abort still holds Pi's
+          // credential lock; it must not keep shutdown waiting too.
+          if (providerRefreshesInFlight.get(id) === pending)
+            providerRefreshesInFlight.delete(id);
+          throw error;
+        }
+      }
+      const [models, allModels, auth] = await bounded(
+        Promise.all([
+          runtime.getAvailable(id),
+          runtime.getAllAvailable(id),
+          runtime.checkAuth(id),
+        ]),
+        `${id}: catalog timed out`,
+      );
+      return [
+        id,
+        {
+          ...(auth ? { auth } : {}),
+          models: models.map((model: { id: string }) => model.id),
+          allModels: allModels.map((model: { id: string }) => model.id),
+        },
+      ];
+    } catch (error) {
+      const cause = providerAuthCauseChain(error);
+      const message =
+        error instanceof ProviderRefreshError
+          ? error.message
+          : `${id}: catalog failed (${cause.at(-1) ?? "unknown error"})`;
+      log("error", "catalog_failed", {
+        provider: id,
+        operation: "catalog",
+        message,
+        cause,
+      });
+      return [id, { error: message, models: [], allModels: [] }];
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function sharedProviderCatalog(): Promise<SharedProviderCatalog> {
+    const providers = runtime.getProviders();
+    const stored = new Map<string, { type?: string; expires?: number }>();
+    const catalog: SharedProviderCatalog = {};
+    for (const provider of providers) {
+      try {
+        stored.set(provider.id, await readStoredCredential(provider.id));
+      } catch (error) {
+        const cause = providerAuthCauseChain(error);
+        const message = `${provider.id}: catalog failed (${providerAuthRootCause(error)})`;
+        log("error", "catalog_failed", {
+          provider: provider.id,
+          operation: "catalog",
+          message,
+          cause,
+        });
+        catalog[provider.id] = { error: message, models: [], allModels: [] };
+      }
+    }
+    const refreshing: string[] = [];
+    const ready: string[] = [];
+    for (const provider of providers) {
+      if (catalog[provider.id]) continue;
+      (credentialNeedsRefresh(stored.get(provider.id))
+        ? refreshing
+        : ready
+      ).push(provider.id);
+    }
+    // Ready providers finish before any refresh takes the credential lock.
+    for (const [id, entry] of await Promise.all(
+      ready.map((id) => catalogProvider(id, false)),
+    ))
+      catalog[id] = entry;
+    for (const [id, entry] of await Promise.all(
+      refreshing.map((id) => catalogProvider(id, true)),
+    ))
+      catalog[id] = entry;
+    return catalog;
+  }
+
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
@@ -594,32 +734,10 @@ export async function createProviderAuthAuthority({
         request.method === "POST" &&
         url.pathname === "/v1/provider-auth/catalog"
       ) {
-        // Account restrictions are evaluated beside the credential. Only the
-        // resulting model IDs and auth classification cross into a workspace.
-        const [models, allModels, checks] = await Promise.all([
-          runtime.getAvailable(),
-          runtime.getAllAvailable(),
-          Promise.all(
-            runtime
-              .getProviders()
-              .map(
-                async ({ id }) => [id, await runtime.checkAuth(id)] as const,
-              ),
-          ),
-        ]);
-        const catalog: SharedProviderCatalog = {};
-        for (const [id, auth] of checks) {
-          catalog[id] = {
-            ...(auth ? { auth } : {}),
-            models: models
-              .filter((model) => model.provider === id)
-              .map((model) => model.id),
-            allModels: allModels
-              .filter((model) => model.provider === id)
-              .map((model) => model.id),
-          };
-        }
-        return send(response, 200, catalog);
+        // Providers that do not need a refresh finish before any refresh
+        // takes the credential lock, and each call is bounded, so one hung
+        // token refresh cannot drop the others (TASK-97).
+        return send(response, 200, await sharedProviderCatalog());
       }
       if (
         request.method === "GET" &&

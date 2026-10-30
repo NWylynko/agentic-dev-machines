@@ -57,6 +57,7 @@ async function runTerminal() {
     throw new Error("Attachment requires an interactive terminal");
   const terminal = new WorkspaceTerminal({
     autoModelSelector: false,
+    deferModelCatalog: true,
     url,
     workspaceId,
     tokenFile,

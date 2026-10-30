@@ -38,6 +38,7 @@ import {
   type ExtensionOperationReceipt,
 } from "./extensions.ts";
 import {
+  sharedProviderCatalogErrors,
   workspaceModels,
   workspaceProviderMetadata,
   type LifecycleAuthorityAvailability,
@@ -758,6 +759,14 @@ export class Workspace {
       : undefined;
     const available = await this.models.getAvailable(undefined, { signal });
     const providers = await workspaceProviderMetadata(this.models, signal);
+    const providerErrors = sharedProviderCatalogErrors(this.models);
+    const refreshErrors = refreshResult?.errors.size
+      ? [...refreshResult.errors.values()].map((error) => error.message)
+      : [];
+    const errorMessages = [
+      ...refreshErrors,
+      ...providerErrors.map((entry) => entry.message),
+    ];
     return {
       selected: await this.conversationSelectedModel(),
       providers,
@@ -771,13 +780,13 @@ export class Workspace {
         reasoning: model.reasoning,
         input: model.input,
       })),
-      error: refreshResult?.errors.size
-        ? [...refreshResult.errors.values()]
-            .map((error) => error.message)
-            .join("; ")
-        : providers.length > 0 && available.length === 0
-          ? "Set workspace credentials before selecting a model."
-          : undefined,
+      error:
+        errorMessages.length > 0
+          ? errorMessages.join("; ")
+          : providers.length > 0 && available.length === 0
+            ? "Set workspace credentials before selecting a model."
+            : undefined,
+      providerErrors,
       refresh: refreshResult
         ? {
             aborted: refreshResult.aborted,

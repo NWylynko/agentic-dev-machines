@@ -45,7 +45,14 @@ pub fn doctor(cli: &Cli, storage_class: &str, json_output: bool) -> Result<()> {
             "action":crate::lifecycle::setup_guidance(cli),
         }),
     };
-    let report = json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"lifecycle":lifecycle,"state":cli.state_path()});
+    let providers = match provider_logins(cli) {
+        Ok(providers) => json!(providers),
+        Err(error) => json!({
+            "status": "unavailable",
+            "error": format!("{error:#}"),
+        }),
+    };
+    let report = json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"lifecycle":lifecycle,"providers":providers,"state":cli.state_path()});
     if json_output {
         print_json(&report)
     } else {
@@ -120,7 +127,54 @@ fn print_doctor_report(report: &Value) {
     if let Some(action) = report["lifecycle"]["action"].as_str() {
         println!("  Next: {action}");
     }
+    println!("Providers:");
+    if let Some(providers) = report["providers"].as_array() {
+        let lines = provider_login_lines(providers);
+        if lines.is_empty() {
+            println!("  no shared provider logins");
+        }
+        for line in lines {
+            println!("  {line}");
+        }
+    } else if let Some(error) = report["providers"]["error"].as_str() {
+        println!("  unavailable: {error}");
+    } else {
+        println!("  unavailable");
+    }
     println!("State: {}", report["state"].as_str().unwrap_or("unknown"));
+}
+
+pub fn provider_logins(cli: &Cli) -> Result<Vec<Value>> {
+    let value = cli.request_lifecycle("GET", "/v1/provider-auth/providers", None)?;
+    serde_json::from_value(value).context("provider login health")
+}
+
+pub fn provider_login_lines(providers: &[Value]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for provider in providers {
+        let id = provider["provider"].as_str().unwrap_or("unknown");
+        match provider["status"].as_str() {
+            Some("login_expired") => {
+                lines.push(format!("{id}: login expired"));
+                lines.push(format!("Next: run adm login {id}"));
+            }
+            Some("authenticated") => lines.push(format!("{id}: authenticated")),
+            _ => {}
+        }
+    }
+    lines
+}
+
+/// Expired logins only, so `adm list` stays quiet when provider-auth is down.
+pub fn print_expired_provider_logins(cli: &Cli) {
+    let Ok(providers) = provider_logins(cli) else {
+        return;
+    };
+    for line in provider_login_lines(&providers) {
+        if line.contains("login expired") || line.contains("adm login ") {
+            println!("{line}");
+        }
+    }
 }
 
 fn inspect_nodes(cli: &Cli) -> Result<Value> {

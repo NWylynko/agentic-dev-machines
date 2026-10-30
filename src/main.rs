@@ -803,7 +803,11 @@ fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
     } else {
         json!({"status":"disabled"})
     };
-    Ok(json!({"workspace":workspace,"cluster":cluster,"agent":agent,"activity":activity}))
+    let providers = match diagnostics::provider_logins(cli) {
+        Ok(providers) => json!(providers),
+        Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
+    };
+    Ok(json!({"workspace":workspace,"cluster":cluster,"agent":agent,"activity":activity,"providers":providers}))
 }
 
 fn pod_summary(status: &Value) -> (String, String) {
@@ -855,6 +859,13 @@ fn print_status(status: &Value) {
     }
     if let Some(reason) = status["cluster"]["containerReason"].as_str() {
         println!("Pod runtime: {reason}");
+    }
+    if let Some(providers) = status["providers"].as_array() {
+        for line in diagnostics::provider_login_lines(providers) {
+            if line.contains("login expired") || line.contains("adm login ") {
+                println!("{line}");
+            }
+        }
     }
 }
 
@@ -1080,6 +1091,7 @@ fn run(cli: &Cli) -> Result<()> {
                 print_json(&workspace_list_report(&items)?)
             } else {
                 print_workspace_list(&reports);
+                diagnostics::print_expired_provider_logins(cli);
                 Ok(())
             }
         }

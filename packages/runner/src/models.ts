@@ -11,6 +11,16 @@ import { readFile } from "node:fs/promises";
 import { workspaceCredentialRuntime } from "./credentials.ts";
 import type { SharedProviderCatalog } from "./provider-auth-authority.ts";
 
+export type SharedProviderCatalogError = { provider: string; message: string };
+
+const sharedCatalogErrors = new WeakMap<object, SharedProviderCatalogError[]>();
+
+export function sharedProviderCatalogErrors(
+  runtime: object,
+): SharedProviderCatalogError[] {
+  return sharedCatalogErrors.get(runtime) ?? [];
+}
+
 export interface LifecycleAuthorityAvailability {
   wait(signal?: AbortSignal): Promise<void>;
   suspend(error: unknown): void;
@@ -232,6 +242,14 @@ export async function configureSharedProviderAuth<
           `Shared provider catalogue failed (${response.status})`,
         );
       catalog = (await response.json()) as SharedProviderCatalog;
+      sharedCatalogErrors.set(
+        runtime,
+        Object.entries(catalog).flatMap(([provider, entry]) =>
+          typeof entry?.error === "string"
+            ? [{ provider, message: entry.error }]
+            : [],
+        ),
+      );
       return catalog;
     })();
     catalogRequests.set(signal, request);
