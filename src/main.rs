@@ -1214,7 +1214,7 @@ fn run(cli: &Cli) -> Result<()> {
                     "zsh",
                     "-l",
                     "-c",
-                    "cd -- \"$1\" && export PWD=\"$1\" && exec zsh -l",
+                    "cd -- \"$1\" && export PWD=\"$1\" USER=\"$(id -un)\" SHELL=/usr/bin/zsh && exec zsh -l",
                     "adm-shell",
                     working_directory,
                 ]);

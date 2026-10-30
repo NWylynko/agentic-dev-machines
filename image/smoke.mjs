@@ -292,14 +292,44 @@ async function verifyZshPersistenceAndShellEntrypoints() {
   const volume = `${container}-workspace`;
   const workingDirectory = "/workspace/shell-fixture";
   const zshDirectory = "/workspace/.adm/zsh";
+  const startupFile = `${zshDirectory}/.zshrc`;
   const marker = "ADM_ZSH_CUSTOM_TEST=persisted";
-  const check = `print -r -- "ZSH=$ZSH_VERSION UID=$UID PWD=$PWD CUSTOM=$ADM_ZSH_CUSTOM_TEST INTERACTIVE=$([[ -o interactive ]] && print yes || print no) AUTO_UPDATE=$DISABLE_AUTO_UPDATE UPDATE_PROMPT=$DISABLE_UPDATE_PROMPT"; print -s ADM_ZSH_HISTORY_TOKEN; fc -W "$HISTFILE"`;
   const quote = (value) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
-  const assertInteractiveZsh = async (entrypoint) => {
+  // Identity and ~/.local/bin come from the interactive startup files.
+  // Do not export SHELL or PATH here: that would hide a shell that never sets them.
+  const identityCheck = [
+    'print -r -- "SHELL=$SHELL"',
+    'print -r -- "ZSH_BIN=$(command -v zsh)"',
+    'print -r -- "USER=$USER"',
+    'print -r -- "LOGNAME=$LOGNAME"',
+    'print -r -- "HOME=$HOME"',
+    'print -r -- "LOGIN_SHELL=$(getent passwd 1000 | cut -d: -f7)"',
+    'print -r -- "STARTUP=$(readlink -f ~/.zshrc)"',
+    'print -r -- "ZSH=$ZSH_VERSION UID=$UID PWD=$PWD CUSTOM=$ADM_ZSH_CUSTOM_TEST INTERACTIVE=$([[ -o interactive ]] && print yes || print no) AUTO_UPDATE=$DISABLE_AUTO_UPDATE UPDATE_PROMPT=$DISABLE_UPDATE_PROMPT"',
+    'print -r -- "LOCAL_BIN=$(adm-local-bin-smoke)"',
+    'print -r -- "PATH_PROBE=$(adm-path-probe)"',
+    'print -s ADM_ZSH_HISTORY_TOKEN',
+    'fc -W "$HISTFILE"',
+  ].join("; ");
+  const sourceStartupFile = [
+    'printf "\\nexport ADM_ZSH_CUSTOM_TEST=persisted\\n" >> "$HOME/.zshrc"',
+    'source "$HOME/.zshrc"',
+    'print -r -- "SOURCED=$ADM_ZSH_CUSTOM_TEST"',
+    'print -r -- "STARTUP=$(readlink -f ~/.zshrc)"',
+  ].join("; ");
+  const prepareUserBin = [
+    'home=$(getent passwd 1000 | cut -d: -f6)',
+    'mkdir -p "$home/.local/bin" /tmp/adm-managed-bin',
+    "printf '%s\\n' '#!/bin/sh' 'printf adm-local-bin-ok\\n' > \"$home/.local/bin/adm-local-bin-smoke\"",
+    "printf '%s\\n' '#!/bin/sh' 'printf local-wins\\n' > \"$home/.local/bin/adm-path-probe\"",
+    "printf '%s\\n' '#!/bin/sh' 'printf managed-wins\\n' > /tmp/adm-managed-bin/adm-path-probe",
+    'chmod 755 "$home/.local/bin/adm-local-bin-smoke" "$home/.local/bin/adm-path-probe" /tmp/adm-managed-bin/adm-path-probe',
+  ].join("; ");
+  const openInteractiveZsh = async (entrypoint, check) => {
     const shell =
       entrypoint === "plain"
-        ? `cd -- ${quote(workingDirectory)} && env TERM=xterm ZDOTDIR=${quote(zshDirectory)} zsh -l -i -c ${quote(check)}`
-        : `bash -l -c ${quote(`cd -- "$1" && export PWD="$1" PATH="$2:$PATH" ADM_MANAGE_SOCKET="$3" && exec env TERM=xterm ZDOTDIR=${zshDirectory} zsh -l -i -c ${quote(check)}`)} adm-shell ${quote(workingDirectory)} /tmp/adm-managed-bin /tmp/adm-managed.sock`;
+        ? `${prepareUserBin}; cd -- ${quote(workingDirectory)} && env TERM=xterm ZDOTDIR=${quote(zshDirectory)} zsh -l -i -c ${quote(check)}`
+        : `${prepareUserBin}; bash -l -c ${quote(`cd -- "$1" && export PWD="$1" PATH="$2:$PATH" ADM_MANAGE_SOCKET="$3" && exec env TERM=xterm ZDOTDIR=${zshDirectory} zsh -l -i -c ${quote(check)}`)} adm-shell ${quote(workingDirectory)} /tmp/adm-managed-bin /tmp/adm-managed.sock`;
     const { stdout } = await docker(
       "run",
       "--rm",
@@ -318,12 +348,30 @@ async function verifyZshPersistenceAndShellEntrypoints() {
       shell,
       "/dev/null",
     );
+    return stdout;
+  };
+  const assertInteractiveZsh = async (entrypoint, { custom }) => {
+    const stdout = await openInteractiveZsh(entrypoint, identityCheck);
+    const shell = /^SHELL=(.*)$/m.exec(stdout)?.[1];
+    const zshBin = /^ZSH_BIN=(.*)$/m.exec(stdout)?.[1];
+    assert.ok(zshBin?.endsWith("/zsh"), stdout);
+    assert.equal(shell, zshBin, stdout);
+    assert.match(stdout, /^USER=node$/m);
+    assert.match(stdout, /^LOGNAME=node$/m);
+    assert.match(stdout, /^HOME=\/home\/node$/m);
+    assert.match(stdout, /^LOGIN_SHELL=\/usr\/bin\/zsh$/m);
+    assert.match(stdout, /^STARTUP=\/workspace\/\.adm\/zsh\/\.zshrc$/m);
     assert.match(stdout, /ZSH=\d/);
     assert.match(stdout, /UID=1000/);
     assert.match(stdout, new RegExp(`PWD=${workingDirectory.replaceAll("/", "\\/")}`));
-    assert.match(stdout, /CUSTOM=persisted/);
+    assert.match(stdout, custom ? /CUSTOM=persisted/ : /CUSTOM=($| )/ );
     assert.match(stdout, /INTERACTIVE=yes/);
     assert.match(stdout, /AUTO_UPDATE=true UPDATE_PROMPT=true/);
+    assert.match(stdout, /LOCAL_BIN=adm-local-bin-ok/);
+    assert.match(
+      stdout,
+      entrypoint === "managed" ? /PATH_PROBE=managed-wins/ : /PATH_PROBE=local-wins/,
+    );
     return stdout;
   };
 
@@ -355,11 +403,19 @@ async function verifyZshPersistenceAndShellEntrypoints() {
       image,
       "-eu",
       "-c",
-      `mkdir -p '${workingDirectory}' && printf '\nexport ${marker}\n' >> '${zshDirectory}/.zshrc'`,
+      `mkdir -p '${workingDirectory}'`,
     );
 
-    await assertInteractiveZsh("plain");
-    await assertInteractiveZsh("managed");
+    await assertInteractiveZsh("plain", { custom: false });
+    await assertInteractiveZsh("managed", { custom: false });
+
+    // ~/.zshrc is the startup file editors and installers write. Sourcing it
+    // affects this session; the next session reads the same persistent file.
+    const sourced = await openInteractiveZsh("plain", sourceStartupFile);
+    assert.match(sourced, /SOURCED=persisted/);
+    assert.match(sourced, /^STARTUP=\/workspace\/\.adm\/zsh\/\.zshrc$/m);
+    await assertInteractiveZsh("plain", { custom: true });
+    await assertInteractiveZsh("managed", { custom: true });
 
     // A replacement Pod runs the initializer again against the same private PVC.
     await docker(
@@ -387,14 +443,34 @@ async function verifyZshPersistenceAndShellEntrypoints() {
       "/bin/sh",
       image,
       "-c",
-      `cat '${zshDirectory}/.zshrc' && test -w '${zshDirectory}/.zsh_history'`,
+      `cat '${startupFile}' && test -w '${zshDirectory}/.zsh_history'`,
     );
     assert.equal(
       config.split("\n").filter((line) => line === `export ${marker}`).length,
       1,
       "workspace initialization must preserve user edits instead of reseeding configuration",
     );
-    await assertInteractiveZsh("plain");
+    await assertInteractiveZsh("plain", { custom: true });
+    // Explicit commands do not become interactive shells: zsh -c keeps its own
+    // environment and does not source the startup file or ~/.local/bin.
+    const { stdout: explicit } = await docker(
+      "run",
+      "--rm",
+      "--user",
+      "1000:1000",
+      "--network",
+      "none",
+      "--mount",
+      `type=volume,src=${volume},dst=/workspace`,
+      "--entrypoint",
+      "zsh",
+      image,
+      "-c",
+      'home=$(getent passwd 1000 | cut -d: -f6); mkdir -p "$home/.local/bin"; printf "%s\\n" "#!/bin/sh" "printf adm-local-bin-ok\\n" > "$home/.local/bin/adm-local-bin-smoke"; chmod 755 "$home/.local/bin/adm-local-bin-smoke"; if command -v adm-local-bin-smoke >/dev/null; then print -r -- "LOCAL_BIN=visible"; else print -r -- "LOCAL_BIN=hidden"; fi; print -r -- "SHELL=${SHELL-unset}"; print -r -- "CUSTOM=${ADM_ZSH_CUSTOM_TEST-unset}"',
+    );
+    assert.match(explicit, /LOCAL_BIN=hidden/);
+    assert.match(explicit, /SHELL=unset/);
+    assert.match(explicit, /CUSTOM=unset/);
     const { stdout: history } = await docker(
       "run",
       "--rm",
@@ -601,6 +677,17 @@ try {
   });
 }
 `;
+
+if (process.argv.includes("--only=zsh")) {
+  try {
+    await verifyZshPersistenceAndShellEntrypoints();
+    process.stdout.write(`Image zsh smoke passed for ${image}\n`);
+  } catch (error) {
+    process.stderr.write(`Image zsh smoke failed: ${error.stack ?? error}\n`);
+    process.exitCode = 1;
+  }
+  process.exit(process.exitCode ?? 0);
+}
 
 try {
   await verifyLifecycleKubeconfigProjection(image);

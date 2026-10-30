@@ -13,3 +13,7 @@ setopt INC_APPEND_HISTORY
 ZSH_THEME="robbyrussell"
 plugins=(git)
 source "$ZSH/oh-my-zsh.sh"
+
+# SHELL, USER, and ~/.local/bin. Also sourced from /etc/zsh/zshrc so an
+# existing startup file keeps this identity without being rewritten.
+source /usr/local/share/adm/zsh-identity.zsh
