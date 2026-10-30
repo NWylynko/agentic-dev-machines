@@ -70,6 +70,10 @@ fn prompt_omits_absent_request_id_and_preserves_explicit_id_deduplication() {
 }
 
 fn adm(root: &Path, arguments: &[&str]) -> Output {
+    adm_from(root, None, arguments)
+}
+
+fn adm_from(root: &Path, current_dir: Option<&Path>, arguments: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_adm"));
     let herdr_bin = root.join("herdr-bin");
     let fixture_path = format!(
@@ -90,6 +94,9 @@ fn adm(root: &Path, arguments: &[&str]) -> Output {
             fs::read_to_string(root.join("runner-url"))
                 .unwrap_or_else(|_| "http://127.0.0.1:1".into()),
         );
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
     configure_lifecycle(&mut command, root);
     command.args(arguments);
     command.output().expect("run public CLI")
@@ -548,6 +555,28 @@ elif args and args[0] == 'exec':
         repos.mkdir(parents=True, exist_ok=True)
         command = args[args.index('--') + 1:]
         command = [item.replace('/repos', str(repos)) for item in command]
+        if command[:2] == ['node', '/opt/adm/browser.mjs']:
+            # Stands in for Chromium. A failed screenshot write still exits 0,
+            # and dbus/zygote noise is printed, matching the real browser.
+            sys.stderr.write('[1:1:ERROR:dbus/bus.cc:406] Failed to connect to the bus: No such file or directory\n')
+            sys.stderr.write('[1:1:ERROR:zygote_host_impl_linux.cc:100] Failed to adjust OOM score of renderer with pid 2\n')
+            if (pathlib.Path(__file__).parent / 'browser-chromium-fail').exists():
+                sys.stderr.write('chromium: navigation failed\n')
+                sys.exit(1)
+            if '--screenshot' in command:
+                shot = command[command.index('--screenshot') + 1]
+                if not (pathlib.Path(__file__).parent / 'browser-omit-file').exists():
+                    path = pathlib.Path(shot)
+                    if not path.is_absolute():
+                        path = repos / path
+                    try:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(bytes.fromhex('89504e470d0a1a0a') + b'fixture-png')
+                    except OSError:
+                        pass
+                sys.exit(0)
+            sys.stdout.write('<html>adm-preview</html>\n')
+            sys.exit(0)
         env=os.environ.copy()
         test_env = pathlib.Path(__file__).parent / 'exec-env.json'
         if test_env.exists(): env.update(json.loads(test_env.read_text()))
@@ -3035,6 +3064,141 @@ fn browser_refuses_to_enter_a_namespace_whose_immutable_ownership_changed() {
     );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("ownership"));
+}
+
+#[test]
+fn browser_screenshot_is_saved_on_the_client() {
+    let root = fixture();
+    assert_ok(adm(root.path(), &["create", "ws", "--no-repositories"]));
+    let shot = root.path().join("x.png");
+    let output = adm_from(
+        root.path(),
+        Some(root.path()),
+        &[
+            "browser",
+            "ws",
+            "http://localhost:8080",
+            "--screenshot",
+            "./x.png",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr={stderr}");
+    let bytes = fs::read(&shot).unwrap_or_else(|_| {
+        panic!(
+            "expected a client PNG at {}, stderr={stderr}",
+            shot.display()
+        )
+    });
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    assert!(
+        bytes
+            .windows(b"fixture-png".len())
+            .any(|window| window == b"fixture-png"),
+        "screenshot bytes did not come from the workspace"
+    );
+    let stderr_lower = stderr.to_ascii_lowercase();
+    assert!(!stderr_lower.contains("dbus"), "{stderr}");
+    assert!(!stderr_lower.contains("oom score"), "{stderr}");
+
+    let verbose = adm_from(
+        root.path(),
+        Some(root.path()),
+        &[
+            "browser",
+            "ws",
+            "http://localhost:8080",
+            "--screenshot",
+            "./verbose.png",
+            "--verbose",
+        ],
+    );
+    assert!(
+        verbose.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verbose.stderr)
+    );
+    let verbose_stderr = String::from_utf8_lossy(&verbose.stderr).to_ascii_lowercase();
+    assert!(verbose_stderr.contains("dbus"), "{verbose_stderr}");
+    assert!(verbose_stderr.contains("oom score"), "{verbose_stderr}");
+    assert_eq!(
+        &fs::read(root.path().join("verbose.png")).unwrap()[..8],
+        b"\x89PNG\r\n\x1a\n"
+    );
+
+    let help = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["browser", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help_text = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        help_text.contains("Save a PNG of the page to this path on the client"),
+        "{help_text}"
+    );
+}
+
+#[test]
+fn browser_screenshot_fails_clearly_when_the_client_path_or_chromium_fails() {
+    let root = fixture();
+    assert_ok(adm(root.path(), &["create", "ws", "--no-repositories"]));
+    let assert_one_line = |output: Output, expected: &str| {
+        assert!(!output.status.success(), "expected failure");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lines: Vec<_> = stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(lines.len(), 1, "{stderr}");
+        let line = lines[0].to_ascii_lowercase();
+        assert!(!line.contains("dbus"), "{stderr}");
+        assert!(!line.contains("oom score"), "{stderr}");
+        assert!(lines[0].contains(expected), "{stderr}");
+    };
+
+    let unwritable = adm_from(
+        root.path(),
+        Some(root.path()),
+        &[
+            "browser",
+            "ws",
+            "http://localhost:8080",
+            "--screenshot",
+            "./missing-dir/x.png",
+        ],
+    );
+    assert_one_line(unwritable, "cannot save screenshot");
+
+    fs::write(root.path().join("browser-chromium-fail"), "1").unwrap();
+    let failed = adm_from(
+        root.path(),
+        Some(root.path()),
+        &[
+            "browser",
+            "ws",
+            "http://localhost:8080",
+            "--screenshot",
+            "./failed.png",
+        ],
+    );
+    assert_one_line(failed, "navigation failed");
+    assert!(!root.path().join("failed.png").exists());
+    fs::remove_file(root.path().join("browser-chromium-fail")).unwrap();
+
+    fs::write(root.path().join("browser-omit-file"), "1").unwrap();
+    let omitted = adm_from(
+        root.path(),
+        Some(root.path()),
+        &[
+            "browser",
+            "ws",
+            "http://localhost:8080",
+            "--screenshot",
+            "./omitted.png",
+        ],
+    );
+    assert_one_line(omitted, "screenshot was not written");
+    assert!(!root.path().join("omitted.png").exists());
 }
 
 #[test]

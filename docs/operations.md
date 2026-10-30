@@ -219,8 +219,10 @@ Kubernetes resolves shell commands and port forwards against `deployment/workspa
 
 ```sh
 adm port my-project 3000 --local-port 3000
-adm browser my-project http://127.0.0.1:3000 --screenshot /workspace/preview.png
+adm browser my-project http://127.0.0.1:3000 --screenshot ./preview.png
 ```
+
+The screenshot path is on the client running `adm`. Chromium writes it inside the workspace Pod, and adm copies the PNG back. Chromium's dbus and zygote startup lines are hidden unless you pass `--verbose`. A missing screenshot or a Chromium failure exits non-zero.
 
 The port is available on the client device running `adm port`; open `http://127.0.0.1:3000` there or use that device's own network forwarding tools to expose it. ADM binds to loopback by default. A failed forward reports interruption; rerunning it resolves the current runtime.
 
