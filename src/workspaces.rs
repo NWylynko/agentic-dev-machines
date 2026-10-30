@@ -2143,36 +2143,92 @@ mv -- "$staging" "$target"
         "preparing repository",
         || {
             kubectl(
-            cli,
-            &[
-                "exec",
-                "-n",
-                &workspace.namespace,
-                "deployment/workspace",
-                "-c",
-                "dev",
-                "--",
-                "sh",
-                "-eu",
-                "-c",
-                script,
-                "adm-repository",
-                owner,
-                name,
-                &workspace.id,
-                workspace.branch.as_deref().unwrap_or(""),
-                workspace.base.as_deref().unwrap_or(""),
-            ],
-            None,
-        )
-        .with_context(|| {
-            format!(
-                "repository {repository} preparation failed; verify the OWNER/REPO spelling and whether the repository is public or accessible from the workspace. Retry the same repository after transient failures. Correcting it requires inspecting and deliberately destroying this failed workspace, then recreating with --repo OWNER/REPO"
+                cli,
+                &[
+                    "exec",
+                    "-n",
+                    &workspace.namespace,
+                    "deployment/workspace",
+                    "-c",
+                    "dev",
+                    "--",
+                    "sh",
+                    "-eu",
+                    "-c",
+                    script,
+                    "adm-repository",
+                    owner,
+                    name,
+                    &workspace.id,
+                    workspace.branch.as_deref().unwrap_or(""),
+                    workspace.base.as_deref().unwrap_or(""),
+                ],
+                None,
             )
-        })?;
+            .map_err(|error| {
+                let headline = repository_preparation_failure_headline(
+                    &format!("{error:#}"),
+                    repository,
+                    &workspace.storage_size,
+                );
+                error.context(headline)
+            })?;
             Ok(())
         },
     )
+}
+
+/// Leads a repository preparation failure with its classified cause; the raw kubectl/git output stays below it.
+fn repository_preparation_failure_headline(
+    output: &str,
+    repository: &str,
+    storage_size: &str,
+) -> String {
+    let output = output.to_lowercase();
+    let found = |needles: &[&str]| needles.iter().any(|needle| output.contains(needle));
+    let recreate = "Correcting it requires inspecting and deliberately destroying this failed workspace, then recreating it";
+    if found(&["no space left on device", "disk quota exceeded"]) {
+        format!(
+            "workspace disk full while preparing repository {repository}: its {storage_size} volume is too small for this checkout. {recreate} with a larger --storage-size (for example --storage-size 16Gi)"
+        )
+    } else if found(&[
+        "container not found",
+        "unable to upgrade connection",
+        "pod not found",
+        "pods \"",
+        "does not have a host assigned",
+        "no running pod",
+        "deployments.apps \"workspace\" not found",
+    ]) {
+        format!(
+            "workspace container unavailable while preparing repository {repository}; its Pod is restarting, not scheduled or its node is down. Check `adm status`, then retry the same create once the workspace Pod runs"
+        )
+    } else if found(&[
+        "could not resolve host",
+        "failed to connect to",
+        "connection timed out",
+        "connection refused",
+        "operation timed out",
+        "network is unreachable",
+    ]) {
+        format!(
+            "network failure while cloning repository {repository}; the workspace could not reach GitHub. Retry the same create once its network works"
+        )
+    } else if found(&[
+        "repository not found",
+        "not found",
+        "could not read username",
+        "authentication failed",
+        "does not appear to be a git repository",
+    ]) {
+        format!(
+            "repository {repository} preparation failed; verify the OWNER/REPO spelling and whether the repository is public or accessible from the workspace. {recreate} with --repo OWNER/REPO"
+        )
+    } else {
+        format!(
+            "repository {repository} preparation failed. Retry the same repository after transient failures. {recreate} with corrected options"
+        )
+    }
 }
 
 fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {

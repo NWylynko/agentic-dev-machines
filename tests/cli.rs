@@ -1728,6 +1728,89 @@ fn repository_branch_and_base_flags_require_repository_and_branch() {
 }
 
 #[test]
+fn repository_preparation_failures_lead_with_their_real_cause() {
+    let root = repository_branch_fixture();
+    let git_path = String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let git_bin = root.path().join("git-bin");
+    fs::create_dir_all(&git_bin).unwrap();
+    let clone_stderr = root.path().join("git-clone-stderr");
+    let wrapper = git_bin.join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = clone ] && [ -f '{0}' ]; then cat '{0}' >&2; exit 128; fi\nexec {git_path} \"$@\"\n",
+            clone_stderr.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, git_stderr, headline, raw) in [
+        (
+            "disk-full",
+            "Cloning into 'owner/.adm-clone'...\nfatal: write error: No space left on device\nfatal: fetch-pack: invalid index-pack output\n",
+            "workspace disk full",
+            "No space left on device",
+        ),
+        (
+            "container-gone",
+            "error: unable to upgrade connection: container not found (\"dev\")\n",
+            "workspace container unavailable",
+            "container not found",
+        ),
+        (
+            "no-network",
+            "Cloning into 'owner/.adm-clone'...\nfatal: unable to access 'https://github.com/owner/project.git/': Could not resolve host: github.com\n",
+            "network failure",
+            "Could not resolve host",
+        ),
+    ] {
+        fs::write(&clone_stderr, git_stderr).unwrap();
+        let output = adm(
+            root.path(),
+            &["create", name, "--no-attach", "--repo", "owner/project"],
+        );
+        assert!(!output.status.success(), "{name} create succeeded");
+        let error = String::from_utf8_lossy(&output.stderr);
+        let headline_at = error
+            .find(headline)
+            .unwrap_or_else(|| panic!("{name}: missing {headline:?}: {error}"));
+        let raw_at = error
+            .find(raw)
+            .unwrap_or_else(|| panic!("{name}: raw output missing: {error}"));
+        assert!(headline_at < raw_at, "{name}: cause must lead: {error}");
+        assert!(
+            !error.contains("spelling"),
+            "{name}: only not-found/no-access mentions OWNER/REPO spelling: {error}"
+        );
+        if name == "disk-full" {
+            assert!(error.contains("--storage-size"), "{error}");
+        }
+    }
+    fs::write(
+        &clone_stderr,
+        "remote: Repository not found.\nfatal: repository 'https://github.com/owner/missing.git/' not found\n",
+    )
+    .unwrap();
+    let output = adm(
+        root.path(),
+        &[
+            "create",
+            "missing-repo",
+            "--no-attach",
+            "--repo",
+            "owner/missing",
+        ],
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("OWNER/REPO spelling"), "{error}");
+    assert!(!error.contains("disk full"), "{error}");
+}
+
+#[test]
 fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace() {
     use std::time::{Duration, Instant};
 
