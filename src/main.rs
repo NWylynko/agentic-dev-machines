@@ -17,8 +17,8 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource};
 use serde_json::{Value, json};
 use std::{
-    io::IsTerminal,
-    path::PathBuf,
+    io::{IsTerminal, Read, Write},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -253,8 +253,12 @@ pub enum Action {
     Browser {
         name: String,
         url: String,
+        /// Save a PNG of the page to this path on the client.
         #[arg(long)]
         screenshot: Option<String>,
+        /// Show Chromium stderr, including dbus and zygote startup noise.
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -1381,35 +1385,203 @@ fn run(cli: &Cli) -> Result<()> {
             name,
             url,
             screenshot,
-        } => {
-            let workspace = cli.active_workspace(name)?;
-            anyhow::ensure!(
-                workspace.role == "coding",
-                "bots have no coding browser environment"
-            );
-            workspaces::verify_ownership(cli, &workspace)?;
-            let mut command = cli.kubectl_command()?;
-            command.args([
-                "exec",
-                "-n",
-                &workspace.namespace,
-                "deployment/workspace",
-                "-c",
-                "dev",
-                "--",
-                "node",
-                "/opt/adm/browser.mjs",
-                url,
-            ]);
-            if let Some(path) = screenshot {
-                command.args(["--screenshot", path]);
-            }
-            command.stdin(Stdio::null());
-            let status = command.status()?;
-            anyhow::ensure!(status.success(), "browser automation failed");
-            Ok(())
-        }
+            verbose,
+        } => run_browser(cli, name, url, screenshot.as_deref(), *verbose),
     }
+}
+
+fn run_browser(
+    cli: &Cli,
+    name: &str,
+    url: &str,
+    screenshot: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    let workspace = cli.active_workspace(name)?;
+    anyhow::ensure!(
+        workspace.role == "coding",
+        "bots have no coding browser environment"
+    );
+    workspaces::verify_ownership(cli, &workspace)?;
+    if let Some(path) = screenshot {
+        ensure_client_screenshot_path(path)?;
+    }
+    let pod_screenshot = screenshot.map(|_| {
+        format!(
+            "/tmp/adm-browser-screenshot-{}.png",
+            uuid::Uuid::new_v4().simple()
+        )
+    });
+    let mut command = workspace_exec(cli, &workspace)?;
+    command.args(["node", "/opt/adm/browser.mjs", url]);
+    if let Some(path) = &pod_screenshot {
+        command.args(["--screenshot", path]);
+    }
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let output = command.output().context("run browser in the workspace")?;
+    if verbose {
+        std::io::stderr().write_all(&output.stderr)?;
+    }
+    std::io::stdout().write_all(&output.stdout)?;
+    if !output.status.success() {
+        return Err(anyhow::Error::msg(browser_failure_line(&output.stderr)));
+    }
+    if !verbose {
+        write_filtered_browser_stderr(&output.stderr)?;
+    }
+    if let (Some(client_path), Some(pod_path)) = (screenshot, pod_screenshot.as_deref()) {
+        copy_pod_screenshot(cli, &workspace, pod_path, client_path)?;
+        remove_pod_screenshot(cli, &workspace, pod_path)?;
+    }
+    Ok(())
+}
+
+fn workspace_exec(cli: &Cli, workspace: &workspaces::Workspace) -> Result<Command> {
+    let mut command = cli.kubectl_command()?;
+    command.args([
+        "exec",
+        "-n",
+        &workspace.namespace,
+        "deployment/workspace",
+        "-c",
+        "dev",
+        "--",
+    ]);
+    Ok(command)
+}
+
+fn ensure_client_screenshot_path(path: &str) -> Result<()> {
+    anyhow::ensure!(
+        !path.is_empty() && !path.contains('\0'),
+        "cannot save screenshot to {path}: path is empty"
+    );
+    let dest = PathBuf::from(path);
+    if dest.exists() && !dest.is_file() {
+        anyhow::bail!("cannot save screenshot to {path}: not a file");
+    }
+    let parent = screenshot_parent(&dest);
+    if !parent.is_dir() {
+        let reason = if parent.exists() {
+            "not a directory"
+        } else {
+            "directory does not exist"
+        };
+        anyhow::bail!("cannot save screenshot to {path}: {reason}");
+    }
+    let probe = parent.join(format!(
+        ".adm-screenshot-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::File::create(&probe).map_err(|error| screenshot_save_error(path, error))?;
+    std::fs::remove_file(&probe).map_err(|error| screenshot_save_error(path, error))?;
+    Ok(())
+}
+
+fn screenshot_save_error(path: &str, error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::msg(format!("cannot save screenshot to {path}: {error}"))
+}
+
+fn screenshot_parent(dest: &Path) -> &Path {
+    match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn chromium_stderr_line_is_noise(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("dbus") || lower.contains("oom score")
+}
+
+fn browser_failure_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !chromium_stderr_line_is_noise(line))
+        .unwrap_or("browser automation failed")
+        .to_string()
+}
+
+fn write_filtered_browser_stderr(stderr: &[u8]) -> Result<()> {
+    let mut out = std::io::stderr().lock();
+    for line in String::from_utf8_lossy(stderr).lines() {
+        if line.trim().is_empty() || chromium_stderr_line_is_noise(line) {
+            continue;
+        }
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+
+fn copy_pod_screenshot(
+    cli: &Cli,
+    workspace: &workspaces::Workspace,
+    pod_path: &str,
+    client_path: &str,
+) -> Result<()> {
+    let dest = PathBuf::from(client_path);
+    let partial = screenshot_parent(&dest).join(format!(
+        ".adm-screenshot-{}.partial",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = std::fs::File::create(&partial)
+        .map_err(|error| screenshot_save_error(client_path, error))?;
+    let mut command = workspace_exec(cli, workspace)?;
+    command.args(["cat", "--", pod_path]);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().context("read screenshot from workspace")?;
+    let mut stdout = child.stdout.take().context("screenshot stream")?;
+    let mut stderr_pipe = child.stderr.take().context("screenshot error stream")?;
+    let stderr_thread = thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buffer);
+        buffer
+    });
+    let copied = std::io::copy(&mut stdout, &mut file);
+    drop(file);
+    let status = child.wait().context("read screenshot from workspace")?;
+    let cat_stderr = stderr_thread
+        .join()
+        .unwrap_or_else(|_| b"screenshot stream failed".to_vec());
+    let bytes = match copied {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(screenshot_save_error(client_path, error));
+        }
+    };
+    let png = std::fs::read(&partial).unwrap_or_default();
+    if !status.success() || bytes == 0 || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let _ = std::fs::remove_file(&partial);
+        let detail = browser_failure_line(&cat_stderr);
+        if detail == "browser automation failed" {
+            anyhow::bail!("screenshot was not written");
+        }
+        anyhow::bail!("screenshot was not written: {detail}");
+    }
+    std::fs::rename(&partial, &dest).map_err(|error| screenshot_save_error(client_path, error))?;
+    Ok(())
+}
+
+fn remove_pod_screenshot(
+    cli: &Cli,
+    workspace: &workspaces::Workspace,
+    pod_path: &str,
+) -> Result<()> {
+    let status = workspace_exec(cli, workspace)?
+        .args(["rm", "-f", "--", pod_path])
+        .stdin(Stdio::null())
+        .status()
+        .context("remove temporary screenshot from workspace")?;
+    anyhow::ensure!(
+        status.success(),
+        "could not remove temporary screenshot from workspace"
+    );
+    Ok(())
 }
 
 fn herdr_partial_success(workspace: &workspaces::Workspace, herdr_space: Option<&str>) -> String {
