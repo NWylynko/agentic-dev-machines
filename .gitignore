@@ -11,3 +11,4 @@
 !.env.schema
 .dev.vars
 coverage/
+/.claude/worktrees/
