@@ -831,6 +831,13 @@ test("OAuth refresh and logout recheck the owner epoch while the credential lock
         return epoch;
       }),
       configure: (runtime) => runtime.registerNativeProvider(provider),
+      // This test drives the request-path refresh; the stored credential is
+      // already expired, so a real schedule would refresh it on start.
+      refreshScheduler: {
+        now: () => Date.now(),
+        setTimer: () => ({}),
+        clearTimer: () => {},
+      },
     });
     await new Promise((resolve) => authority.server.listen(0, "127.0.0.1", resolve));
     return {

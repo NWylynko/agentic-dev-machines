@@ -122,7 +122,10 @@ async function startFakeTokenEndpoint(t) {
   return endpoint;
 }
 
-async function startProviderAuthFixture(t, { credential, scheduler } = {}) {
+async function startProviderAuthFixture(
+  t,
+  { credential, scheduler = createManualRefreshScheduler() } = {},
+) {
   const directory = await mkdtemp(join(tmpdir(), "adm-provider-auth-refresh-"));
   const authPath = join(directory, "auth.json");
   if (credential)
@@ -136,7 +139,7 @@ async function startProviderAuthFixture(t, { credential, scheduler } = {}) {
     configure: (runtime) =>
       runtime.registerNativeProvider(fakeOAuthProvider(tokens.url)),
     log: (line) => logs.push(line),
-    ...(scheduler ? { refreshScheduler: scheduler } : {}),
+    refreshScheduler: scheduler,
   });
   t.after(async () => {
     await authority.close();
@@ -284,4 +287,73 @@ test("an invalid request body is answered and logged with its parse error (TASK-
   const logged = fixture.events().filter((entry) => entry.event === "request_failed");
   assert.equal(logged.length, 1);
   assert.match(logged[0].cause.join(" "), /JSON/);
+});
+
+test("an idle OAuth credential is refreshed 10 min before its stored expiry with no request touching it (TASK-109)", async (t) => {
+  const scheduler = createManualRefreshScheduler();
+  const expires = scheduler.now() + 60 * MINUTE;
+  const fixture = await startProviderAuthFixture(t, {
+    scheduler,
+    credential: {
+      type: "oauth",
+      access: "fake-access-idle-secret",
+      refresh: "fake-refresh-idle-secret",
+      expires,
+    },
+  });
+  // Scheduled on start from the stored expiry, not from a request.
+  assert.equal(scheduler.timers.length, 1);
+  assert.equal(scheduler.timers[0].delayMs, 50 * MINUTE);
+
+  fixture.tokens.responses.push(fixture.tokens.issue("scheduled"));
+  await scheduler.fireNext();
+  assert.deepEqual(fixture.tokens.requests, [
+    { grant_type: "refresh_token", refresh_token: "fake-refresh-idle-secret" },
+  ]);
+  const stored = await fixture.stored();
+  assert.equal(stored.access, "fake-access-scheduled-secret");
+  assert.equal(stored.refresh, "fake-refresh-scheduled-secret");
+  assert.ok(stored.expires > expires + 4 * 60 * MINUTE, "the new expiry is persisted");
+
+  // The next refresh is scheduled from the new expiry.
+  assert.equal(scheduler.timers.length, 1);
+  assert.equal(scheduler.timers[0].at, stored.expires - 10 * MINUTE);
+
+  const events = fixture.events();
+  const succeeded = events.filter((entry) => entry.event === "refresh_succeeded");
+  assert.equal(succeeded.length, 1);
+  assert.equal(succeeded[0].trigger, "scheduled");
+  assert.equal(succeeded[0].expires, new Date(stored.expires).toISOString());
+  assert.equal(
+    events.filter((entry) => entry.event === "refresh_scheduled").length,
+    2,
+  );
+  assert.equal(events.filter((entry) => entry.event === "request_failed").length, 0);
+  assertNoSecretsLogged(fixture.logs);
+});
+
+test("login schedules the credential's refresh and logout cancels it (TASK-109)", async (t) => {
+  const scheduler = createManualRefreshScheduler();
+  const fixture = await startProviderAuthFixture(t, { scheduler });
+  assert.equal(scheduler.timers.length, 0);
+  fixture.tokens.responses.push(fixture.tokens.issue("login"));
+  const login = await fixture.request("/v1/provider-auth/login", "POST", {
+    provider: FAKE_PROVIDER,
+    type: "oauth",
+  });
+  const { operationId } = await login.json();
+  const complete = await fixture.request(
+    `/v1/provider-auth/login/${operationId}/events`,
+  );
+  assert.equal((await complete.json()).event.type, "complete");
+  const stored = await fixture.stored();
+  assert.equal(scheduler.timers.length, 1);
+  assert.equal(scheduler.timers[0].at, stored.expires - 10 * MINUTE);
+
+  const logout = await fixture.request("/v1/provider-auth/logout", "POST", {
+    provider: FAKE_PROVIDER,
+  });
+  assert.equal(logout.status, 200);
+  assert.equal(scheduler.timers.length, 0);
+  assert.equal(fixture.tokens.requests.length, 1, "only the login reached the token endpoint");
 });

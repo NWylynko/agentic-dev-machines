@@ -29,7 +29,29 @@ type AuthorityOptions = {
   ownerGuard?: () => Promise<boolean>;
   /** Receives one JSON line per event; defaults to stdout (TASK-109). */
   log?: (line: string) => void;
+  /** Clock and timers for scheduled refreshes; injectable for tests. */
+  refreshScheduler?: ProviderRefreshScheduler;
 };
+
+export type ProviderRefreshScheduler = {
+  now(): number;
+  setTimer(run: () => Promise<void>, delayMs: number): unknown;
+  clearTimer(timer: unknown): void;
+};
+
+const systemProviderRefreshScheduler: ProviderRefreshScheduler = {
+  now: () => Date.now(),
+  setTimer: (run, delayMs) => setTimeout(run, delayMs).unref(),
+  clearTimer: (timer) => clearTimeout(timer as NodeJS.Timeout),
+};
+
+// Refresh stored OAuth credentials this long before their stored `expires`
+// (Pi already saves `expires` 5 min early). Agreed with Nick 2026-10-30.
+const PROVIDER_REFRESH_LEAD_MS = 10 * 60 * 1000;
+// Pi requires `expires` on OAuth credentials, so this should never apply.
+const PROVIDER_REFRESH_WITHOUT_EXPIRY_MS = 60 * 60 * 1000;
+// setTimeout fires at once for delays above 2^31-1 ms (~24.8 days).
+const MAX_PROVIDER_REFRESH_TIMER_MS = 2 ** 31 - 1;
 
 type ProviderAuthLogLevel = "info" | "warn" | "error";
 export type ProviderAuthLog = (
@@ -211,6 +233,7 @@ export async function createProviderAuthAuthority({
   configure,
   ownerGuard,
   log: writeLog,
+  refreshScheduler = systemProviderRefreshScheduler,
 }: AuthorityOptions) {
   const log = createProviderAuthLog(writeLog);
   const authDirectory = dirname(authPath);
@@ -278,6 +301,7 @@ export async function createProviderAuthAuthority({
               : null,
           durationMs: Date.now() - startedAt,
         });
+        await scheduleProviderCredentialRefresh(providerId);
         return credential;
       } catch (error) {
         log("error", "refresh_failed", {
@@ -298,6 +322,85 @@ export async function createProviderAuthAuthority({
       .finally(() => providerRefreshesInFlight.delete(providerId))
       .catch(() => {});
     return refresh;
+  }
+
+  // While provider-auth runs, each stored OAuth credential is refreshed
+  // PROVIDER_REFRESH_LEAD_MS before its own stored `expires`, so an idle
+  // login stays fresh. Rescheduled after every refresh, login and logout,
+  // and on start (TASK-109).
+  const providerRefreshTimers = new Map<string, unknown>();
+  let refreshSchedulingClosed = false;
+
+  function cancelProviderCredentialRefresh(providerId: string) {
+    const timer = providerRefreshTimers.get(providerId);
+    if (timer === undefined) return;
+    refreshScheduler.clearTimer(timer);
+    providerRefreshTimers.delete(providerId);
+  }
+
+  async function scheduleProviderCredentialRefresh(providerId: string) {
+    cancelProviderCredentialRefresh(providerId);
+    if (refreshSchedulingClosed) return;
+    const credential = await readStoredCredential(providerId);
+    if (credential?.type !== "oauth" || refreshSchedulingClosed) return;
+    cancelProviderCredentialRefresh(providerId);
+    const expires = Number.isFinite(credential.expires)
+      ? (credential.expires as number)
+      : undefined;
+    if (expires === undefined)
+      log("warn", "refresh_without_expiry", {
+        provider: providerId,
+        intervalMs: PROVIDER_REFRESH_WITHOUT_EXPIRY_MS,
+      });
+    const dueAt =
+      expires === undefined
+        ? refreshScheduler.now() + PROVIDER_REFRESH_WITHOUT_EXPIRY_MS
+        : expires - PROVIDER_REFRESH_LEAD_MS;
+    const delayMs = Math.min(
+      Math.max(0, dueAt - refreshScheduler.now()),
+      MAX_PROVIDER_REFRESH_TIMER_MS,
+    );
+    providerRefreshTimers.set(
+      providerId,
+      refreshScheduler.setTimer(
+        () => runScheduledProviderRefresh(providerId, dueAt, expires),
+        delayMs,
+      ),
+    );
+    log("info", "refresh_scheduled", {
+      provider: providerId,
+      at: new Date(dueAt).toISOString(),
+      delayMs,
+    });
+  }
+
+  async function runScheduledProviderRefresh(
+    providerId: string,
+    dueAt: number,
+    expires: number | undefined,
+  ) {
+    providerRefreshTimers.delete(providerId);
+    // A delay longer than the timer limit fires early: wait again.
+    if (refreshScheduler.now() < dueAt)
+      return scheduleProviderCredentialRefresh(providerId);
+    try {
+      // Refresh anything that expires no later than the expiry this was
+      // scheduled from; Pi rechecks that under the credential lock.
+      await refreshProviderCredential(
+        providerId,
+        "scheduled",
+        expires === undefined
+          ? undefined
+          : Math.max(0, expires - Date.now()) + 1,
+      );
+    } catch {
+      // refreshProviderCredential logged the failure.
+    }
+  }
+
+  async function scheduleStoredProviderCredentialRefreshes() {
+    for (const { providerId, type } of await credentialStore.credentials.list())
+      if (type === "oauth") await scheduleProviderCredentialRefresh(providerId);
   }
 
   async function resolveSharedProviderAuth(providerId: string) {
@@ -449,6 +552,7 @@ export async function createProviderAuthAuthority({
             error: { code: "INVALID_REQUEST", message: "provider is required" },
           });
         await runtime.logout(value.provider);
+        cancelProviderCredentialRefresh(value.provider);
         log("info", "logout", { provider: value.provider });
         return send(response, 200, {});
       }
@@ -510,6 +614,7 @@ export async function createProviderAuthAuthority({
                 type: value.type,
                 durationMs: Date.now() - loginStartedAt,
               });
+              await scheduleProviderCredentialRefresh(provider);
               publish(operation, { type: "complete" });
             },
             (error: unknown) => {
@@ -605,9 +710,14 @@ export async function createProviderAuthAuthority({
       else response.end();
     }
   });
+  await scheduleStoredProviderCredentialRefreshes();
   return {
     server,
     close: async () => {
+      refreshSchedulingClosed = true;
+      for (const providerId of [...providerRefreshTimers.keys()])
+        cancelProviderCredentialRefresh(providerId);
+      await Promise.allSettled(providerRefreshesInFlight.values());
       for (const operation of operations.values()) operation.controller.abort();
       if (server.listening)
         await new Promise<void>((resolve, reject) =>
