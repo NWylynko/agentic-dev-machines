@@ -1012,10 +1012,7 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
         output.contains(&format!("physical={backing}\n")),
         "{output}"
     );
-    assert!(
-        output.contains("SHELL=/usr/bin/zsh\n"),
-        "{output}"
-    );
+    assert!(output.contains("SHELL=/usr/bin/zsh\n"), "{output}");
 
     let explicit = adm(
         root.path(),

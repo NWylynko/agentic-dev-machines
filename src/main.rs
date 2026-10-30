@@ -807,7 +807,9 @@ fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
         Ok(providers) => json!(providers),
         Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
     };
-    Ok(json!({"workspace":workspace,"cluster":cluster,"agent":agent,"activity":activity,"providers":providers}))
+    Ok(
+        json!({"workspace":workspace,"cluster":cluster,"agent":agent,"activity":activity,"providers":providers}),
+    )
 }
 
 fn pod_summary(status: &Value) -> (String, String) {

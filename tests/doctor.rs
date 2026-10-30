@@ -473,10 +473,7 @@ else: sys.exit(2)
         String::from_utf8_lossy(&output.stderr)
     );
     let report = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        report.contains("xai: login expired"),
-        "{report}"
-    );
+    assert!(report.contains("xai: login expired"), "{report}");
     assert!(report.contains("adm login xai"), "{report}");
     let json_output = invoke(&["doctor", "--json"]);
     assert!(json_output.status.success());
@@ -488,7 +485,11 @@ else: sys.exit(2)
     assert_eq!(providers[0]["status"], "login_expired");
 
     let list = invoke(&["list"]);
-    assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
     let list = String::from_utf8(list.stdout).unwrap();
     assert!(list.contains("xai: login expired"), "{list}");
     assert!(list.contains("adm login xai"), "{list}");
