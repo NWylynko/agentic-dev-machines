@@ -282,7 +282,9 @@ async function createGuardedCredentialStore(
       }
     },
   };
-  const credentials = storageModule.AuthStorage.fromStorage(guardedBackend);
+  // With authPath, reads use Pi's file-revision cache like its default store;
+  // `fromStorage` would reload under the lock on every read.
+  const credentials = new storageModule.AuthStorage(guardedBackend, authPath);
   // Pi refreshes OAuth inside `modify`, under the credential lock. Check the
   // owner fence there before Pi's update runs: a refresh spends the stored
   // refresh token, so a non-owner must never start one (TASK-109). Plain
