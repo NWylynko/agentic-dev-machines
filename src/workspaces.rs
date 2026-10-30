@@ -1569,7 +1569,7 @@ pub fn workspace_security_context() -> Value {
         "allowPrivilegeEscalation": true,
         "capabilities": {
             "drop": ["ALL"],
-            "add": ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+            "add": ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "AUDIT_WRITE"]
         },
         "seccompProfile": {"type": "RuntimeDefault"}
     })

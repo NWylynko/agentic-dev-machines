@@ -4180,10 +4180,20 @@ fn manifest_exposes_the_workspace_security_profile_and_isolated_storage() {
     );
     assert_eq!(dev["securityContext"]["runAsUser"], 1000);
     assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
-    assert_eq!(dev["securityContext"]["capabilities"]["drop"][0], "ALL");
+    assert_eq!(
+        dev["securityContext"]["capabilities"]["drop"],
+        serde_json::json!(["ALL"])
+    );
     assert_eq!(
         dev["securityContext"]["capabilities"]["add"],
-        serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
+        serde_json::json!([
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "SETGID",
+            "SETUID",
+            "AUDIT_WRITE"
+        ])
     );
     assert!(
         items
@@ -4631,10 +4641,20 @@ fn manifest_gives_the_workspace_unattended_container_administration() {
     assert_eq!(dev["securityContext"]["runAsGroup"], 1000);
     assert_eq!(dev["securityContext"]["runAsNonRoot"], true);
     assert_eq!(dev["securityContext"]["allowPrivilegeEscalation"], true);
-    assert_eq!(dev["securityContext"]["capabilities"]["drop"][0], "ALL");
+    assert_eq!(
+        dev["securityContext"]["capabilities"]["drop"],
+        serde_json::json!(["ALL"])
+    );
     assert_eq!(
         dev["securityContext"]["capabilities"]["add"],
-        serde_json::json!(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"])
+        serde_json::json!([
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "SETGID",
+            "SETUID",
+            "AUDIT_WRITE"
+        ])
     );
     assert_eq!(
         dev["securityContext"]["seccompProfile"]["type"],

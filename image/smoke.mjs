@@ -22,6 +22,19 @@ const image = process.argv[2] ?? "ghcr.io/nwylynko/agentic-dev-machines:latest";
 const container = `adm-image-smoke-${process.pid}`;
 let created = false;
 let failure;
+// Keep in step with workspace_security_context in src/workspaces.rs.
+const workspaceCapabilities = [
+  "CHOWN",
+  "DAC_OVERRIDE",
+  "FOWNER",
+  "SETGID",
+  "SETUID",
+  "AUDIT_WRITE",
+];
+const workspaceCapabilityArgs = workspaceCapabilities.flatMap((capability) => [
+  "--cap-add",
+  capability,
+]);
 
 async function docker(...args) {
   try {
@@ -187,16 +200,7 @@ server.listen(7433, "127.0.0.1", () => {
       "1000:1000",
       "--cap-drop",
       "ALL",
-      "--cap-add",
-      "CHOWN",
-      "--cap-add",
-      "DAC_OVERRIDE",
-      "--cap-add",
-      "FOWNER",
-      "--cap-add",
-      "SETGID",
-      "--cap-add",
-      "SETUID",
+      ...workspaceCapabilityArgs,
       "--security-opt",
       "no-new-privileges:false",
       "--network",
@@ -551,16 +555,7 @@ async function verifyPackageInstallation() {
       "1000:1000",
       "--cap-drop",
       "ALL",
-      "--cap-add",
-      "CHOWN",
-      "--cap-add",
-      "DAC_OVERRIDE",
-      "--cap-add",
-      "FOWNER",
-      "--cap-add",
-      "SETGID",
-      "--cap-add",
-      "SETUID",
+      ...workspaceCapabilityArgs,
       "--security-opt",
       "no-new-privileges:false",
       "--network",
@@ -579,13 +574,10 @@ async function verifyPackageInstallation() {
     const [inspection] = JSON.parse(inspectOutput);
     assert.equal(inspection.Config.User, "1000:1000");
     assert.deepEqual(inspection.HostConfig.CapDrop, ["ALL"]);
-    assert.deepEqual(inspection.HostConfig.CapAdd, [
-      "CAP_CHOWN",
-      "CAP_DAC_OVERRIDE",
-      "CAP_FOWNER",
-      "CAP_SETGID",
-      "CAP_SETUID",
-    ]);
+    assert.deepEqual(
+      [...inspection.HostConfig.CapAdd].sort(),
+      workspaceCapabilities.map((capability) => `CAP_${capability}`).sort(),
+    );
     assert.ok(
       inspection.HostConfig.SecurityOpt.includes("no-new-privileges:false"),
     );
@@ -695,20 +687,13 @@ try {
     "create",
     "--name",
     container,
+    "--hostname",
+    "localhost",
     "--user",
     "1000:1000",
     "--cap-drop",
     "ALL",
-    "--cap-add",
-    "CHOWN",
-    "--cap-add",
-    "DAC_OVERRIDE",
-    "--cap-add",
-    "FOWNER",
-    "--cap-add",
-    "SETGID",
-    "--cap-add",
-    "SETUID",
+    ...workspaceCapabilityArgs,
     "--security-opt",
     "no-new-privileges:false",
     "--network",
@@ -734,13 +719,10 @@ try {
   assert.equal(inspection.HostConfig.NetworkMode, "none");
   assert.deepEqual(inspection.HostConfig.CapDrop, ["ALL"]);
   assert.ok(inspection.HostConfig.SecurityOpt.includes("no-new-privileges:false"));
-  assert.deepEqual(inspection.HostConfig.CapAdd, [
-    "CAP_CHOWN",
-    "CAP_DAC_OVERRIDE",
-    "CAP_FOWNER",
-    "CAP_SETGID",
-    "CAP_SETUID",
-  ]);
+  assert.deepEqual(
+    [...inspection.HostConfig.CapAdd].sort(),
+    workspaceCapabilities.map((capability) => `CAP_${capability}`).sort(),
+  );
   assert.deepEqual(
     inspection.Mounts,
     [],
@@ -771,6 +753,7 @@ try {
     "test \"$(sudo -n id -u)\" = 0 && sudo -n sh -c 'printf smoke > /etc/adm-image-smoke && test \"$(cat /etc/adm-image-smoke)\" = smoke && rm /etc/adm-image-smoke' && printf '%s\\n' 'sudo works'",
   );
   assert.equal(root.stdout.trim(), "sudo works");
+  assert.equal(root.stderr, "", "sudo must not print audit or other warnings");
 
   await docker(
     "exec",
