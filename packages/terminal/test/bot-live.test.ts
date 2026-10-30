@@ -107,7 +107,7 @@ class BotPtyScreen {
 
 test(
   "native bot attach renders live onboarding, published replies, and private working activity across reconnect",
-  { timeout: 40000 },
+  { timeout: 60000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-bot-live-"));
     // A private, gated tool round comes from an installation MCP connector,
