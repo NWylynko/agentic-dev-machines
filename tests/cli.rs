@@ -301,6 +301,7 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
         "serve",
         "stop",
         "doctor",
+        "system-log",
         "herdr",
         "help",
     ] {
@@ -4102,7 +4103,7 @@ zpty adm-completion zsh -f -i
 zpty -w adm-completion $'stty -echo\nfpath=("$ADM_TEST_INSECURE_COMPLETIONS" $fpath)\nautoload -Uz compinit\ncompinit -D -i\nsource "$ADM_TEST_COMPLETION_SCRIPT"\ncompdef _adm adm\nfunction adm() { print -r -- "__ADM_RESULT__:$*"; }\nprint __ADM_READY__\n'
 zpty -r -m adm-completion output '*__ADM_READY__*'
 print -r -- "$output"
-for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t' $'adm create complete --br\t' $'adm create complete --ba\t'; do
+for input in $'adm li\t' $'adm herdr b\t' $'adm list --j\t' $'adm --state-d\t' $'adm create complete --br\t' $'adm create complete --ba\t' $'adm system-l\t' $'adm system-log --fo\t'; do
   zpty -w adm-completion "$input"
   zpty -r -m adm-completion output '*__ADM_RESULT__*'
   print -r -- "$output"
@@ -4133,12 +4134,136 @@ zpty -d adm-completion
         "adm --state-dir",
         "adm create complete --branch",
         "adm create complete --base",
+        "adm system-log",
+        "adm system-log --follow",
     ] {
         assert!(
             candidates.contains(candidate),
             "missing {candidate:?}: {candidates}"
         );
     }
+}
+
+#[test]
+fn system_log_merges_cluster_service_logs_in_time_order_with_service_prefixes() {
+    // TASK-109: one command for the logs of the cluster-owned ADM services.
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("config")).unwrap();
+    let kubectl = root.path().join("kubectl");
+    fs::write(
+        &kubectl,
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+here = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+with open(here / 'kubectl-invocations', 'a') as calls:
+    calls.write(json.dumps({'args': args, 'kubeconfig': os.environ.get('KUBECONFIG')}) + '\n')
+container = args[args.index('-c') + 1]
+lines = {
+    'lifecycle': ['2026-10-30T14:00:01Z lifecycle listening', '2026-10-30T14:00:03.5Z lease renewed'],
+    'provider-auth': ['2026-10-30T14:00:01.25Z {"event":"refresh_started"}', '2026-10-30T14:00:02.000000001Z {"event":"refresh_succeeded"}'],
+}[container]
+for line in lines:
+    print(line, flush=True)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let kubeconfig = root.path().join("client-kubeconfig");
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_adm"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .arg("--kubectl")
+            .arg(&kubectl)
+            .arg("--kubeconfig")
+            .arg(&kubeconfig)
+            .args(["--lifecycle-namespace", "adm-test", "system-log"])
+            .args(arguments)
+            .output()
+            .expect("run adm system-log")
+    };
+    let invocations = || {
+        let calls = fs::read_to_string(root.path().join("kubectl-invocations")).unwrap_or_default();
+        fs::remove_file(root.path().join("kubectl-invocations")).ok();
+        let mut calls = calls
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|call| call["args"].to_string());
+        calls
+    };
+
+    let merged = run(&[]);
+    assert!(
+        merged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(merged.stdout).unwrap(),
+        concat!(
+            "lifecycle     2026-10-30T14:00:01Z lifecycle listening\n",
+            "provider-auth 2026-10-30T14:00:01.25Z {\"event\":\"refresh_started\"}\n",
+            "provider-auth 2026-10-30T14:00:02.000000001Z {\"event\":\"refresh_succeeded\"}\n",
+            "lifecycle     2026-10-30T14:00:03.5Z lease renewed\n",
+        )
+    );
+    let calls = invocations();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for (call, container) in calls.iter().zip(["lifecycle", "provider-auth"]) {
+        assert_eq!(
+            call["args"],
+            serde_json::json!([
+                "logs",
+                "-n",
+                "adm-test",
+                "deployment/adm-lifecycle",
+                "-c",
+                container,
+                "--timestamps",
+                "--since=1h"
+            ])
+        );
+        assert_eq!(call["kubeconfig"], kubeconfig.to_str().unwrap());
+    }
+
+    let followed = run(&["--service", "provider-auth", "--since", "10m", "--follow"]);
+    assert!(
+        followed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&followed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(followed.stdout).unwrap(),
+        concat!(
+            "provider-auth 2026-10-30T14:00:01.25Z {\"event\":\"refresh_started\"}\n",
+            "provider-auth 2026-10-30T14:00:02.000000001Z {\"event\":\"refresh_succeeded\"}\n",
+        )
+    );
+    let calls = invocations();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(
+        calls[0]["args"],
+        serde_json::json!([
+            "logs",
+            "-n",
+            "adm-test",
+            "deployment/adm-lifecycle",
+            "-c",
+            "provider-auth",
+            "--timestamps",
+            "--since=10m",
+            "--follow"
+        ])
+    );
+
+    let unknown = run(&["--service", "nope"]);
+    assert!(!unknown.status.success());
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("unknown service nope"), "{stderr}");
+    assert!(stderr.contains("lifecycle, provider-auth"), "{stderr}");
+    assert!(invocations().is_empty());
 }
 
 #[test]

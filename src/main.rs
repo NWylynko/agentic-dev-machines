@@ -9,6 +9,7 @@ mod runtime_access;
 mod setup;
 mod setup_connection;
 mod setup_control_plane;
+mod system_log;
 mod update;
 mod workspaces;
 
@@ -194,6 +195,18 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Print the logs of the cluster-owned ADM services, merged in time order.
+    SystemLog {
+        /// Only this service (lifecycle, provider-auth).
+        #[arg(long)]
+        service: Option<String>,
+        /// How far back to read, as a kubectl duration (e.g. 10m, 6h).
+        #[arg(long, default_value = "1h")]
+        since: String,
+        /// Keep streaming new lines as they arrive.
+        #[arg(long)]
+        follow: bool,
+    },
     /// Configure workspace defaults and optionally install the cluster controller.
     Setup,
     /// Connect this client to an already-installed cluster without changing it.
@@ -329,6 +342,7 @@ impl Cli {
             "lifecycle-forward",
             "stop",
             "doctor",
+            "system-log",
             "herdr",
             "completions",
             "help",
@@ -1322,6 +1336,11 @@ fn run(cli: &Cli) -> Result<()> {
             storage_class,
             json,
         } => diagnostics::doctor(cli, storage_class, *json),
+        Action::SystemLog {
+            service,
+            since,
+            follow,
+        } => system_log::run(cli, service.as_deref(), since, *follow),
         Action::Setup => setup::run(cli),
         Action::Connect => setup::connect(cli),
         Action::Update {
@@ -1422,6 +1441,7 @@ fn main() {
             && !matches!(
                 cli.command,
                 Action::Connect
+                    | Action::SystemLog { .. }
                     | Action::Update { .. }
                     | Action::UpdateServices { .. }
                     | Action::Herdr {
