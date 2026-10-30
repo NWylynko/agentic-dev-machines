@@ -372,3 +372,215 @@ test(
       assert.ok(!workspaceData.includes(token), token);
   },
 );
+
+function admCommandEnv(directory) {
+  return {
+    PATH: process.env.PATH,
+    HOME: directory,
+    XDG_CONFIG_HOME: join(directory, "client", "config"),
+    XDG_STATE_HOME: join(directory, "client", "state"),
+    XDG_DATA_HOME: join(directory, "client", "data"),
+  };
+}
+
+// `adm mcp login` with a pipe on stdin. The fake browser follows the
+// authorization URL and stops: it does not fetch the loopback callback.
+// `rewrite` turns that callback URL into the line written to stdin.
+async function loginByPastingRedirect({
+  directory,
+  authorityUrl,
+  tokenFile,
+  fixture,
+  rewrite = (callback) => String(callback),
+}) {
+  const child = spawn(
+    admBinary,
+    [
+      "mcp",
+      "login",
+      "linear",
+      "--lifecycle-url",
+      authorityUrl,
+      "--lifecycle-token-file",
+      tokenFile,
+    ],
+    { stdio: ["pipe", "pipe", "pipe"], env: admCommandEnv(directory) },
+  );
+  let stdout = "";
+  let stderr = "";
+  let pasted = null;
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    const link = /^(http\S+authorize\S+)$/m.exec(stdout);
+    if (!link || pasted) return;
+    pasted = fixture.approve(link[1]).then((callback) => {
+      child.stdin.write(`${rewrite(callback)}\n`);
+      child.stdin.end();
+      return callback;
+    });
+  });
+  const result = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(
+        new Error(
+          `adm mcp login did not exit after the redirect was pasted (listener-only sign-in)\n${stdout}${stderr}`,
+        ),
+      );
+    }, 15000);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+  return { ...result, callback: pasted ? await pasted : null };
+}
+
+async function startPasteSignIn(t) {
+  const directory = await mkdtemp(join(tmpdir(), "adm-connectors-paste-"));
+  const fixture = await startMcpOAuthServer();
+  const authority = await createProviderAuthAuthority({
+    authPath: join(directory, "authority", "auth.json"),
+  });
+  await new Promise((resolve) =>
+    authority.server.listen(0, "127.0.0.1", resolve),
+  );
+  const authorityUrl = `http://127.0.0.1:${authority.server.address().port}`;
+  const tokenFile = join(directory, "lifecycle-token");
+  await writeFile(tokenFile, "operator-lifecycle-token\n", { mode: 0o600 });
+  const authorityRequests = [];
+  authority.server.on("request", (request) => {
+    authorityRequests.push(`${request.method} ${request.url}`);
+  });
+  const added = await fetch(`${authorityUrl}/v1/connectors`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "linear", url: fixture.url }),
+  });
+  assert.equal(added.status, 201, await added.clone().text());
+  const lifecycle = await startPodLifecycle({ authorityUrl });
+  const runners = [];
+  t.after(async () => {
+    for (const runner of runners) await runner.stop();
+    await lifecycle.close();
+    await authority.close();
+    await fixture.close();
+    await rm(directory, { recursive: true });
+  });
+  return {
+    directory,
+    fixture,
+    authorityUrl,
+    tokenFile,
+    authorityRequests,
+    lifecycle,
+    runners,
+  };
+}
+
+test(
+  "a pasted browser redirect signs in when the callback port is unreachable",
+  { timeout: 60000 },
+  async (t) => {
+    const world = await startPasteSignIn(t);
+    const coding = await startPodRunner(world.directory, world.lifecycle, {
+      id: "coding-agent",
+      name: "coding agent",
+      role: "coding",
+    });
+    const bot = await startPodRunner(world.directory, world.lifecycle, {
+      id: "bot-agent",
+      name: "supervisor",
+      role: "bot",
+    });
+    world.runners.push(coding, bot);
+    const mcpTools = async (agent) =>
+      (await agent.request()).body.tools.filter((name) =>
+        name.startsWith("mcp_"),
+      );
+    for (const agent of [coding, bot])
+      assert.deepEqual(await mcpTools(agent), []);
+
+    const signedIn = await loginByPastingRedirect(world);
+    assert.equal(
+      signedIn.code,
+      0,
+      `adm mcp login: ${signedIn.stdout}${signedIn.stderr}`,
+    );
+    assert.match(
+      signedIn.stdout,
+      /Or paste the URL your browser ended up on:/,
+    );
+    assert.match(
+      signedIn.stdout,
+      /Signed in to linear\. Every ADM agent can use its tools: lookup, hang/,
+    );
+    // The callback URL was handed to the CLI on stdin. Nothing fetched it.
+    assert.ok(signedIn.callback instanceof URL);
+
+    for (const agent of [coding, bot]) {
+      const accepted = await agent.request("/input", "POST", {
+        message: plan([
+          { tool: "mcp_linear_lookup", args: { query: `TASK-${agent.id}` } },
+        ]),
+        requestId: `lookup-${agent.id}`,
+      });
+      assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
+      const lookup = await agent.event(
+        (event) =>
+          event.kind === "tool" && event.data.name === "mcp_linear_lookup",
+      );
+      assert.equal(lookup.data.isError, false, lookup.data.text);
+      assert.match(
+        lookup.data.text,
+        new RegExp(`issue TASK-${agent.id}: fixture backlog item`),
+      );
+      assert.deepEqual(await mcpTools(agent), [
+        "mcp_linear_lookup",
+        "mcp_linear_hang",
+      ]);
+    }
+  },
+);
+
+test(
+  "a pasted redirect with the wrong state fails and cancels the pending sign-in",
+  { timeout: 20000 },
+  async (t) => {
+    const world = await startPasteSignIn(t);
+    const failed = await loginByPastingRedirect({
+      ...world,
+      rewrite: (callback) => {
+        const url = new URL(callback);
+        url.searchParams.set("state", "not-the-pending-state");
+        return String(url);
+      },
+    });
+    assert.notEqual(failed.code, 0, failed.stdout);
+    assert.match(
+      `${failed.stderr}\n${failed.stdout}`,
+      /This sign-in link is stale\. Use the newest one printed by adm\./,
+    );
+    assert.ok(
+      world.authorityRequests.includes("DELETE /v1/connectors/linear/sign-in"),
+      world.authorityRequests.join("\n"),
+    );
+    const completed = await fetch(
+      `${world.authorityUrl}/v1/connectors/linear/sign-in/complete`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          state: failed.callback.searchParams.get("state"),
+          code: failed.callback.searchParams.get("code"),
+        }),
+      },
+    );
+    assert.notEqual(completed.status, 200, await completed.text());
+  },
+);
