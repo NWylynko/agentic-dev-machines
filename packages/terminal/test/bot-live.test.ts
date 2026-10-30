@@ -272,11 +272,16 @@ test(
           ),
       };
     };
+    const ckpt = (label: string) =>
+      process.stderr.write(`[ckpt] ${label} @${Date.now()}\n`);
     const first = attach();
     await startup;
+    ckpt("first startup");
     await request("/model", "PUT", { provider: "faux", modelId: "faux-1" });
+    ckpt("first model set");
     const question = "What identity and purpose would you like me to have?";
     await first.waitFor(question);
+    ckpt("first question");
     assert.doesNotMatch(first.text(), /I am ready for setup details\./);
 
     const transport = new WorkspaceTerminal({
@@ -291,7 +296,9 @@ test(
       transport.close();
     });
     await transport.connect();
+    ckpt("transport connected");
     await runtime.initialize();
+    ckpt("runtime initialized");
     const delivered: string[] = [];
     let complete = () => {};
     const published = new Promise<void>((resolve) => (complete = resolve));
@@ -320,10 +327,14 @@ test(
       });
     first.child.stdin.write(`\x1b[200~${prompt}\x1b[201~`);
     await first.waitFor("PRIVATE_LIVE_BOT_MODEL_OUTPUT"); // the user's editor input, not model output
+    ckpt("first editor input visible");
     first.child.stdin.write("\r");
     await published;
+    ckpt("published");
     await first.waitFor(reply);
+    ckpt("first reply visible");
     const history = await request("/history");
+    ckpt("history fetched");
     assert.equal(
       history.events.filter(
         (event: any) => event.kind === "message" && event.data.text === reply,
@@ -335,6 +346,7 @@ test(
       `message_end:${reply}`,
     ]);
     await transport.connect();
+    ckpt("transport reconnected");
     assert.deepEqual(
       delivered,
       [`message_start:${reply}`, `message_end:${reply}`],
@@ -352,11 +364,15 @@ test(
     const exited = once(first.child, "exit");
     first.child.stdin.write("\x03");
     assert.equal((await exited)[0], 0);
+    ckpt("first exited");
     startup = new Promise<void>((resolve) => (ready = resolve));
     const second = attach();
     await startup;
+    ckpt("second startup");
     await second.waitFor(question);
+    ckpt("second question");
     await second.waitFor(reply);
+    ckpt("second reply");
     assert.equal(second.screen.text().split(question).length - 1, 1);
     assert.equal(second.screen.text().split(reply).length - 1, 1);
     assert.equal(
@@ -389,22 +405,29 @@ test(
         }),
     });
     await Promise.all([toolStarted, active]);
+    ckpt("bot-working-success tool started + active");
     assert.equal(
       runtime.sessionProjection().isStreaming,
       true,
       "bot remains working while its private tool runs",
     );
     await second.waitFor("Working");
+    ckpt("second shows Working");
     const secondExit = once(second.child, "exit");
     second.child.stdin.write("\x03");
     assert.equal((await secondExit)[0], 0);
+    ckpt("second exited");
     startup = new Promise<void>((resolve) => (ready = resolve));
     const third = attach();
     await startup;
+    ckpt("third startup");
     await third.waitFor("Working");
+    ckpt("third shows Working (1)");
     release!("PRIVATE_GATE_TOOL_RESULT");
     await idle;
+    ckpt("idle (1)");
     await third.waitForIdle();
+    ckpt("third idle (1)");
     assert.equal(runtime.sessionProjection().isStreaming, false);
     assert.deepEqual(
       events.filter((type) =>
@@ -425,10 +448,14 @@ test(
         JSON.stringify({ calls: [{ tool: "mcp_gate_wait", args: {} }] }),
     });
     await Promise.all([toolStarted, active]);
+    ckpt("bot-working-error tool started + active");
     await third.waitFor("Working");
+    ckpt("third shows Working (2)");
     release!("PRIVATE_GATE_TOOL_RESULT");
     await idle;
+    ckpt("idle (2)");
     await third.waitForIdle();
+    ckpt("third idle (2)");
     assert.equal(
       runtime.sessionProjection().isStreaming,
       false,
@@ -448,11 +475,16 @@ test(
         }),
     });
     await Promise.all([toolStarted, active]);
+    ckpt("bot-working-abort tool started + active");
     assert.equal(runtime.sessionProjection().isStreaming, true);
     await third.waitFor("Working");
+    ckpt("third shows Working (3)");
     await request("/abort", "POST", {});
+    ckpt("abort requested");
     await idle;
+    ckpt("idle (3)");
     await third.waitForIdle();
+    ckpt("third idle (3)");
     assert.equal(
       runtime.sessionProjection().isStreaming,
       false,
