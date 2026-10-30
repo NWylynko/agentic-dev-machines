@@ -95,6 +95,65 @@ function providerAuthRootCause(error: unknown): string {
 /** An error whose message is safe to return to the caller as is. */
 class ProviderAuthRequestError extends Error {}
 
+class ProviderAuthFenceError extends Error {
+  constructor() {
+    super("Lifecycle provider-auth owner fence is not current");
+  }
+}
+
+type ProviderRefreshFailureKind = "fence" | "permanent" | "transient";
+
+class ProviderRefreshError extends ProviderAuthRequestError {
+  readonly kind: ProviderRefreshFailureKind;
+  constructor(
+    message: string,
+    kind: ProviderRefreshFailureKind,
+    options: { cause: unknown },
+  ) {
+    super(message, options);
+    this.kind = kind;
+  }
+}
+
+// The token endpoint rejected the refresh token itself: retrying cannot
+// help, only a new login can. Everything else (network, timeout, 5xx) is
+// treated as transient.
+const PERMANENT_REFRESH_FAILURE = /invalid_grant|\b(?:HTTP|status) 40[01]\b/;
+
+function classifyProviderRefreshFailure(
+  error: unknown,
+): ProviderRefreshFailureKind {
+  for (let current: unknown = error; current; current = (current as Error).cause)
+    if (current instanceof ProviderAuthFenceError) return "fence";
+  return PERMANENT_REFRESH_FAILURE.test(providerAuthCauseChain(error).join("\n"))
+    ? "permanent"
+    : "transient";
+}
+
+const PROVIDER_REFRESH_RETRY_DELAYS_MS = [1, 2, 4, 8].map((minutes) => minutes * 60_000);
+const PROVIDER_REFRESH_RETRY_MAX_DELAY_MS = 15 * 60_000;
+
+function rotatedRefreshTokenProviders(
+  before: string | undefined,
+  after: string,
+): string[] {
+  const parse = (text: string | undefined) => {
+    try {
+      return text ? JSON.parse(text) : {};
+    } catch {
+      return {};
+    }
+  };
+  const previous = parse(before);
+  const next = parse(after);
+  return Object.keys(next).filter(
+    (providerId) =>
+      previous[providerId]?.type === "oauth" &&
+      next[providerId]?.type === "oauth" &&
+      previous[providerId].refresh !== next[providerId].refresh,
+  );
+}
+
 const PI_OAUTH_REFRESH_WINDOW_MS = 5 * 60 * 1000;
 
 type LoginOperation = {
@@ -201,9 +260,15 @@ async function createGuardedCredentialStore(
           const result = await update(content);
           if (result.next !== undefined && !(await ownerGuard())) {
             log("warn", "fence_rejected", { operation: "credential write" });
-            throw new Error(
-              "Lifecycle provider-auth owner fence is not current",
-            );
+            for (const providerId of rotatedRefreshTokenProviders(
+              content,
+              result.next,
+            ))
+              log("error", "refresh_token_lost", {
+                provider: providerId,
+                message: `${providerId}: refreshed, but the owner fence was lost before saving, so the rotated refresh token was lost and the stored one is probably spent: run adm login ${providerId}`,
+              });
+            throw new ProviderAuthFenceError();
           }
           return result;
         },
@@ -217,8 +282,34 @@ async function createGuardedCredentialStore(
       }
     },
   };
+  const credentials = storageModule.AuthStorage.fromStorage(guardedBackend);
+  // Pi refreshes OAuth inside `modify`, under the credential lock. Check the
+  // owner fence there before Pi's update runs: a refresh spends the stored
+  // refresh token, so a non-owner must never start one (TASK-109). Plain
+  // reads also take the lock (Pi reloads through withLockAsync) and are not
+  // fenced, so the check sits on `modify`, not on the backend.
+  const modifyCredential = credentials.modify.bind(credentials);
+  credentials.modify = (
+    providerId: string,
+    update: (current: unknown) => Promise<unknown>,
+    options?: { signal?: AbortSignal },
+  ) =>
+    modifyCredential(
+      providerId,
+      async (current: unknown) => {
+        if (!(await ownerGuard())) {
+          log("warn", "fence_rejected", {
+            operation: "credential update",
+            provider: providerId,
+          });
+          throw new ProviderAuthFenceError();
+        }
+        return update(current);
+      },
+      options,
+    );
   return {
-    credentials: storageModule.AuthStorage.fromStorage(guardedBackend),
+    credentials,
     close: async () => {
       // Pi's background catalog reads can outlive the HTTP server. Fence new
       // storage work, then wait for admitted operations to release their locks.
@@ -269,6 +360,13 @@ export async function createProviderAuthAuthority({
   });
   const operations = new Map<string, LoginOperation>();
   const providerRefreshesInFlight = new Map<string, Promise<unknown>>();
+  // Providers whose refresh token the token endpoint rejected; shown as
+  // `login_expired` in /providers until the next login or refresh.
+  const providerLoginsExpired = new Map<
+    string,
+    { cause: string; since: string }
+  >();
+  const providerRefreshAttempts = new Map<string, number>();
 
   const readStoredCredential = (providerId: string): Promise<any> =>
     credentialStore.credentials.read(providerId);
@@ -301,20 +399,30 @@ export async function createProviderAuthAuthority({
               : null,
           durationMs: Date.now() - startedAt,
         });
+        providerLoginsExpired.delete(providerId);
         await scheduleProviderCredentialRefresh(providerId);
         return credential;
       } catch (error) {
+        const kind = classifyProviderRefreshFailure(error);
+        const cause = providerAuthRootCause(error);
+        const message =
+          `${providerId}: token refresh failed (${cause})` +
+          (kind === "permanent" ? `: run adm login ${providerId}` : "");
+        if (kind === "permanent")
+          providerLoginsExpired.set(providerId, {
+            cause,
+            since: new Date().toISOString(),
+          });
         log("error", "refresh_failed", {
           provider: providerId,
           trigger,
           operation: "token refresh",
+          kind,
+          message,
           durationMs: Date.now() - startedAt,
           cause: providerAuthCauseChain(error),
         });
-        throw new ProviderAuthRequestError(
-          `${providerId}: token refresh failed (${providerAuthRootCause(error)})`,
-          { cause: error },
-        );
+        throw new ProviderRefreshError(message, kind, { cause: error });
       }
     })();
     providerRefreshesInFlight.set(providerId, refresh);
@@ -340,6 +448,7 @@ export async function createProviderAuthAuthority({
 
   async function scheduleProviderCredentialRefresh(providerId: string) {
     cancelProviderCredentialRefresh(providerId);
+    providerRefreshAttempts.delete(providerId);
     if (refreshSchedulingClosed) return;
     const credential = await readStoredCredential(providerId);
     if (credential?.type !== "oauth" || refreshSchedulingClosed) return;
@@ -393,8 +502,34 @@ export async function createProviderAuthAuthority({
           ? undefined
           : Math.max(0, expires - Date.now()) + 1,
       );
-    } catch {
-      // refreshProviderCredential logged the failure.
+    } catch (error) {
+      // refreshProviderCredential logged the failure. A transient failure
+      // or a fence that may come back keeps the stored credential and
+      // retries, also after the access token expired; a rejected refresh
+      // token waits for `adm login`.
+      if (error instanceof ProviderRefreshError && error.kind === "permanent")
+        return;
+      if (refreshSchedulingClosed) return;
+      const attempt = (providerRefreshAttempts.get(providerId) ?? 0) + 1;
+      providerRefreshAttempts.set(providerId, attempt);
+      const delayMs =
+        PROVIDER_REFRESH_RETRY_DELAYS_MS[attempt - 1] ??
+        PROVIDER_REFRESH_RETRY_MAX_DELAY_MS;
+      const retryAt = refreshScheduler.now() + delayMs;
+      cancelProviderCredentialRefresh(providerId);
+      providerRefreshTimers.set(
+        providerId,
+        refreshScheduler.setTimer(
+          () => runScheduledProviderRefresh(providerId, retryAt, expires),
+          delayMs,
+        ),
+      );
+      log("warn", "refresh_retry_scheduled", {
+        provider: providerId,
+        attempt,
+        at: new Date(retryAt).toISOString(),
+        delayMs,
+      });
     }
   }
 
@@ -497,15 +632,27 @@ export async function createProviderAuthAuthority({
         return send(
           response,
           200,
-          runtime.getProviders().map((provider: any) => ({
-            provider: provider.id,
-            name: provider.name,
-            authTypes: [
-              ...(provider.auth.apiKey?.login ? ["api_key"] : []),
-              ...(provider.auth.oauth ? ["oauth"] : []),
-            ],
-            authenticated: credentials.get(provider.id) ?? null,
-          })),
+          runtime.getProviders().map((provider: any) => {
+            const expired = providerLoginsExpired.get(provider.id);
+            const authenticated = credentials.get(provider.id) ?? null;
+            return {
+              provider: provider.id,
+              name: provider.name,
+              authTypes: [
+                ...(provider.auth.apiKey?.login ? ["api_key"] : []),
+                ...(provider.auth.oauth ? ["oauth"] : []),
+              ],
+              authenticated,
+              // login_expired: the token endpoint rejected the stored
+              // refresh token; `cause` says why (TASK-109).
+              status: expired
+                ? "login_expired"
+                : authenticated
+                  ? "authenticated"
+                  : "unauthenticated",
+              ...(expired ? { cause: expired.cause } : {}),
+            };
+          }),
         );
       }
       const resolveMatch = /^\/v1\/provider-auth\/resolve\/([^/]+)$/.exec(
@@ -553,6 +700,8 @@ export async function createProviderAuthAuthority({
           });
         await runtime.logout(value.provider);
         cancelProviderCredentialRefresh(value.provider);
+        providerRefreshAttempts.delete(value.provider);
+        providerLoginsExpired.delete(value.provider);
         log("info", "logout", { provider: value.provider });
         return send(response, 200, {});
       }
@@ -614,6 +763,7 @@ export async function createProviderAuthAuthority({
                 type: value.type,
                 durationMs: Date.now() - loginStartedAt,
               });
+              providerLoginsExpired.delete(provider);
               await scheduleProviderCredentialRefresh(provider);
               publish(operation, { type: "complete" });
             },

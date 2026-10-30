@@ -101,6 +101,7 @@ async function startFakeTokenEndpoint(t) {
     endpoint.requests.push(
       Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString())),
     );
+    endpoint.onRequest?.();
     const next = endpoint.responses.shift() ?? {
       status: 599,
       body: { error: "unexpected_token_request" },
@@ -131,11 +132,18 @@ async function startProviderAuthFixture(
   if (credential)
     await writeFile(authPath, JSON.stringify({ [FAKE_PROVIDER]: credential }));
   const tokens = await startFakeTokenEndpoint(t);
-  const owner = { epoch: 7 };
+  const owner = { epoch: 7, advanceOnNextRead: false };
   const logs = [];
   const authority = await createProviderAuthAuthority({
     authPath,
-    ownerGuard: createOwnerEpochGuard(async () => owner.epoch),
+    ownerGuard: createOwnerEpochGuard(async () => {
+      const epoch = owner.epoch;
+      if (owner.advanceOnNextRead) {
+        owner.advanceOnNextRead = false;
+        owner.epoch += 1;
+      }
+      return epoch;
+    }),
     configure: (runtime) =>
       runtime.registerNativeProvider(fakeOAuthProvider(tokens.url)),
     log: (line) => logs.push(line),
@@ -356,4 +364,164 @@ test("login schedules the credential's refresh and logout cancels it (TASK-109)"
   assert.equal(logout.status, 200);
   assert.equal(scheduler.timers.length, 0);
   assert.equal(fixture.tokens.requests.length, 1, "only the login reached the token endpoint");
+});
+
+const idleCredential = (scheduler) => ({
+  type: "oauth",
+  access: "fake-access-idle-secret",
+  refresh: "fake-refresh-idle-secret",
+  expires: scheduler.now() + 60 * MINUTE,
+});
+
+test("a transient refresh failure keeps the credential and retries with backoff until it succeeds (TASK-109)", async (t) => {
+  const scheduler = createManualRefreshScheduler();
+  const credential = idleCredential(scheduler);
+  const fixture = await startProviderAuthFixture(t, { scheduler, credential });
+  const unavailable = { status: 503, body: { error: "temporarily_unavailable" } };
+  const retryDelays = [];
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    fixture.tokens.responses.push(unavailable);
+    await scheduler.fireNext();
+    assert.deepEqual(await fixture.stored(), credential, "the credential survives");
+    assert.equal(scheduler.timers.length, 1, "a retry is scheduled");
+    retryDelays.push(scheduler.timers[0].delayMs / MINUTE);
+  }
+  assert.deepEqual(retryDelays, [1, 2, 4, 8, 15, 15]);
+  // The fake clock is now past the access token's expiry; retries continue.
+  assert.ok(scheduler.now() > credential.expires);
+
+  fixture.tokens.responses.push(fixture.tokens.issue("recovered"));
+  await scheduler.fireNext();
+  const stored = await fixture.stored();
+  assert.equal(stored.refresh, "fake-refresh-recovered-secret");
+  assert.equal(scheduler.timers.length, 1);
+  assert.equal(scheduler.timers[0].at, stored.expires - 10 * MINUTE);
+  assert.equal(fixture.tokens.requests.length, 7);
+  for (const request of fixture.tokens.requests)
+    assert.equal(request.refresh_token, "fake-refresh-idle-secret");
+
+  const events = fixture.events();
+  const failed = events.filter((entry) => entry.event === "refresh_failed");
+  assert.equal(failed.length, 6);
+  for (const entry of failed) {
+    assert.equal(entry.kind, "transient");
+    assert.match(entry.cause.at(-1), /HTTP 503/);
+  }
+  assert.deepEqual(
+    events
+      .filter((entry) => entry.event === "refresh_retry_scheduled")
+      .map((entry) => entry.attempt),
+    [1, 2, 3, 4, 5, 6],
+  );
+  assert.equal(events.filter((entry) => entry.event === "refresh_succeeded").length, 1);
+  assertNoSecretsLogged(fixture.logs);
+});
+
+test("invalid_grant stops retrying and marks the provider login_expired with its cause (TASK-109)", async (t) => {
+  const scheduler = createManualRefreshScheduler();
+  const fixture = await startProviderAuthFixture(t, {
+    scheduler,
+    credential: idleCredential(scheduler),
+  });
+  fixture.tokens.responses.push({ status: 400, body: { error: "invalid_grant" } });
+  await scheduler.fireNext();
+  assert.equal(scheduler.timers.length, 0, "a permanent failure is not retried");
+  assert.equal(fixture.tokens.requests.length, 1);
+
+  const providers = await (await fixture.request("/v1/provider-auth/providers")).json();
+  const provider = providers.find((item) => item.provider === FAKE_PROVIDER);
+  assert.equal(provider.authenticated, "oauth");
+  assert.equal(provider.status, "login_expired");
+  assert.equal(provider.cause, "Fake OAuth token refresh failed (HTTP 400): invalid_grant");
+
+  const hints = fixture.logs.filter((line) =>
+    line.includes(`adm login ${FAKE_PROVIDER}`),
+  );
+  assert.equal(hints.length, 1, fixture.logs.join("\n"));
+  const failed = JSON.parse(hints[0]);
+  assert.equal(failed.event, "refresh_failed");
+  assert.equal(failed.level, "error");
+  assert.equal(failed.kind, "permanent");
+  assert.equal(
+    failed.message,
+    `${FAKE_PROVIDER}: token refresh failed (Fake OAuth token refresh failed (HTTP 400): invalid_grant): run adm login ${FAKE_PROVIDER}`,
+  );
+
+  // A new login clears the state and schedules again.
+  fixture.tokens.responses.push(fixture.tokens.issue("relogin"));
+  const login = await fixture.request("/v1/provider-auth/login", "POST", {
+    provider: FAKE_PROVIDER,
+    type: "oauth",
+  });
+  const { operationId } = await login.json();
+  await fixture.request(`/v1/provider-auth/login/${operationId}/events`);
+  const after = await (await fixture.request("/v1/provider-auth/providers")).json();
+  const relogged = after.find((item) => item.provider === FAKE_PROVIDER);
+  assert.equal(relogged.status, "authenticated");
+  assert.equal(relogged.cause, undefined);
+  assert.equal(scheduler.timers.length, 1);
+  assertNoSecretsLogged(fixture.logs);
+});
+
+test("a scheduled refresh without a current owner fence never reaches the token endpoint (TASK-109)", async (t) => {
+  const scheduler = createManualRefreshScheduler();
+  const credential = idleCredential(scheduler);
+  const fixture = await startProviderAuthFixture(t, { scheduler, credential });
+  assert.equal((await fixture.request("/health")).status, 200);
+  fixture.owner.epoch = 8;
+  await scheduler.fireNext();
+  assert.deepEqual(fixture.tokens.requests, []);
+  assert.deepEqual(await fixture.stored(), credential);
+  const events = fixture.events();
+  assert.equal(
+    events.filter(
+      (entry) => entry.event === "fence_rejected" && entry.operation === "credential update",
+    ).length,
+    1,
+  );
+  const failed = events.filter((entry) => entry.event === "refresh_failed");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].kind, "fence");
+  assert.equal(scheduler.timers.length, 1, "retried in case the fence comes back");
+});
+
+test("a request-path refresh rechecks the owner fence before spending the refresh token (TASK-109)", async (t) => {
+  const fixture = await startProviderAuthFixture(t, {
+    credential: {
+      type: "oauth",
+      access: "fake-access-old-secret",
+      refresh: "fake-refresh-old-secret",
+      expires: Date.now() - 1000,
+    },
+  });
+  // The request is admitted under epoch 7; the owner moves before the refresh.
+  fixture.owner.advanceOnNextRead = true;
+  const resolved = await fixture.request(`/v1/provider-auth/resolve/${FAKE_PROVIDER}`);
+  assert.equal(resolved.status, 400);
+  assert.match((await resolved.json()).error.message, /owner fence is not current/);
+  assert.deepEqual(fixture.tokens.requests, [], "the refresh token was not spent");
+  assert.equal((await fixture.stored()).refresh, "fake-refresh-old-secret");
+});
+
+test("a refresh whose write is fenced out logs that the rotated refresh token was lost (TASK-109)", async (t) => {
+  const scheduler = createManualRefreshScheduler();
+  const fixture = await startProviderAuthFixture(t, {
+    scheduler,
+    credential: idleCredential(scheduler),
+  });
+  assert.equal((await fixture.request("/health")).status, 200);
+  fixture.tokens.responses.push(fixture.tokens.issue("rotated"));
+  fixture.tokens.onRequest = () => {
+    fixture.owner.epoch = 8;
+  };
+  await scheduler.fireNext();
+  assert.equal(fixture.tokens.requests.length, 1);
+  assert.equal((await fixture.stored()).refresh, "fake-refresh-idle-secret");
+  const lost = fixture.events().filter((entry) => entry.event === "refresh_token_lost");
+  assert.equal(lost.length, 1);
+  assert.equal(lost[0].level, "error");
+  assert.equal(lost[0].provider, FAKE_PROVIDER);
+  assert.match(lost[0].message, /rotated refresh token was lost/);
+  assert.match(lost[0].message, new RegExp(`run adm login ${FAKE_PROVIDER}`));
+  assertNoSecretsLogged(fixture.logs);
 });
