@@ -27,7 +27,54 @@ type AuthorityOptions = {
   authPath: string;
   configure?: (runtime: any) => void;
   ownerGuard?: () => Promise<boolean>;
+  /** Receives one JSON line per event; defaults to stdout (TASK-109). */
+  log?: (line: string) => void;
 };
+
+type ProviderAuthLogLevel = "info" | "warn" | "error";
+export type ProviderAuthLog = (
+  level: ProviderAuthLogLevel,
+  event: string,
+  fields?: Record<string, unknown>,
+) => void;
+
+// One JSON line per event on stdout, read with `adm system-log` (TASK-109).
+// Callers pass provider IDs, timings and error messages only, never credentials.
+export function createProviderAuthLog(
+  write: (line: string) => void = (line) => console.log(line),
+): ProviderAuthLog {
+  return (level, event, fields = {}) =>
+    write(
+      JSON.stringify({
+        time: new Date().toISOString(),
+        service: "provider-auth",
+        level,
+        event,
+        ...fields,
+      }),
+    );
+}
+
+/** Messages of an error and its `cause` chain, outermost first. */
+export function providerAuthCauseChain(error: unknown): string[] {
+  const chain: string[] = [];
+  let current: unknown = error;
+  while (current !== undefined && current !== null && chain.length < 10) {
+    chain.push(current instanceof Error ? current.message : String(current));
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return chain;
+}
+
+function providerAuthRootCause(error: unknown): string {
+  return providerAuthCauseChain(error).at(-1) ?? "unknown error";
+}
+
+/** An error whose message is safe to return to the caller as is. */
+class ProviderAuthRequestError extends Error {}
+
+const PI_OAUTH_REFRESH_WINDOW_MS = 5 * 60 * 1000;
+
 type LoginOperation = {
   controller: AbortController;
   events: unknown[];
@@ -92,6 +139,7 @@ export function createOwnerEpochGuard(
 async function createGuardedCredentialStore(
   authPath: string,
   ownerGuard: () => Promise<boolean>,
+  log: ProviderAuthLog,
 ) {
   // Pi does not export these storage primitives. Wrapping its pinned backend
   // keeps its cross-process lock while fencing the final persisted mutation.
@@ -129,10 +177,12 @@ async function createGuardedCredentialStore(
       const operation = backend.withLockAsync(
         async (content: string | undefined) => {
           const result = await update(content);
-          if (result.next !== undefined && !(await ownerGuard()))
+          if (result.next !== undefined && !(await ownerGuard())) {
+            log("warn", "fence_rejected", { operation: "credential write" });
             throw new Error(
               "Lifecycle provider-auth owner fence is not current",
             );
+          }
           return result;
         },
         options,
@@ -160,7 +210,9 @@ export async function createProviderAuthAuthority({
   authPath,
   configure,
   ownerGuard,
+  log: writeLog,
 }: AuthorityOptions) {
+  const log = createProviderAuthLog(writeLog);
   const authDirectory = dirname(authPath);
   await mkdir(authDirectory, { recursive: true, mode: 0o700 });
   const directoryInfo = await lstat(authDirectory);
@@ -176,12 +228,14 @@ export async function createProviderAuthAuthority({
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
-  const credentialStore = ownerGuard
-    ? await createGuardedCredentialStore(authPath, ownerGuard)
-    : undefined;
+  const credentialStore = await createGuardedCredentialStore(
+    authPath,
+    ownerGuard ?? (async () => true),
+    log,
+  );
   const runtime = await ModelRuntime.create({
     authPath,
-    ...(credentialStore ? { credentials: credentialStore.credentials } : {}),
+    credentials: credentialStore.credentials,
     allowModelNetwork: false,
     refreshOnCreate: false,
   });
@@ -191,6 +245,70 @@ export async function createProviderAuthAuthority({
     ownerGuard,
   });
   const operations = new Map<string, LoginOperation>();
+  const providerRefreshesInFlight = new Map<string, Promise<unknown>>();
+
+  const readStoredCredential = (providerId: string): Promise<any> =>
+    credentialStore.credentials.read(providerId);
+
+  // Every refresh, from a request or the schedule, goes through Pi's normal
+  // path (`getAuth`, under the credential lock) and is logged here. One
+  // refresh per provider runs at a time; concurrent callers share it.
+  function refreshProviderCredential(
+    providerId: string,
+    trigger: "request" | "scheduled",
+    minOAuthValidityMs?: number,
+  ) {
+    const pending = providerRefreshesInFlight.get(providerId);
+    if (pending) return pending;
+    const refresh = (async () => {
+      const startedAt = Date.now();
+      log("info", "refresh_started", { provider: providerId, trigger });
+      try {
+        await runtime.getAuth(
+          providerId,
+          minOAuthValidityMs === undefined ? {} : { minOAuthValidityMs },
+        );
+        const credential = await readStoredCredential(providerId);
+        log("info", "refresh_succeeded", {
+          provider: providerId,
+          trigger,
+          expires:
+            credential?.type === "oauth" && Number.isFinite(credential.expires)
+              ? new Date(credential.expires).toISOString()
+              : null,
+          durationMs: Date.now() - startedAt,
+        });
+        return credential;
+      } catch (error) {
+        log("error", "refresh_failed", {
+          provider: providerId,
+          trigger,
+          operation: "token refresh",
+          durationMs: Date.now() - startedAt,
+          cause: providerAuthCauseChain(error),
+        });
+        throw new ProviderAuthRequestError(
+          `${providerId}: token refresh failed (${providerAuthRootCause(error)})`,
+          { cause: error },
+        );
+      }
+    })();
+    providerRefreshesInFlight.set(providerId, refresh);
+    void refresh
+      .finally(() => providerRefreshesInFlight.delete(providerId))
+      .catch(() => {});
+    return refresh;
+  }
+
+  async function resolveSharedProviderAuth(providerId: string) {
+    const stored = await readStoredCredential(providerId);
+    if (
+      stored?.type === "oauth" &&
+      Date.now() + PI_OAUTH_REFRESH_WINDOW_MS >= stored.expires
+    )
+      await refreshProviderCredential(providerId, "request");
+    return runtime.getAuth(providerId);
+  }
 
   function publish(operation: LoginOperation, value: unknown) {
     const waiter = operation.waiters.shift();
@@ -222,8 +340,13 @@ export async function createProviderAuthAuthority({
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
-      if (ownerGuard && !(await ownerGuard()))
+      if (ownerGuard && !(await ownerGuard())) {
+        log("warn", "fence_rejected", {
+          method: request.method,
+          path: url.pathname,
+        });
         return send(response, 503, { status: "unavailable" });
+      }
       if (request.method === "GET" && url.pathname === "/health")
         return send(response, 200, { status: "ok" });
       if (await connectors.handle(request, response, url)) return;
@@ -287,7 +410,7 @@ export async function createProviderAuthAuthority({
       );
       if (request.method === "GET" && resolveMatch) {
         const provider = decodeURIComponent(resolveMatch[1]!);
-        const resolved = await runtime.getAuth(provider);
+        const resolved = await resolveSharedProviderAuth(provider);
         return resolved
           ? send(response, 200, resolved)
           : send(response, 401, {
@@ -306,7 +429,7 @@ export async function createProviderAuthAuthority({
           return send(response, 400, {
             error: { code: "INVALID_REQUEST", message: "provider is required" },
           });
-        const resolved = await runtime.getAuth(value.provider);
+        const resolved = await resolveSharedProviderAuth(value.provider);
         return resolved
           ? send(response, 200, resolved)
           : send(response, 401, {
@@ -326,6 +449,7 @@ export async function createProviderAuthAuthority({
             error: { code: "INVALID_REQUEST", message: "provider is required" },
           });
         await runtime.logout(value.provider);
+        log("info", "logout", { provider: value.provider });
         return send(response, 200, {});
       }
       if (
@@ -352,6 +476,9 @@ export async function createProviderAuthAuthority({
           prompts: new Map(),
         };
         operations.set(id, operation);
+        const provider = value.provider as string;
+        const loginStartedAt = Date.now();
+        log("info", "login_started", { provider, type: value.type });
         void runtime
           .login(value.provider, value.type as AuthType, {
             signal: operation.controller.signal,
@@ -378,12 +505,23 @@ export async function createProviderAuthAuthority({
           .then(
             async () => {
               await chmod(authPath, 0o600);
+              log("info", "login_succeeded", {
+                provider,
+                type: value.type,
+                durationMs: Date.now() - loginStartedAt,
+              });
               publish(operation, { type: "complete" });
             },
-            (_error: unknown) => {
+            (error: unknown) => {
+              log("error", "login_failed", {
+                provider,
+                type: value.type,
+                durationMs: Date.now() - loginStartedAt,
+                cause: providerAuthCauseChain(error),
+              });
               publish(operation, {
                 type: "error",
-                message: "Provider authentication failed",
+                message: `${provider}: login failed (${providerAuthRootCause(error)})`,
               });
             },
           );
@@ -446,11 +584,22 @@ export async function createProviderAuthAuthority({
         error: { code: "NOT_FOUND", message: "provider auth route not found" },
       });
     } catch (error) {
+      const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+      const cause = providerAuthCauseChain(error);
+      log("error", "request_failed", {
+        method: request.method,
+        path,
+        status: 400,
+        cause,
+      });
       if (!response.headersSent)
         send(response, 400, {
           error: {
             code: "PROVIDER_AUTH_ERROR",
-            message: "Provider authentication request failed",
+            message:
+              error instanceof ProviderAuthRequestError
+                ? error.message
+                : `provider-auth: ${request.method} ${path} failed (${cause.join(": ")})`,
           },
         });
       else response.end();
@@ -465,7 +614,7 @@ export async function createProviderAuthAuthority({
           server.close((error) => (error ? reject(error) : resolve())),
         );
       await connectors.close();
-      await credentialStore?.close();
+      await credentialStore.close();
     },
   };
 }

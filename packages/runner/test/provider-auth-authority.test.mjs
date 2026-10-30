@@ -750,7 +750,8 @@ test("a pending login cannot persist after its lifecycle owner epoch changes", a
     assert.equal(eventResponse.status, 200);
     assert.deepEqual((await eventResponse.json()).event, {
       type: "error",
-      message: "Provider authentication failed",
+      message:
+        "adm-fenced-login: login failed (Lifecycle provider-auth owner fence is not current)",
     });
     assert.equal((await fetch(`${active.url}/health`)).status, 503);
     assert.doesNotMatch(await readFile(authPath, "utf8"), /must-not-persist/);
