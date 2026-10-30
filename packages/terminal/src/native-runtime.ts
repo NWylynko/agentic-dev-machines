@@ -586,6 +586,7 @@ export class DurableInteractiveRuntime {
         return provider?.subscription === true;
       },
     },
+    admModelGate: { openSelector: false },
     authActions: {
       login: async () => {
         if (this.snapshot().role !== "coding")
@@ -766,6 +767,38 @@ export class DurableInteractiveRuntime {
     );
   }
 
+  // The frame is already up: say we are loading models, then show the
+  // picker or the provider error. A hung catalog must not leave this blank.
+  private async presentModelCatalog() {
+    const ui = this.extensionUi;
+    if (this.transport.modelCatalogLoaded()) return;
+    ui?.setWidget("adm.models", ["Loading models…"]);
+    ui?.setStatus("adm.models", "Loading models…");
+    ui?.notify("Loading models…", "info");
+    try {
+      const catalog = await this.transport.loadModelCatalog();
+      this.modelRuntime.refreshSnapshot();
+      const error =
+        typeof catalog.error === "string" && catalog.error
+          ? catalog.error
+          : undefined;
+      if (error) {
+        ui?.setWidget("adm.models", [error]);
+        ui?.setStatus("adm.models", error);
+        ui?.notify(error, "error");
+        return;
+      }
+      ui?.setWidget("adm.models", undefined);
+      ui?.setStatus("adm.models", undefined);
+      if (!catalog.selected)
+        this.remotePorts.admModelGate.openSelector = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ui?.setWidget("adm.models", [message]);
+      ui?.setStatus("adm.models", message);
+      ui?.notify(message, "error");
+    }
+  }
   async initialize() {
     this.current = this.transport.getRemoteSnapshot();
     if (!this.current.connected)
@@ -1230,6 +1263,7 @@ export class DurableInteractiveRuntime {
       navigateTree: (entryId: string) => runtime.forkEntry(entryId),
       bindExtensions: async (options?: { uiContext?: ExtensionUIContext }) => {
         runtime.extensionUi = options?.uiContext;
+        await runtime.presentModelCatalog();
       },
       getAvailableTools: () => runtime.toolDefinitions,
       getActiveToolNames: () =>

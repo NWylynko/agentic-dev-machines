@@ -85,6 +85,8 @@ type ActiveBashOperation = {
 };
 type TerminalOptions = {
   autoModelSelector?: boolean;
+  /** Draw the attach frame before the model catalog returns (TASK-97). */
+  deferModelCatalog?: boolean;
   url: string;
   workspaceId: string;
   tokenFile?: string;
@@ -315,6 +317,7 @@ export class WorkspaceTerminal extends Container {
   };
   private pendingImages: ImageContent[] = [];
   private modelSelector?: ModelSelectorComponent;
+  private deferModelCatalog: boolean;
   private activeSelector?: Component & { handleInput(data: string): void };
   private modelRuntime?: RemoteModelRuntime;
   private workspaceEventListeners = new Set<(event: WorkspaceEvent) => void>();
@@ -322,6 +325,7 @@ export class WorkspaceTerminal extends Container {
   constructor(options: TerminalOptions) {
     super();
     this.options = options;
+    this.deferModelCatalog = options.deferModelCatalog === true;
     if (options.tui) initTheme("dark");
     this.input = options.tui
       ? new Editor(options.tui, editorTheme)
@@ -549,6 +553,22 @@ export class WorkspaceTerminal extends Container {
     }
     return response.json() as Promise<T>;
   }
+  modelCatalogLoaded() {
+    return this.modelRuntime !== undefined;
+  }
+  /** Public so attach can load models after the frame is on screen. */
+  async loadModelCatalog(signal?: AbortSignal) {
+    const catalog = await this.request("/models", undefined, signal);
+    this.modelRuntime = new RemoteModelRuntime(this, catalog);
+    this.currentModel = catalog.selected
+      ? `${catalog.selected.provider}/${catalog.selected.id}`
+      : "model unavailable";
+    return catalog as {
+      selected?: { provider: string; id: string };
+      error?: string;
+      models?: unknown[];
+    };
+  }
   async *subscribeOperationEvents<T extends { seq: number }>(
     path: string,
     signal?: AbortSignal,
@@ -763,14 +783,16 @@ export class WorkspaceTerminal extends Container {
       this.workspaceName = workspace.name;
       const cwd = workspace.cwd ?? workspace.localRoot;
       if (typeof cwd === "string" && cwd.trim()) this.workingDirectory = cwd;
-      const [catalog, settings] = await Promise.all([
-        this.request("/models", undefined, controller.signal),
-        this.request("/settings", undefined, controller.signal),
-      ]);
-      this.modelRuntime = new RemoteModelRuntime(this, catalog);
-      this.currentModel = catalog.selected
-        ? `${catalog.selected.provider}/${catalog.selected.id}`
-        : "model unavailable";
+      const deferModels = this.deferModelCatalog;
+      this.deferModelCatalog = false;
+      const settings = await this.request(
+        "/settings",
+        undefined,
+        controller.signal,
+      );
+      const catalog = deferModels
+        ? undefined
+        : await this.loadModelCatalog(controller.signal);
       this.thinkingLevel = settings.thinkingLevel ?? "off";
       const workspaceStatus =
         workspace.status === "error"
@@ -826,9 +848,15 @@ export class WorkspaceTerminal extends Container {
       if (!Number.isSafeInteger(keepaliveMs) || keepaliveMs < 1)
         throw new Error("Runner did not declare its event-stream keepalive");
       this.connected = true;
-      this.status = `Connected · ${workspaceStatus}`;
+      this.status = deferModels
+        ? "Loading models…"
+        : `Connected · ${workspaceStatus}`;
       this.refresh();
-      if (!catalog.selected && this.options.autoModelSelector !== false)
+      if (
+        catalog &&
+        !catalog.selected &&
+        this.options.autoModelSelector !== false
+      )
         this.openModelSelector();
       void this.consume(response, controller, keepaliveMs);
     } catch (error) {

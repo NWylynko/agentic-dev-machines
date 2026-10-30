@@ -371,6 +371,15 @@ for (const path of ["dist/index.js", "dist/index.d.ts"]) {
 }
 
 await patch("dist/modes/interactive/interactive-mode.js", [
+  [
+    `    async run() {
+        await this.init();
+        if (!process.env.PI_OFFLINE) {`,
+    `    async run() {
+        await this.init();
+        if (this.runtimeHost.remotePorts?.admModelGate?.openSelector) this.showModelSelector();
+        if (!process.env.PI_OFFLINE) {`,
+  ],
   ["await this.handleShareCommand();", "await this.handleShareCommand(text);"],
   [
     "        this.setupKeyHandlers();\n        this.setupEditorSubmitHandler();",
