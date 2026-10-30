@@ -238,7 +238,10 @@ const status = await get("/v1/workspaces/image-pod-runtime");
 if (!(await status.json()).id) throw new Error("workspace was not registered by its Pod runtime");
 const input = await fetch("http://127.0.0.1:7432/v1/workspaces/image-pod-runtime/input", {
   method: "POST", headers, body: JSON.stringify({ message: "/faux " + JSON.stringify({
-    calls: [{ tool: "write", args: { path: "/workspace/repo/pod-owned.txt", content: "executed inside workspace Pod" } }],
+    calls: [
+      { tool: "write", args: { path: "/workspace/repo/pod-owned.txt", content: "executed inside workspace Pod" } },
+      { tool: "bash", args: { command: "locale charmap > /workspace/repo/tool-charmap.txt" } },
+    ],
     answer: "file written",
   }), requestId: "pod-runtime-tool-write" }),
 });
@@ -263,6 +266,13 @@ for (let attempt = 0; attempt < 100; attempt++) {
       "/workspace/repo/pod-owned.txt",
     );
     assert.equal(podOwnedFile, "executed inside workspace Pod");
+    const { stdout: toolCharmap } = await docker(
+      "exec",
+      runtimeContainer,
+      "cat",
+      "/workspace/repo/tool-charmap.txt",
+    );
+    assert.equal(toolCharmap.trim(), "UTF-8", "agent tools must run in a UTF-8 locale");
 
     await docker("stop", "--time", "5", runtimeContainer);
     running = false;
@@ -745,6 +755,8 @@ try {
   const ghHelp = await docker("exec", container, "gh", "help");
   assert.match(ghHelp.stdout, /USAGE\s+gh <command>/);
   assert.match((await docker("exec", container, "zsh", "--version")).stdout, /^zsh 5\./);
+  const charmap = await docker("exec", container, "sh", "-c", "locale charmap");
+  assert.equal(charmap.stdout.trim(), "UTF-8", "workspace shells must use a UTF-8 locale");
   const root = await docker(
     "exec",
     container,

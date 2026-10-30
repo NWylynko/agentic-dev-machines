@@ -63,7 +63,8 @@ RUN chown root:root /usr/local/bin/adm-dev-entrypoint /usr/local/bin/adm-init-wo
  && ln -sfn /workspace/.adm/zsh/.zshrc /home/node/.zshrc \
  && usermod -s /usr/bin/zsh node \
  && printf '\n# ADM interactive workspace shells.\n. /usr/local/share/adm/zsh-identity.zsh\n' >> /etc/zsh/zshrc
-ENV NODE_PATH=/opt/adm/node_modules
+ENV NODE_PATH=/opt/adm/node_modules \
+    LANG=C.UTF-8
 WORKDIR /
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/adm-dev-entrypoint"]
 
