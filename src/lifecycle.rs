@@ -81,7 +81,10 @@ pub struct CreateIntent {
     #[serde(default)]
     pub allow_node_local_storage: bool,
     pub repositories: bool,
-    pub catalog: Value,
+    /// Accepted and ignored: callers before the repository registry sent a
+    /// per-workspace catalog (TASK-112).
+    #[serde(default, rename = "catalog", skip_serializing)]
+    pub ignored_catalog: Option<Value>,
     #[serde(default)]
     pub repository: Option<String>,
     #[serde(default)]
@@ -116,7 +119,7 @@ impl CreateIntent {
             agent_enabled: workspace.agent_enabled,
             allow_node_local_storage: workspace.allow_node_local_storage,
             repositories: workspace.repositories,
-            catalog: workspace.catalog.clone(),
+            ignored_catalog: None,
             repository: workspace.repository.clone(),
             branch: workspace.branch.clone(),
             base: workspace.base.clone(),
@@ -199,7 +202,7 @@ impl CreateIntent {
         );
         ensure!(
             !self.repositories || (self.role == "coding" && self.repository.is_none()),
-            "repository catalog is only supported for coding workspaces without --repo"
+            "the repositories sidecar is only supported for coding workspaces without --repo"
         );
         ensure!(
             !self.image.trim().is_empty()
@@ -249,7 +252,6 @@ impl CreateIntent {
             agent_enabled: true,
             allow_node_local_storage: self.allow_node_local_storage,
             repositories: self.repositories,
-            catalog: self.catalog,
             repository: self.repository,
             branch: self.branch,
             base: self.base,
@@ -812,6 +814,7 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
             ))
         || (method == "GET" && path == "/v1/runtime/agents-file")
         || (method == "GET" && path == "/v1/runtime/repos/token")
+        || (method == "GET" && path == "/v1/runtime/repos/registry")
         || (method == "POST" && path == "/v1/runtime/repos/rejected")
         || (method == "POST"
             && path
@@ -1037,6 +1040,21 @@ fn route(
         || path.starts_with("/v1/runtime/repos/")
     {
         cli.check_lifecycle_fence()?;
+    }
+    if let Some(result) = crate::repo_registry::operator_route(&mut store, method, path, body) {
+        return result;
+    }
+    if method == "GET" && path == "/v1/runtime/repos/registry" {
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
+        ensure!(
+            matches!(caller.phase.as_str(), "provisioning" | "ready"),
+            "workspace lifecycle is not active for provider requests"
+        );
+        ensure!(
+            caller.role == "coding",
+            "the GitHub login is restricted to coding workspaces"
+        );
+        return Ok((200, crate::repo_registry::sidecar_catalog(&store)?));
     }
     // The cluster's GitHub login goes only to coding Pods (their git, gh and
     // repositories sidecar share one Pod identity). Bots are refused here,
@@ -1339,7 +1357,7 @@ impl std::fmt::Display for ProviderAuthUnavailable {
 
 impl std::error::Error for ProviderAuthUnavailable {}
 
-fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Value)> {
+pub(crate) fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Value)> {
     let login_route = path
         .strip_prefix("/v1/provider-auth/login/")
         .is_some_and(|tail| match tail.split_once('/') {
@@ -1371,7 +1389,11 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
     let response = client
         .request(
             reqwest::Method::from_bytes(method.as_bytes())?,
-            format!("http://127.0.0.1:7434{path}"),
+            format!(
+                "{}{path}",
+                std::env::var("ADM_PROVIDER_AUTH_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:7434".to_owned())
+            ),
         )
         .body(body.to_vec())
         .send()
@@ -1406,7 +1428,8 @@ fn is_repos_route(method: &str, path: &str) -> bool {
         return true;
     }
     match (method, path) {
-        ("GET", "/v1/repos/status") | ("POST", "/v1/repos/login" | "/v1/repos/logout") => true,
+        ("GET", "/v1/repos/status")
+        | ("POST", "/v1/repos/login" | "/v1/repos/logout" | "/v1/repos/check") => true,
         _ => path
             .strip_prefix("/v1/repos/login/")
             .is_some_and(|tail| match tail.split_once('/') {

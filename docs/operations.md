@@ -87,7 +87,7 @@ When both stdin and stdout are terminals, a successful `adm create NAME` attache
 
 If coding tools cannot use Kubernetes, verify that the selected host kubeconfig reaches the intended cluster and run `adm reconnect NAME --kubeconfig PATHS`. The command checks the namespace's immutable workspace ownership, then updates the Pod runtime's host-side tool connection while retaining the namespace, workspace ID, files, history, goals, and loops. If active work blocks the rebind, stop it deliberately with `adm abort NAME`, then retry. A workspace Pod replacement retains the registered connection. The `--kubeconfig` argument accepts the ordinary colon-separated merge list; CLI-relative entries are resolved from the current directory.
 
-Every workspace starts with a durable agent. Without a configured default, select a model after attaching with `/model`; input remains paused until a model is selected. By default `/repos` is an ordinary writable directory, so normal cloning works. `--repo OWNER/REPO` performs a normal full clone of a public GitHub repository into `/repos/OWNER/REPO`; Git checks out the remote's advertised default branch. The shell and coding agent start there. The clone uses the private workspace volume and does not enable the lazy catalog. Private repository authentication is not configured by this option, and the clone does not use shallow or filtered fetches. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. `--repo` cannot be combined with `--catalog`, `--no-repositories`, or bot workspaces.
+Every workspace starts with a durable agent. Without a configured default, select a model after attaching with `/model`; input remains paused until a model is selected. By default `/repos` lists every repository registered with `adm repos clone` (below) and opens each one lazily; pass `--no-repositories` for an ordinary writable directory, so normal cloning works. `--repo OWNER/REPO` performs a normal full clone of a public GitHub repository into `/repos/OWNER/REPO`; Git checks out the remote's advertised default branch. The shell and coding agent start there. The clone uses the private workspace volume and does not enable the lazy catalog. Private repository authentication is not configured by this option, and the clone does not use shallow or filtered fetches. Providing `--catalog` opts in to the lazy catalog; it cannot be combined with `--no-repositories` or the bot role. `--repo` cannot be combined with `--catalog`, `--no-repositories`, or bot workspaces.
 
 Add `--branch BRANCH` to open the repository on that branch. An existing `origin/BRANCH` is checked out with remote tracking. Otherwise ADM creates a local branch from the remote's advertised default branch, which may have any name. `--base REF` selects a different starting commit for a new branch; use a Git ref such as `origin/release`, a tag, or a commit ID. An existing remote branch takes precedence over `--base`. New branches remain local until you push them. Both flags require `--repo`, and `--base` also requires `--branch`.
 
@@ -126,14 +126,21 @@ sudo apt-get install -y ripgrep
 
 The workspace and ordinary commands still run as UID 1000. The container gets the capabilities needed for sudo and apt; it does not grant host access. Each Pod receives only its own projected lifecycle identity. Installed packages and other operating-system changes live in the replaceable container and disappear when Kubernetes replaces its Pod. Repository files, Git state, and agent history follow their separate persistence rules.
 
-To seed the catalog without cloning repository contents:
+Register repositories once for the whole installation; every coding workspace then shows them in `/repos`, with no per-workspace catalog file:
 
 ```sh
-adm-repositories discover --owner example-owner > /tmp/adm-catalog.json
-adm create my-project --catalog /tmp/adm-catalog.json --model PROVIDER/MODEL_ID
+adm repos clone OWNER/REPO [--ref BRANCH]   # register; checks the cluster GitHub login can reach it
+adm repos list                              # registered repos, the workspaces using each, GitHub login status
+adm repos remove OWNER/REPO                 # unregister
 ```
 
-Discovery authenticates `gh` on the management host. The lazy catalog sidecar opens private repositories with the cluster's GitHub login (`adm repos login github`); without it a private repository fails to open with a `run adm repos login github` error in the sidecar log. The token reaches Git only through a credential helper, never in remote URLs, Git config, or files on the workspace volume. No eager-clone fallback is used when an upstream lacks filtering support. A failed acquisition stays retryable after its cause is fixed.
+`adm repos clone` asks the lifecycle controller to check that GitHub answers for the repository (and the branch, when `--ref` is given) with the cluster login, then stores it in the lifecycle service's registry. Without `--ref` the repository's default branch is registered. A repository the login cannot reach is refused and nothing is registered; a private repository needs `adm repos login github` first. Registering a repository again is a no-op; to change its branch, remove and clone it again. `adm create --repo OWNER/REPO` registers the repository too if it is not registered yet.
+
+A repository is "used" by a workspace created with `--repo OWNER/REPO`. `adm repos remove` refuses while one exists, naming each, for example `OWNER/REPO is used by workspaces api-fix (ID) and docs (ID); destroy them or remove the repo from them first`, and removes nothing. Workspaces that only browse `/repos` do not block removal; the repository just disappears from their listing.
+
+The repositories sidecar reads the registry from the lifecycle controller (with the Pod identity) each time `/repos` or an owner directory is listed, so repositories registered or removed later show up in existing workspaces without a restart. If the controller cannot be reached the listing fails with an error in the sidecar log instead of showing a stale list. Bots get no catalog, and `--no-repositories` gives a plain `/repos`. The old `--catalog FILE` and `adm-repositories discover` are gone; when the lifecycle service first starts with the registry it registers the GitHub repositories from workspaces created with `--catalog`. Existing coding workspaces created without a catalog keep a plain `/repos` until they are recreated.
+
+The lazy sidecar opens private repositories with the cluster's GitHub login (`adm repos login github`); without it a private repository fails to open with a `run adm repos login github` error in the sidecar log. The token reaches Git only through a credential helper, never in remote URLs, Git config, or files on the workspace volume. No `GH_TOKEN` Secret is involved.
 
 The repository service requires FUSE, mount propagation, and a Linux kernel supporting unique mount identities (`STATX_MNT_ID_UNIQUE`, available since Linux 6.8 according to [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html)). It fails clearly when that support is unavailable. The repository sidecar currently has elevated mount authority; the `dev` container has the standard own-container administration profile while retaining UID 1000 for ordinary work. It receives neither a service-account token nor management-host credentials. Treat the sidecar as a separate trusted component. The immutable-upstream cache is optional and must be mounted read-only; each workspace's Git state and writable files remain private.
 
@@ -143,9 +150,9 @@ Use `/repos` for your work. Its contents depend on how the workspace was created
 
 | Creation choice     | What you find                                   | Next action                                               |
 | ------------------- | ----------------------------------------------- | --------------------------------------------------------- |
-| Plain workspace     | Empty, writable directory                       | Clone a repository into `/repos`                          |
+| `--no-repositories` | Empty, writable directory                       | Clone a repository into `/repos`                          |
 | `--repo OWNER/REPO` | A private Git checkout at `/repos/OWNER/REPO`   | The default shell and coding agent start in that checkout |
-| `--catalog FILE`    | Owner and repository listings from that catalog | Enter a listed repository to acquire its files            |
+| Default (or no flag) | Owner and repository listings of the registry  | Enter a listed repository to acquire its files            |
 
 For a plain workspace, run these inside `adm shell NAME`:
 
@@ -156,9 +163,9 @@ cd agentic-dev-machines
 git status
 ```
 
-To prepare that checkout during creation instead, run `adm create NAME --repo NWylynko/agentic-dev-machines` on the management host. This uses an ordinary private clone and does not enable the lazy catalog.
+To prepare that checkout during creation instead, run `adm create NAME --repo NWylynko/agentic-dev-machines` on the management host. This uses an ordinary private clone and does not enable the lazy listing.
 
-For a catalog containing `NWylynko/agentic-dev-machines`, run these inside its shell:
+With `NWylynko/agentic-dev-machines` registered (`adm repos clone NWylynko/agentic-dev-machines`), run these inside any coding workspace's shell:
 
 ```sh
 cd /repos
@@ -168,7 +175,7 @@ cd /repos/NWylynko/agentic-dev-machines
 git status
 ```
 
-Use names actually present in your catalog. The root and owner listings are read-only; files and Git state inside acquired repositories are private and writable. Listing or reading within a repository triggers acquisition, which can take time or report an upstream/authentication error.
+Use names shown by `adm repos list`. The root and owner listings are read-only; files and Git state inside acquired repositories are private and writable. Listing or reading within a repository triggers acquisition, which can take time or report an upstream/authentication error.
 
 `/workspace/.adm/catalog`, `.adm/git`, `.adm/repositories`, and `.adm/views` hold backing state. Normal work belongs under `/repos`. If you ran `ls .*` in `/workspace`, the shell expanded `.*` to the hidden `.adm` directory and `ls` showed its contents. Those names are children of `.adm`, so `cd repositories` from `/workspace` fails. Use `ls -la /workspace` to see the directory itself, then return to `/repos`.
 

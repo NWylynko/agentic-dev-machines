@@ -5,6 +5,7 @@ mod herdr;
 mod lease;
 mod lifecycle;
 mod provider_auth;
+mod repo_registry;
 mod repos;
 mod runner;
 mod runtime_access;
@@ -1053,6 +1054,9 @@ fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Action::Create(options) => {
             let workspace = options.workspace()?;
+            if let Some(repository) = &workspace.repository {
+                repos::register_repository(cli, repository, None)?;
+            }
             let operation_id = options
                 .operation_id
                 .clone()

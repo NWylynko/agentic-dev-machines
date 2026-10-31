@@ -369,7 +369,6 @@ export function botExtension(
             agent_enabled: true,
             allow_node_local_storage: false,
             repositories: false,
-            catalog: {},
             repository: args.repository,
             branch: args.branch,
             base: args.base,
