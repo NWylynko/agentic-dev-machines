@@ -1715,6 +1715,38 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             Some("runtime-token"),
         )
         .unwrap();
+        let repos_status = request_with_token(
+            &url,
+            "GET",
+            "/v1/repos/status",
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
+        let repos_token = request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/repos/token",
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap();
+        let repos_pod_admin = request_with_token(
+            &url,
+            "POST",
+            "/v1/repos/logout",
+            Some(&json!({"provider":"github"})),
+            Some("runtime-token"),
+        )
+        .unwrap();
+        let repos_operator_token = request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/repos/token",
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
         database.execute("UPDATE workspaces SET phase='ready',spec=json_set(spec,'$.phase','ready') WHERE id=?1", [runtime_id]).unwrap();
         let mut stop = TcpStream::connect("127.0.0.1:7434").unwrap();
         stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -1754,12 +1786,36 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             401,
             "Pods cannot edit the shared agents file"
         );
-        assert_eq!(received.len(), 9, "{received:#?}");
+        assert_eq!(
+            repos_status.status(),
+            200,
+            "{}",
+            repos_status.text().unwrap()
+        );
+        assert_eq!(
+            repos_token.status(),
+            200,
+            "a coding Pod can fetch the cluster GitHub login: {}",
+            repos_token.text().unwrap()
+        );
+        assert_eq!(
+            repos_pod_admin.status(),
+            401,
+            "Pods cannot log the cluster out of GitHub"
+        );
+        assert_eq!(
+            repos_operator_token.status(),
+            403,
+            "the operator credential is not a Pod identity and cannot read the token"
+        );
+        assert_eq!(received.len(), 11, "{received:#?}");
         assert!(received[2].starts_with("POST /v1/runtime/connectors/catalog "));
         assert!(received[5].starts_with("POST /v1/connectors/linear/sign-in "));
         assert!(received[6].starts_with("GET /v1/agents-file "));
         assert!(received[7].starts_with("PUT /v1/agents-file "));
         assert!(received[8].starts_with("GET /v1/runtime/agents-file "));
+        assert!(received[9].starts_with("GET /v1/repos/status "));
+        assert!(received[10].starts_with("GET /v1/runtime/repos/token "));
         let unavailable = request_with_token(
             &url,
             "POST",
@@ -2816,6 +2872,17 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         "target-token:{}:{replacement_uid}",
         bot_workspace["namespace"].as_str().unwrap()
     );
+    for (method, path) in [
+        ("GET", "/v1/runtime/repos/token"),
+        ("POST", "/v1/runtime/repos/rejected"),
+    ] {
+        let refused = request_with_token(&url, method, path, None, Some(&fresh_bot_token)).unwrap();
+        assert_eq!(
+            refused.status(),
+            403,
+            "bots never receive the cluster GitHub login ({path})"
+        );
+    }
     assert_eq!(
         request_with_token(
             &url,

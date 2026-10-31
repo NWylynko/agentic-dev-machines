@@ -14,6 +14,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { createAgentsFileAuthority } from "./agents-file-authority.ts";
 import { createConnectorAuthority } from "./connector-authority.ts";
+import { createGithubAuthority } from "./github-authority.ts";
 
 export type SharedProviderCatalog = Record<
   string,
@@ -378,6 +379,11 @@ export async function createProviderAuthAuthority({
   });
   const agentsFile = await createAgentsFileAuthority({
     statePath: join(authDirectory, "agents-file.json"),
+    ownerGuard,
+    log,
+  });
+  const github = await createGithubAuthority({
+    statePath: join(authDirectory, "github.json"),
     ownerGuard,
     log,
   });
@@ -748,6 +754,7 @@ export async function createProviderAuthAuthority({
       if (request.method === "GET" && url.pathname === "/health")
         return send(response, 200, { status: "ok" });
       if (await agentsFile.handle(request, response, url)) return;
+      if (await github.handle(request, response, url)) return;
       if (await connectors.handle(request, response, url)) return;
       if (
         request.method === "POST" &&
@@ -1013,6 +1020,7 @@ export async function createProviderAuthAuthority({
           server.close((error) => (error ? reject(error) : resolve())),
         );
       await agentsFile.close();
+      await github.close();
       await connectors.close();
       await credentialStore.close();
     },

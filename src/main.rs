@@ -5,6 +5,7 @@ mod herdr;
 mod lease;
 mod lifecycle;
 mod provider_auth;
+mod repos;
 mod runner;
 mod runtime_access;
 mod setup;
@@ -249,6 +250,11 @@ pub enum Action {
     Mcp {
         #[command(subcommand)]
         command: connectors::McpAction,
+    },
+    /// Connect the cluster to GitHub for every coding workspace and repository.
+    Repos {
+        #[command(subcommand)]
+        command: repos::ReposAction,
     },
     /// Edit the installation-wide AGENTS.md shared by every coding agent.
     #[command(name = "agents-file")]
@@ -1417,6 +1423,7 @@ fn run(cli: &Cli) -> Result<()> {
         Action::Login { provider } => provider_auth::login(cli, provider.as_deref()),
         Action::Logout { provider } => provider_auth::logout(cli, provider),
         Action::Mcp { command } => connectors::run(cli, command),
+        Action::Repos { command } => repos::run(cli, command),
         Action::AgentsFile { show } => agents_file::run(cli, *show),
         Action::Herdr { command } => {
             herdr::run(cli, command.as_ref().unwrap_or(&herdr::HerdrAction::Hook))
