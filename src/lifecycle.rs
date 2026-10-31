@@ -784,6 +784,7 @@ fn runtime_http_error_status(error: &anyhow::Error, message: &str) -> (u16, &'st
         || message.contains("bash execution is restricted to the owning coding workspace")
         || message.contains("project resources are restricted to the owning coding workspace")
         || message.contains("shared agents file is restricted to coding workspaces")
+        || message.contains("the GitHub login is restricted to coding workspaces")
         || message.contains("wrong audience")
         || message.contains("not bound to a Pod")
     {
@@ -810,6 +811,8 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
                     | "/v1/runtime/connectors/token"
             ))
         || (method == "GET" && path == "/v1/runtime/agents-file")
+        || (method == "GET" && path == "/v1/runtime/repos/token")
+        || (method == "POST" && path == "/v1/runtime/repos/rejected")
         || (method == "POST"
             && path
                 .strip_prefix("/v1/workspaces/")
@@ -1030,8 +1033,25 @@ fn route(
         || path.starts_with("/v1/runtime/connectors/")
         || path == "/v1/agents-file"
         || path == "/v1/runtime/agents-file"
+        || path.starts_with("/v1/repos/")
+        || path.starts_with("/v1/runtime/repos/")
     {
         cli.check_lifecycle_fence()?;
+    }
+    // The cluster's GitHub login goes only to coding Pods (their git, gh and
+    // repositories sidecar share one Pod identity). Bots are refused here,
+    // before the authority is asked (TASK-111).
+    if is_runtime_repos_route(method, path) {
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
+        ensure!(
+            matches!(caller.phase.as_str(), "provisioning" | "ready"),
+            "workspace lifecycle is not active for provider requests"
+        );
+        ensure!(
+            caller.role == "coding",
+            "the GitHub login is restricted to coding workspaces"
+        );
+        return proxy_provider_auth(method, path, body);
     }
     if method == "GET" && path == "/v1/runtime/agents-file" {
         let caller = authorize_runtime_caller(cli, &store, authorization)?;
@@ -1065,6 +1085,7 @@ fn route(
         || path == "/v1/connectors"
         || path.starts_with("/v1/connectors/")
         || path == "/v1/agents-file"
+        || path.starts_with("/v1/repos/")
     {
         return proxy_provider_auth(method, path, body);
     }
@@ -1337,7 +1358,8 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
                 | "/v1/provider-auth/catalog"
         ) || path.starts_with("/v1/provider-auth/login/") && login_route
             || is_connector_route(method, path)
-            || is_agents_file_route(method, path),
+            || is_agents_file_route(method, path)
+            || is_repos_route(method, path),
         "unknown provider auth route"
     );
     ensure!(
@@ -1372,6 +1394,32 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
 /// Installation MCP connector routes served by the shared authority: the
 /// token-free runtime catalog and access tokens for Pods, and administration
 /// (add, remove, sign-in, logout) for lifecycle-credential callers.
+/// The cluster's repository-provider login: operator administration, and the
+/// two runtime routes coding Pods use (TASK-111).
+fn is_runtime_repos_route(method: &str, path: &str) -> bool {
+    (method == "GET" && path == "/v1/runtime/repos/token")
+        || (method == "POST" && path == "/v1/runtime/repos/rejected")
+}
+
+fn is_repos_route(method: &str, path: &str) -> bool {
+    if is_runtime_repos_route(method, path) {
+        return true;
+    }
+    match (method, path) {
+        ("GET", "/v1/repos/status") | ("POST", "/v1/repos/login" | "/v1/repos/logout") => true,
+        _ => path
+            .strip_prefix("/v1/repos/login/")
+            .is_some_and(|tail| match tail.split_once('/') {
+                Some((operation, suffix)) => {
+                    method == "GET"
+                        && suffix == "events"
+                        && uuid::Uuid::parse_str(operation).is_ok()
+                }
+                None => method == "DELETE" && uuid::Uuid::parse_str(tail).is_ok(),
+            }),
+    }
+}
+
 fn is_agents_file_route(method: &str, path: &str) -> bool {
     (matches!(method, "GET" | "PUT") && path == "/v1/agents-file")
         || (method == "GET" && path == "/v1/runtime/agents-file")
@@ -2070,6 +2118,9 @@ mod provider_auth_wait_tests {
             "/v1/runtime/operations/00000000-0000-4000-8000-000000000001"
         ));
         assert!(is_runtime_auth_route("GET", "/v1/runtime/agents-file"));
+        assert!(is_runtime_auth_route("GET", "/v1/runtime/repos/token"));
+        assert!(!is_runtime_auth_route("POST", "/v1/repos/logout"));
+        assert!(!is_runtime_auth_route("GET", "/v1/repos/status"));
         assert!(!is_runtime_auth_route("PUT", "/v1/agents-file"));
         assert!(!is_runtime_auth_route("GET", "/v1/agents-file"));
         assert!(!is_runtime_auth_route("POST", "/v1/provider-auth/logout"));
