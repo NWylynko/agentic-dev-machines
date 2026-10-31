@@ -15,6 +15,44 @@ import { ApiError, type WorkspaceConfig } from "./types.ts";
 import type { Message } from "@earendil-works/pi-ai";
 import type { LoadedPiExtension } from "./extensions.ts";
 
+/** The installation AGENTS.md applied ahead of repository files on one request. */
+export type SharedAgentsFile = { revision: number; content: string };
+
+/** Shared instructions come first. An empty document adds nothing. */
+export function sharedAgentsFileBlock(shared: SharedAgentsFile | undefined) {
+  const content = shared?.content.replace(/\s+$/u, "") ?? "";
+  if (!shared || !content) return "";
+  return `# Shared installation AGENTS.md (revision ${shared.revision})\n\n${content}`;
+}
+
+/** Prepend the shared document when this runtime has no project resource loader. */
+export function messagesWithSharedAgentsFile(
+  input: readonly Message[],
+  shared: SharedAgentsFile | undefined,
+): readonly Message[] {
+  const extra = sharedAgentsFileBlock(shared);
+  if (!extra) return input;
+  return mergeSystemMessage(input, "", extra);
+}
+
+function mergeSystemMessage(
+  input: readonly Message[],
+  base: string,
+  extra: string,
+): Message[] {
+  const messages = [...input];
+  const leading = messages[0]?.role === "system" ? messages[0] : undefined;
+  const system: Message = {
+    ...leading,
+    role: "system",
+    content: [base, extra].filter(Boolean).join("\n\n"),
+    timestamp: leading?.timestamp ?? 0,
+  };
+  if (leading) messages[0] = system;
+  else messages.unshift(system);
+  return messages;
+}
+
 export type WorkspaceResourceSnapshot = {
   cwd: string;
   trust: { trusted: boolean; trustRequired: boolean; source: string | null };
@@ -97,9 +135,11 @@ export class WorkspaceResources {
 
   async requestMessages(
     input: readonly Message[],
+    shared?: SharedAgentsFile,
   ): Promise<readonly Message[]> {
     const resources = await this.get();
     const extra = [
+      sharedAgentsFileBlock(shared),
       ...resources.agentsFiles.map(
         (file) => `# ${file.path}\n\n${file.content}`,
       ),
@@ -109,8 +149,7 @@ export class WorkspaceResources {
       .filter(Boolean)
       .join("\n\n");
     if (resources.systemPrompt === undefined && !extra) return input;
-    const messages = [...input];
-    const leading = messages[0]?.role === "system" ? messages[0] : undefined;
+    const leading = input[0]?.role === "system" ? input[0] : undefined;
     const base =
       resources.systemPrompt ??
       (leading
@@ -118,15 +157,7 @@ export class WorkspaceResources {
           ? leading.content
           : leading.content.map((part) => part.text).join("\n")
         : "");
-    const system: Message = {
-      ...leading,
-      role: "system",
-      content: [base, extra].filter(Boolean).join("\n\n"),
-      timestamp: leading?.timestamp ?? 0,
-    };
-    if (leading) messages[0] = system;
-    else messages.unshift(system);
-    return messages;
+    return mergeSystemMessage(input, base, extra);
   }
 
   async setTrust(trusted: boolean) {
@@ -218,7 +249,9 @@ export class WorkspaceResources {
           shortcuts: [...extension.shortcuts.values()].map((shortcut) => ({
             name: `${extension.path}:${shortcut.shortcut}`,
             key: shortcut.shortcut,
-            ...(shortcut.description ? { description: shortcut.description } : {}),
+            ...(shortcut.description
+              ? { description: shortcut.description }
+              : {}),
           })),
         }))
       : resolved.extensions

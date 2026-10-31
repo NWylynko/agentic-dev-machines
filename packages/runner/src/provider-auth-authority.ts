@@ -12,6 +12,7 @@ import type {
   AuthPrompt,
   AuthType,
 } from "@earendil-works/pi-ai";
+import { createAgentsFileAuthority } from "./agents-file-authority.ts";
 import { createConnectorAuthority } from "./connector-authority.ts";
 
 export type SharedProviderCatalog = Record<
@@ -127,14 +128,22 @@ const PERMANENT_REFRESH_FAILURE = /invalid_grant|\b(?:HTTP|status) 40[01]\b/;
 function classifyProviderRefreshFailure(
   error: unknown,
 ): ProviderRefreshFailureKind {
-  for (let current: unknown = error; current; current = (current as Error).cause)
+  for (
+    let current: unknown = error;
+    current;
+    current = (current as Error).cause
+  )
     if (current instanceof ProviderAuthFenceError) return "fence";
-  return PERMANENT_REFRESH_FAILURE.test(providerAuthCauseChain(error).join("\n"))
+  return PERMANENT_REFRESH_FAILURE.test(
+    providerAuthCauseChain(error).join("\n"),
+  )
     ? "permanent"
     : "transient";
 }
 
-const PROVIDER_REFRESH_RETRY_DELAYS_MS = [1, 2, 4, 8].map((minutes) => minutes * 60_000);
+const PROVIDER_REFRESH_RETRY_DELAYS_MS = [1, 2, 4, 8].map(
+  (minutes) => minutes * 60_000,
+);
 const PROVIDER_REFRESH_RETRY_MAX_DELAY_MS = 15 * 60_000;
 
 function rotatedRefreshTokenProviders(
@@ -367,6 +376,11 @@ export async function createProviderAuthAuthority({
     statePath: join(authDirectory, "connectors.json"),
     ownerGuard,
   });
+  const agentsFile = await createAgentsFileAuthority({
+    statePath: join(authDirectory, "agents-file.json"),
+    ownerGuard,
+    log,
+  });
   const operations = new Map<string, LoginOperation>();
   const providerRefreshesInFlight = new Map<string, Promise<unknown>>();
   // Providers whose refresh token the token endpoint rejected; shown as
@@ -588,10 +602,14 @@ export async function createProviderAuthAuthority({
     });
   }
 
-  function credentialNeedsRefresh(credential: {
-    type?: string;
-    expires?: number;
-  } | undefined) {
+  function credentialNeedsRefresh(
+    credential:
+      | {
+          type?: string;
+          expires?: number;
+        }
+      | undefined,
+  ) {
     return (
       credential?.type === "oauth" &&
       typeof credential.expires === "number" &&
@@ -729,6 +747,7 @@ export async function createProviderAuthAuthority({
       }
       if (request.method === "GET" && url.pathname === "/health")
         return send(response, 200, { status: "ok" });
+      if (await agentsFile.handle(request, response, url)) return;
       if (await connectors.handle(request, response, url)) return;
       if (
         request.method === "POST" &&
@@ -993,6 +1012,7 @@ export async function createProviderAuthAuthority({
         await new Promise<void>((resolve, reject) =>
           server.close((error) => (error ? reject(error) : resolve())),
         );
+      await agentsFile.close();
       await connectors.close();
       await credentialStore.close();
     },

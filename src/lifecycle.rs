@@ -783,6 +783,7 @@ fn runtime_http_error_status(error: &anyhow::Error, message: &str) -> (u16, &'st
         || message.contains("runtime status is restricted to its own workspace")
         || message.contains("bash execution is restricted to the owning coding workspace")
         || message.contains("project resources are restricted to the owning coding workspace")
+        || message.contains("shared agents file is restricted to coding workspaces")
         || message.contains("wrong audience")
         || message.contains("not bound to a Pod")
     {
@@ -808,6 +809,7 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
                     | "/v1/runtime/connectors/catalog"
                     | "/v1/runtime/connectors/token"
             ))
+        || (method == "GET" && path == "/v1/runtime/agents-file")
         || (method == "POST"
             && path
                 .strip_prefix("/v1/workspaces/")
@@ -1026,8 +1028,22 @@ fn route(
         || path == "/v1/connectors"
         || path.starts_with("/v1/connectors/")
         || path.starts_with("/v1/runtime/connectors/")
+        || path == "/v1/agents-file"
+        || path == "/v1/runtime/agents-file"
     {
         cli.check_lifecycle_fence()?;
+    }
+    if method == "GET" && path == "/v1/runtime/agents-file" {
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
+        ensure!(
+            matches!(caller.phase.as_str(), "provisioning" | "ready"),
+            "workspace lifecycle is not active for provider requests"
+        );
+        ensure!(
+            caller.role == "coding",
+            "shared agents file is restricted to coding workspaces"
+        );
+        return proxy_provider_auth(method, path, body);
     }
     if method == "POST"
         && matches!(
@@ -1048,6 +1064,7 @@ fn route(
     if path.starts_with("/v1/provider-auth/")
         || path == "/v1/connectors"
         || path.starts_with("/v1/connectors/")
+        || path == "/v1/agents-file"
     {
         return proxy_provider_auth(method, path, body);
     }
@@ -1319,11 +1336,13 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
                 | "/v1/provider-auth/resolve"
                 | "/v1/provider-auth/catalog"
         ) || path.starts_with("/v1/provider-auth/login/") && login_route
-            || is_connector_route(method, path),
+            || is_connector_route(method, path)
+            || is_agents_file_route(method, path),
         "unknown provider auth route"
     );
     ensure!(
-        matches!(method, "GET" | "POST" | "DELETE"),
+        matches!(method, "GET" | "POST" | "DELETE")
+            || (method == "PUT" && path == "/v1/agents-file"),
         "unsupported provider auth method"
     );
     let client = reqwest::blocking::Client::new();
@@ -1353,6 +1372,11 @@ fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Result<(u16, Va
 /// Installation MCP connector routes served by the shared authority: the
 /// token-free runtime catalog and access tokens for Pods, and administration
 /// (add, remove, sign-in, logout) for lifecycle-credential callers.
+fn is_agents_file_route(method: &str, path: &str) -> bool {
+    (matches!(method, "GET" | "PUT") && path == "/v1/agents-file")
+        || (method == "GET" && path == "/v1/runtime/agents-file")
+}
+
 fn is_connector_route(method: &str, path: &str) -> bool {
     if method == "POST"
         && matches!(
@@ -1582,6 +1606,9 @@ fn collect_runtime_status(
                             .get("connectors")
                             .cloned()
                             .unwrap_or_else(|| Value::Array(Vec::new()));
+                        if let Some(agents_file) = report.get("agentsFile") {
+                            status["agentsFile"] = agents_file.clone();
+                        }
                     }
                 }
                 Ok(_) => set_runtime_activity_unavailable(
@@ -1592,6 +1619,32 @@ fn collect_runtime_status(
             }
         }
     });
+}
+
+fn valid_agents_file_report(agents_file: &Value) -> bool {
+    let Some(object) = agents_file.as_object() else {
+        return false;
+    };
+    if object
+        .keys()
+        .any(|key| !["source", "status", "revision", "error"].contains(&key.as_str()))
+        || agents_file["source"] != "installation"
+    {
+        return false;
+    }
+    let revision_ok =
+        agents_file["revision"].is_null() || agents_file["revision"].as_u64().is_some();
+    let error = agents_file["error"].as_str();
+    match agents_file["status"].as_str() {
+        Some("current") => {
+            agents_file["revision"].as_u64().is_some()
+                && error.is_none_or(|error| error.len() <= 2000)
+        }
+        Some("unavailable") => {
+            revision_ok && error.is_some_and(|error| !error.is_empty() && error.len() <= 2000)
+        }
+        _ => false,
+    }
 }
 
 fn valid_runtime_status_report(report: &Value) -> bool {
@@ -1609,6 +1662,11 @@ fn valid_runtime_status_report(report: &Value) -> bool {
     if activity["error"]
         .as_str()
         .is_some_and(|error| error.len() > 2000)
+    {
+        return false;
+    }
+    if let Some(agents_file) = report.get("agentsFile")
+        && !valid_agents_file_report(agents_file)
     {
         return false;
     }
@@ -2011,6 +2069,9 @@ mod provider_auth_wait_tests {
             "GET",
             "/v1/runtime/operations/00000000-0000-4000-8000-000000000001"
         ));
+        assert!(is_runtime_auth_route("GET", "/v1/runtime/agents-file"));
+        assert!(!is_runtime_auth_route("PUT", "/v1/agents-file"));
+        assert!(!is_runtime_auth_route("GET", "/v1/agents-file"));
         assert!(!is_runtime_auth_route("POST", "/v1/provider-auth/logout"));
         assert!(!is_runtime_auth_route(
             "GET",

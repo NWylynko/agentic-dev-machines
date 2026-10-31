@@ -1,3 +1,4 @@
+mod agents_file;
 mod connectors;
 mod diagnostics;
 mod herdr;
@@ -248,6 +249,13 @@ pub enum Action {
     Mcp {
         #[command(subcommand)]
         command: connectors::McpAction,
+    },
+    /// Edit the installation-wide AGENTS.md shared by every coding agent.
+    #[command(name = "agents-file")]
+    AgentsFile {
+        /// Print the saved document and its revision instead of editing it.
+        #[arg(long)]
+        show: bool,
     },
     /// Bridge explicit Herdr lifecycle events to workspace ownership.
     Herdr {
@@ -906,6 +914,22 @@ fn print_summary_errors(status: &Value) {
     } else if activity["status"] == "unavailable" {
         println!("Agent unavailable for {identity}: workspace runtime did not report a cause");
     }
+    if let Some(agents_file) = workspace["runtime_status"].get("agentsFile") {
+        match agents_file["status"].as_str() {
+            Some("unavailable") => println!(
+                "Shared agents file unavailable for {identity}: {}",
+                agents_file["error"]
+                    .as_str()
+                    .unwrap_or("the runtime did not report a cause")
+            ),
+            Some("current") => {
+                if let Some(revision) = agents_file["revision"].as_u64() {
+                    println!("Shared agents file: installation revision {revision}");
+                }
+            }
+            _ => {}
+        }
+    }
     for connector in workspace["runtime_status"]["connectors"]
         .as_array()
         .into_iter()
@@ -1393,6 +1417,7 @@ fn run(cli: &Cli) -> Result<()> {
         Action::Login { provider } => provider_auth::login(cli, provider.as_deref()),
         Action::Logout { provider } => provider_auth::logout(cli, provider),
         Action::Mcp { command } => connectors::run(cli, command),
+        Action::AgentsFile { show } => agents_file::run(cli, *show),
         Action::Herdr { command } => {
             herdr::run(cli, command.as_ref().unwrap_or(&herdr::HerdrAction::Hook))
         }

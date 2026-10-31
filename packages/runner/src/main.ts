@@ -1101,6 +1101,18 @@ async function runtimeStatusReport(workspace: Workspace) {
           })),
         }
       : {}),
+    ...(status.agentsFile
+      ? {
+          agentsFile: {
+            source: status.agentsFile.source,
+            status: status.agentsFile.status,
+            revision: status.agentsFile.revision,
+            ...(status.agentsFile.error
+              ? { error: status.agentsFile.error.slice(0, 2000) }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
 function json(response: ServerResponse, status: number, value: unknown) {
