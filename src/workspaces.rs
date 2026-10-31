@@ -89,7 +89,6 @@ pub struct Workspace {
     #[serde(default)]
     pub allow_node_local_storage: bool,
     pub repositories: bool,
-    pub catalog: Value,
     #[serde(default)]
     pub repository: Option<String>,
     #[serde(default)]
@@ -149,10 +148,9 @@ pub struct CreateOptions {
     pub cpu: String,
     #[arg(long, default_value = "2Gi")]
     pub memory: String,
+    /// Leave /repos an ordinary directory instead of showing the registered repositories.
     #[arg(long)]
     pub no_repositories: bool,
-    #[arg(long)]
-    pub catalog: Option<std::path::PathBuf>,
     /// Clone one public GitHub repository into this workspace.
     #[arg(long)]
     pub repo: Option<String>,
@@ -300,18 +298,6 @@ impl CreateOptions {
             validate_repository_ref(repository)?;
         }
         ensure!(
-            !(self.no_repositories && self.catalog.is_some()),
-            "--catalog cannot be combined with --no-repositories"
-        );
-        ensure!(
-            !(self.role == "bot" && self.catalog.is_some()),
-            "--catalog is only supported for coding workspaces"
-        );
-        ensure!(
-            self.repo.is_none() || self.catalog.is_none(),
-            "--repo cannot be combined with --catalog"
-        );
-        ensure!(
             self.repo.is_none() || !self.no_repositories,
             "--repo cannot be combined with --no-repositories"
         );
@@ -351,12 +337,6 @@ impl CreateOptions {
             }
             None => None,
         };
-        let catalog = match &self.catalog {
-            Some(path) => serde_json::from_slice(
-                &fs::read(path).with_context(|| format!("read catalog {}", path.display()))?,
-            )?,
-            None => json!({"repositories":[]}),
-        };
         let cwd = self.repo.as_ref().map_or_else(
             || "/repos".to_owned(),
             |repository| format!("/repos/{repository}"),
@@ -379,8 +359,7 @@ impl CreateOptions {
             memory: self.memory.clone(),
             agent_enabled: true,
             allow_node_local_storage: self.allow_node_local_storage,
-            repositories: self.catalog.is_some() && !self.no_repositories && self.role == "coding",
-            catalog,
+            repositories: !self.no_repositories && self.role == "coding" && self.repo.is_none(),
             repository: self.repo.clone(),
             branch: self.branch.clone(),
             base: self.base.clone(),
@@ -404,8 +383,8 @@ pub enum RuntimeMaintenanceAck {
 }
 
 pub struct WorkspaceStore {
-    connection: Connection,
-    fencing_token: u64,
+    pub(crate) connection: Connection,
+    pub(crate) fencing_token: u64,
 }
 
 fn lifecycle_receipt(
@@ -431,7 +410,7 @@ fn lifecycle_receipt(
     })
 }
 
-fn ensure_store_fence(connection: &Connection, fencing_token: u64) -> Result<()> {
+pub(crate) fn ensure_store_fence(connection: &Connection, fencing_token: u64) -> Result<()> {
     let latest: i64 = connection.query_row(
         "SELECT fencing_token FROM lifecycle_owner WHERE singleton=1",
         [],
@@ -469,14 +448,17 @@ impl WorkspaceStore {
         let connection = Connection::open(path.join("workspaces.sqlite"))?;
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,phase TEXT NOT NULL,spec TEXT NOT NULL,fencing_token INTEGER NOT NULL DEFAULT 0);CREATE UNIQUE INDEX IF NOT EXISTS active_workspace_names ON workspaces(name) WHERE phase!='deleted'; CREATE TABLE IF NOT EXISTS lifecycle_operations(operation_id TEXT PRIMARY KEY,kind TEXT NOT NULL,request TEXT NOT NULL,workspace_id TEXT NOT NULL,status TEXT NOT NULL,accepted_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,stage TEXT,last_error TEXT,timings TEXT NOT NULL DEFAULT '{}',fencing_token INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS runtime_leases(workspace_id TEXT PRIMARY KEY,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS runtime_lease_revocations(workspace_id TEXT NOT NULL,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,operation_id TEXT NOT NULL,PRIMARY KEY(workspace_id,holder)); CREATE TABLE IF NOT EXISTS runtime_maintenance(singleton INTEGER PRIMARY KEY CHECK(singleton=1),maintenance_id TEXT NOT NULL,expires_at INTEGER NOT NULL,lifecycle_fencing_token INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS runtime_maintenance_leases(maintenance_id TEXT NOT NULL,workspace_id TEXT NOT NULL,holder TEXT NOT NULL,fencing_token INTEGER NOT NULL,expires_at INTEGER NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(maintenance_id,workspace_id)); CREATE TABLE IF NOT EXISTS lifecycle_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),fencing_token INTEGER NOT NULL);")?;
+        connection.execute_batch(crate::repo_registry::REGISTRY_TABLES)?;
         connection.execute(
             "INSERT INTO lifecycle_owner(singleton,fencing_token) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET fencing_token=MAX(lifecycle_owner.fencing_token,excluded.fencing_token)",
             [fencing_token as i64],
         )?;
-        Ok(Self {
+        let mut store = Self {
             connection,
             fencing_token,
-        })
+        };
+        store.import_workspace_catalogs()?;
+        Ok(store)
     }
     pub fn admit_lifecycle_operation(
         &mut self,
@@ -1453,7 +1435,7 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         json!({"name":"runtime-config","mountPath":"/run/adm","readOnly":true}),
         json!({"name":"runtime-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true}),
     ];
-    let mut volumes = vec![
+    let volumes = vec![
         json!({"name":"work","persistentVolumeClaim":{"claimName":"work"}}),
         json!({"name":"shm","emptyDir":{"medium":"Memory","sizeLimit":"256Mi"}}),
         json!({"name":"runtime-config","configMap":{"name":"workspace-runtime","items":[{"key":"workspace.json","path":"workspace.json"}]}}),
@@ -1471,9 +1453,7 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     }
     let mut containers = vec![dev];
     if w.repositories {
-        volumes.push(json!({"name":"catalog","configMap":{"name":"repositories"}}));
-        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--catalog","/config/catalog.json","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"env":[{"name":"ADM_LIFECYCLE_URL","value":lifecycle_url}],"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":[{"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"},{"name":"catalog","mountPath":"/config","readOnly":true},{"name":"runtime-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true}]}));
-        items.push(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"repositories"),"data":{"catalog.json":serde_json::to_string(&w.catalog)?}}));
+        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"env":[{"name":"ADM_LIFECYCLE_URL","value":lifecycle_url}],"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":[{"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"},{"name":"runtime-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true}]}));
     }
     let init = json!({"name":"initialize","image":w.workspace_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
     let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"serviceAccountName":"adm-runtime","automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
@@ -2109,7 +2089,6 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.agent_enabled == requested.agent_enabled
         && existing.allow_node_local_storage == requested.allow_node_local_storage
         && existing.repositories == requested.repositories
-        && existing.catalog == requested.catalog
         && existing.repository == requested.repository
         && existing.branch == requested.branch
         && existing.base == requested.base

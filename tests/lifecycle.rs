@@ -1747,6 +1747,53 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             Some("synthetic-lifecycle-token"),
         )
         .unwrap();
+        // The cluster repository registry a coding Pod's sidecar reads (TASK-112).
+        database
+            .execute(
+                "INSERT INTO registered_repositories(repo,branch,added_at) VALUES('example/project','trunk',1)",
+                [],
+            )
+            .unwrap();
+        let registry_runtime = request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/repos/registry",
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap();
+        let registry_operator = request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/repos/registry",
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
+        let registry_pod_admin = request_with_token(
+            &url,
+            "DELETE",
+            "/v1/repos/registry/example/project",
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap();
+        assert_eq!(registry_runtime.status(), 200);
+        assert_eq!(
+            registry_runtime.json::<Value>().unwrap()["repositories"],
+            json!([{"owner":"example","name":"project","remote":"https://github.com/example/project.git","ref":"refs/heads/trunk"}]),
+            "the sidecar gets owner, name, remote and an explicit branch ref"
+        );
+        assert_eq!(
+            registry_operator.status(),
+            403,
+            "the operator credential is not a Pod identity"
+        );
+        assert_eq!(
+            registry_pod_admin.status(),
+            401,
+            "Pods cannot edit the registry"
+        );
         database.execute("UPDATE workspaces SET phase='ready',spec=json_set(spec,'$.phase','ready') WHERE id=?1", [runtime_id]).unwrap();
         let mut stop = TcpStream::connect("127.0.0.1:7434").unwrap();
         stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -2874,6 +2921,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     );
     for (method, path) in [
         ("GET", "/v1/runtime/repos/token"),
+        ("GET", "/v1/runtime/repos/registry"),
         ("POST", "/v1/runtime/repos/rejected"),
     ] {
         let refused = request_with_token(&url, method, path, None, Some(&fresh_bot_token)).unwrap();

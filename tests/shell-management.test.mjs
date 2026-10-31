@@ -53,6 +53,13 @@ const server = createServer(async (request, response) => {
   for await (const chunk of request) chunks.push(chunk);
   const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : undefined;
   const [path, query] = request.url.split("?");
+  // The same stub answers the lifecycle's GitHub reachability check when
+  // `adm create --repo` registers the repository (TASK-112).
+  if (path === "/v1/repos/check") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ repo: body.repo, ref: "main" }));
+    return;
+  }
   await writeFile(
     requestLog,
     `${JSON.stringify({ method: request.method, path: request.url, body })}\n`,
@@ -282,7 +289,10 @@ else if (args[0] === "exec") {
       "--port",
       String(lifecyclePort),
     ],
-    { stdio: "ignore" },
+    {
+      stdio: "ignore",
+      env: { ...process.env, ADM_PROVIDER_AUTH_URL: runnerUrl },
+    },
   );
   const lifecycleReady = Date.now() + 5000;
   while (true) {

@@ -169,13 +169,10 @@ if (!enabled) {
   const state = await mkdtemp(join(tmpdir(), "adm-cluster-contract-state-"));
   const label = `cluster-contract-${randomBytes(4).toString("hex")}`;
   const space = `cluster-contract-space-${randomBytes(4).toString("hex")}`;
-  const catalogPath = join(state, "catalog.json");
   const created = [];
   let failure;
 
   try {
-    await writeFile(catalogPath, JSON.stringify({ repositories: [] }));
-
     const first = json(
       (await adm(state, ["create", label, "--role", "bot"])).stdout,
       "adm create bot",
@@ -201,15 +198,8 @@ if (!enabled) {
     assert.equal(status.agent.status, "needs_model");
 
     const generated = json(
-      (
-        await adm(state, [
-          "manifest",
-          `${label}-contract`,
-          "--catalog",
-          catalogPath,
-        ])
-      ).stdout,
-      "adm manifest --catalog",
+      (await adm(state, ["manifest", `${label}-contract`])).stdout,
+      "adm manifest",
     );
     const dryRun = pointManifestAtWorkspace(generated, first);
     const kinds = dryRun.items.map((item) => item.kind).sort();

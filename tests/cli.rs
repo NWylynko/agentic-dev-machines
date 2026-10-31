@@ -233,12 +233,30 @@ fn start_runner_stub() -> (String, u16, std::thread::JoinHandle<()>) {
             if first_line.starts_with("GET /shutdown ") {
                 break;
             }
-            let body = if first_line.starts_with("GET /health ") {
-                r#"{"status":"ok"}"#
+            // This stub doubles as the provider-auth authority: it answers the
+            // GitHub reachability check the lifecycle runs when a repository is
+            // registered (TASK-112). Names ending in /unreachable are refused.
+            let (status, body) = if first_line.starts_with("GET /health ") {
+                ("200 OK", r#"{"status":"ok"}"#.to_owned())
+            } else if first_line.starts_with("POST /v1/repos/check ") {
+                let request_body: Value =
+                    serde_json::from_slice(&request[header_end..]).unwrap_or(Value::Null);
+                let repo = request_body["repo"].as_str().unwrap_or("").to_owned();
+                if repo.ends_with("/unreachable") {
+                    (
+                        "404 Not Found",
+                        serde_json::json!({"error":{"code":"REPOSITORY_NOT_REACHABLE","message":format!("{repo} is not reachable with the GitHub login (account nwylynko): Not Found")}}).to_string(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        serde_json::json!({"repo":repo,"ref":request_body["ref"].as_str().unwrap_or("trunk")}).to_string(),
+                    )
+                }
             } else {
-                r#"{"ok":true}"#
+                ("200 OK", r#"{"ok":true}"#.to_owned())
             };
-            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
         }
     });
     (format!("http://127.0.0.1:{port}"), port, server)
@@ -619,6 +637,7 @@ else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exi
         .args(["--runner-url", runner_url])
         .args(["--lifecycle-token-file"])
         .arg(root.path().join("lifecycle-token"))
+        .env("ADM_PROVIDER_AUTH_URL", &default_runner_url)
         .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
         .arg(port.to_string())
         .stdout(Stdio::null())
@@ -1748,17 +1767,7 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
         "{shell_guidance}"
     );
 
-    let catalog = root.path().join("catalog.json");
-    fs::write(&catalog, r#"{"repositories":[]}"#).unwrap();
-    let catalog = adm(
-        root.path(),
-        &[
-            "create",
-            "catalog-navigation",
-            "--catalog",
-            catalog.to_str().unwrap(),
-        ],
-    );
+    let catalog = adm(root.path(), &["create", "catalog-navigation"]);
     assert!(catalog.status.success(), "{catalog:?}");
 
     let command = [
@@ -3972,7 +3981,10 @@ fn status_reports_cluster_connection_errors_with_local_workspace_state() {
 #[test]
 fn manifest_exposes_the_workspace_security_profile_and_isolated_storage() {
     let root = tempfile::tempdir().unwrap();
-    let manifest = assert_ok(adm(root.path(), &["manifest", "example"]));
+    let manifest = assert_ok(adm(
+        root.path(),
+        &["manifest", "example", "--no-repositories"],
+    ));
     let items = manifest["items"].as_array().unwrap();
     let deployment = items
         .iter()
@@ -4009,16 +4021,7 @@ fn manifest_exposes_the_workspace_security_profile_and_isolated_storage() {
 #[test]
 fn repository_sidecar_runs_as_the_development_user_and_catalog_is_the_repos_view() {
     let root = tempfile::tempdir().unwrap();
-    let catalog = root.path().join("catalog.json");
-    fs::write(
-        &catalog,
-        r#"{"repositories":[{"name":"demo","url":"https://example.invalid/demo.git"}]}"#,
-    )
-    .unwrap();
-    let manifest = assert_ok(adm(
-        root.path(),
-        &["manifest", "repos", "--catalog", catalog.to_str().unwrap()],
-    ));
+    let manifest = assert_ok(adm(root.path(), &["manifest", "repos"]));
     let items = manifest["items"].as_array().unwrap();
     let deployment = items
         .iter()
@@ -4108,8 +4111,6 @@ fn workspace_roles_select_their_release_images_and_custom_images_require_a_role(
         "example/adm-repositories:release\n",
     )
     .unwrap();
-    let catalog = root.path().join("catalog.json");
-    fs::write(&catalog, r#"{"repositories":[]}"#).unwrap();
     let code = assert_ok(adm(
         root.path(),
         &[
@@ -4117,8 +4118,6 @@ fn workspace_roles_select_their_release_images_and_custom_images_require_a_role(
             release.to_str().unwrap(),
             "manifest",
             "code",
-            "--catalog",
-            catalog.to_str().unwrap(),
         ],
     ));
     let bot = assert_ok(adm(
@@ -4180,8 +4179,6 @@ fn workspace_roles_select_their_release_images_and_custom_images_require_a_role(
             "coding",
             "--image",
             "custom/image:tag",
-            "--catalog",
-            catalog.to_str().unwrap(),
         ],
     ));
     let pod = &custom["items"]
@@ -4236,8 +4233,6 @@ fn create_applies_the_bot_and_coding_role_images_to_their_pod_containers() {
     assert_eq!(pod["containers"][0]["image"], "registry.test/adm-bot:v110");
     assert_eq!(pod["containers"].as_array().unwrap().len(), 1);
 
-    let catalog = root.path().join("catalog.json");
-    fs::write(&catalog, r#"{"repositories":[]}"#).unwrap();
     assert_ok(adm(
         root.path(),
         &[
@@ -4245,8 +4240,6 @@ fn create_applies_the_bot_and_coding_role_images_to_their_pod_containers() {
             release.to_str().unwrap(),
             "create",
             "coding",
-            "--catalog",
-            catalog.to_str().unwrap(),
             "--no-attach",
         ],
     ));
@@ -4272,32 +4265,7 @@ fn create_applies_the_bot_and_coding_role_images_to_their_pod_containers() {
 }
 
 #[test]
-fn repository_catalog_options_must_match_the_workspace_role() {
-    let root = tempfile::tempdir().unwrap();
-    let catalog = root.path().join("catalog.json");
-    fs::write(&catalog, r#"{"repositories":[]}"#).unwrap();
-    for args in [
-        vec![
-            "manifest",
-            "coding",
-            "--catalog",
-            catalog.to_str().unwrap(),
-            "--no-repositories",
-        ],
-        vec![
-            "manifest",
-            "bot",
-            "--role",
-            "bot",
-            "--catalog",
-            catalog.to_str().unwrap(),
-        ],
-    ] {
-        let output = adm(root.path(), &args);
-        assert!(!output.status.success(), "args={args:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("catalog"));
-    }
-
+fn repository_options_must_match_the_workspace_role() {
     let fixture = fixture();
     for (args, error) in [
         (
@@ -4324,17 +4292,6 @@ fn repository_catalog_options_must_match_the_workspace_role() {
                 "owner/project",
             ],
             "coding workspaces",
-        ),
-        (
-            vec![
-                "create",
-                "catalog-repo",
-                "--catalog",
-                catalog.to_str().unwrap(),
-                "--repo",
-                "owner/project",
-            ],
-            "--catalog",
         ),
     ] {
         let output = adm(fixture.path(), &args);
@@ -4471,7 +4428,10 @@ fn manifest_delivers_only_referenced_workspace_credentials_to_the_dev_pod() {
 #[test]
 fn manifest_gives_the_workspace_unattended_container_administration() {
     let root = tempfile::tempdir().unwrap();
-    let manifest = assert_ok(adm(root.path(), &["manifest", "example"]));
+    let manifest = assert_ok(adm(
+        root.path(),
+        &["manifest", "example", "--no-repositories"],
+    ));
     let items = manifest["items"].as_array().unwrap();
     let deployment = items
         .iter()
@@ -4821,4 +4781,218 @@ fn herdr_bound_pane_failure_stays_visible_until_the_user_closes_it() {
     master.write_all(b"\n").unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success());
+}
+
+fn registered_repositories(root: &Path) -> Vec<String> {
+    assert_ok(adm(root, &["repos", "list", "--json"]))["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|repository| repository["repo"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn repos_clone_registers_once_and_list_and_remove_manage_the_cluster_registry() {
+    let root = fixture();
+    assert_eq!(registered_repositories(root.path()), Vec::<String>::new());
+    let cloned = adm(root.path(), &["repos", "clone", "owner/project"]);
+    assert!(
+        cloned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    // Registering again is not an error and does not duplicate the entry.
+    assert_ok_text(adm(root.path(), &["repos", "clone", "owner/project"]));
+    assert_ok_text(adm(
+        root.path(),
+        &["repos", "clone", "owner/second", "--ref", "release"],
+    ));
+    assert_eq!(
+        registered_repositories(root.path()),
+        ["owner/project", "owner/second"]
+    );
+    let listed = assert_ok_text(adm(root.path(), &["repos", "list"]));
+    assert!(listed.contains("owner/project"), "{listed}");
+    assert!(listed.contains("owner/second"), "{listed}");
+    assert!(listed.contains("release"), "{listed}");
+    assert!(listed.contains("GitHub:"), "{listed}");
+    assert_ok_text(adm(root.path(), &["repos", "remove", "owner/second"]));
+    assert_eq!(registered_repositories(root.path()), ["owner/project"]);
+    let missing = adm(root.path(), &["repos", "remove", "owner/second"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("owner/second is not registered"));
+}
+
+#[test]
+fn repos_clone_of_a_repository_the_github_login_cannot_reach_registers_nothing() {
+    let root = fixture();
+    let output = adm(root.path(), &["repos", "clone", "owner/unreachable"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("owner/unreachable is not reachable with the GitHub login"),
+        "{stderr}"
+    );
+    assert_eq!(registered_repositories(root.path()), Vec::<String>::new());
+    // The same refusal applies when `adm create --repo` would register it.
+    let created = adm(
+        root.path(),
+        &["create", "cannot-reach", "--repo", "owner/unreachable"],
+    );
+    assert!(!created.status.success());
+    assert!(
+        assert_ok(adm(root.path(), &["list", "--json"]))
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "nothing is provisioned for a repository that cannot be reached"
+    );
+}
+
+#[test]
+fn repos_remove_refuses_while_a_workspace_uses_the_repository_and_names_it() {
+    let root = repository_branch_fixture();
+    assert_ok_text(adm(root.path(), &["repos", "clone", "owner/project"]));
+    let workspace = assert_ok(adm(
+        root.path(),
+        &["create", "api-fix", "--repo", "owner/project"],
+    ));
+    let refused = adm(root.path(), &["repos", "remove", "owner/project"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let expected = format!(
+        "owner/project is used by workspaces api-fix ({}); destroy them or remove the repo from them first",
+        workspace["id"].as_str().unwrap()
+    );
+    assert!(stderr.contains(&expected), "{stderr}");
+    assert_eq!(registered_repositories(root.path()), ["owner/project"]);
+    let listed = assert_ok_text(adm(root.path(), &["repos", "list"]));
+    assert!(listed.contains("api-fix"), "{listed}");
+    assert_ok(adm(root.path(), &["destroy", "api-fix", "--wait"]));
+    assert_ok_text(adm(root.path(), &["repos", "remove", "owner/project"]));
+    assert_eq!(registered_repositories(root.path()), Vec::<String>::new());
+}
+
+#[test]
+fn create_with_repo_registers_a_repository_that_is_not_registered_yet() {
+    let root = repository_branch_fixture();
+    assert_ok(adm(
+        root.path(),
+        &["create", "new-repo", "--repo", "owner/project"],
+    ));
+    assert_eq!(registered_repositories(root.path()), ["owner/project"]);
+}
+
+#[test]
+fn create_defaults_to_the_repository_sidecar_and_the_registry_is_the_repos_view() {
+    let root = fixture();
+    assert_ok_text(adm(root.path(), &["repos", "clone", "owner/project"]));
+    let manifest = assert_ok(adm(root.path(), &["manifest", "defaults"]));
+    let items = manifest["items"].as_array().unwrap();
+    let pod = &items
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"];
+    let sidecar = pod["containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|container| container["name"] == "repositories")
+        .expect("coding workspaces get the repositories sidecar by default");
+    let command = sidecar["command"].as_array().unwrap();
+    assert!(
+        !command.iter().any(|part| part == "--catalog"),
+        "the sidecar reads the cluster registry, not a per-workspace file"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| item["metadata"]["name"] == "repositories"),
+        "no per-workspace catalog ConfigMap"
+    );
+    assert_eq!(pod["initContainers"][0]["command"][1], "repositories");
+
+    let created = assert_ok(adm(root.path(), &["create", "with-view"]));
+    assert_eq!(created["repositories"], true);
+    let plain = assert_ok(adm(
+        root.path(),
+        &["create", "plain-repos", "--no-repositories"],
+    ));
+    assert_eq!(plain["repositories"], false);
+    let no_sidecar = assert_ok(adm(
+        root.path(),
+        &["manifest", "plain", "--no-repositories"],
+    ));
+    let pod = &no_sidecar["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"];
+    assert_eq!(pod["containers"].as_array().unwrap().len(), 1);
+    let bot = assert_ok(adm(root.path(), &["manifest", "bot", "--role", "bot"]));
+    assert!(
+        !bot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["metadata"]["name"] == "repositories"),
+        "bots get no repository catalog"
+    );
+}
+
+#[test]
+fn catalog_flag_is_removed() {
+    let root = fixture();
+    for command in ["create", "manifest"] {
+        let output = adm(
+            root.path(),
+            &[command, "old-flag", "--catalog", "catalog.json"],
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument '--catalog'"),
+            "{stderr}"
+        );
+    }
+}
+
+fn assert_ok_text(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn repositories_from_workspaces_created_with_the_old_catalog_flag_join_the_registry() {
+    let root = fixture();
+    let legacy = assert_ok(adm(root.path(), &["create", "legacy", "--no-repositories"]));
+    // A workspace stored before the registry carries its own catalog in its
+    // spec; only GitHub entries with an explicit branch can be registered.
+    let catalog = r#"{"repositories":[
+        {"owner":"example","name":"api","remote":"https://github.com/example/api.git","ref":"refs/heads/trunk"},
+        {"owner":"example","name":"docs","remote":"https://github.com/example/docs","ref":"refs/heads/main"},
+        {"owner":"local","name":"fixture","remote":"file:///srv/fixture","ref":"refs/heads/main"}]}"#;
+    let database =
+        rusqlite::Connection::open(root.path().join("lifecycle-state/workspaces.sqlite")).unwrap();
+    database
+        .execute(
+            "UPDATE workspaces SET spec=json_set(spec,'$.catalog',json(?1)) WHERE id=?2",
+            rusqlite::params![catalog, legacy["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    database
+        .execute("DELETE FROM registry_migrations", [])
+        .unwrap();
+    assert_eq!(
+        registered_repositories(root.path()),
+        ["example/api", "example/docs"]
+    );
+    let listed = assert_ok(adm(root.path(), &["repos", "list", "--json"]));
+    assert_eq!(listed["repositories"][0]["branch"], "trunk");
 }
