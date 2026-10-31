@@ -1460,8 +1460,10 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         json!({"name":"runtime-token","projected":{"sources":[{"serviceAccountToken":{"audience":"adm-lifecycle","expirationSeconds":3600,"path":"token"}}]}}),
     ];
     let mut dev = json!({"name":if w.role == "coding" { "dev" } else { "bot" },"image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":if w.role == "coding" { "/repos" } else { "/workspace" },"ports":[{"name":"http","containerPort":7432}],"securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"httpGet":{"path":"/ready","port":7432},"initialDelaySeconds":1,"periodSeconds":2},"livenessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":10,"periodSeconds":10,"failureThreshold":3}});
+    let lifecycle_url =
+        format!("http://adm-lifecycle.{lifecycle_namespace}.svc.cluster.local:7433");
     dev["env"] = json!([
-        {"name":"ADM_LIFECYCLE_URL","value":format!("http://adm-lifecycle.{lifecycle_namespace}.svc.cluster.local:7433")},
+        {"name":"ADM_LIFECYCLE_URL","value":lifecycle_url},
         {"name":"ADM_POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}
     ]);
     for reference in &w.credential_env {
@@ -1470,7 +1472,7 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     let mut containers = vec![dev];
     if w.repositories {
         volumes.push(json!({"name":"catalog","configMap":{"name":"repositories"}}));
-        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--catalog","/config/catalog.json","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":[{"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"},{"name":"catalog","mountPath":"/config","readOnly":true}]}));
+        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--catalog","/config/catalog.json","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"env":[{"name":"ADM_LIFECYCLE_URL","value":lifecycle_url}],"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":[{"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"},{"name":"catalog","mountPath":"/config","readOnly":true},{"name":"runtime-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true}]}));
         items.push(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"repositories"),"data":{"catalog.json":serde_json::to_string(&w.catalog)?}}));
     }
     let init = json!({"name":"initialize","image":w.workspace_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
