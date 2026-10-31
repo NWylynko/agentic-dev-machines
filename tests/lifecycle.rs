@@ -187,7 +187,7 @@ fn start_runtime_status_server(root: &Path) -> (u16, thread::JoinHandle<()>) {
                 write!(stream, "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
                 continue;
             }
-            let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"},"connectors":[{"name":"linear","status":"sign_in_required","error":"MCP connector linear needs sign-in: run adm mcp login linear"}]}"#;
+            let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"},"connectors":[{"name":"linear","status":"sign_in_required","error":"MCP connector linear needs sign-in: run adm mcp login linear"}],"agentsFile":{"source":"installation","status":"current","revision":3}}"#;
             write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
         }
     });
@@ -1374,6 +1374,10 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         json!([{"name":"linear","status":"sign_in_required","error":"MCP connector linear needs sign-in: run adm mcp login linear"}]),
         "connector failures reach adm status"
     );
+    assert_eq!(
+        replacement_entry["runtime_status"]["agentsFile"]["revision"], 3,
+        "the shared agents file revision reaches adm status"
+    );
     fs::write(root.path().join("runtime-status-hold"), "").unwrap();
     let held_started = Instant::now();
     let held_directory: Vec<Value> = request_with_token(
@@ -1675,6 +1679,42 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             Some("synthetic-lifecycle-token"),
         )
         .unwrap();
+        let agents_file_admin: Vec<_> = [
+            ("GET", "/v1/agents-file", None),
+            (
+                "PUT",
+                "/v1/agents-file",
+                Some(json!({"content":"shared","baseRevision":0})),
+            ),
+        ]
+        .into_iter()
+        .map(|(method, path, body)| {
+            request_with_token(
+                &url,
+                method,
+                path,
+                body.as_ref(),
+                Some("synthetic-lifecycle-token"),
+            )
+            .unwrap()
+        })
+        .collect();
+        let agents_file_runtime = request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/agents-file",
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap();
+        let agents_file_pod_admin = request_with_token(
+            &url,
+            "PUT",
+            "/v1/agents-file",
+            Some(&json!({"content":"nope","baseRevision":0})),
+            Some("runtime-token"),
+        )
+        .unwrap();
         database.execute("UPDATE workspaces SET phase='ready',spec=json_set(spec,'$.phase','ready') WHERE id=?1", [runtime_id]).unwrap();
         let mut stop = TcpStream::connect("127.0.0.1:7434").unwrap();
         stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -1700,9 +1740,26 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         }
         assert_eq!(pod_admin.status(), 401, "Pods cannot administer connectors");
         assert_eq!(escaped.status(), 400, "{}", escaped.text().unwrap());
-        assert_eq!(received.len(), 6, "{received:#?}");
+        for response in agents_file_admin {
+            assert_eq!(response.status(), 200, "{}", response.text().unwrap());
+        }
+        assert_eq!(
+            agents_file_runtime.status(),
+            200,
+            "a coding Pod can read the shared agents file: {}",
+            agents_file_runtime.text().unwrap()
+        );
+        assert_eq!(
+            agents_file_pod_admin.status(),
+            401,
+            "Pods cannot edit the shared agents file"
+        );
+        assert_eq!(received.len(), 9, "{received:#?}");
         assert!(received[2].starts_with("POST /v1/runtime/connectors/catalog "));
         assert!(received[5].starts_with("POST /v1/connectors/linear/sign-in "));
+        assert!(received[6].starts_with("GET /v1/agents-file "));
+        assert!(received[7].starts_with("PUT /v1/agents-file "));
+        assert!(received[8].starts_with("GET /v1/runtime/agents-file "));
         let unavailable = request_with_token(
             &url,
             "POST",

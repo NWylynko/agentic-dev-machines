@@ -556,7 +556,7 @@ test("ownership loss during input admission rejects promptly and closes the work
   const control = createServer(async (request, response) => {
     let text = "";
     for await (const chunk of request) text += chunk;
-    const body = JSON.parse(text);
+    const body = text ? JSON.parse(text) : {};
     // Allow the route and serialized request checks, then revoke at admission.
     const denied = request.url.endsWith("/check") && armed && ++checks >= 3;
     response.writeHead(denied ? 410 : 200, {
@@ -635,7 +635,7 @@ test("workspace requests are authorized by lifecycle against the caller's projec
   const control = createServer(async (request, response) => {
     let text = "";
     for await (const chunk of request) text += chunk;
-    const body = JSON.parse(text);
+    const body = text ? JSON.parse(text) : {};
     authorizations.push({
       path: request.url,
       authorization: request.headers.authorization,
@@ -881,7 +881,7 @@ test(
     const control = createServer(async (request, response) => {
       let text = "";
       for await (const chunk of request) text += chunk;
-      const body = JSON.parse(text);
+      const body = text ? JSON.parse(text) : {};
       const headers = { "content-type": "application/json" };
       if (
         request.headers.authorization !== "Bearer temporary-outage-identity"
@@ -1151,7 +1151,7 @@ test(
     const control = createServer(async (request, response) => {
       let text = "";
       for await (const chunk of request) text += chunk;
-      const body = JSON.parse(text);
+      const body = text ? JSON.parse(text) : {};
       const renewal = request.url?.endsWith("/runtime/lease/renew");
       if (renewal) renew();
       response.writeHead(200, { "content-type": "application/json" }).end(
@@ -1224,7 +1224,7 @@ async function startMaintenanceAckRunner(t, name, ack) {
   const control = createServer(async (request, response) => {
     let text = "";
     for await (const chunk of request) text += chunk;
-    const body = JSON.parse(text);
+    const body = text ? JSON.parse(text) : {};
     const headers = { "content-type": "application/json" };
     if (request.headers.authorization !== `Bearer ${name}-identity`) {
       response
@@ -1461,7 +1461,7 @@ test(
     const control = createServer(async (request, response) => {
       let text = "";
       for await (const chunk of request) text += chunk;
-      const body = JSON.parse(text);
+      const body = text ? JSON.parse(text) : {};
       response.writeHead(200, { "content-type": "application/json" }).end(
         JSON.stringify({
           workspaceId: "workspace-expired-fence",

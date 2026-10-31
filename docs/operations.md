@@ -207,6 +207,19 @@ Running agents pick up connector changes at their next turn without being recrea
 
 Only remote Streamable HTTP servers with OAuth sign-in are supported. Every agent receives every connector; choosing which agents get which connectors is not available yet. The per-workspace `--mcp-config` stdio grants were removed.
 
+## Shared agents file
+
+`adm agents-file` edits one installation-wide instruction document for every coding agent, the same kind of "how to work" text as a personal `AGENTS.md`. Repository `AGENTS.md` files stay in the project and are not overwritten. Bot agents do not receive the shared document.
+
+```sh
+adm agents-file          # open $EDITOR (nano when EDITOR is unset) and save on exit
+adm agents-file --show   # print the source, revision, and document
+```
+
+The document lives on the lifecycle deployment's persistent volume, next to provider credentials. Saving publishes it through the lifecycle API. An editor that exits non-zero, or a save whose text did not change, leaves the published document as it was. A save that lost a race with another client fails with the current revision instead of overwriting it; `provider-auth` logs `agents_file_rejected`. Run `adm agents-file` again to edit the current text.
+
+A coding agent reads the document at the start of each provider request. A save during a turn that is already in flight shows up on the next turn. New agents and restarted runtimes read the same saved revision. The request lists the shared document first, then repository `AGENTS.md` files. `adm agents-file --show` prints `source: installation` and the revision. `adm status NAME` prints `Shared agents file: installation revision N`, or `Shared agents file unavailable` with the cause when the runtime could not read it. A failed read is left out of that turn, so an older copy is not presented as the current document.
+
 ## Errors and recovery
 
 The terminal supports `/status`, `/resume`, `/reconnect`, `/abort`, `/abort all`, `/newgoal DESCRIPTION`, and `/loop SECONDS PROMPT`. See the [terminal controls](../packages/terminal/README.md).

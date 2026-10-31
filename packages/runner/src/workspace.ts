@@ -24,7 +24,11 @@ import { defaultRemoteEnv, KubernetesExecutionEnv } from "./kubernetes-env.ts";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
-import { WorkspaceResources } from "./resources.ts";
+import { WorkspaceAgentsFile } from "./agents-file.ts";
+import {
+  messagesWithSharedAgentsFile,
+  WorkspaceResources,
+} from "./resources.ts";
 import { UserBashTask, type BashInput, type BashResult } from "./bash.ts";
 import { WorkspaceCacheWarming } from "./cache-warming.ts";
 import {
@@ -165,6 +169,7 @@ function agentIsBusy(task: TaskInspection) {
 export class Workspace {
   config: WorkspaceConfig;
   resources?: WorkspaceResources;
+  agentsFile?: WorkspaceAgentsFile;
   harness: Awaited<ReturnType<typeof Harness.open>>;
   conversation: Awaited<
     ReturnType<Awaited<ReturnType<typeof Harness.open>>["root"]>
@@ -461,6 +466,10 @@ export class Workspace {
         config.role === "coding" && config.environment !== "kubernetes"
           ? new WorkspaceResources(config, directory, () => assertActive())
           : undefined;
+      const agentsFile =
+        config.role === "coding" && connectorLifecycle && !passive
+          ? new WorkspaceAgentsFile(connectorLifecycle)
+          : undefined;
       if (resources && !passive) {
         await resources.reload();
         registry.install(
@@ -481,13 +490,23 @@ export class Workspace {
               beforeRequest: async (request, _api, context) => {
                 await assertActive(context.abortSignal);
                 openedWorkspace?.setExtensionGenerationBusy(true);
-                return resources
-                  ? {
-                      messages: await resources.requestMessages(
-                        request.messages,
-                      ),
-                    }
+                // The read happens at the start of this request. A save during
+                // an in-flight turn is included on the next one.
+                const shared = agentsFile
+                  ? await agentsFile.refresh()
                   : undefined;
+                if (resources)
+                  return {
+                    messages: await resources.requestMessages(
+                      request.messages,
+                      shared,
+                    ),
+                  };
+                const messages = messagesWithSharedAgentsFile(
+                  request.messages,
+                  shared,
+                );
+                return messages === request.messages ? undefined : { messages };
               },
               afterResponse: async (message, api) => {
                 openedWorkspace?.setExtensionGenerationBusy(false);
@@ -604,6 +623,7 @@ export class Workspace {
       );
       openedWorkspace = workspace;
       workspace.resources = resources;
+      workspace.agentsFile = agentsFile;
       if (!passive) workspace.refreshExtensionRegistry();
       workspace.lastError = reportedError;
       workspace.localEnv = localEnv;
@@ -710,6 +730,9 @@ export class Workspace {
       tasks: inspection.tasks,
       error,
       connectors: this.connectors?.status() ?? [],
+      ...(this.agentsFile?.status()
+        ? { agentsFile: this.agentsFile.status() }
+        : {}),
       tools: (await this.conversation.agent(context)).tools.map(
         (tool) => tool.name,
       ),

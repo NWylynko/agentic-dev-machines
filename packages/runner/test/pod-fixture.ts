@@ -19,20 +19,45 @@ export async function startPodLifecycle({
 }: {
   authorityUrl: string;
 }) {
-  const identities = new Map<string, string>();
+  const identities = new Map<string, { id: string; role: "coding" | "bot" }>();
   const connectorRequests: { sourceId: string; path: string }[] = [];
+  const agentsFileRequests: { sourceId: string; path: string }[] = [];
+  let failAgentsFile = false;
   const server = createServer(async (request, response) => {
     const headers = { "content-type": "application/json" };
-    const sourceId = identities.get(
+    const source = identities.get(
       request.headers.authorization?.replace(/^Bearer /, "") ?? "",
     );
     const requestUrl = request.url ?? "/";
     let raw = "";
     for await (const chunk of request) raw += chunk;
-    if (!sourceId)
+    if (!source)
       return response
         .writeHead(403, headers)
         .end(JSON.stringify({ error: { message: "forbidden" } }));
+    const sourceId = source.id;
+    if (request.method === "GET" && requestUrl === "/v1/runtime/agents-file") {
+      if (source.role !== "coding")
+        return response.writeHead(403, headers).end(
+          JSON.stringify({
+            error: {
+              message:
+                "shared agents file is restricted to coding workspaces",
+            },
+          }),
+        );
+      if (failAgentsFile)
+        return response.writeHead(503, headers).end(
+          JSON.stringify({
+            error: { message: "agents file authority is down" },
+          }),
+        );
+      agentsFileRequests.push({ sourceId, path: requestUrl });
+      const upstream = await fetch(authorityUrl + requestUrl);
+      return response
+        .writeHead(upstream.status, headers)
+        .end(await upstream.text());
+    }
     if (
       request.method === "POST" &&
       requestUrl.startsWith("/v1/runtime/connectors/")
@@ -82,6 +107,13 @@ export async function startPodLifecycle({
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     identities,
     connectorRequests,
+    agentsFileRequests,
+    get failAgentsFile() {
+      return failAgentsFile;
+    },
+    set failAgentsFile(value: boolean) {
+      failAgentsFile = value;
+    },
     async close() {
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
@@ -112,7 +144,7 @@ export async function startPodRunner(
   const token = `identity-${id}`;
   const tokenFile = join(directory, "projected-token");
   await writeFile(tokenFile, `${token}\n`, { mode: 0o600 });
-  lifecycle.identities.set(token, id);
+  lifecycle.identities.set(token, { id, role });
   const workspaceConfig = join(directory, "workspace.json");
   await writeFile(
     workspaceConfig,
