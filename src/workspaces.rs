@@ -77,6 +77,10 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<Value>,
     pub image: String,
+    #[serde(default = "default_workspace_image")]
+    pub workspace_image: String,
+    #[serde(default = "default_repositories_image")]
+    pub repositories_image: String,
     pub storage_class: String,
     pub storage_size: String,
     pub cpu: String,
@@ -132,6 +136,10 @@ pub struct CreateOptions {
         hide_default_value = true
     )]
     pub image: String,
+    #[arg(skip = default_workspace_image())]
+    pub workspace_image: String,
+    #[arg(skip = default_repositories_image())]
+    pub repositories_image: String,
     /// StorageClass; otherwise use the configured default or adm-replicated.
     #[arg(long, default_value = "adm-replicated", hide_default_value = true)]
     pub storage_class: String,
@@ -183,6 +191,14 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 fn default_workspace_cwd() -> String {
     "/repos".into()
+}
+
+pub(crate) fn default_workspace_image() -> String {
+    "ghcr.io/nwylynko/agentic-dev-machines/adm-workspace:latest".into()
+}
+
+pub(crate) fn default_repositories_image() -> String {
+    "ghcr.io/nwylynko/agentic-dev-machines/adm-repositories:latest".into()
 }
 
 pub fn validate_repository_ref(repository: &str) -> Result<(&str, &str)> {
@@ -303,6 +319,16 @@ impl CreateOptions {
             self.repo.is_none() || self.role != "bot",
             "--repo is only supported for coding workspaces"
         );
+        ensure!(
+            [
+                self.image.as_str(),
+                self.workspace_image.as_str(),
+                self.repositories_image.as_str()
+            ]
+            .iter()
+            .all(|image| !image.trim().is_empty() && !image.chars().any(char::is_whitespace)),
+            "workspace image references must be nonempty and contain no whitespace"
+        );
         let credential_env = self
             .credential_env
             .iter()
@@ -345,6 +371,8 @@ impl CreateOptions {
             deletion_operation_id: None,
             runtime_status: None,
             image: self.image.clone(),
+            workspace_image: self.workspace_image.clone(),
+            repositories_image: self.repositories_image.clone(),
             storage_class: self.storage_class.clone(),
             storage_size: self.storage_size.clone(),
             cpu: self.cpu.clone(),
@@ -581,6 +609,8 @@ impl WorkspaceStore {
             OperationRequest::Update {
                 workspace_id,
                 image,
+                workspace_image,
+                repositories_image,
                 ..
             } => {
                 let raw: String = transaction
@@ -602,6 +632,12 @@ impl WorkspaceStore {
                     workspace.name
                 );
                 workspace.image = image.clone();
+                if let Some(workspace_image) = workspace_image {
+                    workspace.workspace_image = workspace_image.clone();
+                }
+                if let Some(repositories_image) = repositories_image {
+                    workspace.repositories_image = repositories_image.clone();
+                }
                 workspace.last_error = None;
                 let changed = transaction.execute(
                     "UPDATE workspaces SET spec=?2,fencing_token=?3 WHERE id=?1 AND phase='ready' AND fencing_token<=?3",
@@ -1434,10 +1470,10 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     let mut containers = vec![dev];
     if w.repositories {
         volumes.push(json!({"name":"catalog","configMap":{"name":"repositories"}}));
-        containers.push(json!({"name":"repositories","image":w.image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--catalog","/config/catalog.json","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":[{"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"},{"name":"catalog","mountPath":"/config","readOnly":true}]}));
+        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--catalog","/config/catalog.json","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":[{"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"},{"name":"catalog","mountPath":"/config","readOnly":true}]}));
         items.push(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"repositories"),"data":{"catalog.json":serde_json::to_string(&w.catalog)?}}));
     }
-    let init = json!({"name":"initialize","image":w.image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
+    let init = json!({"name":"initialize","image":w.workspace_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
     let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"serviceAccountName":"adm-runtime","automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
     let mut ingress = vec![
         json!({"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":lifecycle_namespace}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"adm-lifecycle"}}}],"ports":[{"protocol":"TCP","port":7432}]}),
@@ -2062,6 +2098,8 @@ mv -- "$staging" "$target"
 fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
     existing.role == requested.role
         && existing.image == requested.image
+        && existing.workspace_image == requested.workspace_image
+        && existing.repositories_image == requested.repositories_image
         && existing.storage_class == requested.storage_class
         && existing.storage_size == requested.storage_size
         && existing.cpu == requested.cpu

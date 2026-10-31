@@ -13,6 +13,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -77,6 +79,9 @@ impl Config {
         if let Some(image) = &self.image {
             validate_value(image, "image")?;
         }
+        if let Some(image) = &self.bot_image {
+            validate_value(image, "botImage")?;
+        }
         if let Some(storage_class) = &self.storage_class {
             validate_value(storage_class, "storageClass")?;
         }
@@ -103,15 +108,28 @@ pub fn read_config() -> Result<Config> {
 }
 
 pub fn default_image(cli: &Cli) -> Result<String> {
-    let path = cli.project_dir.join("IMAGE");
+    default_role_image(cli, "CODE_IMAGE")
+}
+
+pub fn default_role_image(cli: &Cli, filename: &str) -> Result<String> {
+    let path = cli.project_dir.join(filename);
     match fs::read_to_string(&path) {
         Ok(image) => {
             let image = image.trim();
-            validate_value(image, "release IMAGE")?;
+            validate_value(image, "release image")?;
             Ok(image.to_owned())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok("ghcr.io/nwylynko/agentic-dev-machines:latest".into())
+            let role = match filename {
+                "CONTROL_IMAGE" => "adm-control",
+                "REPOSITORIES_IMAGE" => "adm-repositories",
+                "WORKSPACE_IMAGE" => "adm-workspace",
+                "BOT_IMAGE" => "adm-bot",
+                _ => "adm-code",
+            };
+            Ok(format!(
+                "ghcr.io/nwylynko/agentic-dev-machines/{role}:latest"
+            ))
         }
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
@@ -151,7 +169,12 @@ pub fn run(cli: &Cli) -> Result<()> {
         Some(image) => image.clone(),
         None => default_image(cli)?,
     };
-    config.image = Some(prompt("Workspace image", &image)?);
+    config.image = Some(prompt("Coding workspace image", &image)?);
+    let bot_image = match &config.bot_image {
+        Some(image) => image.clone(),
+        None => default_role_image(cli, "BOT_IMAGE")?,
+    };
+    config.bot_image = Some(prompt("Bot workspace image", &bot_image)?);
     config.storage_class = Some(prompt(
         "StorageClass",
         config.storage_class.as_deref().unwrap_or("adm-replicated"),
@@ -189,7 +212,7 @@ pub fn run(cli: &Cli) -> Result<()> {
             crate::setup_connection::preflight(&connection)?;
             crate::setup_control_plane::install(
                 &connection,
-                config.image.as_deref().expect("configured image"),
+                &default_role_image(cli, "CONTROL_IMAGE")?,
                 config
                     .storage_class
                     .as_deref()

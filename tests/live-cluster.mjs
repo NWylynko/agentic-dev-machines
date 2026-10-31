@@ -362,6 +362,8 @@ test(
       workspace,
       "--image",
       image,
+      "--role",
+      "coding",
       "--storage-class",
       "local-path",
       "--storage-size",

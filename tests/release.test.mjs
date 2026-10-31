@@ -42,8 +42,16 @@ test(
         join(project, "scripts/build-release.mjs"),
         "--version",
         "v9.8.7",
-        "--image",
-        "ghcr.io/example/adm:9.8.7",
+        "--control-image",
+        "ghcr.io/example/adm-control:9.8.7",
+        "--repositories-image",
+        "ghcr.io/example/adm-repositories:9.8.7",
+        "--workspace-image",
+        "ghcr.io/example/adm-workspace:9.8.7",
+        "--code-image",
+        "ghcr.io/example/adm-code:9.8.7",
+        "--bot-image",
+        "ghcr.io/example/adm-bot:9.8.7",
         "--adm",
         resolve(
           process.env.ADM_RELEASE_TEST_ADM ?? join(project, "target/debug/adm"),
@@ -136,9 +144,9 @@ test(
     const lifecyclePod = lifecycleDeployment.spec.template.spec;
     assert.equal(
       lifecyclePod.initContainers[0].image,
-      "ghcr.io/example/adm:9.8.7",
+      "ghcr.io/example/adm-control:9.8.7",
     );
-    assert.equal(lifecyclePod.containers[0].image, "ghcr.io/example/adm:9.8.7");
+    assert.equal(lifecyclePod.containers[0].image, "ghcr.io/example/adm-control:9.8.7");
     assert.equal(
       lifecyclePod.volumes.find((volume) => volume.name === "token").secret
         .defaultMode,
@@ -163,8 +171,8 @@ test(
       },
     );
     assert.equal(
-      await readFile(join(installed, "IMAGE"), "utf8"),
-      "ghcr.io/example/adm:9.8.7\n",
+      await readFile(join(installed, "CONTROL_IMAGE"), "utf8"),
+      "ghcr.io/example/adm-control:9.8.7\n",
     );
     assert.ok(
       (
@@ -186,7 +194,7 @@ test(
     );
     assert.equal(
       deployment.spec.template.spec.containers[0].image,
-      "ghcr.io/example/adm:9.8.7",
+      "ghcr.io/example/adm-code:9.8.7",
     );
     await assert.rejects(
       execute(
@@ -202,7 +210,8 @@ test(
     await writeFile(lifecycleTokenFile, "synthetic-lifecycle-token\n", { mode: 0o600 });
     const applied = join(directory, "controller-applied");
     const kubectlLog = join(directory, "kubectl.log");
-    const targetImage = "ghcr.io/example/adm:9.8.7";
+    const targetImage = "ghcr.io/example/adm-code:9.8.7";
+    const targetControlImage = "ghcr.io/example/adm-control:9.8.7";
     const fixtureResources = YAML.parseAllDocuments(
       await readFile(join(installed, "deploy/lifecycle/control-plane.yaml"), "utf8"),
     ).map((document) => document.toJSON());
@@ -212,7 +221,7 @@ test(
     for (const container of [
       ...deploymentResource.spec.template.spec.initContainers,
       ...deploymentResource.spec.template.spec.containers,
-    ]) container.image = targetImage;
+    ]) container.image = targetControlImage;
     const resourcesFile = join(directory, "lifecycle-resources.json");
     await writeFile(resourcesFile, fixtureResources.map(JSON.stringify).join("\n"));
     const fakeKubectl = join(hostTools, "kubectl");
@@ -225,14 +234,14 @@ case "$*" in
   *"get namespace adm-system"*) printf '{"metadata":{"name":"adm-system","labels":{"app.kubernetes.io/part-of":"adm"}}}\\n' ;;
   *"get pvc adm-lifecycle-state"*) printf '{"metadata":{"name":"adm-lifecycle-state","namespace":"adm-system"},"spec":{"storageClassName":"installed-lifecycle-class"}}\\n' ;;
   *"get deployment adm-lifecycle"*)
-    image=${JSON.stringify(targetImage)}
+    image=${JSON.stringify(targetControlImage)}
     [ ! -f ${JSON.stringify(applied)} ] || image=$(cut -d= -f2 ${JSON.stringify(applied)})
     printf '{"metadata":{"name":"adm-lifecycle","namespace":"adm-system"},"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"adm-lifecycle"}},"template":{"spec":{"serviceAccountName":"adm-lifecycle","volumes":[{"name":"state","persistentVolumeClaim":{"claimName":"adm-lifecycle-state"}}],"initContainers":[{"image":"%s"}],"containers":[{"image":"%s"}]}}}}\\n' "$image" "$image"
     ;;
   *"get storageclass"*) printf '{"provisioner":"rook-ceph.rbd.csi.ceph.com"}\\n' ;;
   *"create --dry-run=client"*) cat ${JSON.stringify(resourcesFile)} ;;
   *"get secret adm-lifecycle-token"*) exit 0 ;;
-  *"apply -f -"*) manifest=$(cat); printf '%s' "$manifest" > ${JSON.stringify(applied)}.manifest; printf 'image=${targetImage}\\n' > ${JSON.stringify(applied)} ;;
+  *"apply -f -"*) manifest=$(cat); printf '%s' "$manifest" > ${JSON.stringify(applied)}.manifest; printf 'image=${targetControlImage}\\n' > ${JSON.stringify(applied)} ;;
   *"rollout status deployment/adm-lifecycle"*) exit 0 ;;
   *"create secret generic adm-lifecycle-token"*) cat >/dev/null ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
@@ -270,7 +279,7 @@ esac
         role: "coding",
         namespace: "adm-55f9ea6355064b39",
         phase: "ready",
-        image: "ghcr.io/example/adm-dev:stale-workspace-image",
+        image: "ghcr.io/other/adm-code:stale-workspace-image",
         storage_class: "adm-replicated",
         storage_size: "1Gi",
         cpu: "1",
@@ -343,7 +352,7 @@ esac
     await writeFile(
       join(environment.XDG_CONFIG_HOME, "adm", "config.json"),
       JSON.stringify({
-        image: "ghcr.io/example/adm-dev:stale-workspace-image",
+        image: "ghcr.io/other/adm-code:stale-workspace-image",
         storageClass: "stale-workspace-storage",
         lifecycle: {
           url: `http://127.0.0.1:${lifecycleServer.address().port}`,
@@ -376,7 +385,7 @@ esac
       "/v1/runtime/maintenance/await",
       "/v1/runtime/maintenance/complete",
     ]);
-    assert.equal(await readFile(applied, "utf8"), `image=${targetImage}\n`);
+    assert.equal(await readFile(applied, "utf8"), `image=${targetControlImage}\n`);
     const appliedCalls = (await readFile(kubectlLog, "utf8"))
       .split("\n")
       .filter((call) => call.startsWith("apply "));
@@ -393,7 +402,7 @@ esac
     const savedConfig = JSON.parse(await readFile(configPath, "utf8"));
     assert.equal(
       savedConfig.image,
-      "ghcr.io/example/adm-dev:stale-workspace-image",
+      "ghcr.io/other/adm-code:stale-workspace-image",
       "an image from another repository is the user's own choice and survives updates",
     );
     // `adm setup` saves the release's own image as an explicit reference. An
@@ -401,7 +410,7 @@ esac
     // (TASK-62: fixes shipped, but fresh workspaces still ran the old release).
     await writeFile(
       configPath,
-      JSON.stringify({ ...savedConfig, image: "ghcr.io/example/adm:sha-setup-time-release" }),
+      JSON.stringify({ ...savedConfig, image: "ghcr.io/example/adm-code:sha-setup-time-release" }),
     );
     await execute(
       adm,

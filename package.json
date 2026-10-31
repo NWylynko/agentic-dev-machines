@@ -12,7 +12,7 @@
   },
   "scripts": {
     "postinstall": "node scripts/patch-pi-interactive.mjs",
-    "test": "node --test packages/runner/test/*.test.mjs image/browser.test.mjs tests/lifecycle-rbac.test.mjs && node --import tsx --test packages/terminal/test/*.test.ts",
+    "test": "node --test packages/runner/test/*.test.mjs image/browser.test.mjs image/secret-scan.test.mjs tests/lifecycle-rbac.test.mjs && node --import tsx --test packages/terminal/test/*.test.ts",
     "test:runner": "node --test packages/runner/test/*.test.mjs",
     "test:terminal": "node --import tsx --test packages/terminal/test/*.test.ts",
     "test:install": "node --test tests/install.test.mjs",
@@ -22,7 +22,8 @@
     "test:repositories": "PATH=\"$(go env GOPATH)/bin:$PATH\" go test -C packages/repositories -count=1 -timeout 180s",
     "test:cluster": "node tests/live-cluster.mjs",
     "test:cluster-contract": "node tests/cluster-contract.mjs",
-    "test:image": "node image/smoke.mjs",
+    "test:image": "node image/role-smoke.mjs",
+    "test:image:full": "node image/smoke.mjs",
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "runner": "node --import tsx packages/runner/src/main.ts"

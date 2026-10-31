@@ -1830,21 +1830,37 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
         return Ok(());
     }
     let (_, arguments) = matches.subcommand().expect("required CLI command");
-    let image = if matches!(&cli.command, Action::Create(_) | Action::Manifest(_))
-        && arguments.value_source("image") == Some(ValueSource::DefaultValue)
-    {
-        Some(match config.image {
-            Some(image) => image,
-            None => setup::default_image(cli)?,
-        })
-    } else {
-        None
-    };
+    let code_default = config
+        .image
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| setup::default_role_image(cli, "CODE_IMAGE"))?;
+    let bot_default = config
+        .bot_image
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| setup::default_role_image(cli, "BOT_IMAGE"))?;
+    let workspace_default = setup::default_role_image(cli, "WORKSPACE_IMAGE")?;
+    let repositories_default = setup::default_role_image(cli, "REPOSITORIES_IMAGE")?;
     match &mut cli.command {
         Action::Create(options) | Action::Manifest(options) => {
-            if let Some(image) = image {
-                options.image = image;
+            let role_was_explicit =
+                arguments.value_source("role") != Some(ValueSource::DefaultValue);
+            let image_was_explicit =
+                arguments.value_source("image") != Some(ValueSource::DefaultValue);
+            anyhow::ensure!(
+                !image_was_explicit || role_was_explicit,
+                "--image requires --role (coding or bot)"
+            );
+            if !image_was_explicit {
+                options.image = if options.role == "bot" {
+                    bot_default
+                } else {
+                    code_default
+                };
             }
+            options.workspace_image = workspace_default;
+            options.repositories_image = repositories_default;
             if arguments.value_source("storage_class") == Some(ValueSource::DefaultValue)
                 && let Some(storage_class) = config.storage_class
             {

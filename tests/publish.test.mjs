@@ -215,7 +215,8 @@ test("main publishes a complete immutable release and rerunning keeps its existi
   assert.equal(release.prerelease, false);
   assert.equal(release.draft, false);
   assert.deepEqual(Object.keys(release.assets).sort(), [...assetNames].sort());
-  assert.match(release.body, /ghcr\.io\/nwylynko\/agentic-dev-machines:sha-0123456789ab/);
+  for (const role of ["adm-control", "adm-repositories", "adm-workspace", "adm-code", "adm-bot"])
+    assert.match(release.body, new RegExp(`agentic-dev-machines/${role}:sha-0123456789ab`));
   assert.match(release.body, /releases\/download\/sha-0123456789ab\/install\.sh/);
   await fixture.artifacts("rerun must not replace published bytes");
   await fixture.publish(newerCommit);
@@ -279,7 +280,7 @@ test("version tags stay pinned and never replace the default download", async (t
   assert.equal(state.releases["v1.2.3"].latestFlag, "false");
   assert.equal(state.releases["v1.2.3"].target, newerCommit);
   assert.match(state.releases["v1.2.3"].body, /releases\/download\/v1\.2\.3\/install\.sh/);
-  assert.match(state.releases["v1.2.3"].body, /ghcr\.io\/nwylynko\/agentic-dev-machines:sha-0123456789ab/);
+  assert.match(state.releases["v1.2.3"].body, /agentic-dev-machines\/adm-code:sha-0123456789ab/);
 
   await fixture.artifacts("older main");
   await fixture.publish(olderCommit);

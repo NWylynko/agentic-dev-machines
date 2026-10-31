@@ -54,6 +54,10 @@ pub enum OperationRequest {
         #[serde(rename = "workspaceId")]
         workspace_id: String,
         image: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_image: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repositories_image: Option<String>,
     },
 }
 
@@ -65,6 +69,10 @@ pub struct CreateIntent {
     pub name: String,
     pub role: String,
     pub image: String,
+    #[serde(default = "crate::workspaces::default_workspace_image")]
+    pub workspace_image: String,
+    #[serde(default = "crate::workspaces::default_repositories_image")]
+    pub repositories_image: String,
     pub storage_class: String,
     pub storage_size: String,
     pub cpu: String,
@@ -99,6 +107,8 @@ impl CreateIntent {
             name: workspace.name.clone(),
             role: workspace.role.clone(),
             image: workspace.image.clone(),
+            workspace_image: workspace.workspace_image.clone(),
+            repositories_image: workspace.repositories_image.clone(),
             storage_class: workspace.storage_class.clone(),
             storage_size: workspace.storage_size.clone(),
             cpu: workspace.cpu.clone(),
@@ -193,6 +203,8 @@ impl CreateIntent {
         );
         ensure!(
             !self.image.trim().is_empty()
+                && !self.workspace_image.trim().is_empty()
+                && !self.repositories_image.trim().is_empty()
                 && !self.storage_size.trim().is_empty()
                 && !self.cpu.trim().is_empty()
                 && !self.memory.trim().is_empty(),
@@ -228,6 +240,8 @@ impl CreateIntent {
             deletion_operation_id: None,
             runtime_status: None,
             image: self.image,
+            workspace_image: self.workspace_image,
+            repositories_image: self.repositories_image,
             storage_class: self.storage_class,
             storage_size: self.storage_size,
             cpu: self.cpu,

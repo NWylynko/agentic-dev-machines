@@ -1,5 +1,5 @@
 # Verifies the CLI, runner, and terminal, then publishes the linux/amd64
-# management-host distribution, its GitHub release, and the workspace image.
+# management-host distribution, its GitHub release, and the ADM role images.
 # Markdown-only pushes and pull requests do not run this workflow. FUSE
 # repository tests stay local: this runner does not provide a usable /dev/fuse mount.
 
@@ -89,26 +89,19 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Build workspace image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: image/Dockerfile
-          load: true
-          push: false
-          provenance: false
-          platforms: linux/amd64
-          tags: adm-dev:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.licenses=MIT
-            org.opencontainers.image.title=adm-dev
-            org.opencontainers.image.description=ADM development workspace
-
-      - name: Smoke test workspace image
-        run: node image/smoke.mjs adm-dev:ci
+      - name: Build, inspect and smoke test role images
+        run: |
+          set -eu
+          for role in adm-control adm-repositories adm-workspace adm-code adm-bot; do
+            docker build --platform linux/amd64 --target "$role" -f image/Dockerfile -t "$role:ci" .
+            id=$(docker create "$role:ci")
+            mkdir -p "/tmp/$role-root"
+            docker export "$id" | tar -xf - -C "/tmp/$role-root"
+            docker rm "$id" >/dev/null
+            node image/scan-secrets.mjs "/tmp/$role-root"
+            npm run test:image -- "$role:ci" "$role"
+          done
+          node --test image/secret-scan.test.mjs
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -118,11 +111,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish workspace image
+      - name: Publish role images
         if: github.event_name != 'pull_request'
         run: |
           set -eu
-          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          repo="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           sha="sha-${GITHUB_SHA::12}"
           tags="$sha"
           if [ "$GITHUB_REF" = "refs/heads/main" ]; then
@@ -133,14 +126,17 @@ jobs:
             tags="$tags $version $GITHUB_REF_NAME latest"
           fi
           {
-            echo "## Workspace image"
+            echo "## ADM role images"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
           for tag in $tags; do
-            docker tag adm-dev:ci "$image:$tag"
-            docker push "$image:$tag"
-            echo "- \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "pushed $image:$tag"
+            for role in adm-control adm-repositories adm-workspace adm-code adm-bot; do
+              image="$repo/$role"
+              docker tag "$role:ci" "$image:$tag"
+              docker push "$image:$tag"
+              echo "- \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "pushed $image:$tag"
+            done
           done
 
   binaries:
@@ -197,12 +193,17 @@ jobs:
         run: |
           set -eu
           version="sha-${GITHUB_SHA::12}"
-          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]'):sha-${GITHUB_SHA::12}"
+          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; fi
           args=""
           if [ "${{ runner.os }}" = Linux ]; then args="--repositories /tmp/adm-repositories"; fi
           node scripts/build-release.mjs \
-            --version "$version" --image "$image" \
+            --version "$version" \
+            --control-image "$image/adm-control:sha-${GITHUB_SHA::12}" \
+            --repositories-image "$image/adm-repositories:sha-${GITHUB_SHA::12}" \
+            --workspace-image "$image/adm-workspace:sha-${GITHUB_SHA::12}" \
+            --code-image "$image/adm-code:sha-${GITHUB_SHA::12}" \
+            --bot-image "$image/adm-bot:sha-${GITHUB_SHA::12}" \
             --adm target/release/adm $args \
             --output "dist/${{ matrix.platform }}"
           cp install.sh "dist/${{ matrix.platform }}/install.sh"
@@ -313,16 +314,20 @@ jobs:
           curl -fsSL https://github.com/${repo}/releases/download/${tag}/install.sh | sh -s -- --version ${tag}
           \`\`\`
 
-          Omit \`--version\` to install or update to the latest successful main release while preserving settings and workspace state. First installation offers \`adm setup\`. The workspace image is linux/amd64.
+          Omit \`--version\` to install or update to the latest successful main release while preserving settings and workspace state. First installation offers \`adm setup\`. ADM publishes separate linux/amd64 images for each role.
 
-          ## Workspace image
+          ## Role images
 
-          \`${image}:${sha_tag}\`
+          - Controller: \`${image}/adm-control:${sha_tag}\`
+          - Repository sidecar: \`${image}/adm-repositories:${sha_tag}\`
+          - Shared workspace base: \`${image}/adm-workspace:${sha_tag}\`
+          - Coding agents: \`${image}/adm-code:${sha_tag}\`
+          - Bots: \`${image}/adm-bot:${sha_tag}\`
 
           linux/amd64.
 
           \`\`\`sh
-          adm create my-project --image ${image}:${sha_tag} --model PROVIDER/MODEL_ID
+          adm create my-project --role coding --image ${image}/adm-code:${sha_tag} --model PROVIDER/MODEL_ID
           \`\`\`
 
           If the GHCR package is private, the cluster needs a pull credential before Kubernetes can fetch it.

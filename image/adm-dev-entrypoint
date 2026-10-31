@@ -8,12 +8,7 @@ if [ "${1:-}" = "--check" ]; then
   test -f /opt/adm/workspace-env.mjs
   test -f /opt/adm/runner.mjs
   test -d /opt/adm/node_modules/@earendil-works/pi-durable
-  test -f /opt/adm/browser.mjs
-  test -x /usr/local/bin/adm-repositories
-  test -x /usr/local/bin/artifact-fs
   test -x /usr/local/bin/adm-init-workspace
-  test -x /usr/local/bin/adm-git-credential
-  test -x /usr/local/lib/adm-repositories/git
   test -x /usr/bin/zsh
   test -f /usr/local/share/adm/zshrc
   test -f /usr/local/share/adm/zsh-identity.zsh
@@ -22,6 +17,10 @@ if [ "${1:-}" = "--check" ]; then
   test "$(getent passwd node | cut -d: -f7)" = /usr/bin/zsh
   grep -q '/usr/local/share/adm/zsh-identity.zsh' /etc/zsh/zshrc
   test -f /opt/adm/oh-my-zsh/oh-my-zsh.sh
+  if [ "${2:-code}" = "code" ]; then
+    test -f /opt/adm/browser.mjs
+    test -x /usr/local/bin/adm-git-credential
+  fi
   exit 0
 fi
 if [ "$#" -gt 0 ]; then

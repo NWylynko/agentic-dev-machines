@@ -39,14 +39,18 @@ fn setup_saves_defaults_used_by_workspace_commands_and_keeps_them_on_rerun() {
     assert_ok(adm(
         root.path(),
         &["setup"],
-        "registry.example/adm:v2\nreplicated-work\nopenai/example-model\nn\nn\n",
+        "registry.example/adm-code:v2\n\nreplicated-work\nopenai/example-model\nn\n",
     ));
     let config_path = root.path().join("config/adm/config.json");
     let configured: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-    assert_eq!(configured["image"], "registry.example/adm:v2");
+    assert_eq!(configured["image"], "registry.example/adm-code:v2");
+    assert_eq!(
+        configured["botImage"],
+        "ghcr.io/nwylynko/agentic-dev-machines/adm-bot:latest"
+    );
     assert_eq!(configured["storageClass"], "replicated-work");
     assert_eq!(configured["model"], "openai/example-model");
-    assert_eq!(configured.as_object().unwrap().len(), 3);
+    assert_eq!(configured.as_object().unwrap().len(), 4);
 
     let output = assert_ok(adm(root.path(), &["manifest", "configured"], ""));
     let manifest: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -61,11 +65,29 @@ fn setup_saves_defaults_used_by_workspace_commands_and_keeps_them_on_rerun() {
         .unwrap();
     assert_eq!(
         deployment["spec"]["template"]["spec"]["containers"][0]["image"],
-        "registry.example/adm:v2"
+        "registry.example/adm-code:v2"
     );
     assert_eq!(claim["spec"]["storageClassName"], "replicated-work");
 
-    assert_ok(adm(root.path(), &["setup"], "\n\n\nn\nn\n"));
+    let bot = assert_ok(adm(
+        root.path(),
+        &["manifest", "configured-bot", "--role", "bot"],
+        "",
+    ));
+    let bot: Value = serde_json::from_slice(&bot.stdout).unwrap();
+    let bot_pod = &bot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"];
+    assert_eq!(
+        bot_pod["containers"][0]["image"],
+        "ghcr.io/nwylynko/agentic-dev-machines/adm-bot:latest"
+    );
+    assert_eq!(bot_pod["containers"].as_array().unwrap().len(), 1);
+
+    assert_ok(adm(root.path(), &["setup"], "\n\n\n\nn\n"));
     let retained: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     assert_eq!(retained, configured);
     assert!(
@@ -81,15 +103,14 @@ fn saved_setup_image_is_preserved_even_if_release_metadata_is_unavailable() {
     assert_ok(adm(
         root.path(),
         &["setup"],
-        "registry.example/kept:v1\n\n\nn\nn\n",
+        "registry.example/kept:v1\n\n\n\nn\n",
     ));
     let runtime = root.path().join("runtime");
     fs::create_dir_all(&runtime).unwrap();
-    fs::write(runtime.join("IMAGE"), "\n").unwrap();
     assert_ok(adm(
         root.path(),
         &["--project-dir", runtime.to_str().unwrap(), "setup"],
-        "\n\n\nn\nn\n",
+        "\n\n\n\nn\n",
     ));
     let configured: Value =
         serde_json::from_slice(&fs::read(root.path().join("config/adm/config.json")).unwrap())
