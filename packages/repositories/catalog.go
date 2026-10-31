@@ -455,9 +455,13 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 	if config.GitWrapper != "" {
 		gitExecutable = config.GitWrapper
 	}
+	gitEnv, err := config.gitEnvironment()
+	if err != nil {
+		return "", err
+	}
 	gitCommand := func(args ...string) *exec.Cmd {
 		command := exec.CommandContext(ctx, gitExecutable, args...)
-		command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		command.Env = gitEnv
 		return command
 	}
 	if repo.UpstreamGitDir != "" {
@@ -490,7 +494,7 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 		args = append(args, "--", repo.Remote, work)
 		output, err := gitCommand(args...).CombinedOutput()
 		if err != nil {
-			return "", fmt.Errorf("lazy Git acquisition failed for %s (configure a scoped credential helper for private repositories): %w: %s", key, err, output)
+			return "", fmt.Errorf("lazy Git acquisition failed for %s (private repositories need the cluster GitHub login: run adm repos login github): %w: %s", key, err, output)
 		}
 		if strings.Contains(string(output), "filtering not recognized by server") {
 			return "", errors.New("upstream does not support partial-clone filtering; refusing an eager clone")
@@ -521,7 +525,10 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 	} else {
 		return "", err
 	}
-	env := append(os.Environ(), "ARTIFACT_FS_ROOT="+state, "GIT_TERMINAL_PROMPT=0")
+	env, err := config.gitEnvironment("ARTIFACT_FS_ROOT=" + state)
+	if err != nil {
+		return "", err
+	}
 	if config.GitWrapper != "" {
 		env = append(env, "PATH="+filepath.Dir(config.GitWrapper)+":"+os.Getenv("PATH"))
 	}

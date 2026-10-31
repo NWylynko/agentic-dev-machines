@@ -826,8 +826,9 @@ fn workspace_status(cli: &Cli, name: &str) -> Result<Value> {
         Ok(providers) => json!(providers),
         Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
     };
+    let github = repos::github_status(cli);
     Ok(
-        json!({"workspace":workspace,"cluster":cluster,"agent":agent,"activity":activity,"providers":providers}),
+        json!({"workspace":workspace,"cluster":cluster,"agent":agent,"activity":activity,"providers":providers,"github":github}),
     )
 }
 
@@ -887,6 +888,9 @@ fn print_status(status: &Value) {
                 println!("{line}");
             }
         }
+    }
+    if status.get("github").is_some() {
+        println!("{}", repos::status_text(&status["github"]));
     }
 }
 

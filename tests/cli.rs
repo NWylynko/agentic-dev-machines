@@ -4052,6 +4052,39 @@ fn repository_sidecar_runs_as_the_development_user_and_catalog_is_the_repos_view
     assert!(command.iter().any(|part| part == "/workspace/.adm/catalog"));
     assert!(command.iter().any(|part| part == "--uid"));
     assert!(command.iter().any(|part| part == "1000"));
+    // The sidecar opens private repositories with the cluster GitHub login,
+    // fetched from the lifecycle controller with the Pod identity (TASK-111).
+    // It is given no Secret and no token value.
+    let sidecar_env = sidecar["env"].as_array().expect("sidecar environment");
+    assert!(sidecar_env.iter().any(|entry| {
+        entry["name"] == "ADM_LIFECYCLE_URL"
+            && entry["value"]
+                .as_str()
+                .is_some_and(|url| url.contains("adm-lifecycle"))
+    }));
+    assert!(
+        sidecar_env
+            .iter()
+            .all(|entry| entry.get("valueFrom").is_none()),
+        "{sidecar_env:?}"
+    );
+    assert!(
+        sidecar["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mount| mount["name"] == "runtime-token"
+                && mount["mountPath"] == "/var/run/secrets/kubernetes.io/serviceaccount"
+                && mount["readOnly"] == true)
+    );
+    assert!(
+        dev["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["name"] != "GH_TOKEN"),
+        "a coding workspace needs no GH_TOKEN Secret"
+    );
     let init = &pod["initContainers"][0];
     assert_eq!(init["command"][0], "/usr/local/bin/adm-init-workspace");
     assert_eq!(init["command"][1], "repositories");

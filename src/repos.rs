@@ -27,7 +27,12 @@ pub fn run(cli: &Cli, action: &ReposAction) -> Result<()> {
         ReposAction::Login { provider } => login(cli, provider.as_deref()),
         ReposAction::Logout { provider } => logout(cli, provider.as_deref()),
         ReposAction::Status => {
-            println!("{}", status_line(cli)?);
+            let github = github_status(cli);
+            println!("{}", status_text(&github));
+            ensure!(
+                github["status"] != "unavailable",
+                "could not read the GitHub login status"
+            );
             Ok(())
         }
     }
@@ -42,17 +47,28 @@ fn pick_provider(provider: Option<&str>) -> Result<&'static str> {
     }
 }
 
+/// The cluster's GitHub login as JSON, for `adm status`; a failure to ask is
+/// reported as `unavailable`, never as "not logged in".
+pub fn github_status(cli: &Cli) -> serde_json::Value {
+    match cli.request_lifecycle("GET", "/v1/repos/status", None) {
+        Ok(status) => status["github"].clone(),
+        Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
+    }
+}
+
 /// One line for `adm repos status` and `adm status`.
-pub fn status_line(cli: &Cli) -> Result<String> {
-    let status = cli.request_lifecycle("GET", "/v1/repos/status", None)?;
-    let github = &status["github"];
-    Ok(match github["status"].as_str() {
+pub fn status_text(github: &serde_json::Value) -> String {
+    match github["status"].as_str() {
         Some("connected") => format!(
             "GitHub: connected as {}",
             github["account"].as_str().unwrap_or("unknown")
         ),
-        _ => "GitHub: not logged in; run adm repos login github".to_owned(),
-    })
+        Some("not_logged_in") => "GitHub: not logged in; run adm repos login github".to_owned(),
+        _ => format!(
+            "GitHub: status unavailable: {}",
+            github["error"].as_str().unwrap_or("unknown error")
+        ),
+    }
 }
 
 fn login(cli: &Cli, provider: Option<&str>) -> Result<()> {

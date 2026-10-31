@@ -32,7 +32,9 @@ type Catalog struct {
 
 type Config struct {
 	State, GitRoot, Views, Mount, Artifact, GitWrapper string
-	UID, GID                                           uint32
+	// Where Git credentials for GitHub come from (TASK-111).
+	LifecycleURL, TokenFile, GitCredentialURL string
+	UID, GID                                  uint32
 }
 
 var namespacePart = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -134,6 +136,9 @@ func run(ctx context.Context, arguments []string) error {
 		flags.StringVar(&config.Mount, "mount", "", "exported catalog mount")
 		flags.StringVar(&config.Artifact, "artifact-fs", "artifact-fs", "pinned ArtifactFS executable")
 		flags.StringVar(&config.GitWrapper, "git-wrapper", "/usr/local/lib/adm-repositories/git", "image-owned no-new-privileges Git wrapper")
+		flags.StringVar(&config.LifecycleURL, "lifecycle-url", os.Getenv("ADM_LIFECYCLE_URL"), "lifecycle controller that hands out the cluster GitHub login")
+		flags.StringVar(&config.TokenFile, "token-file", defaultTokenFile, "projected Pod identity token")
+		flags.StringVar(&config.GitCredentialURL, "git-credential-url", "https://github.com", "the only origin that receives the GitHub token")
 		flags.UintVar(&uid, "uid", 1000, "development user UID")
 		flags.UintVar(&gid, "gid", 1000, "development user GID")
 		if err := flags.Parse(arguments[1:]); err != nil {
@@ -163,6 +168,8 @@ func run(ctx context.Context, arguments []string) error {
 		case failure := <-server.failures:
 			return errors.Join(failure, server.Close())
 		}
+	case "git-credential":
+		return gitCredential(ctx, arguments[1:], os.Stdin, os.Stdout)
 	case "prepare-base":
 		flags := flag.NewFlagSet("prepare-base", flag.ContinueOnError)
 		remote := flags.String("remote", "", "published upstream URL")
