@@ -93,6 +93,10 @@ COPY --from=go-build /go/bin/artifact-fs /usr/local/bin/artifact-fs
 COPY packages/repositories/git /usr/local/lib/adm-repositories/git
 RUN chown root:root /usr/local/bin/adm-repositories /usr/local/bin/artifact-fs /usr/local/lib/adm-repositories/git \
  && chmod 0755 /usr/local/bin/adm-repositories /usr/local/bin/artifact-fs /usr/local/lib/adm-repositories/git
+# The sidecar mounts FUSE as UID/GID 1000 through setuid fusermount3, which needs /etc/mtab
+# (containerd does not create it) and a passwd entry for the mounting user.
+RUN ln -s /proc/self/mounts /etc/mtab \
+ && groupadd --gid 1000 node && useradd --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin node
 
 FROM node:24.18.0-bookworm AS adm-control
 COPY --from=adm-build /src/target/release/adm /usr/local/bin/adm
