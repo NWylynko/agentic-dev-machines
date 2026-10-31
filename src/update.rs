@@ -438,7 +438,8 @@ fn cancel_update_maintenance(cli: &Cli, maintenance_id: &str, expires_at: u64) {
 /// `adm setup` saves the release's own image as an explicit reference, so new
 /// workspaces would keep the setup-time runner forever. A saved image from the
 /// release's repository follows the update; an image from any other repository
-/// is the user's own choice and is kept.
+/// is the user's own choice and is kept. Before TASK-110 every role ran one image
+/// whose repository is the parent of the per-role ones, so it follows too.
 fn advance_saved_release_images(cli: &Cli) -> Result<()> {
     let mut config = setup::read_config()?;
     for (saved, filename) in [
@@ -449,9 +450,13 @@ fn advance_saved_release_images(cli: &Cli) -> Result<()> {
             continue;
         };
         let target_image = packaged_value(cli, filename)?;
-        if saved_image != target_image
-            && image_repository(saved_image) == image_repository(&target_image)
-        {
+        let saved_repository = image_repository(saved_image);
+        let target_repository = image_repository(&target_image);
+        let release_owned = saved_repository == target_repository
+            || target_repository
+                .strip_prefix(saved_repository)
+                .is_some_and(|role| role.starts_with("/adm-"));
+        if saved_image != target_image && release_owned {
             eprintln!("adm: update: new workspaces now use {target_image} (was {saved_image})");
             *saved = Some(target_image);
         }

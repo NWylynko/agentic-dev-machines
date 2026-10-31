@@ -3909,6 +3909,16 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
         })
     };
 
+    // A client set up before TASK-110 saved the single all-in-one image, whose
+    // repository is the parent of the per-role release images.
+    let client_config = fixture.root.path().join("config/adm/config.json");
+    fs::create_dir_all(client_config.parent().unwrap()).unwrap();
+    fs::write(
+        &client_config,
+        r#"{"image":"ghcr.io/example:sha-before-split"}"#,
+    )
+    .unwrap();
+
     let output = run_adm_update_services(&fixture, proxy);
     stop.store(true, Ordering::SeqCst);
     let rejections = runtime.join().unwrap();
@@ -3917,6 +3927,11 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("updated lifecycle API answered"),
         "{report}"
+    );
+    let client: Value = serde_json::from_slice(&fs::read(&client_config).unwrap()).unwrap();
+    assert_eq!(
+        client["image"], "ghcr.io/example/adm-code:v9.9.9",
+        "the pre-split single image follows the update to the coding image: {report}"
     );
     assert_eq!(
         fs::read_to_string(fixture.root.path().join("controller-image")).unwrap(),
