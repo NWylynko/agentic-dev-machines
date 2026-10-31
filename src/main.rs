@@ -18,6 +18,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser
 use serde_json::{Value, json};
 use std::{
     io::{IsTerminal, Read, Write},
+    net::IpAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -143,14 +144,18 @@ pub enum Action {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Forward a development port to this client device.
+    /// Forward a development port to this client while this command runs.
     Port {
         name: String,
         port: u16,
         #[arg(long)]
         local_port: Option<u16>,
+        /// Address to listen on. Defaults to this device's loopback.
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        /// Bind 0.0.0.0 and print every address other devices on this network can open.
+        #[arg(long, conflicts_with = "bind")]
+        lan: bool,
     },
     /// Send work without keeping a terminal attached.
     Prompt {
@@ -1272,18 +1277,14 @@ fn run(cli: &Cli) -> Result<()> {
             port,
             local_port,
             bind,
+            lan,
         } => {
-            anyhow::ensure!(
-                bind == "127.0.0.1" || bind == "::1",
-                "port forwarding must bind to loopback on this client device"
-            );
             let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(workspace.role == "coding", "bots have no development ports");
             workspaces::verify_ownership(cli, &workspace)?;
             let local = local_port.unwrap_or(*port);
-            eprintln!(
-                "Preview: http://{bind}:{local} (available on this client while the port forward is running)"
-            );
+            let bind = if *lan { "0.0.0.0" } else { bind.as_str() };
+            announce_port_forward(bind, local)?;
             let status = cli
                 .kubectl_command()?
                 .args([
@@ -1596,6 +1597,111 @@ fn remove_pod_screenshot(
         "could not remove temporary screenshot from workspace"
     );
     Ok(())
+}
+
+const PORT_FORWARD_WARNING: &str = "Warning: anyone on this network can open this port with no authentication; it closes when this command exits.";
+
+fn announce_port_forward(bind: &str, local: u16) -> Result<()> {
+    if is_loopback_bind(bind) {
+        eprintln!(
+            "Preview: {} (available on this client while the port forward is running)",
+            preview_url(bind, local)
+        );
+        return Ok(());
+    }
+    if is_wildcard_bind(bind) {
+        let urls = reachable_interface_urls(local)?;
+        if urls.is_empty() {
+            eprintln!(
+                "No non-loopback address was found on this machine; the port is bound to {bind}."
+            );
+        } else {
+            for url in urls {
+                eprintln!("{url}");
+            }
+        }
+    } else {
+        eprintln!("{}", preview_url(bind, local));
+    }
+    eprintln!("{PORT_FORWARD_WARNING}");
+    Ok(())
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    matches!(bind, "127.0.0.1" | "::1" | "localhost")
+}
+
+fn is_wildcard_bind(bind: &str) -> bool {
+    matches!(bind, "0.0.0.0" | "::" | "::0")
+}
+
+fn preview_url(bind: &str, local: u16) -> String {
+    if bind.contains(':') {
+        format!("http://[{bind}]:{local}")
+    } else {
+        format!("http://{bind}:{local}")
+    }
+}
+
+fn reachable_interface_urls(local: u16) -> Result<Vec<String>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    let rc = unsafe { libc::getifaddrs(&mut head) };
+    if rc != 0 {
+        anyhow::bail!(
+            "list network interfaces: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut urls = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        let interface = unsafe { &*cursor };
+        if let Some(ip) = sockaddr_ip(interface.ifa_addr)
+            && publishable_address(&ip)
+        {
+            urls.push(preview_url(&ip.to_string(), local));
+        }
+        cursor = interface.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(head) };
+    urls.sort();
+    urls.dedup();
+    Ok(urls)
+}
+
+fn sockaddr_ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
+    if addr.is_null() {
+        return None;
+    }
+    let family = i32::from(unsafe { (*addr).sa_family });
+    if family == libc::AF_INET {
+        let v4 = unsafe { &*(addr.cast::<libc::sockaddr_in>()) };
+        Some(IpAddr::V4(std::net::Ipv4Addr::from(
+            v4.sin_addr.s_addr.to_ne_bytes(),
+        )))
+    } else if family == libc::AF_INET6 {
+        let v6 = unsafe { &*(addr.cast::<libc::sockaddr_in6>()) };
+        Some(IpAddr::V6(std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr)))
+    } else {
+        None
+    }
+}
+
+fn publishable_address(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(address) => {
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_link_local())
+        }
+        IpAddr::V6(address) => {
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_unicast_link_local())
+        }
+    }
 }
 
 fn herdr_partial_success(workspace: &workspaces::Workspace, herdr_space: Option<&str>) -> String {
