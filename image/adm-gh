@@ -1,0 +1,13 @@
+#!/bin/sh
+# Installed as /usr/local/bin/gh, ahead of the real /usr/bin/gh. A workspace
+# GH_TOKEN Secret wins; otherwise gh gets the cluster's GitHub login in its
+# environment for this one process (TASK-111). A missing login prints the
+# reason and still runs gh, whose own error then follows.
+set -u
+if [ -z "${GH_TOKEN:-}" ]; then
+  if token=$("$(dirname "$0")/adm-github-token"); then
+    GH_TOKEN=$token
+    export GH_TOKEN
+  fi
+fi
+exec "${ADM_REAL_GH:-/usr/bin/gh}" "$@"

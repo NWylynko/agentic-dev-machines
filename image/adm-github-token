@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+// Fetch the cluster's GitHub login for this Pod from the lifecycle controller
+// (TASK-111). `adm-github-token` prints the token on stdout; `adm-github-token
+// rejected` tells the controller GitHub refused it (logged, no token sent).
+// The Pod identity is the projected ServiceAccount token, the same one the
+// runner uses; nothing is cached or written to disk here.
+(async () => {
+  const fs = process.getBuiltinModule("node:fs");
+  const base = process.env.ADM_LIFECYCLE_URL;
+  const tokenFile =
+    process.env.ADM_LIFECYCLE_TOKEN_FILE ||
+    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+  const fail = (message) => {
+    process.stderr.write(`adm-github-token: ${message}\n`);
+    process.exit(1);
+  };
+  if (!base)
+    fail("ADM_LIFECYCLE_URL is not set; run adm repos login github, or give this workspace a GH_TOKEN Secret");
+  let identity;
+  try {
+    identity = fs.readFileSync(tokenFile, "utf8").trim();
+  } catch (error) {
+    fail(`cannot read the Pod identity token (${error.code ?? error.message})`);
+  }
+  const rejected = process.argv[2] === "rejected";
+  let response;
+  try {
+    response = await fetch(
+      `${base.replace(/\/$/, "")}/v1/runtime/repos/${rejected ? "rejected" : "token"}`,
+      {
+        method: rejected ? "POST" : "GET",
+        headers: { authorization: `Bearer ${identity}` },
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+  } catch (error) {
+    fail(`cannot reach the lifecycle controller (${error.message}); is the cluster up? GitHub login comes from adm repos login github`);
+  }
+  const value = await response.json().catch(() => ({}));
+  if (!response.ok)
+    fail(value.error?.message ?? `the lifecycle controller answered ${response.status}; run adm repos login github`);
+  if (!rejected) {
+    if (typeof value.token !== "string" || !value.token)
+      fail("the lifecycle controller returned no token; run adm repos login github");
+    process.stdout.write(`${value.token}\n`);
+  }
+})();

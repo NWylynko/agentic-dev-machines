@@ -12,7 +12,7 @@ const absent = (command) => `! command -v ${command} >/dev/null 2>&1`;
 if (role === "adm-repositories") {
   await run(["test -x /usr/local/bin/adm-repositories", "test -x /usr/local/bin/artifact-fs", ...["sudo", "node", "chromium", "gh"].map(absent)].join(" && "));
 } else if (role === "adm-control") {
-  await run(["test -x /usr/local/bin/adm", "test -x /usr/local/bin/kubectl", "test -f /opt/adm/provider-auth.mjs", "test -d /opt/adm/node_modules", absent("chromium"), absent("sudo")].join(" && "));
+  await run(["test -x /usr/local/bin/adm", "test -x /usr/local/bin/kubectl", "test -f /opt/adm/provider-auth.mjs", "test -x /usr/bin/gh", "test -d /opt/adm/node_modules", absent("chromium"), absent("sudo")].join(" && "));
 } else if (role === "adm-code") {
   await execute("docker", ["run", "--rm", image, "/usr/local/bin/adm-dev-entrypoint", "--check"]);
 } else if (role === "adm-bot") {

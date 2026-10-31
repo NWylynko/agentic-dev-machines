@@ -20,6 +20,9 @@ if [ "${1:-}" = "--check" ]; then
   if [ "${2:-code}" = "code" ]; then
     test -f /opt/adm/browser.mjs
     test -x /usr/local/bin/adm-git-credential
+    test -x /usr/local/bin/adm-github-token
+    test "$(command -v gh)" = /usr/local/bin/gh
+    test -x /usr/bin/gh
   fi
   exit 0
 fi

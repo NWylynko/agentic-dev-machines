@@ -77,8 +77,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git chromium na
  && rm /etc/chromium.d/apikeys \
  && rm -rf /var/lib/apt/lists/*
 COPY image/adm-git-credential /usr/local/bin/adm-git-credential
+COPY image/adm-github-token /usr/local/bin/adm-github-token
+# Ahead of /usr/bin/gh on PATH: gives gh the cluster's GitHub login (TASK-111).
+COPY image/adm-gh /usr/local/bin/gh
 COPY image/browser.mjs /opt/adm/browser.mjs
-RUN chmod 0755 /usr/local/bin/adm-git-credential \
+RUN chmod 0755 /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/gh \
  && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential'
 
 FROM adm-workspace AS adm-bot
@@ -94,6 +97,13 @@ RUN chown root:root /usr/local/bin/adm-repositories /usr/local/bin/artifact-fs /
 FROM node:24.18.0-bookworm AS adm-control
 COPY --from=adm-build /src/target/release/adm /usr/local/bin/adm
 COPY --from=kubectl-build /usr/local/bin/kubectl /usr/local/bin/kubectl
+# gh runs `gh auth login --web` for `adm repos login github` (TASK-111).
+RUN install -d -m 0755 /etc/apt/keyrings \
+ && wget -qO /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=js-build /out/provider-auth.mjs /opt/adm/provider-auth.mjs
 COPY --from=js-build /src/node_modules /opt/adm/node_modules
 ENV NODE_PATH=/opt/adm/node_modules
