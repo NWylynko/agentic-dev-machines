@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -141,20 +140,7 @@ func run(ctx context.Context, arguments []string) error {
 		if !filepath.IsAbs(*destination) {
 			return errors.New("base destination must be absolute")
 		}
-		if _, err := os.Lstat(*destination); !os.IsNotExist(err) {
-			return errors.New("immutable base destination already exists or cannot be inspected")
-		}
-		command := exec.CommandContext(ctx, "git", "clone", "--bare", "--single-branch", "--no-tags", "--branch", strings.TrimPrefix(*ref, "refs/heads/"), "--", *remote, *destination)
-		command.Stdout = os.Stdout
-		command.Stderr = os.Stderr
-		if err := command.Run(); err != nil {
-			return fmt.Errorf("published upstream base acquisition failed: %w", err)
-		}
-		if _, err := exec.CommandContext(ctx, "git", "--git-dir", *destination, "config", "gc.auto", "0").Output(); err != nil {
-			return err
-		}
-		fmt.Fprintln(os.Stdout, "Mount this immutable published base read-only at the same path in the sidecar and development containers before selecting upstreamGitDir.")
-		return nil
+		return prepareBase(ctx, *remote, *ref, *destination)
 	default:
 		return fmt.Errorf("unknown repositories command %q", arguments[0])
 	}
