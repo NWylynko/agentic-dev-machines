@@ -36,6 +36,10 @@ type catalogServer struct {
 	closed    bool
 	closeOnce sync.Once
 	failures  chan error
+	// source answers "which repositories are in /repos right now". It is read
+	// on every listing of the root and owner directories, so a repository
+	// registered later appears without restarting the sidecar (TASK-112).
+	source func(context.Context) (Catalog, error)
 }
 
 type repositoryRuntime struct {
@@ -55,16 +59,42 @@ type artifactDaemon struct {
 
 type catalogDirectory struct {
 	fs.Inode
-	server       *catalogServer
-	owner        string
-	owners       map[string][]Repository
-	repositories map[string]Repository
+	server *catalogServer
+	owner  string
 }
 
+// mountCatalog serves a fixed catalog (development and tests).
 func mountCatalog(parent context.Context, config Config, catalog Catalog) (*catalogServer, error) {
 	if err := validateCatalog(catalog); err != nil {
 		return nil, err
 	}
+	return mountSource(parent, config, func(context.Context) (Catalog, error) { return catalog, nil })
+}
+
+// mountRegistry serves the cluster repository registry kept by the lifecycle
+// controller, fetched with the Pod identity each time /repos is listed.
+func mountRegistry(parent context.Context, config Config) (*catalogServer, error) {
+	if config.LifecycleURL == "" {
+		return nil, errors.New("the repository registry needs --lifecycle-url (ADM_LIFECYCLE_URL)")
+	}
+	return mountSource(parent, config, func(ctx context.Context) (Catalog, error) {
+		value, err := lifecycleRequest(ctx, config.LifecycleURL, config.TokenFile, "GET", "/v1/runtime/repos/registry")
+		if err != nil {
+			return Catalog{}, fmt.Errorf("cannot read the repository registry: %w", err)
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return Catalog{}, err
+		}
+		var catalog Catalog
+		if err := json.Unmarshal(encoded, &catalog); err != nil {
+			return Catalog{}, fmt.Errorf("invalid repository registry: %w", err)
+		}
+		return catalog, validateCatalog(catalog)
+	})
+}
+
+func mountSource(parent context.Context, config Config, source func(context.Context) (Catalog, error)) (*catalogServer, error) {
 	paths := []string{config.State, config.GitRoot, config.Views, config.Mount}
 	for i, path := range paths {
 		if !filepath.IsAbs(path) || filepath.Clean(path) == "/" {
@@ -107,11 +137,8 @@ func mountCatalog(parent context.Context, config Config, catalog Catalog) (*cata
 		return nil, fmt.Errorf("repository store already has an owner: %w", err)
 	}
 	ctx, cancel := context.WithCancel(parent)
-	host := &catalogServer{config: config, ctx: ctx, cancel: cancel, lock: lock, repos: map[string]*repositoryRuntime{}, failures: make(chan error, 1)}
-	root := &catalogDirectory{server: host, owners: map[string][]Repository{}}
-	for _, repo := range catalog.Repositories {
-		root.owners[repo.Owner] = append(root.owners[repo.Owner], repo)
-	}
+	host := &catalogServer{config: config, ctx: ctx, cancel: cancel, lock: lock, repos: map[string]*repositoryRuntime{}, failures: make(chan error, 1), source: source}
+	root := &catalogDirectory{server: host}
 	zero := time.Duration(0)
 	host.server, err = fs.Mount(config.Mount, root, &fs.Options{UID: config.UID, GID: config.GID, EntryTimeout: &zero, AttrTimeout: &zero, MountOptions: fuse.MountOptions{FsName: "adm-repositories", Name: "adm-repositories", AllowOther: false, DisableXAttrs: true}})
 	if err != nil {
@@ -159,15 +186,34 @@ func (node *catalogDirectory) Getattr(_ context.Context, _ fs.FileHandle, out *f
 	return 0
 }
 
-func (node *catalogDirectory) Readdir(_ context.Context) (fs.DirStream, syscall.Errno) {
+// owners reads the current catalog grouped by owner. A failure is logged and
+// reported as an I/O error: a stale or empty /repos would hide the cause.
+func (server *catalogServer) owners(ctx context.Context) (map[string][]Repository, syscall.Errno) {
+	catalog, err := server.source(ctx)
+	if err != nil {
+		slog.Error("repository catalog unavailable", "error", err)
+		return nil, syscall.EIO
+	}
+	owners := map[string][]Repository{}
+	for _, repo := range catalog.Repositories {
+		owners[repo.Owner] = append(owners[repo.Owner], repo)
+	}
+	return owners, 0
+}
+
+func (node *catalogDirectory) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	owners, errno := node.server.owners(ctx)
+	if errno != 0 {
+		return nil, errno
+	}
 	entries := []fuse.DirEntry{}
 	if node.owner == "" {
-		for owner := range node.owners {
+		for owner := range owners {
 			entries = append(entries, fuse.DirEntry{Name: owner, Mode: syscall.S_IFDIR})
 		}
 	} else {
-		for name := range node.repositories {
-			entries = append(entries, fuse.DirEntry{Name: name, Mode: syscall.S_IFDIR})
+		for _, repo := range owners[node.owner] {
+			entries = append(entries, fuse.DirEntry{Name: repo.Name, Mode: syscall.S_IFDIR})
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
@@ -175,30 +221,32 @@ func (node *catalogDirectory) Readdir(_ context.Context) (fs.DirStream, syscall.
 }
 
 func (node *catalogDirectory) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	owners, errno := node.server.owners(ctx)
+	if errno != 0 {
+		return nil, errno
+	}
 	if node.owner == "" {
-		repos, exists := node.owners[name]
-		if !exists {
+		if _, exists := owners[name]; !exists {
 			return nil, syscall.ENOENT
 		}
-		child := &catalogDirectory{server: node.server, owner: name, repositories: map[string]Repository{}}
-		for _, repo := range repos {
-			child.repositories[repo.Name] = repo
-		}
+		child := &catalogDirectory{server: node.server, owner: name}
 		out.Mode = syscall.S_IFDIR | 0555
 		out.Uid = node.server.config.UID
 		out.Gid = node.server.config.GID
 		return node.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-owner:"+name, nil)}), 0
 	}
-	repo, exists := node.repositories[name]
-	if !exists {
-		return nil, syscall.ENOENT
+	for _, repo := range owners[node.owner] {
+		if repo.Name != name {
+			continue
+		}
+		// The name is visible before any Git data exists. Acquisition starts from
+		// the first operation that needs the working tree, not from this lookup.
+		out.Mode = syscall.S_IFDIR | 0755
+		out.Uid = node.server.config.UID
+		out.Gid = node.server.config.GID
+		return node.NewInode(ctx, &repositoryView{server: node.server, repo: repo}, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-repository:"+repo.Owner+"/"+repo.Name, nil)}), 0
 	}
-	// The name is visible before any Git data exists. Acquisition starts from
-	// the first operation that needs the working tree, not from this lookup.
-	out.Mode = syscall.S_IFDIR | 0755
-	out.Uid = node.server.config.UID
-	out.Gid = node.server.config.GID
-	return node.NewInode(ctx, &repositoryView{server: node.server, repo: repo}, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-repository:"+repo.Owner+"/"+repo.Name, nil)}), 0
+	return nil, syscall.ENOENT
 }
 
 // repositoryView is the catalog entry for one repository. Listing it does not

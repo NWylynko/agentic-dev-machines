@@ -216,6 +216,13 @@ func TestCatalogValidationRejectsUnsafeNamespaces(t *testing.T) {
 	}
 }
 
+func TestCatalogValidationAcceptsDotGitHubStyleNames(t *testing.T) {
+	repo := Repository{Owner: "example", Name: ".github", Remote: "https://github.com/example/.github.git", Ref: "refs/heads/main"}
+	if err := validateCatalog(Catalog{Repositories: []Repository{repo}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRepositoryRefusesEagerCloningOnRetry(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skip("repository integration requires /dev/fuse")
