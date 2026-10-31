@@ -1459,7 +1459,10 @@ fn is_repos_route(method: &str, path: &str) -> bool {
     }
     match (method, path) {
         ("GET", "/v1/repos/status")
-        | ("POST", "/v1/repos/login" | "/v1/repos/logout" | "/v1/repos/check") => true,
+        | (
+            "POST",
+            "/v1/repos/login" | "/v1/repos/logout" | "/v1/repos/check" | "/v1/repos/create",
+        ) => true,
         _ => path
             .strip_prefix("/v1/repos/login/")
             .is_some_and(|tail| match tail.split_once('/') {

@@ -98,6 +98,16 @@ pub fn register_repository(
     )
 }
 
+/// Creates OWNER/REPO on GitHub as an empty private repository with one
+/// empty commit on main, then registers it (`adm create --new-repo`, TASK-117).
+pub fn create_repository(cli: &Cli, repository: &str) -> Result<serde_json::Value> {
+    cli.request_lifecycle(
+        "POST",
+        "/v1/repos/registry",
+        Some(&json!({"repo":repository,"create":true})),
+    )
+}
+
 fn list_repositories(cli: &Cli, as_json: bool) -> Result<()> {
     let registry = cli.request_lifecycle("GET", "/v1/repos/registry", None)?;
     let github = github_status(cli);

@@ -205,6 +205,10 @@ pub struct CreateOptions {
     /// Clone one public GitHub repository into this workspace.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Create OWNER/REPO on GitHub as an empty private repository with the
+    /// cluster GitHub login, then open the workspace in it like --repo.
+    #[arg(long, value_name = "OWNER/REPO", conflicts_with_all = ["repo", "branch", "base", "no_repositories"])]
+    pub new_repo: Option<String>,
     /// Check out an existing remote branch or create it from the remote default.
     #[arg(long, requires = "repo")]
     pub branch: Option<String>,
@@ -338,22 +342,27 @@ fn parse_credential_env_ref(reference: &str) -> Result<CredentialEnvRef> {
 }
 
 impl CreateOptions {
+    /// The repository this workspace opens: --repo, or the one --new-repo creates.
+    pub fn selected_repo(&self) -> Option<&String> {
+        self.repo.as_ref().or(self.new_repo.as_ref())
+    }
+
     pub fn workspace(&self) -> Result<Workspace> {
         validate_name(&self.name)?;
         validate_repository_selection(
-            self.repo.as_deref(),
+            self.selected_repo().map(String::as_str),
             self.branch.as_deref(),
             self.base.as_deref(),
         )?;
-        if let Some(repository) = &self.repo {
+        if let Some(repository) = self.selected_repo() {
             validate_repository_ref(repository)?;
         }
         ensure!(
-            self.repo.is_none() || !self.no_repositories,
+            self.selected_repo().is_none() || !self.no_repositories,
             "--repo cannot be combined with --no-repositories"
         );
         ensure!(
-            self.repo.is_none() || self.role != "bot",
+            self.selected_repo().is_none() || self.role != "bot",
             "--repo is only supported for coding workspaces"
         );
         ensure!(
@@ -388,7 +397,7 @@ impl CreateOptions {
             }
             None => None,
         };
-        let cwd = self.repo.as_ref().map_or_else(
+        let cwd = self.selected_repo().map_or_else(
             || "/repos".to_owned(),
             |repository| format!("/repos/{repository}"),
         );
@@ -410,9 +419,11 @@ impl CreateOptions {
             memory: self.memory.clone(),
             agent_enabled: true,
             allow_node_local_storage: self.allow_node_local_storage,
-            repositories: !self.no_repositories && self.role == "coding" && self.repo.is_none(),
+            repositories: !self.no_repositories
+                && self.role == "coding"
+                && self.selected_repo().is_none(),
             repository_bases: None,
-            repository: self.repo.clone(),
+            repository: self.selected_repo().cloned(),
             branch: self.branch.clone(),
             base: self.base.clone(),
             cwd,

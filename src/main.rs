@@ -1054,7 +1054,9 @@ fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Action::Create(options) => {
             let workspace = options.workspace()?;
-            if let Some(repository) = &workspace.repository {
+            if let Some(repository) = &options.new_repo {
+                repos::create_repository(cli, repository)?;
+            } else if let Some(repository) = &workspace.repository {
                 repos::register_repository(cli, repository, None)?;
             }
             let operation_id = options

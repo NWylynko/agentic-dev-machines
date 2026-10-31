@@ -275,6 +275,48 @@ export async function createGithubAuthority({
     return { repo: details.full_name, ref: branch };
   }
 
+  // Creates OWNER/REPO as an empty private repository with the cluster login,
+  // on the logged-in account or on an organization (TASK-117).
+  async function createRepository(repo: unknown) {
+    if (typeof repo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(repo))
+      throw new GithubError(400, "INVALID_REQUEST", "repo must be OWNER/REPO");
+    if (!stored) throw new GithubError(409, "GITHUB_NOT_LOGGED_IN", NOT_LOGGED_IN);
+    const [owner, name] = repo.split("/");
+    const api = process.env.ADM_GITHUB_API_URL ?? "https://api.github.com";
+    const own = owner.toLowerCase() === stored.account.toLowerCase();
+    let created: Response;
+    try {
+      created = await fetch(`${api}/${own ? "user/repos" : `orgs/${owner}/repos`}`, {
+        method: "POST",
+        headers: {
+          accept: "application/vnd.github+json",
+          "content-type": "application/json",
+          "user-agent": "adm-lifecycle",
+          authorization: `Bearer ${stored.token}`,
+        },
+        body: JSON.stringify({ name, private: true, auto_init: false }),
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (error) {
+      throw new GithubError(503, "GITHUB_UNAVAILABLE", `could not ask GitHub to create ${repo}: ${error instanceof Error ? error.message : error}`);
+    }
+    const details = (await created.json().catch(() => ({}))) as {
+      full_name?: string;
+      message?: string;
+      errors?: { message?: string }[];
+    };
+    if (created.status === 422 && details.errors?.some((error) => /already exists/.test(error.message ?? "")))
+      throw new GithubError(409, "REPOSITORY_EXISTS", `${repo} already exists on GitHub; use --repo ${repo} to open it`);
+    if (!created.ok || !details.full_name)
+      throw new GithubError(
+        created.status === 404 ? 404 : 502,
+        "REPOSITORY_NOT_CREATED",
+        `GitHub refused to create ${repo} for account ${stored.account} (${created.status}: ${details.message ?? "no message"})`,
+      );
+    log("info", "github_repository_created", { repo: details.full_name, account: stored.account });
+    return { repo: details.full_name, account: stored.account };
+  }
+
   async function handle(
     request: IncomingMessage,
     response: ServerResponse,
@@ -306,6 +348,10 @@ export async function createGithubAuthority({
             ? { status: "connected", account: stored.account, loggedInAt: stored.loggedInAt }
             : { status: "not_logged_in" },
         });
+      if (request.method === "POST" && path === "/v1/repos/create") {
+        const value = await body(request);
+        return send(response, 200, await createRepository(value.repo));
+      }
       if (request.method === "POST" && path === "/v1/repos/check") {
         const value = await body(request);
         return send(response, 200, await checkRepository(value.repo, value.ref));
