@@ -223,7 +223,7 @@ impl WorkspaceStore {
     }
 }
 
-fn repo_body(body: &[u8]) -> Result<(String, Option<String>)> {
+fn repo_body(body: &[u8]) -> Result<(String, Option<String>, bool)> {
     let request: Value = serde_json::from_slice(body).context("registry request must be JSON")?;
     let repo = request["repo"].as_str().context("repo is required")?;
     validate_repository_ref(repo)?;
@@ -231,7 +231,12 @@ fn repo_body(body: &[u8]) -> Result<(String, Option<String>)> {
     if let Some(branch) = &branch {
         validate_registry_branch(branch)?;
     }
-    Ok((repo.to_owned(), branch))
+    let create = request["create"].as_bool().unwrap_or(false);
+    ensure!(
+        !(create && branch.is_some()),
+        "a new repository starts on main; it takes no branch"
+    );
+    Ok((repo.to_owned(), branch, create))
 }
 
 /// Operator routes `/v1/repos/registry...` and the Pod route
@@ -269,7 +274,12 @@ fn list(store: &WorkspaceStore) -> Result<(u16, Value)> {
 }
 
 fn register(store: &mut WorkspaceStore, body: &[u8]) -> Result<(u16, Value)> {
-    let (repo, requested) = repo_body(body)?;
+    let (mut repo, mut requested, create) = repo_body(body)?;
+    // A retried `adm create --new-repo` finds it registered and carries on.
+    if create && store.registered_repository(&repo)?.is_none() {
+        repo = create_github_repository(&repo)?;
+        requested = Some("main".to_owned());
+    }
     if let Some(existing) = store.registered_repository(&repo)? {
         ensure!(
             requested
@@ -371,6 +381,117 @@ pub fn record_opened(store: &mut WorkspaceStore, workspace_id: &str, path: &str)
     Ok(json!({"repo":registered.repo,"workspaceId":workspace_id}))
 }
 
+/// Creates the repository on GitHub with the cluster login and pushes one
+/// empty commit to main, so it has a branch to register and check out while
+/// the checkout holds only `.git` (TASK-117). Returns the canonical name.
+fn create_github_repository(repo: &str) -> Result<String> {
+    let (status, created) = crate::lifecycle::proxy_provider_auth(
+        "POST",
+        "/v1/repos/create",
+        &serde_json::to_vec(&json!({"repo":repo}))?,
+    )?;
+    if status != 200 {
+        bail!(
+            "{}",
+            created["error"]["message"]
+                .as_str()
+                .unwrap_or("GitHub did not create the repository")
+        );
+    }
+    let canonical = created["repo"]
+        .as_str()
+        .context("create returned no repo")?;
+    validate_repository_ref(canonical)?;
+    let account = created["account"]
+        .as_str()
+        .context("create returned no account")?;
+    let token = github_token()?;
+    let scratch = std::env::temp_dir().join(format!("adm-new-repo-{}", uuid::Uuid::new_v4()));
+    let scratch_path = scratch.to_str().context("temp path is not UTF-8")?;
+    let author = format!("user.email={account}@users.noreply.github.com");
+    let name = format!("user.name={account}");
+    let pushed = github_git(
+        &token,
+        &["init", "--quiet", "--initial-branch=main", scratch_path],
+    )
+    .and_then(|()| {
+        github_git(
+            &token,
+            &[
+                "-C",
+                scratch_path,
+                "-c",
+                &name,
+                "-c",
+                &author,
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "Initial commit",
+            ],
+        )
+    })
+    .and_then(|()| {
+        github_git(
+            &token,
+            &[
+                "-C",
+                scratch_path,
+                "push",
+                "--quiet",
+                &format!("https://github.com/{canonical}.git"),
+                "main",
+            ],
+        )
+    });
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch)?;
+    }
+    pushed.with_context(|| format!("{canonical} was created on GitHub but its first commit was not pushed; run adm create with --repo {canonical} after pushing a commit"))?;
+    eprintln!("adm repository created {canonical} on GitHub for {account}");
+    Ok(canonical.to_owned())
+}
+
+/// The cluster GitHub token, or None when not logged in (public repos only).
+fn github_token() -> Result<Option<String>> {
+    let (status, login) =
+        crate::lifecycle::proxy_provider_auth("GET", "/v1/runtime/repos/token", b"")?;
+    match status {
+        200 => Ok(Some(
+            login["token"]
+                .as_str()
+                .context("GitHub login has no token")?
+                .to_owned(),
+        )),
+        409 => Ok(None),
+        _ => bail!("cannot read the cluster GitHub login ({status}): {login}"),
+    }
+}
+
+/// Runs git with the cluster GitHub token offered to github.com only. `-c`
+/// rather than `GIT_CONFIG_*`, so an operator's or test's git env still applies.
+fn github_git(token: &Option<String>, args: &[&str]) -> Result<()> {
+    let mut command = Command::new("git");
+    command.env("GIT_TERMINAL_PROMPT", "0").args([
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.https://github.com.helper=!f() { test \"$1\" = get && echo username=x-access-token && echo \"password=$ADM_GITHUB_TOKEN\"; }; f",
+    ]);
+    if let Some(token) = token {
+        command.env("ADM_GITHUB_TOKEN", token);
+    }
+    let output = command.args(args).output().context("run git")?;
+    ensure!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
 /// The lifecycle's writable view of the bases volume.
 fn repository_bases_dir() -> Result<PathBuf> {
     let dir = std::env::var_os("ADM_REPOSITORY_BASES")
@@ -391,38 +512,9 @@ pub fn prepare_repository_base(repo: &str, branch: &str) -> Result<()> {
     let remote = format!("https://github.com/{repo}.git");
     let reference = format!("refs/heads/{branch}");
     // Private repositories need the cluster GitHub login; public ones do not.
-    let (status, login) =
-        crate::lifecycle::proxy_provider_auth("GET", "/v1/runtime/repos/token", b"")?;
-    let token = match status {
-        200 => Some(
-            login["token"]
-                .as_str()
-                .context("GitHub login has no token")?
-                .to_owned(),
-        ),
-        409 => None,
-        _ => bail!("cannot read the cluster GitHub login ({status}): {login}"),
-    };
-    let git = |args: &[&str]| -> Result<()> {
-        let mut command = Command::new("git");
-        command.env("GIT_TERMINAL_PROMPT", "0").args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.https://github.com.helper=!f() { test \"$1\" = get && echo username=x-access-token && echo \"password=$ADM_GITHUB_TOKEN\"; }; f",
-        ]);
-        if let Some(token) = &token {
-            command.env("ADM_GITHUB_TOKEN", token);
-        }
-        let output = command.args(args).output().context("run git")?;
-        ensure!(
-            output.status.success(),
-            "git {} for the shared base of {repo} failed: {}",
-            args.first().copied().unwrap_or_default(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        Ok(())
-    };
+    let token = github_token()?;
+    let git =
+        |args: &[&str]| github_git(&token, args).with_context(|| format!("shared base of {repo}"));
     if destination.exists() {
         let path = destination.to_str().context("base path is not UTF-8")?;
         git(&[

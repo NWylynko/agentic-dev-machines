@@ -315,3 +315,84 @@ test(
     );
   },
 );
+
+test(
+  "creating a new repository makes it private with the cluster login, on the user or the organization, and refuses names that exist",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-github-create-"));
+    const created = [];
+    // A GitHub API stand-in where nwylynko/taken already exists.
+    const github = createServer(async (request, response) => {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : {};
+      const reply = (status, value) => {
+        response.writeHead(status, { "content-type": "application/json" });
+        response.end(JSON.stringify(value));
+      };
+      if (request.headers.authorization !== "Bearer gho_CREATEsecret001") return reply(401, { message: "Bad credentials" });
+      const owner = request.url === "/user/repos" ? "nwylynko" : /^\/orgs\/([^/]+)\/repos$/.exec(request.url)?.[1];
+      if (request.method !== "POST" || !owner) return reply(404, { message: "Not Found" });
+      if (`${owner}/${body.name}` === "nwylynko/taken")
+        return reply(422, { message: "Repository creation failed.", errors: [{ message: "name already exists on this account" }] });
+      created.push({ url: request.url, ...body });
+      reply(201, { full_name: `${owner}/${body.name}`, private: body.private });
+    });
+    github.listen(0, "127.0.0.1");
+    await once(github, "listening");
+    process.env.ADM_GITHUB_API_URL = `http://127.0.0.1:${github.address().port}`;
+    await mkdir(join(directory, "authority"), { recursive: true });
+    const logs = [];
+    const start = async () => {
+      const authority = await createProviderAuthAuthority({
+        authPath: join(directory, "authority", "auth.json"),
+        log: (line) => logs.push(line),
+      });
+      await new Promise((resolve) => authority.server.listen(0, "127.0.0.1", resolve));
+      return authority;
+    };
+    let authority = await start();
+    t.after(async () => {
+      delete process.env.ADM_GITHUB_API_URL;
+      await authority.close();
+      github.close();
+      await rm(directory, { recursive: true });
+    });
+    const create = async (repo) => {
+      const response = await fetch(`http://127.0.0.1:${authority.server.address().port}/v1/repos/create`, {
+        method: "POST",
+        body: JSON.stringify({ repo }),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    // Creating needs the cluster login.
+    const noLogin = await create("nwylynko/fresh");
+    assert.equal(noLogin.status, 409);
+    assert.match(noLogin.body.error.message, /adm repos login github/);
+
+    await writeFile(
+      join(directory, "authority", "github.json"),
+      JSON.stringify({ token: "gho_CREATEsecret001", account: "nwylynko", loggedInAt: "2026-10-31T00:00:00Z" }),
+      { mode: 0o600 },
+    );
+    await authority.close();
+    authority = await start();
+
+    // The logged-in account's own repository, and an organization's.
+    assert.deepEqual(await create("NWylynko/fresh"), { status: 200, body: { repo: "nwylynko/fresh", account: "nwylynko" } });
+    assert.deepEqual(await create("example-org/tool"), { status: 200, body: { repo: "example-org/tool", account: "nwylynko" } });
+    assert.deepEqual(created, [
+      { url: "/user/repos", name: "fresh", private: true, auto_init: false },
+      { url: "/orgs/example-org/repos", name: "tool", private: true, auto_init: false },
+    ]);
+
+    // A name that exists says so and points at --repo.
+    const taken = await create("nwylynko/taken");
+    assert.equal(taken.status, 409);
+    assert.equal(taken.body.error.code, "REPOSITORY_EXISTS");
+    assert.match(taken.body.error.message, /nwylynko\/taken already exists on GitHub; use --repo nwylynko\/taken/);
+    assert.equal(JSON.stringify([taken.body, logs]).includes("gho_CREATEsecret001"), false);
+  },
+);

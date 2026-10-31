@@ -193,7 +193,9 @@ fn install_terminal_fixture(root: &Path) -> PathBuf {
     project
 }
 
-fn start_runner_stub() -> (String, u16, std::thread::JoinHandle<()>) {
+/// `upstreams` is the fake github.com: `POST /v1/repos/create` makes an empty
+/// bare repository there (TASK-117).
+fn start_runner_stub(upstreams: PathBuf) -> (String, u16, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
@@ -245,6 +247,30 @@ fn start_runner_stub() -> (String, u16, std::thread::JoinHandle<()>) {
                     r#"{"error":{"code":"GITHUB_NOT_LOGGED_IN","message":"not logged in"}}"#
                         .to_owned(),
                 )
+            } else if first_line.starts_with("POST /v1/repos/create ") {
+                let request_body: Value =
+                    serde_json::from_slice(&request[header_end..]).unwrap_or(Value::Null);
+                let repo = request_body["repo"].as_str().unwrap_or("").to_owned();
+                let bare = upstreams.join(format!("{repo}.git"));
+                if bare.exists() {
+                    (
+                        "409 Conflict",
+                        serde_json::json!({"error":{"code":"REPOSITORY_EXISTS","message":format!("{repo} already exists on GitHub; use --repo {repo} to open it")}}).to_string(),
+                    )
+                } else {
+                    fs::create_dir_all(&bare).unwrap();
+                    let status = Command::new("git")
+                        // GitHub makes the first branch pushed the default.
+                        .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+                        .arg(&bare)
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                    (
+                        "200 OK",
+                        serde_json::json!({"repo":repo,"account":"nwylynko"}).to_string(),
+                    )
+                }
             } else if first_line.starts_with("POST /v1/repos/check ") {
                 let request_body: Value =
                     serde_json::from_slice(&request[header_end..]).unwrap_or(Value::Null);
@@ -466,7 +492,8 @@ fn fixture_with_runner(runner_override: Option<&str>) -> TestFixture {
     let mut permissions = fs::metadata(&herdr).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&herdr, permissions).unwrap();
-    let (default_runner_url, runner_port, runner) = start_runner_stub();
+    let (default_runner_url, runner_port, runner) =
+        start_runner_stub(root.path().join("upstreams"));
     let runner_url = runner_override.unwrap_or(&default_runner_url);
     fs::write(root.path().join("runner-url"), runner_url).unwrap();
     let kubectl = root.path().join("kubectl");
@@ -5067,4 +5094,97 @@ fn repositories_from_workspaces_created_with_the_old_catalog_flag_join_the_regis
     );
     let listed = assert_ok(adm(root.path(), &["repos", "list", "--json"]));
     assert_eq!(listed["repositories"][0]["branch"], "trunk");
+}
+
+#[test]
+fn create_with_new_repo_makes_an_empty_private_repository_and_opens_the_workspace_in_it() {
+    let root = fixture();
+    let upstreams = root.path().join("upstreams");
+    fs::create_dir_all(&upstreams).unwrap();
+    // The workspace Pod's checkout clones from the fake github.com too.
+    fs::write(
+        root.path().join("git-rewrite"),
+        format!("url.file://{}/.insteadOf", upstreams.display()),
+    )
+    .unwrap();
+    let created = assert_ok(adm(
+        root.path(),
+        &["create", "fresh-app", "--new-repo", "owner/fresh"],
+    ));
+    // GitHub has the repository with one empty commit on main.
+    let bare = upstreams.join("owner/fresh.git");
+    let git_dir = bare.to_str().unwrap();
+    assert_eq!(
+        repository_git(
+            root.path(),
+            &[
+                "--git-dir",
+                git_dir,
+                "rev-list",
+                "--count",
+                "refs/heads/main"
+            ]
+        ),
+        "1"
+    );
+    assert_eq!(
+        repository_git(
+            root.path(),
+            &["--git-dir", git_dir, "ls-tree", "-r", "refs/heads/main"]
+        ),
+        ""
+    );
+    assert_eq!(registered_repositories(root.path()), ["owner/fresh"]);
+    assert_eq!(created["repository"], "owner/fresh");
+    assert_eq!(created["cwd"], "/repos/owner/fresh");
+    // The checkout holds only .git, so `npx create-next-app .` accepts it.
+    let checkout = root
+        .path()
+        .join("pv")
+        .join(created["namespace"].as_str().unwrap())
+        .join("repos/owner/fresh");
+    let entries: Vec<_> = fs::read_dir(&checkout)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(entries, [".git"]);
+    assert_eq!(
+        repository_git(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main"
+    );
+
+    // Retrying with the repository already registered carries on.
+    assert_ok(adm(
+        root.path(),
+        &["create", "fresh-app-retry", "--new-repo", "owner/fresh"],
+    ));
+    // A repository that exists on GitHub but is not registered points at --repo.
+    fake_github_repository(root.path(), "owner/existing", &["trunk"]);
+    let existing = adm(
+        root.path(),
+        &["create", "not-new", "--new-repo", "owner/existing"],
+    );
+    assert!(!existing.status.success());
+    let stderr = String::from_utf8_lossy(&existing.stderr);
+    assert!(
+        stderr.contains("owner/existing already exists on GitHub; use --repo owner/existing"),
+        "{stderr}"
+    );
+    assert!(
+        !registered_repositories(root.path()).contains(&"owner/existing".to_owned()),
+        "nothing is registered when the create is refused"
+    );
+    let conflicting = adm(
+        root.path(),
+        &[
+            "create",
+            "both",
+            "--new-repo",
+            "owner/a",
+            "--repo",
+            "owner/a",
+        ],
+    );
+    assert!(!conflicting.status.success());
+    assert!(String::from_utf8_lossy(&conflicting.stderr).contains("cannot be used with"));
 }
