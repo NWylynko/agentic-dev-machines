@@ -32,19 +32,19 @@ if (
 const platform = `${platformName}-${process.arch === "x64" ? "amd64" : "arm64"}`;
 const { values } = parseArgs({
   options: Object.fromEntries(
-    ["version", "image", "adm", "repositories", "output"].map((name) => [
+    ["version", "control-image", "repositories-image", "workspace-image", "code-image", "bot-image", "adm", "repositories", "output"].map((name) => [
       name,
       { type: "string" },
     ]),
   ),
 });
-for (const name of ["version", "image", "adm", "output"]) {
+for (const name of ["version", "control-image", "repositories-image", "workspace-image", "code-image", "bot-image", "adm", "output"]) {
   if (!values[name]) throw new Error(`--${name} is required`);
 }
 if (!/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(values.version))
   throw new Error("--version must be a release tag or build identifier");
-if (/\s/.test(values.image))
-  throw new Error("--image must be a single image reference");
+for (const name of ["control-image", "repositories-image", "workspace-image", "code-image", "bot-image"])
+  if (/\s/.test(values[name])) throw new Error(`--${name} must be a single image reference`);
 const output = resolve(values.output);
 const staging = await mkdtemp(join(tmpdir(), "adm-release-"));
 try {
@@ -93,7 +93,7 @@ try {
     ...lifecyclePod.initContainers,
     ...lifecyclePod.containers,
   ]) {
-    container.image = values.image;
+    container.image = values["control-image"];
   }
   await writeFile(
     join(lifecycleDirectory, "control-plane.yaml"),
@@ -137,7 +137,13 @@ try {
     { cwd: project, maxBuffer: 1024 * 1024 },
   );
   await writeFile(join(staging, "VERSION"), values.version + "\n");
-  await writeFile(join(staging, "IMAGE"), values.image + "\n");
+  for (const [filename, option] of [
+    ["CONTROL_IMAGE", "control-image"],
+    ["REPOSITORIES_IMAGE", "repositories-image"],
+    ["WORKSPACE_IMAGE", "workspace-image"],
+    ["CODE_IMAGE", "code-image"],
+    ["BOT_IMAGE", "bot-image"],
+  ]) await writeFile(join(staging, filename), values[option] + "\n");
   await mkdir(output, { recursive: true });
   const archive = `adm-${platform}.tar.gz`;
   await execute("tar", ["-czf", join(output, archive), "-C", staging, "."]);

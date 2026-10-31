@@ -128,7 +128,7 @@ bundle=$temporary/bundle
 for binary in $binaries; do
   [ -f "$bundle/bin/$binary" ] && [ -x "$bundle/bin/$binary" ] || fail "release is missing executable bin/$binary"
 done
-for path in runtime/runner.mjs runtime/terminal.mjs package.json VERSION IMAGE; do
+for path in runtime/runner.mjs runtime/terminal.mjs package.json VERSION CONTROL_IMAGE REPOSITORIES_IMAGE WORKSPACE_IMAGE CODE_IMAGE BOT_IMAGE; do
   [ -f "$bundle/$path" ] || fail "release is missing $path"
 done
 [ -d "$bundle/node_modules" ] || fail 'release is missing node_modules'
@@ -149,7 +149,7 @@ function validateLinks(directory) {
 validateLinks(root);
 if (JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).type !== 'module')
   throw new Error('release package.json must declare type module');
-for (const name of ['VERSION', 'IMAGE']) {
+for (const name of ['VERSION', 'CONTROL_IMAGE', 'REPOSITORIES_IMAGE', 'WORKSPACE_IMAGE', 'CODE_IMAGE', 'BOT_IMAGE']) {
   const value = fs.readFileSync(path.join(root, name), 'utf8').trim();
   if (!value || /\s/.test(value)) throw new Error(`invalid release ${name}`);
 }

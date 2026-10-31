@@ -102,7 +102,7 @@ Branch validation and checkout happen inside the owning Pod, in staging before t
 
 Use `adm shell NAME --manage` when you also need the current agent controls from inside that shell. The private `adm` client supports `adm status [--json]`, `adm history [--after N] [--limit N]`, `adm prompt MESSAGE`, `adm abort [--background]`, and `adm help`. History defaults to 200 entries; its response limit is 1 MiB, so use a smaller `--limit` if it reports an oversized response. It can address only the workspace selected on the management host; workspace IDs, host state, credentials, and the runner URL are not passed into the development container. Same-workspace processes can use the allowed actions while the managed session is open. Closing the shell closes the temporary management relay and leaves the agent running. The ordinary `adm shell NAME` path does not start a relay. Use the management host for `adm list`, creation/deletion, port forwarding, `exec`, and other workspace operations.
 
-The workspace image includes `nano`, GitHub CLI (`gh`), and passwordless `sudo`. `gh` comes from GitHub's signed Debian repository and takes the current stable package when the image is built; an existing image stays at that package version until rebuilt. Git's credential helper uses only an explicit `GH_TOKEN` supplied to that workspace. It applies to HTTPS remotes on `github.com`; Git author identity remains the repository's separate `user.name` and `user.email` settings. The helper does not save credentials in Git or `gh` config, and it does not send the token to other hosts.
+Coding workspaces use `adm-code`, which includes `nano`, GitHub CLI (`gh`), Chromium, and passwordless `sudo`. Bots use `adm-bot`, which carries the durable runtime and shell without coding tools. Custom agent images should extend `adm-code` or `adm-bot` for their selected role. The privileged `adm-repositories` sidecar has its own image with filesystem and Git dependencies. `adm-control` carries the lifecycle controller and provider-auth authority. Setup stores a default image for coding and bot workspaces; a custom `--image` requires an explicit `--role` and changes the agent container only. `gh` comes from GitHub's signed Debian repository and takes the current stable package when the image is built; an existing image stays at that package version until rebuilt. Git's credential helper uses only an explicit `GH_TOKEN` supplied to a coding workspace. It applies to HTTPS remotes on `github.com`; Git author identity remains the repository's separate `user.name` and `user.email` settings. The helper does not save credentials in Git or `gh` config, and it does not send the token to other hosts.
 
 Provision a fine-grained token through the selected secret manager, limited to the repository or repositories the workspace needs and with repository `Contents: read and write` permission for pushes. Have the cluster's secret controller create a key such as `token` in the workspace's own namespace, then select that key when creating the workspace:
 
@@ -266,7 +266,8 @@ npm run test:publish
 cargo build --bin adm
 npm run test:release
 npm run test:repositories
-npm run test:image -- adm-dev:0.1.0
+npm run test:image -- ghcr.io/nwylynko/agentic-dev-machines/adm-code:latest adm-code
+npm run test:image -- ghcr.io/nwylynko/agentic-dev-machines/adm-repositories:latest adm-repositories
 ```
 
 The CLI tests need Python 3, Node.js, and zsh on the test host: their Pod fixtures execute the real workspace shell arguments locally. The Node tests use real HTTP/SSE, SQLite, subprocess kills/restarts, a terminal PTY, and Chromium. They need permission to open loopback sockets and run a browser. The Go filesystem tests need `/dev/fuse`, FUSE mount permission, and the pinned `artifact-fs` binary on PATH. Install that pin with `go install github.com/cloudflare/artifact-fs/cmd/artifact-fs@$(cat packages/repositories/ARTIFACTFS)`. A missing FUSE device produces an explicit skip; a missing binary with FUSE available fails.
@@ -283,7 +284,7 @@ The full opt-in cluster suite creates coding workspaces, checks normal Git and u
 
 ```sh
 cargo build
-ADM_LIVE_CLUSTER=1 ADM_LIFECYCLE_URL=http://127.0.0.1:7433 ADM_LIFECYCLE_TOKEN_FILE=/secure/path/lifecycle-token ADM_LIVE_IMAGE=adm-dev:0.1.0 npm run test:cluster
+ADM_LIVE_CLUSTER=1 ADM_LIFECYCLE_URL=http://127.0.0.1:7433 ADM_LIFECYCLE_TOKEN_FILE=/secure/path/lifecycle-token ADM_LIVE_IMAGE=ghcr.io/nwylynko/agentic-dev-machines/adm-code:latest npm run test:cluster
 ```
 
 The suite checks that this image is present on every schedulable node before creating anything. Ordinary `npm test` does not mutate the cluster. Passing the local-path experiment does not prove cross-node storage durability, a sudden-node-failure loss window, live account refresh, or connectivity from client laptops.

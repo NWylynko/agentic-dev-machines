@@ -409,7 +409,9 @@ elif args[0] == 'apply':
     if doc.get('kind') == 'Namespace' and doc['metadata']['name'] == 'adm-system': sys.exit(0)
     controller=[item for item in doc.get('items',[]) if item['kind']=='Deployment' and item['metadata']['name']=='adm-lifecycle']
     if controller:
-        with locked(): put(root/'controller-image', controller[0]['spec']['template']['spec']['containers'][0]['image'])
+        with locked():
+            put(root/'controller-image', controller[0]['spec']['template']['spec']['containers'][0]['image'])
+            put(root/'controller-manifest.json', json.dumps(controller[0]))
         sys.exit(0)
     with locked():
         state=load_state()
@@ -3730,7 +3732,19 @@ fn run_adm_update_services(fixture: &MaintenanceFixture, proxy: u16) -> std::pro
     let release = root.join("release");
     fs::create_dir_all(&release).unwrap();
     fs::write(release.join("VERSION"), "v9.9.9\n").unwrap();
-    fs::write(release.join("IMAGE"), "ghcr.io/example/adm:v9.9.9\n").unwrap();
+    for (name, image) in [
+        ("CONTROL_IMAGE", "adm-control"),
+        ("REPOSITORIES_IMAGE", "adm-repositories"),
+        ("WORKSPACE_IMAGE", "adm-workspace"),
+        ("CODE_IMAGE", "adm-code"),
+        ("BOT_IMAGE", "adm-bot"),
+    ] {
+        fs::write(
+            release.join(name),
+            format!("ghcr.io/example/{image}:v9.9.9\n"),
+        )
+        .unwrap();
+    }
     fs::write(root.join("kubeconfig"), "").unwrap();
     Command::new(env!("CARGO_BIN_EXE_adm"))
         .env_clear()
@@ -3786,9 +3800,12 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
     let fixture = start_maintenance_fixture();
     let proxy = start_lifecycle_proxy(fixture.root.path(), fixture.port);
     let (workspace_id, pod_uid, lease) = fixture.leased_workspace("through-update");
+    let (_, workspace_before_update) =
+        fixture.admin("GET", &format!("/v1/workspaces/{workspace_id}"), None);
     // The workspace runtime renews and acks directly against the lifecycle
     // Service, like the runner (its connection is not the client's forward).
     let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let runtime_workspace_id = workspace_id.clone();
     let runtime = {
         let stop = stop.clone();
         let url = fixture.url.clone();
@@ -3796,7 +3813,7 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
         thread::spawn(move || {
             let mut rejections = Vec::new();
             while !stop.load(Ordering::SeqCst) {
-                let path = format!("/v1/workspaces/{workspace_id}/runtime/lease/renew");
+                let path = format!("/v1/workspaces/{runtime_workspace_id}/runtime/lease/renew");
                 let renewed = request_with_token(
                     &url,
                     "POST",
@@ -3816,7 +3833,7 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
                 let renewed: Value = renewed.json().unwrap();
                 if let Some(maintenance_id) = renewed["maintenanceId"].as_str() {
                     let ack = json!({"holder":lease_body["holder"],"fencingToken":lease_body["fencingToken"],"maintenanceId":maintenance_id,"expiresAt":renewed["expiresAt"]});
-                    let path = format!("/v1/workspaces/{workspace_id}/runtime/lease/ack");
+                    let path = format!("/v1/workspaces/{runtime_workspace_id}/runtime/lease/ack");
                     let acked =
                         request_with_token(&url, "POST", &path, Some(&ack), Some("runtime-token"))
                             .unwrap();
@@ -3846,7 +3863,29 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
     );
     assert_eq!(
         fs::read_to_string(fixture.root.path().join("controller-image")).unwrap(),
-        "ghcr.io/example/adm:v9.9.9"
+        "ghcr.io/example/adm-control:v9.9.9"
+    );
+    let controller: Value = serde_json::from_slice(
+        &fs::read(fixture.root.path().join("controller-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let pod = &controller["spec"]["template"]["spec"];
+    assert_eq!(
+        pod["initContainers"][0]["image"],
+        "ghcr.io/example/adm-control:v9.9.9"
+    );
+    assert!(
+        pod["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|container| { container["image"] == "ghcr.io/example/adm-control:v9.9.9" })
+    );
+    let (_, workspace_after_update) =
+        fixture.admin("GET", &format!("/v1/workspaces/{workspace_id}"), None);
+    assert_eq!(
+        workspace_after_update["image"], workspace_before_update["image"],
+        "controller updates leave current workspaces on their existing image"
     );
     assert_eq!(
         open_maintenance_windows(&fixture),

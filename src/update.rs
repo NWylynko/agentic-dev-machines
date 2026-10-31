@@ -14,6 +14,13 @@ const MAINTENANCE_SECONDS: u64 = 300;
 const UPDATED_LIFECYCLE_WAIT: Duration = Duration::from_secs(60);
 const UPDATED_LIFECYCLE_RETRY: Duration = Duration::from_secs(1);
 
+struct WorkspaceImages {
+    code: String,
+    bot: String,
+    workspace: String,
+    repositories: String,
+}
+
 pub fn run(
     cli: &Cli,
     version: Option<&str>,
@@ -158,7 +165,7 @@ fn installed_version(managed_command: &std::path::Path) -> Result<String> {
 pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str>) -> Result<()> {
     validate_selection(selected, operation_id)?;
     let target_version = packaged_value(cli, "VERSION")?;
-    let target_image = packaged_value(cli, "IMAGE")?;
+    let target_image = packaged_value(cli, "CONTROL_IMAGE")?;
     ensure!(
         cli.lifecycle_namespace == "adm-system",
         "automatic controller updates require lifecycle namespace adm-system; install a custom control plane manually"
@@ -214,15 +221,15 @@ pub fn update_services(cli: &Cli, selected: &[String], operation_id: Option<&str
             return Err(error);
         }
     };
-    advance_saved_release_image(&target_image)?;
+    advance_saved_release_images(cli)?;
     if !selected.is_empty() {
-        upgrade_selected(
-            &connected,
-            selected,
-            &target_image,
-            &target_version,
-            operation_id,
-        )?;
+        let images = WorkspaceImages {
+            code: packaged_value(cli, "CODE_IMAGE")?,
+            bot: packaged_value(cli, "BOT_IMAGE")?,
+            workspace: packaged_value(cli, "WORKSPACE_IMAGE")?,
+            repositories: packaged_value(cli, "REPOSITORIES_IMAGE")?,
+        };
+        upgrade_selected(&connected, selected, &images, &target_version, operation_id)?;
     }
     drop(connection);
     Ok(())
@@ -432,16 +439,23 @@ fn cancel_update_maintenance(cli: &Cli, maintenance_id: &str, expires_at: u64) {
 /// workspaces would keep the setup-time runner forever. A saved image from the
 /// release's repository follows the update; an image from any other repository
 /// is the user's own choice and is kept.
-fn advance_saved_release_image(target_image: &str) -> Result<()> {
+fn advance_saved_release_images(cli: &Cli) -> Result<()> {
     let mut config = setup::read_config()?;
-    let Some(saved) = config.image.as_deref() else {
-        return Ok(());
-    };
-    if saved == target_image || image_repository(saved) != image_repository(target_image) {
-        return Ok(());
+    for (saved, filename) in [
+        (&mut config.image, "CODE_IMAGE"),
+        (&mut config.bot_image, "BOT_IMAGE"),
+    ] {
+        let Some(saved_image) = saved.as_deref() else {
+            continue;
+        };
+        let target_image = packaged_value(cli, filename)?;
+        if saved_image != target_image
+            && image_repository(saved_image) == image_repository(&target_image)
+        {
+            eprintln!("adm: update: new workspaces now use {target_image} (was {saved_image})");
+            *saved = Some(target_image);
+        }
     }
-    eprintln!("adm: update: new workspaces now use {target_image} (was {saved})");
-    config.image = Some(target_image.to_owned());
     setup::save_config(&config).context("save the updated workspace image default")?;
     Ok(())
 }
@@ -575,7 +589,7 @@ fn controller_storage_class(cli: &Cli) -> Result<String> {
 fn upgrade_selected(
     cli: &Cli,
     names: &[String],
-    image: &str,
+    images: &WorkspaceImages,
     version: &str,
     operation_id: Option<&str>,
 ) -> Result<()> {
@@ -587,8 +601,8 @@ fn upgrade_selected(
             workspace.name
         );
         eprintln!(
-            "adm: update: selected workspace {} ({}) will be interrupted while image {} is applied; identity, repository files, and agent history remain on its existing workspace volume",
-            workspace.name, workspace.id, image
+            "adm: update: selected workspace {} ({}) will be interrupted while its role image is applied; identity, repository files, and agent history remain on its existing workspace volume",
+            workspace.name, workspace.id
         );
         let operation_id = operation_id
             .filter(|_| index == 0)
@@ -605,7 +619,14 @@ fn upgrade_selected(
                 lifecycle::OperationRequest::Update {
                     operation_id,
                     workspace_id: workspace.id.clone(),
-                    image: image.to_owned(),
+                    image: if workspace.role == "bot" {
+                        &images.bot
+                    } else {
+                        &images.code
+                    }
+                    .to_owned(),
+                    workspace_image: Some(images.workspace.clone()),
+                    repositories_image: Some(images.repositories.clone()),
                 },
             )?),
         )?;

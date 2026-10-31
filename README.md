@@ -12,7 +12,7 @@ Run on a macOS or Linux client with Node.js 24+ installed. Supported clients are
 curl -fsSL https://raw.githubusercontent.com/NWylynko/agentic-dev-machines/main/install.sh | sh
 ```
 
-This downloads the release CLI, workspace runtime, terminal, and their dependencies. No clone, Rust, Go, or npm install is needed. Add `~/.local/bin` to your PATH. Use `adm update` to update the CLI and owned cluster services; settings are preserved, new workspaces use the updated release image (unless setup selected an image from another repository), and existing workspace images stay running. Select `adm update --workspace NAME` explicitly to update a workspace image and interrupt its agent.
+This downloads the release CLI, workspace runtime, terminal, and their dependencies. No clone, Rust, Go, or npm install is needed. Add `~/.local/bin` to your PATH. Use `adm update` to update the CLI and controller; settings are preserved, new coding and bot workspaces use their updated role images, and existing workspaces stay running. Select `adm update --workspace NAME` explicitly to update a workspace and interrupt its agent.
 
 Successful `main` builds publish a release automatically. See [installation details](docs/installation.md) for pinned versions, prerequisites, and updates.
 
@@ -29,7 +29,7 @@ adm create my-project
 
 On another client that only needs access to an already-installed cluster, run `adm connect`; it verifies access and saves that device's kubeconfig selection without installing cluster resources.
 
-Setup asks for the image, storage class, and optional default model, then offers to install or update the cluster controller. Client commands use the selected kubeconfig to open a temporary authenticated port-forward and close it when the command exits. No system service or permanent management host is required. See [installation details](docs/installation.md#in-cluster-lifecycle-owner) for prerequisites and advanced manual installation.
+Setup asks for a coding image, bot image, storage class, and optional default model, then offers to install or update the cluster controller. `adm create --role coding|bot` uses that role's image. A custom `--image` requires an explicit `--role`. Client commands use the selected kubeconfig to open a temporary authenticated port-forward and close it when the command exits. No system service or permanent management host is required. See [installation details](docs/installation.md#in-cluster-lifecycle-owner) for prerequisites and advanced manual installation.
 
 Every workspace starts with its durable agent. Choose a default model during setup or pass `--model PROVIDER/MODEL_ID` when creating a workspace; otherwise select one in `adm attach` with `/model`. Authenticate a provider once for the installation with `adm login [PROVIDER]`; use `adm logout PROVIDER` to revoke that shared login. Refresh credentials stay on the lifecycle persistent volume and are never copied into workspace Pods. Connect remote MCP servers for every agent with `adm mcp add NAME URL`, which signs in through the browser; see [MCP connectors](docs/operations.md#mcp-connectors).
 

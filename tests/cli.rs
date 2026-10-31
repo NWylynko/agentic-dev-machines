@@ -4059,6 +4059,186 @@ fn repository_sidecar_runs_as_the_development_user_and_catalog_is_the_repos_view
 }
 
 #[test]
+fn workspace_roles_select_their_release_images_and_custom_images_require_a_role() {
+    let root = tempfile::tempdir().unwrap();
+    let release = root.path().join("release");
+    fs::create_dir_all(&release).unwrap();
+    fs::write(release.join("CODE_IMAGE"), "example/adm-code:release\n").unwrap();
+    fs::write(release.join("BOT_IMAGE"), "example/adm-bot:release\n").unwrap();
+    fs::write(
+        release.join("WORKSPACE_IMAGE"),
+        "example/adm-workspace:release\n",
+    )
+    .unwrap();
+    fs::write(
+        release.join("REPOSITORIES_IMAGE"),
+        "example/adm-repositories:release\n",
+    )
+    .unwrap();
+    let catalog = root.path().join("catalog.json");
+    fs::write(&catalog, r#"{"repositories":[]}"#).unwrap();
+    let code = assert_ok(adm(
+        root.path(),
+        &[
+            "--project-dir",
+            release.to_str().unwrap(),
+            "manifest",
+            "code",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ],
+    ));
+    let bot = assert_ok(adm(
+        root.path(),
+        &[
+            "--project-dir",
+            release.to_str().unwrap(),
+            "manifest",
+            "bot",
+            "--role",
+            "bot",
+        ],
+    ));
+    let items = code["items"].as_array().unwrap();
+    let pod = &items
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"];
+    assert_eq!(pod["containers"][0]["image"], "example/adm-code:release");
+    assert_eq!(
+        pod["containers"][1]["image"],
+        "example/adm-repositories:release"
+    );
+    assert_eq!(
+        pod["initContainers"][0]["image"],
+        "example/adm-workspace:release"
+    );
+    let bot_pod = &bot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"];
+    assert_eq!(bot_pod["containers"][0]["image"], "example/adm-bot:release");
+    assert_eq!(bot_pod["containers"].as_array().unwrap().len(), 1);
+
+    let custom_without_role = adm(
+        root.path(),
+        &[
+            "--project-dir",
+            release.to_str().unwrap(),
+            "manifest",
+            "custom",
+            "--image",
+            "custom/image:tag",
+        ],
+    );
+    assert!(!custom_without_role.status.success());
+    assert!(String::from_utf8_lossy(&custom_without_role.stderr).contains("--role"));
+
+    let custom = assert_ok(adm(
+        root.path(),
+        &[
+            "--project-dir",
+            release.to_str().unwrap(),
+            "manifest",
+            "custom",
+            "--role",
+            "coding",
+            "--image",
+            "custom/image:tag",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ],
+    ));
+    let pod = &custom["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"];
+    assert_eq!(pod["containers"][0]["image"], "custom/image:tag");
+    assert_eq!(
+        pod["containers"][1]["image"],
+        "example/adm-repositories:release"
+    );
+}
+
+#[test]
+fn create_applies_the_bot_and_coding_role_images_to_their_pod_containers() {
+    let root = fixture();
+    let release = root.path().join("release-images");
+    fs::create_dir_all(&release).unwrap();
+    for (filename, image) in [
+        ("CODE_IMAGE", "registry.test/adm-code:v110"),
+        ("BOT_IMAGE", "registry.test/adm-bot:v110"),
+        ("WORKSPACE_IMAGE", "registry.test/adm-workspace:v110"),
+        ("REPOSITORIES_IMAGE", "registry.test/adm-repositories:v110"),
+    ] {
+        fs::write(release.join(filename), format!("{image}\n")).unwrap();
+    }
+    let created = assert_ok(adm(
+        root.path(),
+        &[
+            "--project-dir",
+            release.to_str().unwrap(),
+            "create",
+            "supervisor",
+            "--role",
+            "bot",
+            "--no-attach",
+        ],
+    ));
+    assert_eq!(created["image"], "registry.test/adm-bot:v110");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.path().join("last-manifest.json")).unwrap()).unwrap();
+    let pod = manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"]
+        .clone();
+    assert_eq!(pod["containers"][0]["name"], "bot");
+    assert_eq!(pod["containers"][0]["image"], "registry.test/adm-bot:v110");
+    assert_eq!(pod["containers"].as_array().unwrap().len(), 1);
+
+    let catalog = root.path().join("catalog.json");
+    fs::write(&catalog, r#"{"repositories":[]}"#).unwrap();
+    assert_ok(adm(
+        root.path(),
+        &[
+            "--project-dir",
+            release.to_str().unwrap(),
+            "create",
+            "coding",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--no-attach",
+        ],
+    ));
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.path().join("last-manifest.json")).unwrap()).unwrap();
+    let pod = &manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"];
+    assert_eq!(pod["containers"][0]["name"], "dev");
+    assert_eq!(pod["containers"][0]["image"], "registry.test/adm-code:v110");
+    assert_eq!(pod["containers"][1]["name"], "repositories");
+    assert_eq!(
+        pod["containers"][1]["image"],
+        "registry.test/adm-repositories:v110"
+    );
+    assert_eq!(
+        pod["initContainers"][0]["image"],
+        "registry.test/adm-workspace:v110"
+    );
+}
+
+#[test]
 fn repository_catalog_options_must_match_the_workspace_role() {
     let root = tempfile::tempdir().unwrap();
     let catalog = root.path().join("catalog.json");

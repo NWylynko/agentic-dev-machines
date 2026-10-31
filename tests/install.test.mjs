@@ -75,10 +75,8 @@ async function fixture(t) {
         "export const fixture = true;\n",
       );
     await writeFile(join(bundle, "VERSION"), `${name}\n`);
-    await writeFile(
-      join(bundle, "IMAGE"),
-      `ghcr.io/nwylynko/agentic-dev-machines:${name}\n`,
-    );
+    for (const image of ["CONTROL_IMAGE", "REPOSITORIES_IMAGE", "WORKSPACE_IMAGE", "CODE_IMAGE", "BOT_IMAGE"])
+      await writeFile(join(bundle, image), `ghcr.io/nwylynko/agentic-dev-machines/${image.toLowerCase()}:${name}\n`);
     await customize(bundle);
     const archive = join(directory, `${name}.tar.gz`);
     await execute("tar", ["-czf", archive, "-C", bundle, "."]);
