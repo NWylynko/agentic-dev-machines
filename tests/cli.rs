@@ -590,6 +590,9 @@ elif args and args[0] == 'exec':
         result = subprocess.run(command, cwd=repos, env=env)
         sys.exit(result.returncode)
 elif args and args[0] == 'port-forward':
+    (pathlib.Path(__file__).parent / 'port-forward-args.json').write_text(json.dumps(args))
+    if (pathlib.Path(__file__).parent / 'port-forward-exit').exists():
+        sys.exit(0)
     print('Forwarding from 127.0.0.1:43127 -> 7432', flush=True)
     __import__('time').sleep(60)
 else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exit(2)
@@ -2135,6 +2138,102 @@ fn public_cli_rejects_unsafe_names_before_touching_the_cluster() {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("name"));
     }
+}
+
+#[test]
+fn port_lan_publishes_non_loopback_urls_and_bind_is_passed_through() {
+    let root = fixture();
+    assert_ok(adm(
+        root.path(),
+        &["create", "preview", "--no-repositories"],
+    ));
+    fs::write(root.path().join("port-forward-exit"), "1").unwrap();
+
+    let lan = adm(root.path(), &["port", "preview", "3000", "--lan"]);
+    assert!(
+        lan.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&lan.stdout),
+        String::from_utf8_lossy(&lan.stderr)
+    );
+    let lan_args = port_forward_args(root.path());
+    assert!(
+        lan_args
+            .windows(2)
+            .any(|pair| pair == ["--address", "0.0.0.0"]),
+        "{lan_args:?}"
+    );
+    assert!(
+        lan_args.iter().any(|arg| arg == "3000:3000"),
+        "{lan_args:?}"
+    );
+    let lan_err = String::from_utf8(lan.stderr).unwrap();
+    assert!(
+        lan_err.contains("anyone on this network can open this port with no authentication"),
+        "{lan_err}"
+    );
+    assert!(
+        preview_hosts(&lan_err)
+            .iter()
+            .any(|host| host != "127.0.0.1" && host != "::1" && host != "localhost"),
+        "expected a non-loopback URL in: {lan_err}"
+    );
+
+    let bound = adm(
+        root.path(),
+        &["port", "preview", "3000", "--bind", "192.168.1.5"],
+    );
+    assert!(
+        bound.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bound.stderr)
+    );
+    let bound_args = port_forward_args(root.path());
+    assert!(
+        bound_args
+            .windows(2)
+            .any(|pair| pair == ["--address", "192.168.1.5"]),
+        "{bound_args:?}"
+    );
+
+    let default = adm(root.path(), &["port", "preview", "3000"]);
+    assert!(
+        default.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    let default_args = port_forward_args(root.path());
+    assert!(
+        default_args
+            .windows(2)
+            .any(|pair| pair == ["--address", "127.0.0.1"]),
+        "{default_args:?}"
+    );
+    let default_err = String::from_utf8(default.stderr).unwrap();
+    assert!(
+        default_err.contains("http://127.0.0.1:3000"),
+        "{default_err}"
+    );
+    assert!(!default_err.contains("no authentication"), "{default_err}");
+}
+
+fn port_forward_args(root: &Path) -> Vec<String> {
+    serde_json::from_slice(&fs::read(root.join("port-forward-args.json")).unwrap()).unwrap()
+}
+
+fn preview_hosts(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("http://")?;
+            let host = if let Some(host) = rest.strip_prefix('[') {
+                host.split(']').next()?
+            } else {
+                rest.split(':').next()?
+            };
+            Some(host.to_owned())
+        })
+        .collect()
 }
 
 #[test]
