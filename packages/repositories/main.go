@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"syscall"
 )
@@ -37,12 +36,13 @@ type Config struct {
 	UID, GID                                  uint32
 }
 
-var namespacePart = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+// GitHub repository names may start with "." or "_" (for example .github).
+var namespacePart = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 func validateCatalog(catalog Catalog) error {
 	seen := map[string]bool{}
 	for _, repo := range catalog.Repositories {
-		if !namespacePart.MatchString(repo.Owner) || !namespacePart.MatchString(repo.Name) || len(repo.Owner) > 100 || len(repo.Name) > 100 {
+		if repo.Owner == "." || repo.Owner == ".." || repo.Name == "." || repo.Name == ".." || !namespacePart.MatchString(repo.Owner) || !namespacePart.MatchString(repo.Name) || len(repo.Owner) > 100 || len(repo.Name) > 100 {
 			return errors.New("repository owner/name must be plain GitHub namespace components")
 		}
 		key := strings.ToLower(repo.Owner + "/" + repo.Name)
@@ -70,66 +70,17 @@ func validateCatalog(catalog Catalog) error {
 	return nil
 }
 
-func discover(ctx context.Context, owner string, limit int, gh string) (Catalog, error) {
-	if !namespacePart.MatchString(owner) || limit < 1 || limit > 100000 {
-		return Catalog{}, errors.New("invalid owner or catalog limit")
-	}
-	command := exec.CommandContext(ctx, gh, "repo", "list", owner, "--limit", fmt.Sprint(limit), "--json", "name,nameWithOwner,url,defaultBranchRef")
-	output, err := command.Output()
-	if err != nil {
-		return Catalog{}, fmt.Errorf("GitHub catalog discovery failed; authenticate gh on the management host: %w", err)
-	}
-	var records []struct {
-		Name             string `json:"name"`
-		NameWithOwner    string `json:"nameWithOwner"`
-		URL              string `json:"url"`
-		DefaultBranchRef *struct {
-			Name string `json:"name"`
-		} `json:"defaultBranchRef"`
-	}
-	if err := json.Unmarshal(output, &records); err != nil {
-		return Catalog{}, fmt.Errorf("invalid gh catalog JSON: %w", err)
-	}
-	catalog := Catalog{}
-	for _, record := range records {
-		parts := strings.Split(record.NameWithOwner, "/")
-		if len(parts) != 2 || !strings.EqualFold(parts[0], owner) || parts[1] != record.Name {
-			return Catalog{}, errors.New("gh returned a repository outside the requested owner")
-		}
-		// Empty repositories have no starting revision and cannot form a Git base.
-		if record.DefaultBranchRef == nil || record.DefaultBranchRef.Name == "" {
-			continue
-		}
-		catalog.Repositories = append(catalog.Repositories, Repository{Owner: parts[0], Name: parts[1], Remote: record.URL + ".git", Ref: "refs/heads/" + record.DefaultBranchRef.Name})
-	}
-	sort.Slice(catalog.Repositories, func(i, j int) bool { return catalog.Repositories[i].Name < catalog.Repositories[j].Name })
-	return catalog, validateCatalog(catalog)
-}
-
 func run(ctx context.Context, arguments []string) error {
 	if len(arguments) == 0 {
-		return errors.New("usage: adm-repositories discover|serve|prepare-base")
+		return errors.New("usage: adm-repositories serve|git-credential|prepare-base")
 	}
 	switch arguments[0] {
-	case "discover":
-		flags := flag.NewFlagSet("discover", flag.ContinueOnError)
-		owner := flags.String("owner", "", "GitHub owner")
-		limit := flags.Int("limit", 10000, "maximum repositories")
-		gh := flags.String("gh", "gh", "GitHub CLI executable")
-		if err := flags.Parse(arguments[1:]); err != nil {
-			return err
-		}
-		catalog, err := discover(ctx, *owner, *limit, *gh)
-		if err != nil {
-			return err
-		}
-		return json.NewEncoder(os.Stdout).Encode(catalog)
 	case "serve":
 		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 		config := Config{}
 		var uid, gid uint
 		var catalogPath string
-		flags.StringVar(&catalogPath, "catalog", "", "catalog JSON file")
+		flags.StringVar(&catalogPath, "catalog", "", "fixed catalog JSON file for development; by default /repos shows the cluster registry from the lifecycle controller")
 		flags.StringVar(&config.State, "state", "", "durable private ArtifactFS state")
 		flags.StringVar(&config.GitRoot, "git-root", "", "private Git directories, also visible in dev container at this path")
 		flags.StringVar(&config.Views, "views", "", "private ArtifactFS mount directory")
@@ -149,19 +100,25 @@ func run(ctx context.Context, arguments []string) error {
 		if os.Getuid() == 0 || uint32(os.Getuid()) != config.UID || uint32(os.Getgid()) != config.GID {
 			return errors.New("serve must run as the configured unprivileged development UID/GID; launch it through setpriv, never as root")
 		}
-		bytes, err := os.ReadFile(catalogPath)
+		var server *catalogServer
+		var err error
+		if catalogPath != "" {
+			var bytes []byte
+			if bytes, err = os.ReadFile(catalogPath); err != nil {
+				return err
+			}
+			var catalog Catalog
+			if err = json.Unmarshal(bytes, &catalog); err != nil {
+				return err
+			}
+			server, err = mountCatalog(ctx, config, catalog)
+		} else {
+			server, err = mountRegistry(ctx, config)
+		}
 		if err != nil {
 			return err
 		}
-		var catalog Catalog
-		if err = json.Unmarshal(bytes, &catalog); err != nil {
-			return err
-		}
-		server, err := mountCatalog(ctx, config, catalog)
-		if err != nil {
-			return err
-		}
-		slog.Info("repository catalog ready", "mount", config.Mount, "repositories", len(catalog.Repositories))
+		slog.Info("repository catalog ready", "mount", config.Mount, "fixedCatalog", catalogPath != "")
 		select {
 		case <-ctx.Done():
 			return server.Close()
