@@ -32,7 +32,11 @@ type catalogServer struct {
 	mu        sync.Mutex
 	acquireMu sync.Mutex
 	repos     map[string]*repositoryRuntime
-	daemon    *artifactDaemon
+	// One ArtifactFS daemon per opened repository. Each repository keeps its
+	// own ArtifactFS root (state/OWNER/REPO), and a daemon only watches the
+	// registry under its own root, so a shared daemon never mounted a second
+	// repository.
+	daemons   map[string]*artifactDaemon
 	closed    bool
 	closeOnce sync.Once
 	failures  chan error
@@ -137,7 +141,7 @@ func mountSource(parent context.Context, config Config, source func(context.Cont
 		return nil, fmt.Errorf("repository store already has an owner: %w", err)
 	}
 	ctx, cancel := context.WithCancel(parent)
-	host := &catalogServer{config: config, ctx: ctx, cancel: cancel, lock: lock, repos: map[string]*repositoryRuntime{}, failures: make(chan error, 1), source: source}
+	host := &catalogServer{config: config, ctx: ctx, cancel: cancel, lock: lock, repos: map[string]*repositoryRuntime{}, daemons: map[string]*artifactDaemon{}, failures: make(chan error, 1), source: source}
 	root := &catalogDirectory{server: host}
 	zero := time.Duration(0)
 	host.server, err = fs.Mount(config.Mount, root, &fs.Options{UID: config.UID, GID: config.GID, EntryTimeout: &zero, AttrTimeout: &zero, MountOptions: fuse.MountOptions{FsName: "adm-repositories", Name: "adm-repositories", AllowOther: false, DisableXAttrs: true}})
@@ -161,15 +165,17 @@ func (server *catalogServer) Close() error {
 		}
 		server.cancel()
 		server.acquireMu.Lock()
-		if daemon := server.daemon; daemon != nil {
+		for _, daemon := range server.daemons {
 			select {
 			case <-daemon.done:
 			default:
 				if err := daemon.command.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 					result = errors.Join(result, err)
 				}
-				<-daemon.done
 			}
+		}
+		for _, daemon := range server.daemons {
+			<-daemon.done
 		}
 		server.acquireMu.Unlock()
 		if err := server.lock.Close(); err != nil {
@@ -458,10 +464,8 @@ func (node *repositoryView) Setattr(ctx context.Context, handle fs.FileHandle, i
 }
 
 func (server *catalogServer) acquire(repo Repository) (string, error) {
-	// ArtifactFS runs one daemon per workspace state/view root. Its daemon
-	// watches the shared registry and mounts every registered repository.
-	// Serializing acquisition prevents concurrent repo registrations from
-	// starting competing daemons against the same SQLite state and FUSE mounts.
+	// Serializing acquisition keeps daemon startup and the mount-notification
+	// wait for one repository from racing another's.
 	server.acquireMu.Lock()
 	defer server.acquireMu.Unlock()
 
@@ -618,7 +622,7 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 }
 
 func (server *catalogServer) ensureArtifactDaemon(env []string, key string) (*artifactDaemon, error) {
-	if daemon := server.daemon; daemon != nil {
+	if daemon := server.daemons[key]; daemon != nil {
 		select {
 		case <-daemon.done:
 			return nil, fmt.Errorf("ArtifactFS daemon exited for %s: %w", key, daemon.err)
@@ -639,7 +643,7 @@ func (server *catalogServer) ensureArtifactDaemon(env []string, key string) (*ar
 		return nil, err
 	}
 	daemon := &artifactDaemon{command: command, done: make(chan struct{}), ctx: ctx, cancel: cancel}
-	server.daemon = daemon
+	server.daemons[key] = daemon
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
