@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -200,5 +201,117 @@ test(
         `${event} missing from: ${logs.join("\n")}`,
       );
     assert.deepEqual(await readdir(join(directory, "authority")).then((names) => names.filter((name) => name.startsWith("gh-"))), []);
+  },
+);
+
+test(
+  "repository registration check reaches GitHub with the cluster login, names the canonical repo, and explains what it cannot reach",
+  { timeout: 30000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-github-check-"));
+    const seen = [];
+    // A GitHub API stand-in: `Example/Project` is public, `example/secret` is
+    // private (404 without the cluster token, exactly like github.com).
+    const github = createServer((request, response) => {
+      seen.push({ url: request.url, authorization: request.headers.authorization });
+      const reply = (status, body) => {
+        response.writeHead(status, { "content-type": "application/json" });
+        response.end(JSON.stringify(body));
+      };
+      const authorized = request.headers.authorization === "Bearer gho_CHECKsecret0001";
+      const match = /^\/repos\/([^/]+)\/([^/]+)(?:\/branches\/(.+))?$/.exec(request.url);
+      if (!match) return reply(404, { message: "Not Found" });
+      const [, owner, name, branch] = match;
+      const key = `${owner}/${name}`.toLowerCase();
+      const repo = { "example/project": ["example/project", false], "example/secret": ["example/secret", true] }[key];
+      if (!repo || (repo[1] && !authorized)) return reply(404, { message: "Not Found" });
+      if (branch !== undefined)
+        return ["trunk", "release/1"].includes(decodeURIComponent(branch))
+          ? reply(200, { name: decodeURIComponent(branch) })
+          : reply(404, { message: "Branch not found" });
+      reply(200, { full_name: repo[0], default_branch: "trunk", private: repo[1] });
+    });
+    github.listen(0, "127.0.0.1");
+    await once(github, "listening");
+    process.env.ADM_GITHUB_API_URL = `http://127.0.0.1:${github.address().port}`;
+    const logs = [];
+    await mkdir(join(directory, "authority"), { recursive: true });
+    const authority = await createProviderAuthAuthority({
+      authPath: join(directory, "authority", "auth.json"),
+      log: (line) => logs.push(line),
+    });
+    await new Promise((resolve) => authority.server.listen(0, "127.0.0.1", resolve));
+    t.after(async () => {
+      delete process.env.ADM_GITHUB_API_URL;
+      await authority.close();
+      github.close();
+      await rm(directory, { recursive: true });
+    });
+    const base = `http://127.0.0.1:${authority.server.address().port}`;
+    const check = async (repo, ref) => {
+      const response = await fetch(`${base}/v1/repos/check`, {
+        method: "POST",
+        body: JSON.stringify({ repo, ref }),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+
+    // Not logged in: a public repository is reachable, resolved to its
+    // canonical name and default branch, without any credential.
+    const publicRepo = await check("Example/Project");
+    assert.equal(publicRepo.status, 200, JSON.stringify(publicRepo.body));
+    assert.deepEqual(publicRepo.body, { repo: "example/project", ref: "trunk" });
+    assert.equal(seen[0].authorization, undefined);
+
+    // A private repository without the login says what to run.
+    const noLogin = await check("example/secret");
+    assert.equal(noLogin.status, 404);
+    assert.match(noLogin.body.error.message, /example\/secret is not reachable/);
+    assert.match(noLogin.body.error.message, /adm repos login github/);
+
+    // With the cluster login the same repository is reachable.
+    await writeFile(
+      join(directory, "authority", "github.json"),
+      JSON.stringify({ token: "gho_CHECKsecret0001", account: "nwylynko", loggedInAt: "2026-10-31T00:00:00Z" }),
+      { mode: 0o600 },
+    );
+    await authority.close();
+    const second = await createProviderAuthAuthority({
+      authPath: join(directory, "authority", "auth.json"),
+      log: (line) => logs.push(line),
+    });
+    await new Promise((resolve) => second.server.listen(0, "127.0.0.1", resolve));
+    t.after(() => second.close());
+    const secondBase = `http://127.0.0.1:${second.server.address().port}`;
+    const checkLoggedIn = async (repo, ref) => {
+      const response = await fetch(`${secondBase}/v1/repos/check`, {
+        method: "POST",
+        body: JSON.stringify({ repo, ref }),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const secret = await checkLoggedIn("example/secret");
+    assert.equal(secret.status, 200, JSON.stringify(secret.body));
+    assert.deepEqual(secret.body, { repo: "example/secret", ref: "trunk" });
+    assert.equal(seen.at(-1).authorization, "Bearer gho_CHECKsecret0001");
+
+    // An explicit branch must exist; branch names with slashes work.
+    assert.deepEqual((await checkLoggedIn("example/secret", "release/1")).body, {
+      repo: "example/secret",
+      ref: "release/1",
+    });
+    const noBranch = await checkLoggedIn("example/secret", "nope");
+    assert.equal(noBranch.status, 404);
+    assert.match(noBranch.body.error.message, /branch nope was not found in example\/secret/);
+
+    const missing = await checkLoggedIn("example/missing");
+    assert.equal(missing.status, 404);
+    assert.match(missing.body.error.message, /example\/missing is not reachable with the GitHub login \(account nwylynko\)/);
+
+    // The token is never in an error or a log line.
+    assert.equal(
+      JSON.stringify([missing.body, noBranch.body, noLogin.body, logs]).includes("gho_CHECKsecret0001"),
+      false,
+    );
   },
 );

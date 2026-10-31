@@ -229,6 +229,52 @@ export async function createGithubAuthority({
     }
   }
 
+  // Can the cluster reach OWNER/REPO (and BRANCH)? Uses the cluster login when
+  // there is one, otherwise only public repositories answer. Returns the
+  // canonical name and the branch to register (TASK-112).
+  async function checkRepository(repo: unknown, ref: unknown) {
+    if (typeof repo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(repo))
+      throw new GithubError(400, "INVALID_REQUEST", "repo must be OWNER/REPO");
+    if (ref !== undefined && ref !== null && typeof ref !== "string")
+      throw new GithubError(400, "INVALID_REQUEST", "ref must be a branch name");
+    const api = process.env.ADM_GITHUB_API_URL ?? "https://api.github.com";
+    const get = (resource: string) =>
+      fetch(`${api}/${resource}`, {
+        headers: {
+          accept: "application/vnd.github+json",
+          "user-agent": "adm-lifecycle",
+          ...(stored ? { authorization: `Bearer ${stored.token}` } : {}),
+        },
+        signal: AbortSignal.timeout(20_000),
+      });
+    const unreachable = (why: string) =>
+      new GithubError(
+        404,
+        "REPOSITORY_NOT_REACHABLE",
+        `${repo} is not reachable with the GitHub login (${
+          stored ? `account ${stored.account}` : "not logged in; run adm repos login github"
+        }): ${why}`,
+      );
+    let found: Response;
+    try {
+      found = await get(`repos/${repo}`);
+    } catch (error) {
+      throw new GithubError(503, "GITHUB_UNAVAILABLE", `could not ask GitHub about ${repo}: ${error instanceof Error ? error.message : error}`);
+    }
+    if (!found.ok) throw unreachable(found.status === 404 ? "not found, or private to other accounts" : `GitHub answered ${found.status}`);
+    const details = (await found.json()) as { full_name?: string; default_branch?: string };
+    if (!details.full_name || !details.default_branch)
+      throw unreachable("GitHub returned no repository details");
+    const branch = ref ?? details.default_branch;
+    if (ref) {
+      const exists = await get(`repos/${repo}/branches/${ref.split("/").map(encodeURIComponent).join("/")}`);
+      if (!exists.ok)
+        throw new GithubError(404, "BRANCH_NOT_FOUND", `branch ${ref} was not found in ${details.full_name}`);
+    }
+    log("info", "github_repository_checked", { repo: details.full_name, branch, authenticated: Boolean(stored) });
+    return { repo: details.full_name, ref: branch };
+  }
+
   async function handle(
     request: IncomingMessage,
     response: ServerResponse,
@@ -260,6 +306,10 @@ export async function createGithubAuthority({
             ? { status: "connected", account: stored.account, loggedInAt: stored.loggedInAt }
             : { status: "not_logged_in" },
         });
+      if (request.method === "POST" && path === "/v1/repos/check") {
+        const value = await body(request);
+        return send(response, 200, await checkRepository(value.repo, value.ref));
+      }
       if (request.method === "POST" && path === "/v1/repos/login") {
         const value = await body(request);
         if (value.provider !== "github")
