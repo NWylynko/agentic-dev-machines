@@ -238,6 +238,13 @@ fn start_runner_stub() -> (String, u16, std::thread::JoinHandle<()>) {
             // registered (TASK-112). Names ending in /unreachable are refused.
             let (status, body) = if first_line.starts_with("GET /health ") {
                 ("200 OK", r#"{"status":"ok"}"#.to_owned())
+            } else if first_line.starts_with("GET /v1/runtime/repos/token ") {
+                // Not logged in: shared bases clone public repositories.
+                (
+                    "409 Conflict",
+                    r#"{"error":{"code":"GITHUB_NOT_LOGGED_IN","message":"not logged in"}}"#
+                        .to_owned(),
+                )
             } else if first_line.starts_with("POST /v1/repos/check ") {
                 let request_body: Value =
                     serde_json::from_slice(&request[header_end..]).unwrap_or(Value::Null);
@@ -525,6 +532,12 @@ elif args[:2] == ['get', 'storageclass']:
     if (pathlib.Path(__file__).parent / 'missing-storage').exists():
         print('Error from server (NotFound): storageclass adm-replicated not found',file=sys.stderr);sys.exit(1)
     print(json.dumps({'provisioner':'driver.longhorn.io','metadata':{'name':args[2]}}))
+elif args[:3] == ['get','pvc','adm-repository-bases']:
+    print(json.dumps({'metadata':{'name':'adm-repository-bases'},'spec':{'volumeName':'pvc-bases'},'status':{'phase':'Bound'}}))
+elif args[:3] == ['get','pv','pvc-bases']:
+    print(json.dumps({'metadata':{'name':'pvc-bases'},'spec':{'csi':{'driver':'driver.longhorn.io','volumeHandle':'pvc-bases'}}}))
+elif args[:2] == ['delete','pv']:
+    print('deleted')
 elif args[0] == 'apply':
     doc=json.load(sys.stdin)
     (pathlib.Path(__file__).parent / 'last-manifest.json').write_text(json.dumps(doc))
@@ -638,6 +651,20 @@ else: print('unexpected kubectl arguments: '+repr(args),file=sys.stderr);sys.exi
         .args(["--lifecycle-token-file"])
         .arg(root.path().join("lifecycle-token"))
         .env("ADM_PROVIDER_AUTH_URL", &default_runner_url)
+        // Shared repository bases (TASK-113) are cloned from a directory of
+        // bare repositories standing in for github.com.
+        .env("ADM_REPOSITORY_BASES", root.path().join("bases"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env(
+            "GIT_CONFIG_KEY_0",
+            format!(
+                "url.file://{}/.insteadOf",
+                root.path().join("upstreams").display()
+            ),
+        )
+        .env("GIT_CONFIG_VALUE_0", "https://github.com/")
         .args(["lifecycle-serve", "--host", "127.0.0.1", "--port"])
         .arg(port.to_string())
         .stdout(Stdio::null())
@@ -1112,10 +1139,10 @@ fn create_prepares_a_private_public_repository_inside_each_workspace_pod() {
     git(&[
         "init",
         "--bare",
-        "--initial-branch=main",
+        "--initial-branch=trunk",
         upstream.to_str().unwrap(),
     ]);
-    git(&["init", "--initial-branch=main", seed.to_str().unwrap()]);
+    git(&["init", "--initial-branch=trunk", seed.to_str().unwrap()]);
     for (key, value) in [
         ("user.name", "Fixture User"),
         ("user.email", "fixture@example.invalid"),
@@ -1132,7 +1159,14 @@ fn create_prepares_a_private_public_repository_inside_each_workspace_pod() {
         "origin",
         upstream.to_str().unwrap(),
     ]);
-    git(&["-C", seed.to_str().unwrap(), "push", "-u", "origin", "main"]);
+    git(&[
+        "-C",
+        seed.to_str().unwrap(),
+        "push",
+        "-u",
+        "origin",
+        "trunk",
+    ]);
 
     let git_bin = root.path().join("git-bin");
     fs::create_dir_all(&git_bin).unwrap();
@@ -1270,6 +1304,40 @@ fn repository_branch_fixture() -> TestFixture {
     )
     .unwrap();
     root
+}
+
+/// A repository on the fake github.com with one commit on each branch.
+fn fake_github_repository(root: &Path, repo: &str, branches: &[&str]) {
+    let bare = root.join("upstreams").join(format!("{repo}.git"));
+    fs::create_dir_all(&bare).unwrap();
+    repository_git(&bare, &["init", "--bare", "--initial-branch", branches[0]]);
+    let seed = root.join("seed-".to_owned() + &repo.replace('/', "-"));
+    fs::create_dir_all(&seed).unwrap();
+    repository_git(&seed, &["init", "--initial-branch", branches[0]]);
+    fs::write(seed.join("README.md"), format!("{repo}\n")).unwrap();
+    repository_git(&seed, &["add", "README.md"]);
+    repository_git(
+        &seed,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+    for branch in branches {
+        repository_git(
+            &seed,
+            &[
+                "push",
+                bare.to_str().unwrap(),
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        );
+    }
 }
 
 fn repository_git(checkout: &Path, args: &[&str]) -> String {
@@ -1637,6 +1705,7 @@ fn destruction_during_repository_preparation_cannot_restore_a_deleted_workspace(
     use std::time::{Duration, Instant};
 
     let root = fixture();
+    fake_github_repository(root.path(), "owner/project", &["trunk"]);
     let block = root.path().join("block-repository-exec");
     fs::write(&block, "wait").unwrap();
     let mut create = Command::new(env!("CARGO_BIN_EXE_adm"));
@@ -4795,6 +4864,8 @@ fn registered_repositories(root: &Path) -> Vec<String> {
 #[test]
 fn repos_clone_registers_once_and_list_and_remove_manage_the_cluster_registry() {
     let root = fixture();
+    fake_github_repository(root.path(), "owner/project", &["trunk"]);
+    fake_github_repository(root.path(), "owner/second", &["release"]);
     assert_eq!(registered_repositories(root.path()), Vec::<String>::new());
     let cloned = adm(root.path(), &["repos", "clone", "owner/project"]);
     assert!(
@@ -4887,6 +4958,7 @@ fn create_with_repo_registers_a_repository_that_is_not_registered_yet() {
 #[test]
 fn create_defaults_to_the_repository_sidecar_and_the_registry_is_the_repos_view() {
     let root = fixture();
+    fake_github_repository(root.path(), "owner/project", &["trunk"]);
     assert_ok_text(adm(root.path(), &["repos", "clone", "owner/project"]));
     let manifest = assert_ok(adm(root.path(), &["manifest", "defaults"]));
     let items = manifest["items"].as_array().unwrap();

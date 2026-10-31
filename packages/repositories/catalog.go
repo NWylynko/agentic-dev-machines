@@ -529,6 +529,13 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 		}
 	}
 	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		// The clone below links to the shared base for good, so the lifecycle
+		// must know this workspace uses it before it can ever delete the base.
+		if repo.UpstreamGitDir != "" && config.LifecycleURL != "" {
+			if _, err := lifecycleRequest(ctx, config.LifecycleURL, config.TokenFile, "POST", "/v1/runtime/repos/opened/"+key); err != nil {
+				return "", fmt.Errorf("cannot record that this workspace uses the shared base of %s: %w", key, err)
+			}
+		}
 		if err := os.MkdirAll(filepath.Dir(gitDir), 0755); err != nil {
 			return "", err
 		}
@@ -564,8 +571,12 @@ func (server *catalogServer) acquire(repo Repository) (string, error) {
 	}
 	// The durable source identity prevents a modified catalog from silently
 	// retargeting existing work. New source revisions need normal Git commands.
+	// The shared base is only where objects are stored, not which repository
+	// this is, so a base that appears later does not change the identity.
 	identity := filepath.Join(state, "source.json")
-	expected, _ := json.Marshal(repo)
+	source := repo
+	source.UpstreamGitDir = ""
+	expected, _ := json.Marshal(source)
 	if bytes, err := os.ReadFile(identity); err == nil {
 		if string(bytes) != string(expected) {
 			return "", errors.New("catalog source changed for an existing private checkout; use a new workspace or explicit Git operations")

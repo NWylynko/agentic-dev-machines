@@ -71,7 +71,7 @@ func validateCatalog(catalog Catalog) error {
 
 func run(ctx context.Context, arguments []string) error {
 	if len(arguments) == 0 {
-		return errors.New("usage: adm-repositories serve|git-credential|prepare-base")
+		return errors.New("usage: adm-repositories serve|git-credential")
 	}
 	switch arguments[0] {
 	case "serve":
@@ -126,21 +126,6 @@ func run(ctx context.Context, arguments []string) error {
 		}
 	case "git-credential":
 		return gitCredential(ctx, arguments[1:], os.Stdin, os.Stdout)
-	case "prepare-base":
-		flags := flag.NewFlagSet("prepare-base", flag.ContinueOnError)
-		remote := flags.String("remote", "", "published upstream URL")
-		destination := flags.String("destination", "", "new immutable base directory")
-		ref := flags.String("ref", "refs/heads/main", "upstream branch ref")
-		if err := flags.Parse(arguments[1:]); err != nil {
-			return err
-		}
-		if err := validateCatalog(Catalog{Repositories: []Repository{{Owner: "upstream", Name: "base", Remote: *remote, Ref: *ref}}}); err != nil {
-			return err
-		}
-		if !filepath.IsAbs(*destination) {
-			return errors.New("base destination must be absolute")
-		}
-		return prepareBase(ctx, *remote, *ref, *destination)
 	default:
 		return fmt.Errorf("unknown repositories command %q", arguments[0])
 	}

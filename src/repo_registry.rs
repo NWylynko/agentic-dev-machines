@@ -6,14 +6,29 @@
 //!
 //! A repository is "used" by a workspace created with `--repo OWNER/REPO`
 //! (its checkout lives in that workspace); workspaces that only browse
-//! `/repos` through the sidecar do not pin anything.
+//! `/repos` through the sidecar do not pin the registration.
+//!
+//! Each registered repository is stored once (TASK-113): the lifecycle keeps a
+//! bare clone of its branch, the *base*, on one ReadWriteMany volume. Coding
+//! workspaces mount that volume read-only at [`REPOSITORY_BASES_MOUNT`] and the
+//! sidecar clones against the base, so a file read in many workspaces is
+//! stored once while edits and commits stay in each workspace. A clone links to
+//! its base for good, so a base is deleted only when its repository is no
+//! longer registered and no live workspace has opened it.
 use crate::workspaces::{WorkspaceStore, now, validate_repository_ref};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-pub const REGISTRY_TABLES: &str = "CREATE TABLE IF NOT EXISTS registered_repositories(repo TEXT PRIMARY KEY COLLATE NOCASE,branch TEXT NOT NULL,added_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS registry_migrations(name TEXT PRIMARY KEY);";
+pub const REGISTRY_TABLES: &str = "CREATE TABLE IF NOT EXISTS registered_repositories(repo TEXT PRIMARY KEY COLLATE NOCASE,branch TEXT NOT NULL,added_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS registry_migrations(name TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS repository_base_users(repo TEXT NOT NULL COLLATE NOCASE,workspace_id TEXT NOT NULL,PRIMARY KEY(repo,workspace_id));";
+
+/// Where workspace Pods see the shared bases volume, read-only. The sidecar
+/// records `<this>/OWNER/REPO.git` in each clone, so the dev container mounts
+/// it at the same path.
+pub const REPOSITORY_BASES_MOUNT: &str = "/var/lib/adm-repository-bases";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RegisteredRepository {
@@ -90,6 +105,36 @@ impl WorkspaceStore {
         )? > 0;
         transaction.commit()?;
         Ok(added)
+    }
+
+    /// Records that a workspace's sidecar cloned against this repository's base.
+    pub fn record_repository_base_user(&mut self, repo: &str, workspace_id: &str) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::workspaces::ensure_store_fence(&transaction, self.fencing_token)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO repository_base_users(repo,workspace_id) VALUES(?1,?2)",
+            params![repo, workspace_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Live workspaces whose clones link to this repository's base.
+    fn repository_base_users(&self, repo: &str) -> Result<Vec<String>> {
+        let users: Vec<String> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT workspace_id FROM repository_base_users WHERE repo=?1")?;
+            let rows = statement.query_map([repo], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let live = self.list(false)?;
+        Ok(users
+            .into_iter()
+            .filter(|id| live.iter().any(|workspace| &workspace.id == id))
+            .collect())
     }
 
     pub fn unregister_repository(&mut self, repo: &str) -> Result<()> {
@@ -235,6 +280,8 @@ fn register(store: &mut WorkspaceStore, body: &[u8]) -> Result<(u16, Value)> {
             existing.branch,
             existing.repo
         );
+        // Registering again brings the base up to date with GitHub.
+        prepare_repository_base(&existing.repo, &existing.branch)?;
         return Ok((
             200,
             json!({"repo":existing.repo,"branch":existing.branch,"registered":false}),
@@ -259,6 +306,7 @@ fn register(store: &mut WorkspaceStore, body: &[u8]) -> Result<(u16, Value)> {
         .context("check returned no branch")?;
     validate_repository_ref(canonical)?;
     validate_registry_branch(branch)?;
+    prepare_repository_base(canonical, branch)?;
     let registered = store.register_repository(canonical, branch)?;
     Ok((
         200,
@@ -272,22 +320,209 @@ fn remove(store: &mut WorkspaceStore, repo: &str) -> Result<(u16, Value)> {
         .registered_repository(repo)?
         .with_context(|| format!("{repo} is not registered"))?;
     store.unregister_repository(&registered.repo)?;
+    collect_repository_bases(store)?;
     Ok((200, json!({"repo":registered.repo,"removed":true})))
 }
 
-/// The registry in the shape the repositories sidecar mounts.
-pub fn sidecar_catalog(store: &WorkspaceStore) -> Result<Value> {
+/// The registry in the shape the repositories sidecar mounts. A workspace
+/// that mounts the bases volume is told where each prepared base is.
+pub fn sidecar_catalog(store: &WorkspaceStore, mounts_bases: bool) -> Result<Value> {
+    let bases = if mounts_bases {
+        Some(repository_bases_dir()?)
+    } else {
+        None
+    };
     let repositories = store
         .registered_repositories()?
         .into_iter()
         .filter_map(|registered| {
             let (owner, name) = registered.repo.split_once('/')?;
-            Some(json!({
+            let mut entry = json!({
                 "owner":owner,"name":name,
                 "remote":format!("https://github.com/{}.git", registered.repo),
                 "ref":format!("refs/heads/{}", registered.branch),
-            }))
+            });
+            if bases
+                .as_ref()
+                .is_some_and(|bases| base_path(bases, &registered.repo).exists())
+            {
+                entry["upstreamGitDir"] = json!(base_path(
+                    Path::new(REPOSITORY_BASES_MOUNT),
+                    &registered.repo
+                ));
+            }
+            Some(entry)
         })
         .collect::<Vec<_>>();
     Ok(json!({"repositories":repositories}))
+}
+
+/// `POST /v1/runtime/repos/opened/OWNER/REPO`: the caller's sidecar is about
+/// to clone against this repository's base.
+pub fn record_opened(store: &mut WorkspaceStore, workspace_id: &str, path: &str) -> Result<Value> {
+    let repo = path
+        .strip_prefix("/v1/runtime/repos/opened/")
+        .context("not an opened route")?;
+    validate_repository_ref(repo)?;
+    let registered = store
+        .registered_repository(repo)?
+        .with_context(|| format!("{repo} is not registered"))?;
+    store.record_repository_base_user(&registered.repo, workspace_id)?;
+    Ok(json!({"repo":registered.repo,"workspaceId":workspace_id}))
+}
+
+/// The lifecycle's writable view of the bases volume.
+fn repository_bases_dir() -> Result<PathBuf> {
+    let dir = std::env::var_os("ADM_REPOSITORY_BASES")
+        .context("this lifecycle has no repository bases volume (ADM_REPOSITORY_BASES); run adm update to apply the current control plane")?;
+    Ok(PathBuf::from(dir))
+}
+
+fn base_path(bases: &Path, repo: &str) -> PathBuf {
+    bases.join(format!("{repo}.git"))
+}
+
+/// Clones the base for a registered repository, or fetches its branch into an
+/// existing one. A fetch only adds objects, so no workspace's work moves, and
+/// objects are never pruned (`gc.auto=0`) because clones depend on them.
+pub fn prepare_repository_base(repo: &str, branch: &str) -> Result<()> {
+    let bases = repository_bases_dir()?;
+    let destination = base_path(&bases, repo);
+    let remote = format!("https://github.com/{repo}.git");
+    let reference = format!("refs/heads/{branch}");
+    // Private repositories need the cluster GitHub login; public ones do not.
+    let (status, login) =
+        crate::lifecycle::proxy_provider_auth("GET", "/v1/runtime/repos/token", b"")?;
+    let token = match status {
+        200 => Some(
+            login["token"]
+                .as_str()
+                .context("GitHub login has no token")?
+                .to_owned(),
+        ),
+        409 => None,
+        _ => bail!("cannot read the cluster GitHub login ({status}): {login}"),
+    };
+    let git = |args: &[&str]| -> Result<()> {
+        let mut command = Command::new("git");
+        command.env("GIT_TERMINAL_PROMPT", "0").args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.https://github.com.helper=!f() { test \"$1\" = get && echo username=x-access-token && echo \"password=$ADM_GITHUB_TOKEN\"; }; f",
+        ]);
+        if let Some(token) = &token {
+            command.env("ADM_GITHUB_TOKEN", token);
+        }
+        let output = command.args(args).output().context("run git")?;
+        ensure!(
+            output.status.success(),
+            "git {} for the shared base of {repo} failed: {}",
+            args.first().copied().unwrap_or_default(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(())
+    };
+    if destination.exists() {
+        let path = destination.to_str().context("base path is not UTF-8")?;
+        git(&[
+            "--git-dir",
+            path,
+            "fetch",
+            "--no-tags",
+            "--",
+            &remote,
+            &format!("+{reference}:{reference}"),
+        ])?;
+        eprintln!("adm repository base refreshed {repo} ({branch})");
+        return Ok(());
+    }
+    let parent = destination.parent().context("base has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    // Clone beside the destination and rename, so a failed clone never leaves
+    // a partial base that workspaces would trust.
+    let staging = parent.join(format!(".prepare-{}", uuid::Uuid::new_v4()));
+    let staging_path = staging.to_str().context("base path is not UTF-8")?;
+    let prepared = git(&[
+        "clone",
+        "--bare",
+        "--single-branch",
+        "--no-tags",
+        "--branch",
+        branch,
+        "--",
+        &remote,
+        staging_path,
+    ])
+    .and_then(|()| git(&["--git-dir", staging_path, "config", "gc.auto", "0"]))
+    .and_then(|()| {
+        std::fs::rename(&staging, &destination)
+            .with_context(|| format!("publish the shared base of {repo}"))
+    });
+    if prepared.is_err() && staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    prepared?;
+    eprintln!("adm repository base prepared {repo} ({branch})");
+    Ok(())
+}
+
+/// Deletes the base of every repository that is no longer registered and that
+/// no live workspace has opened. Runs after a removal and after a destroy.
+pub fn collect_repository_bases(store: &WorkspaceStore) -> Result<()> {
+    let bases = repository_bases_dir()?;
+    let Ok(owners) = std::fs::read_dir(&bases) else {
+        return Ok(());
+    };
+    for owner in owners {
+        let owner = owner?;
+        if !owner.file_type()?.is_dir() || owner.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        for base in std::fs::read_dir(owner.path())? {
+            let base = base?;
+            let file_name = base.file_name();
+            let Some(name) = file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".git"))
+            else {
+                continue;
+            };
+            let repo = format!("{}/{name}", owner.file_name().to_string_lossy());
+            if store.registered_repository(&repo)?.is_some() {
+                continue;
+            }
+            let users = store.repository_base_users(&repo)?;
+            if users.is_empty() {
+                std::fs::remove_dir_all(base.path())
+                    .with_context(|| format!("delete the shared base of {repo}"))?;
+                eprintln!("adm repository base deleted {repo}");
+            } else {
+                eprintln!(
+                    "adm repository base kept {repo}: still opened by workspaces {}",
+                    users.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bases for repositories registered before bases existed (TASK-113). Runs
+/// once when the lifecycle starts; a failure is logged and the repository
+/// still works, each workspace just stores its own copy.
+pub fn prepare_missing_repository_bases(store: &WorkspaceStore) -> Result<()> {
+    let bases = repository_bases_dir()?;
+    for registered in store.registered_repositories()? {
+        if base_path(&bases, &registered.repo).exists() {
+            continue;
+        }
+        if let Err(error) = prepare_repository_base(&registered.repo, &registered.branch) {
+            eprintln!(
+                "adm repository base for {} failed: {error:#}",
+                registered.repo
+            );
+        }
+    }
+    Ok(())
 }

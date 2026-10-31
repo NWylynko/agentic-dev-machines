@@ -89,6 +89,11 @@ pub struct Workspace {
     #[serde(default)]
     pub allow_node_local_storage: bool,
     pub repositories: bool,
+    /// The shared repository bases volume this workspace mounts read-only
+    /// (TASK-113). Set by the lifecycle when it creates a coding workspace
+    /// with the repositories sidecar; older workspaces have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_bases: Option<RepositoryBasesVolume>,
     #[serde(default)]
     pub repository: Option<String>,
     #[serde(default)]
@@ -103,6 +108,52 @@ pub struct Workspace {
     pub herdr_space: Option<String>,
     pub created_at: u64,
     pub last_error: Option<String>,
+}
+
+/// The CSI volume behind the lifecycle's `adm-repository-bases` claim.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryBasesVolume {
+    pub driver: String,
+    pub volume_handle: String,
+}
+
+/// PersistentVolumes are cluster-scoped, so each workspace gets its own,
+/// named after its namespace.
+pub fn repository_bases_volume_name(w: &Workspace) -> String {
+    format!("{}-repository-bases", w.namespace)
+}
+
+/// Looks up the CSI volume of the lifecycle's shared bases claim. A coding
+/// workspace with the sidecar cannot start without it.
+fn resolve_repository_bases(cli: &Cli) -> Result<RepositoryBasesVolume> {
+    let namespace =
+        std::env::var("ADM_LIFECYCLE_NAMESPACE").unwrap_or_else(|_| "adm-system".to_owned());
+    let claim: Value = serde_json::from_slice(&kubectl(
+        cli,
+        &[
+            "get",
+            "pvc",
+            "adm-repository-bases",
+            "-n",
+            &namespace,
+            "-o",
+            "json",
+        ],
+        None,
+    )?)?;
+    let volume = claim["spec"]["volumeName"].as_str().filter(|_| claim["status"]["phase"] == "Bound").with_context(|| format!("the shared repository bases volume (PersistentVolumeClaim adm-repository-bases in {namespace}) is not bound; it needs a ReadWriteMany StorageClass, see deploy/storage.md"))?;
+    let volume: Value =
+        serde_json::from_slice(&kubectl(cli, &["get", "pv", volume, "-o", "json"], None)?)?;
+    Ok(RepositoryBasesVolume {
+        driver: volume["spec"]["csi"]["driver"]
+            .as_str()
+            .context("the repository bases volume is not a CSI volume")?
+            .to_owned(),
+        volume_handle: volume["spec"]["csi"]["volumeHandle"]
+            .as_str()
+            .context("the repository bases volume has no CSI volume handle")?
+            .to_owned(),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -360,6 +411,7 @@ impl CreateOptions {
             agent_enabled: true,
             allow_node_local_storage: self.allow_node_local_storage,
             repositories: !self.no_repositories && self.role == "coding" && self.repo.is_none(),
+            repository_bases: None,
             repository: self.repo.clone(),
             branch: self.branch.clone(),
             base: self.base.clone(),
@@ -1451,9 +1503,29 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     for reference in &w.credential_env {
         dev["env"].as_array_mut().unwrap().push(json!({"name":reference.name,"valueFrom":{"secretKeyRef":{"name":reference.secret_name,"key":reference.key}}}));
     }
+    let mut volumes = volumes;
+    let mut sidecar_mounts = vec![
+        json!({"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"}),
+        json!({"name":"runtime-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true}),
+    ];
+    let mut bases_items = Vec::new();
+    if let (true, Some(bases)) = (w.repositories, &w.repository_bases) {
+        // The lifecycle's ReadWriteMany bases volume, seen read-only through a
+        // static PersistentVolume, since a claim cannot cross namespaces.
+        let name = repository_bases_volume_name(w);
+        bases_items.push(json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":name,"labels":labels},"spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadOnlyMany"],"persistentVolumeReclaimPolicy":"Retain","storageClassName":"","claimRef":{"namespace":w.namespace,"name":"repository-bases"},"csi":{"driver":bases.driver,"volumeHandle":bases.volume_handle,"readOnly":true,"volumeAttributes":{"share":"true"}}}}));
+        bases_items.push(json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":metadata(w,"repository-bases"),"spec":{"accessModes":["ReadOnlyMany"],"storageClassName":"","volumeName":name,"resources":{"requests":{"storage":"1Gi"}}}}));
+        volumes.push(json!({"name":"repository-bases","persistentVolumeClaim":{"claimName":"repository-bases","readOnly":true}}));
+        let mount = json!({"name":"repository-bases","mountPath":crate::repo_registry::REPOSITORY_BASES_MOUNT,"readOnly":true});
+        dev["volumeMounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(mount.clone());
+        sidecar_mounts.push(mount);
+    }
     let mut containers = vec![dev];
     if w.repositories {
-        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"env":[{"name":"ADM_LIFECYCLE_URL","value":lifecycle_url}],"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":[{"name":"work","mountPath":"/workspace","mountPropagation":"Bidirectional"},{"name":"runtime-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true}]}));
+        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"env":[{"name":"ADM_LIFECYCLE_URL","value":lifecycle_url}],"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":sidecar_mounts}));
     }
     let init = json!({"name":"initialize","image":w.workspace_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
     let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"serviceAccountName":"adm-runtime","automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
@@ -1471,7 +1543,9 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         egress.push(json!({"to":[{"namespaceSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"coding"}},"podSelector":{"matchLabels":{"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/role":"coding"}}}],"ports":[{"protocol":"TCP","port":7432}]}));
     }
     let network = json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":metadata(w,"workspace-isolation"),"spec":{"podSelector":{},"policyTypes":["Ingress","Egress"],"ingress":ingress,"egress":egress}});
-    items.extend([runtime_config, claim, service, deployment, network]);
+    items.extend([runtime_config, claim]);
+    items.extend(bases_items);
+    items.extend([service, deployment, network]);
     Ok(json!({"apiVersion":"v1","kind":"List","items":items}))
 }
 
@@ -1678,6 +1752,18 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
             );
             Ok(())
         })?;
+        if w.repositories && w.repository_bases.is_none() {
+            w.repository_bases = Some(lifecycle_stage(
+                cli,
+                "create",
+                &w.name,
+                "finding the shared repository bases",
+                || resolve_repository_bases(cli),
+            )?);
+            if resuming {
+                store.save(&w)?;
+            }
+        }
     }
     if resuming {
         lifecycle_stage(
@@ -2157,9 +2243,32 @@ pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {
             Ok(())
         },
     )?;
+    if w.repository_bases.is_some() {
+        let volume = repository_bases_volume_name(&w);
+        lifecycle_stage(
+            cli,
+            "destroy",
+            &w.name,
+            "removing the repository bases volume",
+            || {
+                kubectl(
+                    cli,
+                    &["delete", "pv", &volume, "--ignore-not-found=true"],
+                    None,
+                )?;
+                Ok(())
+            },
+        )?;
+    }
     w.phase = "deleted".into();
     w.last_error = None;
     store.save(&w)?;
+    if let Err(error) = crate::repo_registry::collect_repository_bases(&store) {
+        eprintln!(
+            "adm repository bases cleanup after destroying {} failed: {error:#}",
+            w.name
+        );
+    }
     lifecycle_complete("destroy", &w.name, "deleted", started);
     Ok(w)
 }

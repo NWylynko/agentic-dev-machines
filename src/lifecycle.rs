@@ -252,6 +252,7 @@ impl CreateIntent {
             agent_enabled: true,
             allow_node_local_storage: self.allow_node_local_storage,
             repositories: self.repositories,
+            repository_bases: None,
             repository: self.repository,
             branch: self.branch,
             base: self.base,
@@ -452,6 +453,16 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
     for (operation_id, _) in cli.store()?.pending_lifecycle_operations()? {
         let _ = wake.send(operation_id);
     }
+    // After the first store open above, which creates the database.
+    let bases_cli = cli.clone_for_lifecycle();
+    thread::spawn(move || {
+        if let Err(error) = bases_cli
+            .store()
+            .and_then(|store| crate::repo_registry::prepare_missing_repository_bases(&store))
+        {
+            eprintln!("adm repository bases startup preparation failed: {error:#}");
+        }
+    });
     eprintln!("adm lifecycle ready on {bind}:{port}");
     for incoming in listener.incoming() {
         let mut stream = incoming?;
@@ -816,6 +827,7 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
         || (method == "GET" && path == "/v1/runtime/repos/token")
         || (method == "GET" && path == "/v1/runtime/repos/registry")
         || (method == "POST" && path == "/v1/runtime/repos/rejected")
+        || (method == "POST" && path.starts_with("/v1/runtime/repos/opened/"))
         || (method == "POST"
             && path
                 .strip_prefix("/v1/workspaces/")
@@ -1054,7 +1066,25 @@ fn route(
             caller.role == "coding",
             "the GitHub login is restricted to coding workspaces"
         );
-        return Ok((200, crate::repo_registry::sidecar_catalog(&store)?));
+        return Ok((
+            200,
+            crate::repo_registry::sidecar_catalog(&store, caller.repository_bases.is_some())?,
+        ));
+    }
+    if method == "POST" && path.starts_with("/v1/runtime/repos/opened/") {
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
+        ensure!(
+            matches!(caller.phase.as_str(), "provisioning" | "ready"),
+            "workspace lifecycle is not active for provider requests"
+        );
+        ensure!(
+            caller.role == "coding",
+            "repository bases are restricted to coding workspaces"
+        );
+        return Ok((
+            200,
+            crate::repo_registry::record_opened(&mut store, &caller.id, path)?,
+        ));
     }
     // The cluster's GitHub login goes only to coding Pods (their git, gh and
     // repositories sidecar share one Pod identity). Bots are refused here,

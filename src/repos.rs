@@ -22,7 +22,7 @@ pub enum ReposAction {
     },
     /// Show which account the cluster is connected as.
     Status,
-    /// Register a GitHub repository so every coding workspace shows it in /repos.
+    /// Register a GitHub repository so every coding workspace shows it in /repos, stored once in a shared base. Run again to fetch new commits into the base.
     Clone {
         /// OWNER/REPO
         repository: String,

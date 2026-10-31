@@ -54,6 +54,10 @@ fn start_service(root: &Path, port: u16) -> ServiceProcess {
         fs::read_to_string(root.join("runtime-status-port")).unwrap_or_else(|_| "7432".into());
     let runner_url = fs::read_to_string(root.join("runner-url")).unwrap();
     let log_path = root.join("service.log");
+    // Extra environment for one test's service (TASK-113), e.g. a fake GitHub.
+    let env: Vec<(String, String)> = fs::read_to_string(root.join("service-env.json"))
+        .map(|text| serde_json::from_str(&text).unwrap())
+        .unwrap_or_default();
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -62,6 +66,7 @@ fn start_service(root: &Path, port: u16) -> ServiceProcess {
     ServiceProcess(
         Command::new(env!("CARGO_BIN_EXE_adm"))
             .process_group(0)
+            .envs(env)
             .args(["--state-dir"])
             .arg(root.join("state"))
             .args(["--kubectl"])
@@ -309,7 +314,7 @@ elif args[:3] == ['get','deployment','adm-lifecycle']:
 elif args[:3] == ['get','pvc','adm-lifecycle-state']:
     print(json.dumps({'metadata':{'name':'adm-lifecycle-state','namespace':'adm-system'},'spec':{'storageClassName':'lifecycle-storage'}}))
 elif args[:2] == ['create','--dry-run=client']:
-    for item in [{'kind':'Namespace','metadata':{'name':'adm-system'}},{'kind':'PersistentVolumeClaim','metadata':{'name':'adm-lifecycle-state','namespace':'adm-system'},'spec':{}},{'kind':'Deployment','metadata':{'name':'adm-lifecycle','namespace':'adm-system'},'spec':{'template':{'spec':{'initContainers':[{'name':'init','image':'unset'}],'containers':[{'name':'lifecycle','image':'unset'}]}}}}]:
+    for item in [{'kind':'Namespace','metadata':{'name':'adm-system'}},{'kind':'PersistentVolumeClaim','metadata':{'name':'adm-lifecycle-state','namespace':'adm-system'},'spec':{}},{'kind':'PersistentVolumeClaim','metadata':{'name':'adm-repository-bases','namespace':'adm-system'},'spec':{}},{'kind':'Deployment','metadata':{'name':'adm-lifecycle','namespace':'adm-system'},'spec':{'template':{'spec':{'initContainers':[{'name':'init','image':'unset'}],'containers':[{'name':'lifecycle','image':'unset'}]}}}}]:
         print(json.dumps(item))
 elif args[:4] == ['-n','adm-system','get','secret']:
     print('secret/adm-lifecycle-token' if '--ignore-not-found' in args else (root/'token').read_text().strip())
@@ -387,6 +392,16 @@ elif args[:3] == ['get','deployment','workspace']:
     workspace_id=(root/'expected-workspace-id').read_text()
     labels={'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id,'adm.dev/role':'coding'}
     print(json.dumps({'kind':'Deployment','metadata':{'name':'workspace','namespace':namespace,'labels':labels},'spec':{'selector':{'matchLabels':labels},'template':{'metadata':{'labels':labels},'spec':{'serviceAccountName':'adm-runtime','volumes':[{'name':'work','persistentVolumeClaim':{'claimName':'work'}}]}}}}))
+# The shared repository bases volume the lifecycle Pod mounts (TASK-113).
+elif args[:3] == ['get','pvc','adm-repository-bases']:
+    if (root/'bases-unbound').exists():
+        print(json.dumps({'metadata':{'name':'adm-repository-bases'},'spec':{},'status':{'phase':'Pending'}})); sys.exit(0)
+    print(json.dumps({'metadata':{'name':'adm-repository-bases'},'spec':{'volumeName':'pvc-bases'},'status':{'phase':'Bound'}}))
+elif args[:3] == ['get','pv','pvc-bases']:
+    print(json.dumps({'metadata':{'name':'pvc-bases'},'spec':{'csi':{'driver':'driver.longhorn.io','volumeHandle':'pvc-bases','fsType':'ext4','volumeAttributes':{'share':'true'}}}}))
+elif args[:2] == ['delete','pv']:
+    with locked():
+        with (root/'deleted-pvs').open('a') as deleted: deleted.write(args[2]+'\n')
 elif args[:2] == ['get','pvc'] and args[2] == 'work':
     namespace=args[args.index('-n')+1]
     workspace_id=(root/'expected-workspace-id').read_text()
@@ -4175,4 +4190,366 @@ fn adm_update_retry_resumes_the_maintenance_window_a_failed_update_left_open() {
         "{report}"
     );
     assert!(!root.join("client-state/update-maintenance.json").exists());
+}
+
+/// The provider-auth authority as the shared-base test needs it: every
+/// repository is reachable and public, and there is no GitHub login.
+fn start_public_github_authority() -> (String, u16, thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(end + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + length {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first_line = headers.lines().next().unwrap_or("").to_owned();
+            if first_line.starts_with("GET /shutdown ") {
+                break;
+            }
+            let (status, body) = if first_line.starts_with("POST /v1/repos/check ") {
+                let checked: Value = serde_json::from_slice(&request[header_end..]).unwrap();
+                (
+                    "200 OK",
+                    json!({"repo":checked["repo"],"ref":checked["ref"].as_str().unwrap_or("trunk")})
+                        .to_string(),
+                )
+            } else if first_line.starts_with("GET /v1/runtime/repos/token ") {
+                (
+                    "409 Conflict",
+                    json!({"error":{"code":"GITHUB_NOT_LOGGED_IN","message":"not logged in"}})
+                        .to_string(),
+                )
+            } else {
+                (
+                    "404 Not Found",
+                    json!({"error":{"code":"NOT_FOUND"}}).to_string(),
+                )
+            };
+            write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), port, server)
+}
+
+fn git_in(directory: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+// TASK-113: a registered repository is stored once, in a base on the lifecycle's
+// shared volume. Coding workspaces mount that volume read-only and the sidecar
+// is told where each base is. A removed repository's base is deleted once no
+// live workspace has opened it.
+#[test]
+fn registered_repositories_get_one_shared_base_that_workspaces_mount_read_only() {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner_server) = start_runner_stub();
+    let (authority_url, authority_port, authority_server) = start_public_github_authority();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("storage-release"), "continue").unwrap();
+
+    // GitHub is a directory of bare repositories: owner/project on trunk.
+    let upstreams = root.path().join("upstreams");
+    let seed = root.path().join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    for name in ["owner/project.git", "owner/second.git"] {
+        let bare = upstreams.join(name);
+        fs::create_dir_all(&bare).unwrap();
+        git_in(&bare, &["init", "--bare", "--initial-branch=trunk"]);
+    }
+    git_in(&seed, &["init", "--initial-branch=trunk"]);
+    git_in(&seed, &["config", "user.name", "Fixture"]);
+    git_in(&seed, &["config", "user.email", "fixture@example.invalid"]);
+    fs::write(seed.join("README.md"), "first\n").unwrap();
+    git_in(&seed, &["add", "README.md"]);
+    git_in(&seed, &["commit", "-m", "first"]);
+    for name in ["owner/project.git", "owner/second.git"] {
+        git_in(
+            &seed,
+            &["push", upstreams.join(name).to_str().unwrap(), "trunk"],
+        );
+    }
+    let first = git_in(&seed, &["rev-parse", "HEAD"]);
+    let bases = root.path().join("bases");
+    fs::write(
+        root.path().join("service-env.json"),
+        json!([
+            ["ADM_PROVIDER_AUTH_URL", authority_url],
+            ["ADM_REPOSITORY_BASES", bases.to_str().unwrap()],
+            ["GIT_CONFIG_NOSYSTEM", "1"],
+            ["GIT_CONFIG_GLOBAL", "/dev/null"],
+            ["GIT_CONFIG_COUNT", "1"],
+            [
+                "GIT_CONFIG_KEY_0",
+                format!("url.file://{}/.insteadOf", upstreams.display())
+            ],
+            ["GIT_CONFIG_VALUE_0", "https://github.com/"],
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let _service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    let operator = |method: &str, path: &str, body: Option<&Value>| {
+        let response =
+            request_with_token(&url, method, path, body, Some("synthetic-lifecycle-token"))
+                .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json::<Value>().unwrap_or(Value::Null))
+    };
+    let base = bases.join("owner/project.git");
+    let base_branch = || {
+        git_in(
+            root.path(),
+            &[
+                "--git-dir",
+                base.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/trunk",
+            ],
+        )
+    };
+
+    // Registering clones the base; registering again refreshes it.
+    let (status, body) = operator(
+        "POST",
+        "/v1/repos/registry",
+        Some(&json!({"repo":"owner/project"})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(base_branch(), first);
+    assert_eq!(
+        git_in(
+            root.path(),
+            &[
+                "--git-dir",
+                base.to_str().unwrap(),
+                "rev-parse",
+                "--is-bare-repository"
+            ]
+        ),
+        "true"
+    );
+    fs::write(seed.join("README.md"), "second\n").unwrap();
+    git_in(&seed, &["commit", "-am", "second"]);
+    git_in(
+        &seed,
+        &[
+            "push",
+            upstreams.join("owner/project.git").to_str().unwrap(),
+            "trunk",
+        ],
+    );
+    let second = git_in(&seed, &["rev-parse", "HEAD"]);
+    let (status, body) = operator(
+        "POST",
+        "/v1/repos/registry",
+        Some(&json!({"repo":"owner/project"})),
+    );
+    assert_eq!(
+        (status, &body["registered"]),
+        (200, &json!(false)),
+        "{body}"
+    );
+    assert_eq!(
+        base_branch(),
+        second,
+        "registering again refreshes the base"
+    );
+
+    // A coding workspace with the sidecar mounts the bases volume read-only.
+    let mut spec = workspace_spec("shared-base");
+    spec["repositories"] = json!(true);
+    let operation = "4a0c5d7e-2b1f-4c3d-9e8f-113000000001";
+    let (status, body) = operator(
+        "POST",
+        "/v1/operations",
+        Some(&json!({"operationId":operation,"kind":"create","spec":spec})),
+    );
+    assert!(status < 300, "{body}");
+    let receipt = wait_for(|| {
+        Some(operator("GET", &format!("/v1/operations/{operation}"), None).1)
+            .filter(|receipt| receipt["status"] == "completed" || receipt["status"] == "failed")
+    });
+    assert_eq!(receipt["status"], "completed", "{receipt}");
+    let workspace_id = receipt["workspaceId"].as_str().unwrap().to_owned();
+    let (_, workspace) = operator("GET", &format!("/v1/workspaces/{workspace_id}"), None);
+    let namespace = workspace["namespace"].as_str().unwrap().to_owned();
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(root.path().join("applied")).unwrap()).unwrap();
+    let items = applied["items"].as_array().unwrap();
+    let volume = items
+        .iter()
+        .find(|item| item["kind"] == "PersistentVolume")
+        .expect("a read-only PersistentVolume onto the shared bases volume");
+    assert_eq!(volume["spec"]["csi"]["volumeHandle"], "pvc-bases");
+    assert_eq!(volume["spec"]["csi"]["driver"], "driver.longhorn.io");
+    assert_eq!(volume["spec"]["csi"]["readOnly"], true);
+    assert_eq!(volume["spec"]["accessModes"], json!(["ReadOnlyMany"]));
+    assert_eq!(volume["spec"]["persistentVolumeReclaimPolicy"], "Retain");
+    assert_eq!(volume["spec"]["claimRef"]["namespace"], namespace.as_str());
+    let claim = items
+        .iter()
+        .find(|item| {
+            item["kind"] == "PersistentVolumeClaim"
+                && item["metadata"]["name"] == "repository-bases"
+        })
+        .unwrap();
+    assert_eq!(claim["spec"]["volumeName"], volume["metadata"]["name"]);
+    let pod = &items
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap()["spec"]["template"]["spec"];
+    assert!(
+        pod["volumes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name":"repository-bases","persistentVolumeClaim":{"claimName":"repository-bases","readOnly":true}}))
+    );
+    for container in ["dev", "repositories"] {
+        let mounts = &pod["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["name"] == container)
+            .unwrap()["volumeMounts"];
+        assert!(
+            mounts.as_array().unwrap().contains(&json!({"name":"repository-bases","mountPath":"/var/lib/adm-repository-bases","readOnly":true})),
+            "{container} must see the bases read-only at the path the clone records: {mounts}"
+        );
+    }
+
+    // The sidecar is told where each base is, and reports opening one.
+    fs::write(root.path().join("expected-namespace"), &namespace).unwrap();
+    // The fake kubectl lists Pods with this UID unless a rollout chose another.
+    let pod_uid = fs::read_to_string(root.path().join("expected-pod-uid"))
+        .unwrap_or_else(|_| "4b53eaa6-4e4d-42dd-9a02-4702a842155a".into());
+    fs::write(root.path().join("expected-pod-uid"), &pod_uid).unwrap();
+    let claims = json!({"adm-test-pod":{"namespace":namespace,"uid":pod_uid}});
+    let pod_token = format!(
+        "e30.{}.signature",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let pod_request = |method: &str, path: &str| {
+        let response = request_with_token(&url, method, path, None, Some(&pod_token)).unwrap();
+        let status = response.status().as_u16();
+        (status, response.json::<Value>().unwrap_or(Value::Null))
+    };
+    // A Pod takes its runtime lease on boot; runtime routes require it.
+    let lease = request_with_token(
+        &url,
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/runtime/lease"),
+        Some(&json!({"holder":pod_uid})),
+        Some(&pod_token),
+    )
+    .unwrap();
+    assert_eq!(lease.status(), 200, "{}", lease.text().unwrap());
+    let (status, catalog) = pod_request("GET", "/v1/runtime/repos/registry");
+    assert_eq!(status, 200, "{catalog}");
+    assert_eq!(
+        catalog["repositories"],
+        json!([{"owner":"owner","name":"project","remote":"https://github.com/owner/project.git","ref":"refs/heads/trunk","upstreamGitDir":"/var/lib/adm-repository-bases/owner/project.git"}])
+    );
+    let (status, body) = pod_request("POST", "/v1/runtime/repos/opened/owner/project");
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = pod_request("POST", "/v1/runtime/repos/opened/owner/never-registered");
+    assert_eq!(status, 400, "only a registered repository can be opened");
+
+    // A repository nobody opened loses its base as soon as it is removed.
+    let (status, body) = operator(
+        "POST",
+        "/v1/repos/registry",
+        Some(&json!({"repo":"owner/second"})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(bases.join("owner/second.git").exists());
+    let (status, body) = operator("DELETE", "/v1/repos/registry/owner/second", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(!bases.join("owner/second.git").exists());
+
+    // An opened repository disappears from /repos at once, but its base stays
+    // until the last workspace that opened it is destroyed.
+    let (status, body) = operator("DELETE", "/v1/repos/registry/owner/project", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        pod_request("GET", "/v1/runtime/repos/registry").1["repositories"],
+        json!([])
+    );
+    assert!(
+        base.exists(),
+        "a workspace's clone still links to this base"
+    );
+    let delete = "4a0c5d7e-2b1f-4c3d-9e8f-113000000002";
+    operator(
+        "POST",
+        "/v1/operations",
+        Some(&json!({"operationId":delete,"kind":"delete","workspaceId":workspace_id})),
+    );
+    let receipt = wait_for(|| {
+        Some(operator("GET", &format!("/v1/operations/{delete}"), None).1)
+            .filter(|receipt| receipt["status"] == "completed" || receipt["status"] == "failed")
+    });
+    assert_eq!(receipt["status"], "completed", "{receipt}");
+    assert!(
+        !base.exists(),
+        "the last user is gone, so the base is deleted"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("deleted-pvs")).unwrap(),
+        format!("{}\n", volume["metadata"]["name"].as_str().unwrap()),
+        "destroy deletes the workspace's cluster-scoped PersistentVolume"
+    );
+    stop_http_stub(runner_port, runner_server);
+    stop_http_stub(authority_port, authority_server);
 }

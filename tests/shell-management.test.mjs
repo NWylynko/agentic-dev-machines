@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createServer as createTcpServer, createConnection } from "node:net";
 import {
   mkdir,
@@ -17,6 +17,28 @@ import { tmpdir } from "node:os";
 const adm = process.argv[2];
 assert.ok(adm, "pass the public adm executable");
 const root = await mkdtemp(join(tmpdir(), "adm-managed-shell-"));
+// owner/project on the fake github.com, for its shared base (TASK-113).
+{
+  const bare = join(root, "upstreams", "owner", "project.git");
+  const seed = join(root, "seed");
+  const git = (...args) => execFileSync("git", args, { stdio: "pipe" });
+  git("init", "--bare", "--initial-branch=main", bare);
+  git("init", "--initial-branch=main", seed);
+  await writeFile(join(seed, "README.md"), "fixture\n");
+  git("-C", seed, "add", "README.md");
+  git(
+    "-C",
+    seed,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "commit",
+    "-m",
+    "seed",
+  );
+  git("-C", seed, "push", bare, "main");
+}
 const stateFile = join(root, "cluster.json");
 const leaseFile = join(root, "lifecycle-lease.json");
 const execLog = join(root, "exec.jsonl");
@@ -58,6 +80,16 @@ const server = createServer(async (request, response) => {
   if (path === "/v1/repos/check") {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ repo: body.repo, ref: "main" }));
+    return;
+  }
+  // Not logged in to GitHub: the shared base clones the public repository.
+  if (path === "/v1/runtime/repos/token") {
+    response.writeHead(409, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        error: { code: "GITHUB_NOT_LOGGED_IN", message: "not logged in" },
+      }),
+    );
     return;
   }
   await writeFile(
@@ -291,7 +323,17 @@ else if (args[0] === "exec") {
     ],
     {
       stdio: "ignore",
-      env: { ...process.env, ADM_PROVIDER_AUTH_URL: runnerUrl },
+      env: {
+        ...process.env,
+        ADM_PROVIDER_AUTH_URL: runnerUrl,
+        // Shared repository bases (TASK-113), cloned from a fake github.com.
+        ADM_REPOSITORY_BASES: join(root, "bases"),
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: `url.file://${join(root, "upstreams")}/.insteadOf`,
+        GIT_CONFIG_VALUE_0: "https://github.com/",
+      },
     },
   );
   const lifecycleReady = Date.now() + 5000;
@@ -300,7 +342,10 @@ else if (args[0] === "exec") {
       const response = await fetch(`${lifecycleUrl}/health`);
       if (response.ok) break;
     } catch {}
-    assert.ok(Date.now() < lifecycleReady, "isolated lifecycle fixture did not start");
+    assert.ok(
+      Date.now() < lifecycleReady,
+      "isolated lifecycle fixture did not start",
+    );
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   const env = {
@@ -596,7 +641,10 @@ if adm destroy sibling-workspace 2>/dev/null; then exit 42; else echo VERB_DENIE
     0,
     `stdout=${defaultShell.stdout}\\nstderr=${defaultShell.stderr}`,
   );
-  assert.ok(defaultShell.stdout.includes(mappedRepository), defaultShell.stdout);
+  assert.ok(
+    defaultShell.stdout.includes(mappedRepository),
+    defaultShell.stdout,
+  );
   assert.match(defaultShell.stdout, /selected repository/);
   assert.match(defaultShell.stdout, /"status": "running"/);
   const allKubectlCalls = (await readFile(execLog, "utf8"))
