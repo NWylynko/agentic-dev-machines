@@ -1504,7 +1504,8 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         json!({"name":"runtime-config","configMap":{"name":"workspace-runtime","items":[{"key":"workspace.json","path":"workspace.json"}]}}),
         json!({"name":"runtime-token","projected":{"sources":[{"serviceAccountToken":{"audience":"adm-lifecycle","expirationSeconds":3600,"path":"token"}}]}}),
     ];
-    let mut dev = json!({"name":if w.role == "coding" { "dev" } else { "bot" },"image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":if w.role == "coding" { "/repos" } else { "/workspace" },"ports":[{"name":"http","containerPort":7432}],"securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"httpGet":{"path":"/ready","port":7432},"initialDelaySeconds":1,"periodSeconds":2},"livenessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":10,"periodSeconds":10,"failureThreshold":3}});
+    // workingDir is never /repos: runc (root) cannot stat the sidecar's UID 1000 FUSE catalog there.
+    let mut dev = json!({"name":if w.role == "coding" { "dev" } else { "bot" },"image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/workspace","ports":[{"name":"http","containerPort":7432}],"securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"httpGet":{"path":"/ready","port":7432},"initialDelaySeconds":1,"periodSeconds":2},"livenessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":10,"periodSeconds":10,"failureThreshold":3}});
     let lifecycle_url =
         format!("http://adm-lifecycle.{lifecycle_namespace}.svc.cluster.local:7433");
     dev["env"] = json!([

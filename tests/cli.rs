@@ -4125,7 +4125,9 @@ fn repository_sidecar_runs_as_the_development_user_and_catalog_is_the_repos_view
         .unwrap();
     let pod = &deployment["spec"]["template"]["spec"];
     let dev = &pod["containers"][0];
-    assert_eq!(dev["workingDir"], "/repos");
+    // Not /repos: runc creates the working directory as root, and root cannot stat the
+    // sidecar's FUSE catalog (UID 1000, no allow_other), so the container would never start.
+    assert_eq!(dev["workingDir"], "/workspace");
     // Readiness requires the runtime lease; liveness only requires a live,
     // unfenced runner, so waiting out a slow lifecycle does not restart it.
     assert_eq!(dev["readinessProbe"]["httpGet"]["path"], "/ready");
