@@ -63,6 +63,7 @@ fn setup_installs_connects_and_reuses_the_controller_without_manual_credentials(
     let manifest = json!({"apiVersion":"v1","kind":"List","items":[
         {"apiVersion":"v1","kind":"Namespace","metadata":{"name":"adm-system"}},
         {"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"adm-lifecycle-state","namespace":"adm-system"},"spec":{"storageClassName":"adm-replicated"}},
+        {"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"adm-repository-bases","namespace":"adm-system"},"spec":{"accessModes":["ReadWriteMany"],"storageClassName":"adm-replicated"}},
         {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"adm-lifecycle","namespace":"adm-system"},"spec":{"template":{"spec":{"initContainers":[{"name":"prepare-state","image":"old-image"}],"containers":[{"name":"lifecycle","image":"old-image"}]}}}},
         {"apiVersion":"v1","kind":"Service","metadata":{"name":"adm-lifecycle","namespace":"adm-system"}}
     ]});
@@ -92,6 +93,10 @@ elif args[:6]==['-n','adm-system','create','secret','generic','adm-lifecycle-tok
  if token.exists(): print('refusing token rotation',file=sys.stderr);sys.exit(1)
  token.write_bytes(sys.stdin.buffer.read());token.chmod(0o600)
  print('secret/adm-lifecycle-token created')
+elif args[:3]==['get','pvc','adm-repository-bases']:
+ print(json.dumps({'status':{'phase':'Pending' if (root/'bases-pending').exists() else 'Bound'}}))
+elif args[:2]==['get','events']:
+ print(json.dumps({'items':[{'message':'failed to provision volume: access mode ReadWriteMany is not supported'}]}))
 elif args[:5]==['-n','adm-system','rollout','status','deployment/adm-lifecycle']:
  if (root/'fail-rollout').exists(): print('ImagePullBackOff: fixture registry denied',file=sys.stderr);sys.exit(1)
  print('successfully rolled out')
@@ -207,7 +212,41 @@ else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
     let output = invoke(root.path(), &arguments, "\n\n\n\n\n");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("ImagePullBackOff"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("ReadWriteMany"),
+        "a bound bases volume is not blamed"
+    );
     assert_eq!(fs::read(&config_path).unwrap(), saved);
+    // The shared repository bases volume uses the chosen StorageClass, and a
+    // class without ReadWriteMany is named as the reason the lifecycle cannot
+    // start (TASK-113).
+    let applied: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.path().join("applied.json")).unwrap())
+            .unwrap();
+    let classes: Vec<_> = applied["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "PersistentVolumeClaim")
+        .map(|claim| claim["spec"]["storageClassName"].clone())
+        .collect();
+    assert_eq!(classes.len(), 2);
+    assert!(
+        classes
+            .iter()
+            .all(|class| *class == classes[0] && *class != "adm-replicated"),
+        "{classes:?}"
+    );
+    fs::write(root.path().join("bases-pending"), "").unwrap();
+    let output = invoke(root.path(), &arguments, "\n\n\n\n\n");
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("adm-system/adm-repository-bases is Pending (failed to provision volume: access mode ReadWriteMany is not supported)")
+            && error.contains("must support ReadWriteMany, see deploy/storage.md"),
+        "{error}"
+    );
+    fs::remove_file(root.path().join("bases-pending")).unwrap();
     assert_eq!(
         fs::read_to_string(root.path().join("controller-token")).unwrap(),
         token

@@ -46,6 +46,11 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list"]
+  # Each coding workspace gets a read-only PersistentVolume onto the shared
+  # repository bases volume, since a claim cannot cross namespaces (TASK-113).
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
@@ -104,6 +109,21 @@ spec:
     requests:
       storage: 1Gi
 ---
+# One bare clone ("base") per registered repository, shared read-only by every
+# coding workspace so a repository is stored once (TASK-113). Needs a
+# StorageClass that supports ReadWriteMany; see deploy/storage.md.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: adm-repository-bases
+  namespace: adm-system
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: adm-replicated
+  resources:
+    requests:
+      storage: 20Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -128,12 +148,14 @@ spec:
       initContainers:
         - name: prepare-state
           image: ghcr.io/nwylynko/agentic-dev-machines:latest
-          command: ["chown", "-R", "1000:1000", "/var/lib/adm"]
+          command: ["chown", "-R", "1000:1000", "/var/lib/adm", "/var/lib/adm-repository-bases"]
           securityContext:
             runAsUser: 0
           volumeMounts:
             - name: state
               mountPath: /var/lib/adm
+            - name: repository-bases
+              mountPath: /var/lib/adm-repository-bases
       containers:
         - name: lifecycle
           image: ghcr.io/nwylynko/agentic-dev-machines:latest
@@ -149,6 +171,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: ADM_REPOSITORY_BASES
+              value: /var/lib/adm-repository-bases
           ports:
             - name: http
               containerPort: 7433
@@ -185,6 +209,8 @@ spec:
             - name: identity
               mountPath: /var/run/adm-identity
               readOnly: true
+            - name: repository-bases
+              mountPath: /var/lib/adm-repository-bases
         - name: provider-auth
           image: ghcr.io/nwylynko/agentic-dev-machines:latest
           imagePullPolicy: IfNotPresent
@@ -219,6 +245,9 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: adm-lifecycle-state
+        - name: repository-bases
+          persistentVolumeClaim:
+            claimName: adm-repository-bases
         - name: kubeconfig
           configMap:
             name: adm-lifecycle-kubeconfig

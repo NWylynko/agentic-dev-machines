@@ -69,6 +69,14 @@ pub fn install(cli: &Cli, image: &str, storage_class: &str) -> Result<()> {
         })
         .context("lifecycle manifest has no adm-lifecycle-state PersistentVolumeClaim")?;
     claim["spec"]["storageClassName"] = json!(storage_class);
+    resources
+        .iter_mut()
+        .find(|resource| {
+            resource["kind"] == "PersistentVolumeClaim"
+                && resource["metadata"]["name"] == "adm-repository-bases"
+        })
+        .context("lifecycle manifest has no adm-repository-bases PersistentVolumeClaim")?["spec"]
+        ["storageClassName"] = json!(storage_class);
     let deployment = resources
         .iter_mut()
         .find(|resource| {
@@ -114,8 +122,63 @@ pub fn install(cli: &Cli, image: &str, storage_class: &str) -> Result<()> {
             "--timeout=180s",
         ],
         None,
-    )?;
+    )
+    .map_err(|error| match unbound_repository_bases(cli, storage_class) {
+        Some(reason) => error.context(reason),
+        None => error,
+    })?;
     Ok(())
+}
+
+/// Why the lifecycle cannot start when its shared repository bases volume
+/// (ReadWriteMany, TASK-113) never bound, or None when it is bound.
+fn unbound_repository_bases(cli: &Cli, storage_class: &str) -> Option<String> {
+    let claim: Value = serde_json::from_slice(
+        &workspaces::kubectl(
+            cli,
+            &[
+                "get",
+                "pvc",
+                "adm-repository-bases",
+                "-n",
+                "adm-system",
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .ok()?,
+    )
+    .ok()?;
+    if claim["status"]["phase"] == "Bound" {
+        return None;
+    }
+    let events: Value = workspaces::kubectl(
+        cli,
+        &[
+            "get",
+            "events",
+            "-n",
+            "adm-system",
+            "--field-selector",
+            "involvedObject.name=adm-repository-bases",
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .ok()
+    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    .unwrap_or_default();
+    let last = events["items"]
+        .as_array()
+        .and_then(|items| items.last())
+        .and_then(|event| event["message"].as_str())
+        .unwrap_or("no events");
+    Some(format!(
+        "the shared repository bases volume adm-system/adm-repository-bases is {} ({last}); StorageClass {storage_class} must support ReadWriteMany, see deploy/storage.md",
+        claim["status"]["phase"].as_str().unwrap_or("not bound")
+    ))
 }
 
 fn install_token(cli: &Cli, explicit_token: Option<&str>) -> Result<()> {

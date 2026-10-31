@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"math/rand"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -48,9 +52,7 @@ func TestSharedBaseStoresFilesOnceAndKeepsWorkPrivate(t *testing.T) {
 	// The lifecycle prepares the base on a volume it owns; workspaces only ever
 	// see that volume through a read-only mount.
 	writable := filepath.Join(dir, "bases")
-	if err := run(context.Background(), []string{"prepare-base", "--remote", "file://" + upstream, "--ref", "refs/heads/main", "--destination", filepath.Join(writable, "example", "project.git")}); err != nil {
-		t.Fatal(err)
-	}
+	prepareTestBase(t, "file://"+upstream, filepath.Join(writable, "example", "project.git"))
 	readOnly := filepath.Join(dir, "bases-ro")
 	mountReadOnly(t, writable, readOnly)
 	base := filepath.Join(readOnly, "example", "project.git")
@@ -60,16 +62,40 @@ func TestSharedBaseStoresFilesOnceAndKeepsWorkPrivate(t *testing.T) {
 		return Config{State: filepath.Join(root, "state"), GitRoot: filepath.Join(root, "git"), Views: filepath.Join(root, "views"), Mount: filepath.Join(root, "repos"), UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), Artifact: artifact}
 	}
 	shared := Catalog{Repositories: []Repository{{Owner: "example", Name: "project", Remote: "file://" + upstream, Ref: "refs/heads/main", UpstreamGitDir: base}}}
-	a, b, alone := newWorkspace("a"), newWorkspace("b"), newWorkspace("alone")
-	for _, workspace := range []struct {
-		config  Config
-		catalog Catalog
-	}{{a, shared}, {b, shared}, {alone, Catalog{Repositories: []Repository{{Owner: "example", Name: "project", Remote: "file://" + upstream, Ref: "refs/heads/main"}}}}} {
-		server, err := mountCatalog(context.Background(), workspace.config, workspace.catalog)
-		if err != nil {
-			t.Fatal(err)
+	// Workspace A reads the registry from a lifecycle, which must hear that A
+	// uses the base before A's clone links to it.
+	var mu sync.Mutex
+	var opened []string
+	lifecycle := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/v1/runtime/repos/opened/") {
+			opened = append(opened, strings.TrimPrefix(r.URL.Path, "/v1/runtime/repos/opened/"))
+			_, _ = w.Write([]byte("{}"))
+			return
 		}
-		defer server.Close()
+		_ = json.NewEncoder(w).Encode(shared)
+	}))
+	defer lifecycle.Close()
+	tokenFile := filepath.Join(dir, "identity")
+	write(t, tokenFile, "pod-identity\n")
+	a, b, alone := newWorkspace("a"), newWorkspace("b"), newWorkspace("alone")
+	a.LifecycleURL, a.TokenFile = lifecycle.URL, tokenFile
+	first, err := mountRegistry(context.Background(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := mountCatalog(context.Background(), b, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	withoutBaseCatalog := Catalog{Repositories: []Repository{{Owner: "example", Name: "project", Remote: "file://" + upstream, Ref: "refs/heads/main"}}}
+	control, err := mountCatalog(context.Background(), alone, withoutBaseCatalog)
+	if err != nil {
+		t.Fatal(err)
 	}
 	projectA, projectB := filepath.Join(a.Mount, "example", "project"), filepath.Join(b.Mount, "example", "project")
 	for _, project := range []string{projectA, projectB, filepath.Join(alone.Mount, "example", "project")} {
@@ -86,6 +112,23 @@ func TestSharedBaseStoresFilesOnceAndKeepsWorkPrivate(t *testing.T) {
 	if withoutBase < 2048 {
 		t.Fatalf("control workspace stores only %d KiB; the measurement cannot see a 2 MiB file", withoutBase)
 	}
+	mu.Lock()
+	if strings.Join(opened, ",") != "example/project" {
+		t.Fatalf("lifecycle heard opened=%v, want example/project once", opened)
+	}
+	mu.Unlock()
+
+	// A repository opened before its base existed keeps working when the
+	// registry later offers the base: the base is storage, not identity.
+	if err := control.Close(); err != nil {
+		t.Fatal(err)
+	}
+	control, err = mountCatalog(context.Background(), alone, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	assertFile(t, filepath.Join(alone.Mount, "example", "project", "README.md"), "upstream\n")
 
 	// Work stays private to each workspace.
 	git(t, projectA, "config", "user.name", "Workspace A")
@@ -113,9 +156,7 @@ func TestSharedBaseStoresFilesOnceAndKeepsWorkPrivate(t *testing.T) {
 	write(t, filepath.Join(upstream, "README.md"), "upstream moved\n")
 	git(t, upstream, "commit", "-am", "upstream moved")
 	moved := strings.TrimSpace(git(t, upstream, "rev-parse", "HEAD"))
-	if err := run(context.Background(), []string{"prepare-base", "--remote", "file://" + upstream, "--ref", "refs/heads/main", "--destination", filepath.Join(writable, "example", "project.git")}); err != nil {
-		t.Fatal(err)
-	}
+	git(t, filepath.Join(writable, "example", "project.git"), "fetch", "--no-tags", "file://"+upstream, "+refs/heads/main:refs/heads/main")
 	if _, err := exec.Command("git", "--git-dir", base, "cat-file", "-e", moved).Output(); err != nil {
 		t.Fatal("refresh did not add the new upstream commit to the base")
 	}
@@ -149,9 +190,7 @@ func TestSharedBaseMustBeReadOnly(t *testing.T) {
 	git(t, upstream, "add", ".")
 	git(t, upstream, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-m", "upstream")
 	base := filepath.Join(dir, "bases", "example", "project.git")
-	if err := run(context.Background(), []string{"prepare-base", "--remote", "file://" + upstream, "--destination", base}); err != nil {
-		t.Fatal(err)
-	}
+	prepareTestBase(t, "file://"+upstream, base)
 	config := Config{State: filepath.Join(dir, "state"), GitRoot: filepath.Join(dir, "git"), Views: filepath.Join(dir, "views"), Mount: filepath.Join(dir, "repos"), UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), Artifact: artifact}
 	server, err := mountCatalog(context.Background(), config, Catalog{Repositories: []Repository{{Owner: "example", Name: "project", Remote: "file://" + upstream, Ref: "refs/heads/main", UpstreamGitDir: base}}})
 	if err != nil {
@@ -160,6 +199,17 @@ func TestSharedBaseMustBeReadOnly(t *testing.T) {
 	defer server.Close()
 	if _, err := os.ReadFile(filepath.Join(config.Mount, "example", "project", "README.md")); err == nil {
 		t.Fatal("opened a repository against a writable shared base")
+	}
+}
+
+// prepareTestBase makes a base the way the lifecycle does (src/repo_registry.rs).
+func prepareTestBase(t *testing.T, remote, destination string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "clone", "--bare", "--single-branch", "--no-tags", "--branch", "main", "--", remote, destination).CombinedOutput(); err != nil {
+		t.Fatalf("clone base: %v\n%s", err, output)
 	}
 }
 
