@@ -55,6 +55,7 @@ On another laptop, `adm connect` uses an existing installation without installin
 ![adm repos list and adm mcp list](docs/images/adm-shared-setup.png)
 
 - **Repositories:** `adm repos clone OWNER/REPO` registers a repo once and it shows up in every coding workspace under `/repos`, fetched the first time you open it. `adm create --repo OWNER/REPO --branch feature/x` starts on a branch, and `--new-repo OWNER/NAME` creates a new private GitHub repo. See [finding your repositories](docs/operations.md#find-your-repositories).
+- **Browser:** coding agents have a built-in headless Chromium they drive with `browser_*` Playwright tools (navigate, snapshot, click, screenshot), including your dev servers on `localhost`. Bots do not get it. See [Built-in browser](docs/operations.md#built-in-browser).
 - **MCP servers:** `adm mcp add NAME URL` gives every agent a remote MCP server, signed in through your browser. See [MCP connectors](docs/operations.md#mcp-connectors).
 - **Shared instructions:** `adm agents-file` edits one `AGENTS.md` that is prepended for every coding agent. See [shared agents file](docs/operations.md#shared-agents-file).
 - **Claude Code:** `adm claude my-project` creates the workspace if needed and attaches to a Claude Code that keeps running with Remote Control on, next to the Pi agent. See [Claude Code](docs/operations.md#claude-code).

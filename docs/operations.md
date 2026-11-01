@@ -220,6 +220,12 @@ Claude Code runs **alongside** the Pi agent, in the same Pod and the same checko
 
 Login is still per workspace for now: on first attach Claude asks for its theme, a login (`/login`, copy-code flow) and whether to trust the folder. Remote Control needs that full claude.ai login; `claude setup-token` / `CLAUDE_CODE_OAUTH_TOKEN` tokens are refused for Remote Control ([research/claude-code](../research/claude-code/README.md)). Shared `adm login claude` and the installation MCP connectors for Claude are not built yet.
 
+## Built-in browser
+
+Every coding workspace runs the Playwright MCP server (`@playwright/mcp`, pinned in `package.json`) over stdio inside its `dev` container, with the image's system Chromium, headless and isolated (nothing persists between runs). The runner starts the server when the workspace opens; Chromium itself launches on the first tool call. Its tools reach the agent as `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_take_screenshot` and so on, through the same MCP path as connectors, and the agent's prompt says it has a browser. Screenshots and other output land in `/workspace/.adm/browser`. Chromium runs with `--no-sandbox`, as `adm browser` does, because the Pod drops the capabilities its sandbox needs. Bots never get it.
+
+If the server exits, in-flight and later browser calls fail with `Browser tools stopped; they restart on the next turn`, and the next turn restarts it. A browser that cannot start never fails the workspace: `adm status NAME` prints `Browser tools unavailable for ...` with the cause. Memory measured on a development host: the idle stdio server (Node plus Playwright, no Chromium yet) is about 130 MB RSS; with one page open, server plus Chromium is about 1 GB RSS for the process tree. Viewing the browser yourself is not available yet.
+
 ## MCP connectors
 
 An MCP connector is a remote MCP server shared by every coding agent and bot in the installation. Add one and sign in with the browser:
@@ -330,7 +336,7 @@ npm run test:image -- ghcr.io/nwylynko/agentic-dev-machines/adm-code:latest adm-
 npm run test:image -- ghcr.io/nwylynko/agentic-dev-machines/adm-repositories:latest adm-repositories
 ```
 
-The CLI tests need Python 3, Node.js, and zsh on the test host: their Pod fixtures execute the real workspace shell arguments locally. The Node tests use real HTTP/SSE, SQLite, subprocess kills/restarts, a terminal PTY, and Chromium. They need permission to open loopback sockets and run a browser. The Go filesystem tests need `/dev/fuse`, FUSE mount permission, and the pinned `artifact-fs` binary on PATH. Install that pin with `go install github.com/cloudflare/artifact-fs/cmd/artifact-fs@$(cat packages/repositories/ARTIFACTFS)`. A missing FUSE device produces an explicit skip; a missing binary with FUSE available fails.
+The CLI tests need Python 3, Node.js, and zsh on the test host: their Pod fixtures execute the real workspace shell arguments locally. The Node tests use real HTTP/SSE, SQLite, subprocess kills/restarts, a terminal PTY, and Chromium. They need permission to open loopback sockets and run a browser. The Go filesystem tests need `/dev/fuse`, FUSE mount permission, and the pinned `artifact-fs` binary on PATH. Install that pin with `go install github.com/cloudflare/artifact-fs/cmd/artifact-fs@$(cat packages/repositories/ARTIFACTFS)`. `packages/runner/test/browser.test.mjs` needs `node_modules/@playwright/mcp` and a Chromium (`ADM_BROWSER_CHROMIUM`, `chromium` on PATH, or a Playwright browser cache) and skips with a message otherwise; `npm run test:image -- IMAGE adm-code` runs the bundled server against the image's Chromium. A missing FUSE device produces an explicit skip; a missing binary with FUSE available fails.
 
 The lighter cluster contract check needs no workspace image or storage provisioner. It creates and removes uniquely owned bot namespaces, validates the coding manifests with the real API's server-side dry run, and exercises explicit Herdr-event cleanup and label reuse:
 
