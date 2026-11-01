@@ -352,46 +352,38 @@ impl Cli {
             "history",
             "browser",
         ];
-        const MANAGEMENT: &[&str] = &[
-            "manifest",
-            "setup",
-            "update",
-            "connect",
-            "login",
-            "logout",
-            "mcp",
-            "start",
-            "serve",
-            "lifecycle-serve",
-            "lifecycle-forward",
-            "stop",
-            "doctor",
-            "system-log",
-            "herdr",
-            "completions",
-            "help",
-        ];
         let mut command = Self::command();
         command.build();
-        let grouped = |names: &[&str], command: &clap::Command| {
-            names
-                .iter()
-                .filter_map(|name| {
-                    command.find_subcommand(name).map(|subcommand| {
-                        format!(
-                            "  {:<16} {}",
-                            subcommand.get_name(),
-                            subcommand.get_about().unwrap_or_default()
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+        // Every visible subcommand outside WORKSPACE lands under management, so a
+        // new command can never be missing from the top-level help.
+        let help_line = |subcommand: &clap::Command| {
+            format!(
+                "  {:<16} {}",
+                subcommand.get_name(),
+                subcommand.get_about().unwrap_or_default()
+            )
         };
+        let workspace = WORKSPACE
+            .iter()
+            .map(|name| {
+                help_line(
+                    command
+                        .find_subcommand(name)
+                        .expect("workspace help command"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let management = command
+            .get_subcommands()
+            .filter(|subcommand| {
+                !subcommand.is_hide_set() && !WORKSPACE.contains(&subcommand.get_name())
+            })
+            .map(help_line)
+            .collect::<Vec<_>>()
+            .join("\n");
         let template = format!(
-            "{{before-help}}{{name}} {{version}}\n{{about-with-newline}}{{usage-heading}} {{usage}}\n\nWorkspace use:\n{}\n\nADM management:\n{}\n\nOptions:\n{{options}}{{after-help}}",
-            grouped(WORKSPACE, &command),
-            grouped(MANAGEMENT, &command)
+            "{{before-help}}{{name}} {{version}}\n{{about-with-newline}}{{usage-heading}} {{usage}}\n\nWorkspace use:\n{workspace}\n\nADM management:\n{management}\n\nOptions:\n{{options}}{{after-help}}"
         );
         command = command.help_template(template);
         command
