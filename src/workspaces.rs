@@ -173,6 +173,12 @@ pub struct CreateOptions {
     /// Open a new stock Herdr space and run `adm attach` in its initial pane.
     #[arg(long, conflicts_with_all = ["no_attach", "herdr_space"])]
     pub herdr: bool,
+    /// Also run Claude Code with Remote Control in the workspace and attach to it (see `adm claude`).
+    #[arg(long, conflicts_with = "herdr")]
+    pub claude: bool,
+    /// Set when the command line gave any workspace spec option (TASK-90).
+    #[arg(skip)]
+    pub explicit_spec: bool,
     /// Stable lifecycle operation UUID used to replay this create request.
     #[arg(long)]
     pub operation_id: Option<String>,

@@ -352,6 +352,7 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
         "abort",
         "history",
         "browser",
+        "claude",
         "manifest",
         "setup",
         "update",
@@ -5301,4 +5302,141 @@ fn create_with_new_repo_makes_an_empty_private_repository_and_opens_the_workspac
     );
     assert!(!conflicting.status.success());
     assert!(String::from_utf8_lossy(&conflicting.stderr).contains("cannot be used with"));
+}
+
+/// Stands in for the Pod's `adm-claude` (image/adm-claude): records each call.
+fn install_fake_adm_claude(root: &Path) {
+    let script = root.join("herdr-bin/adm-claude");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/../claude-calls\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn claude_calls(root: &Path) -> Vec<String> {
+    let calls = fs::read_to_string(root.join("claude-calls")).unwrap_or_default();
+    let calls = calls.lines().map(str::to_owned).collect();
+    let _ = fs::remove_file(root.join("claude-calls"));
+    calls
+}
+
+fn exec_command(root: &Path) -> Vec<String> {
+    serde_json::from_slice(&fs::read(root.join("exec-args.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn claude_creates_a_missing_workspace_then_attaches_and_reuses_an_existing_one() {
+    let root = fixture();
+    let project = install_terminal_fixture(root.path());
+    install_fake_adm_claude(root.path());
+
+    // A new name takes `adm create`'s options, creates, then attaches.
+    let (status, stderr) = interactive_cli(
+        root.path(),
+        &project,
+        &["claude", "claude-new", "--no-repositories", "--cpu", "3"],
+    );
+    assert!(status.success(), "{stderr}");
+    assert_eq!(claude_calls(root.path()), ["attach"]);
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(root.path().join("last-manifest.json")).unwrap()).unwrap();
+    let deployment = manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "Deployment")
+        .unwrap();
+    assert_eq!(
+        deployment["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["cpu"],
+        "3"
+    );
+    let exec = exec_command(root.path());
+    assert!(exec.contains(&"-it".to_owned()), "{exec:?}");
+    assert!(
+        exec.contains(&"deployment/workspace".to_owned()),
+        "{exec:?}"
+    );
+    assert_eq!(exec[exec.len() - 2..], ["adm-claude", "attach"]);
+    assert!(
+        !root.path().join("attach-invocations.jsonl").exists(),
+        "adm claude opens Claude Code, not the Pi terminal"
+    );
+
+    // The same name again: no create, just attach.
+    fs::remove_file(root.path().join("last-manifest.json")).unwrap();
+    let (status, stderr) = interactive_cli(root.path(), &project, &["claude", "claude-new"]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(claude_calls(root.path()), ["attach"]);
+    assert!(!root.path().join("last-manifest.json").exists());
+
+    // A workspace made without Claude gets it added; with --no-attach (or no
+    // terminal) Claude is started and the record printed.
+    assert_ok(adm(
+        root.path(),
+        &["create", "plain", "--no-repositories", "--no-attach"],
+    ));
+    assert!(claude_calls(root.path()).is_empty());
+    fs::remove_file(root.path().join("last-manifest.json")).unwrap();
+    let workspace = assert_ok(adm(root.path(), &["claude", "plain", "--no-attach"]));
+    assert_eq!(workspace["name"], "plain");
+    assert_eq!(claude_calls(root.path()), ["start"]);
+    assert!(!root.path().join("last-manifest.json").exists());
+    let exec = exec_command(root.path());
+    assert!(!exec.contains(&"-it".to_owned()), "{exec:?}");
+
+    // adm create --claude: the same kind of workspace, Claude started, no attach.
+    let workspace = assert_ok(adm(
+        root.path(),
+        &[
+            "create",
+            "with-claude",
+            "--no-repositories",
+            "--claude",
+            "--no-attach",
+        ],
+    ));
+    assert_eq!(workspace["name"], "with-claude");
+    assert_eq!(workspace["phase"], "ready");
+    assert_eq!(claude_calls(root.path()), ["start"]);
+    fs::remove_file(root.path().join("last-manifest.json")).unwrap();
+
+    // Create options on an existing workspace go through admission, which
+    // refuses a changed spec rather than ignoring it.
+    let changed = adm(
+        root.path(),
+        &[
+            "claude",
+            "plain",
+            "--no-repositories",
+            "--cpu",
+            "4",
+            "--no-attach",
+        ],
+    );
+    assert!(!changed.status.success(), "{changed:?}");
+    assert!(claude_calls(root.path()).is_empty());
+
+    // Bots have no shell or coding tools, so no Claude Code.
+    for args in [
+        &[
+            "create",
+            "bot-claude",
+            "--role",
+            "bot",
+            "--claude",
+            "--no-attach",
+        ][..],
+        &["claude", "bot-claude", "--role", "bot", "--no-attach"][..],
+    ] {
+        let output = adm(root.path(), args);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("bots"),
+            "{output:?}"
+        );
+    }
+    assert!(claude_calls(root.path()).is_empty());
+    assert!(!root.path().join("last-manifest.json").exists());
 }

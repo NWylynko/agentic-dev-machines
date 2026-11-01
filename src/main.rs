@@ -92,6 +92,8 @@ pub enum Action {
     Create(CreateOptions),
     /// Print provisioning resources without mutating the cluster.
     Manifest(CreateOptions),
+    /// Attach to Claude Code (with Remote Control) in a workspace, creating it first if missing.
+    Claude(CreateOptions),
     /// List cluster-owned workspaces.
     List {
         #[arg(long)]
@@ -351,6 +353,7 @@ impl Cli {
             "abort",
             "history",
             "browser",
+            "claude",
         ];
         let mut command = Self::command();
         command.build();
@@ -1042,41 +1045,127 @@ fn print_inspect(status: &Value) -> Result<()> {
     Ok(())
 }
 
+fn create_workspace(cli: &Cli, options: &CreateOptions) -> Result<workspaces::Workspace> {
+    let workspace = options.workspace()?;
+    if let Some(repository) = &options.new_repo {
+        repos::create_repository(cli, repository)?;
+    } else if let Some(repository) = &workspace.repository {
+        repos::register_repository(cli, repository, None)?;
+    }
+    let operation_id = options
+        .operation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let receipt = cli.request_lifecycle(
+        "POST",
+        "/v1/operations",
+        Some(&serde_json::to_value(
+            lifecycle::OperationRequest::Create {
+                operation_id,
+                spec: Box::new(lifecycle::CreateIntent::from_workspace(&workspace)),
+            },
+        )?),
+    )?;
+    let operation_id = receipt["operationId"]
+        .as_str()
+        .context("lifecycle receipt omitted operationId")?;
+    let workspace_id = receipt["workspaceId"]
+        .as_str()
+        .context("lifecycle receipt omitted workspaceId")?;
+    cli.wait_for_lifecycle_workspace(operation_id, workspace_id, "create", &workspace.name)
+}
+
+fn claude_requires_coding(options: &CreateOptions) -> Result<()> {
+    anyhow::ensure!(
+        options.role == "coding",
+        "bots have no shell or coding tools, so they cannot run Claude Code"
+    );
+    Ok(())
+}
+
+/// Start the workspace's long-lived Claude Code (image/adm-claude) and, with a
+/// terminal and without --no-attach, attach to it; otherwise print the record.
+fn open_claude(
+    cli: &Cli,
+    workspace: &workspaces::Workspace,
+    options: &CreateOptions,
+) -> Result<()> {
+    anyhow::ensure!(
+        workspace.role == "coding",
+        "bots have no shell or coding tools, so they cannot run Claude Code"
+    );
+    workspaces::verify_ownership(cli, workspace)?;
+    let attach =
+        !options.no_attach && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let mut child = cli.kubectl_command()?;
+    child.args([
+        "exec",
+        "-n",
+        &workspace.namespace,
+        "deployment/workspace",
+        "-c",
+        "dev",
+    ]);
+    if attach {
+        eprintln!(
+            "adm: attaching to Claude Code in {}; detach with Ctrl-b d, it keeps running",
+            workspace.name
+        );
+        child.arg("-it");
+    }
+    child.args(["--", "adm-claude", if attach { "attach" } else { "start" }]);
+    let status = child
+        .status()
+        .context("connect to the development container")?;
+    anyhow::ensure!(
+        status.success(),
+        "Claude Code in workspace {} ({}) exited with {status}; retry with `adm claude {}`",
+        workspace.name,
+        workspace.id,
+        workspace.name
+    );
+    if attach {
+        Ok(())
+    } else {
+        print_json(workspace)
+    }
+}
+
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
+        Action::Claude(options) => {
+            claude_requires_coding(options)?;
+            // A bare `adm claude NAME` on an existing workspace adds Claude to it.
+            // Spec options always go through create admission, which re-admits the
+            // same spec and refuses a changed one (TASK-73).
+            let existing = if options.explicit_spec {
+                None
+            } else {
+                cli.workspaces(false)?
+                    .into_iter()
+                    .find(|workspace| workspace.name == options.name)
+            };
+            let workspace = match existing {
+                Some(workspace) => {
+                    anyhow::ensure!(
+                        workspace.phase != "deleting",
+                        "workspace {} has been deleted",
+                        workspace.name
+                    );
+                    workspace
+                }
+                None => create_workspace(cli, options)?,
+            };
+            open_claude(cli, &workspace, options)
+        }
         Action::Create(options) => {
-            let workspace = options.workspace()?;
-            if let Some(repository) = &options.new_repo {
-                repos::create_repository(cli, repository)?;
-            } else if let Some(repository) = &workspace.repository {
-                repos::register_repository(cli, repository, None)?;
+            if options.claude {
+                claude_requires_coding(options)?;
             }
-            let operation_id = options
-                .operation_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let receipt = cli.request_lifecycle(
-                "POST",
-                "/v1/operations",
-                Some(&serde_json::to_value(
-                    lifecycle::OperationRequest::Create {
-                        operation_id,
-                        spec: Box::new(lifecycle::CreateIntent::from_workspace(&workspace)),
-                    },
-                )?),
-            )?;
-            let operation_id = receipt["operationId"]
-                .as_str()
-                .context("lifecycle receipt omitted operationId")?;
-            let workspace_id = receipt["workspaceId"]
-                .as_str()
-                .context("lifecycle receipt omitted workspaceId")?;
-            let workspace = cli.wait_for_lifecycle_workspace(
-                operation_id,
-                workspace_id,
-                "create",
-                &workspace.name,
-            )?;
+            let workspace = create_workspace(cli, options)?;
+            if options.claude {
+                return open_claude(cli, &workspace, options);
+            }
             if options.herdr {
                 eprintln!(
                     "adm: workspace {} is ready; opening a Herdr space and attaching there",
@@ -1760,7 +1849,7 @@ fn main() {
     let matches = Cli::help_command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).expect("validated CLI arguments");
     if let Err(error) = configure_defaults(&mut cli, &matches).and_then(|()| {
-        if let Action::Create(options) = &cli.command {
+        if let Action::Create(options) | Action::Claude(options) = &cli.command {
             workspaces::validate_name(&options.name)?;
         }
         let _connection = if cli.lifecycle_forward
@@ -1798,7 +1887,7 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
     );
     let workspace_defaults = matches!(
         cli.command,
-        Action::Create(_) | Action::Manifest(_) | Action::Doctor { .. }
+        Action::Create(_) | Action::Manifest(_) | Action::Claude(_) | Action::Doctor { .. }
     );
     let update_connection_defaults = matches!(
         cli.command,
@@ -1877,7 +1966,14 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
     let workspace_default = setup::default_role_image(cli, "WORKSPACE_IMAGE")?;
     let repositories_default = setup::default_role_image(cli, "REPOSITORIES_IMAGE")?;
     match &mut cli.command {
-        Action::Create(options) | Action::Manifest(options) => {
+        Action::Create(options) | Action::Manifest(options) | Action::Claude(options) => {
+            // Global options also show up in `arguments`, so only look at create's own.
+            let create = <CreateOptions as clap::Args>::augment_args(clap::Command::new("create"));
+            options.explicit_spec = create.get_arguments().any(|argument| {
+                let id = argument.get_id().as_str();
+                !matches!(id, "name" | "no_attach" | "operation_id" | "claude")
+                    && arguments.value_source(id) == Some(ValueSource::CommandLine)
+            });
             let role_was_explicit =
                 arguments.value_source("role") != Some(ValueSource::DefaultValue);
             let image_was_explicit =
