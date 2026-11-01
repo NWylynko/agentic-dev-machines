@@ -54,6 +54,15 @@ const smokeImageShipsMtab = async () => {
   }
 };
 
+// Run as the workspace Pod does (src/workspaces.rs workspace_security_context): UID 1000, all
+// capabilities dropped but these. Without AUDIT_WRITE sudo prints "unable to send audit message".
+const workspaceCapabilities = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "AUDIT_WRITE"];
+const smokeWorkspaceShellLocaleAndSudo = async () => {
+  const { stdout, stderr } = await execute("docker", ["run", "--rm", "--user", "1000:1000", "--cap-drop", "ALL", ...workspaceCapabilities.flatMap((capability) => ["--cap-add", capability]), "--security-opt", "no-new-privileges:false", "--entrypoint", "/bin/sh", image, "-ec", "locale charmap && sudo -n true"]);
+  if (stdout.trim() !== "UTF-8") throw new Error(`workspace shells use charmap ${JSON.stringify(stdout.trim())}, expected UTF-8`);
+  if (stderr !== "") throw new Error(`sudo printed warnings in a workspace container: ${stderr}`);
+};
+
 if (role === "adm-repositories") {
   await smokeImageShipsMtab();
   await run(["test -x /usr/local/bin/adm-repositories", "test -x /usr/local/bin/artifact-fs", "getent passwd 1000 >/dev/null", ...["sudo", "node", "chromium", "gh"].map(absent)].join(" && "));
@@ -62,8 +71,9 @@ if (role === "adm-repositories") {
   await run(["test -x /usr/local/bin/adm", "test -x /usr/local/bin/kubectl", "test -f /opt/adm/provider-auth.mjs", "test -x /usr/bin/gh", "test -d /opt/adm/node_modules", absent("chromium"), absent("sudo")].join(" && "));
 } else if (role === "adm-code") {
   await execute("docker", ["run", "--rm", image, "/usr/local/bin/adm-dev-entrypoint", "--check"]);
+  await smokeWorkspaceShellLocaleAndSudo();
 } else if (role === "adm-bot") {
-  await run(["test -x /usr/local/bin/adm-dev-entrypoint", "! command -v gh >/dev/null 2>&1", "! command -v chromium >/dev/null 2>&1", "test -x /usr/bin/zsh", "test -f /opt/adm/runner.mjs"].join(" && "));
+  await run(["test -x /usr/local/bin/adm-dev-entrypoint", 'test "$(locale charmap)" = UTF-8', "! command -v gh >/dev/null 2>&1", "! command -v chromium >/dev/null 2>&1", "test -x /usr/bin/zsh", "test -f /opt/adm/runner.mjs"].join(" && "));
 } else {
   await execute("docker", ["run", "--rm", image, "/usr/local/bin/adm-dev-entrypoint", "--check", "bot"]);
 }

@@ -1801,7 +1801,7 @@ fn repository_preparation_failures_lead_with_their_real_cause() {
             "missing-repo",
             "--no-attach",
             "--repo",
-            "owner/missing",
+            "owner/project",
         ],
     );
     assert!(!output.status.success());
