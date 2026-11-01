@@ -19,7 +19,9 @@ fn port_forward_is_killed_if_stdout_closes_before_readiness() {
     executable(
         &kubectl,
         r#"#!/usr/bin/python3
-import os, pathlib, signal
+import os, pathlib, signal, sys
+if 'port-forward' not in sys.argv:
+    print('unexpected kubectl args: '+repr(sys.argv[1:]),file=sys.stderr);sys.exit(2)
 pathlib.Path(os.environ['HOME'], 'forward.pid').write_text(str(os.getpid()))
 os.close(1)
 signal.pause()
@@ -36,8 +38,16 @@ signal.pause()
         .args(["doctor", "--json"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("stdout closed before readiness"));
+    // Doctor reports the failed forward in its lifecycle section (TASK-91).
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["lifecycle"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("stdout closed before readiness"),
+        "{report}"
+    );
     let pid = fs::read_to_string(root.path().join("forward.pid")).unwrap();
     #[cfg(target_os = "linux")]
     assert!(
@@ -68,13 +78,14 @@ sys.stderr.write('service/adm-lifecycle was not found\n')
         .args(["doctor", "--json"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let error = report["lifecycle"]["error"].as_str().unwrap();
     assert!(
-        stderr.contains("service/adm-lifecycle was not found"),
-        "{stderr}"
+        error.contains("service/adm-lifecycle was not found"),
+        "{error}"
     );
-    assert!(stderr.contains("failed before readiness"), "{stderr}");
+    assert!(error.contains("failed before readiness"), "{error}");
 }
 
 #[test]

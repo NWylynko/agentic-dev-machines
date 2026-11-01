@@ -5440,3 +5440,117 @@ fn claude_creates_a_missing_workspace_then_attaches_and_reuses_an_existing_one()
     assert!(claude_calls(root.path()).is_empty());
     assert!(!root.path().join("last-manifest.json").exists());
 }
+
+/// TASK-91 scope 4: an unreachable lifecycle is explained from the kubeconfig,
+/// not left as a bare port-forward or connection error.
+#[test]
+fn an_unreachable_lifecycle_is_explained_from_its_pod_and_node() {
+    let root = tempfile::tempdir().unwrap();
+    let kubectl = root.path().join("kubectl");
+    fs::write(
+        &kubectl,
+        r#"#!/usr/bin/python3
+import json,pathlib,sys
+root=pathlib.Path(__file__).parent
+args=sys.argv[1:]
+crash=(root/'crashloop').exists()
+if args[:2]==['get','nodes']:
+    print(json.dumps({'items':[
+        {'metadata':{'name':'debian-k3s-1'},'status':{'conditions':[{'type':'Ready','status':'True','lastTransitionTime':'2026-10-30T09:00:00Z'}]}},
+        {'metadata':{'name':'debian-k3s-2'},'status':{'conditions':[{'type':'Ready','status':'True' if crash else 'Unknown','lastTransitionTime':'2026-11-01T07:01:00Z'}]}},
+    ]}))
+elif args[:2]==['get','storageclass']:
+    print(json.dumps({'metadata':{'name':args[2]},'provisioner':'driver.longhorn.io'}))
+elif args[:6]==['-n','adm-system','get','pods','-l','app.kubernetes.io/name=adm-lifecycle']:
+    if crash:
+        pod={'metadata':{'name':'adm-lifecycle-7d9f-abcde'},'spec':{'nodeName':'debian-k3s-1'},'status':{'phase':'Running','conditions':[{'type':'Ready','status':'False'}],'containerStatuses':[{'name':'provider-auth','ready':True,'state':{'running':{}}},{'name':'lifecycle','ready':False,'state':{'waiting':{'reason':'CrashLoopBackOff','message':'back-off 5m0s restarting failed container'}}}]}}
+    else:
+        pod={'metadata':{'name':'adm-lifecycle-7d9f-abcde'},'spec':{'nodeName':'debian-k3s-2'},'status':{'phase':'Running','conditions':[{'type':'Ready','status':'False'}],'containerStatuses':[{'name':'lifecycle','ready':True,'state':{'running':{}}}]}}
+    print(json.dumps({'items':[pod]}))
+elif args[2:4]==['port-forward','service/adm-lifecycle']:
+    sys.stderr.write('error: error upgrading connection: error dialing backend: dial tcp 10.0.0.12:10250: connect: no route to host\n')
+    sys.exit(1)
+else:
+    print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let invoke = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_adm"))
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env_remove("ADM_LIFECYCLE_URL")
+            .env_remove("ADM_LIFECYCLE_TOKEN_FILE")
+            .env_remove("ADM_LIFECYCLE_NAMESPACE")
+            .arg("--state-dir")
+            .arg(root.path().join("state"))
+            .arg("--kubectl")
+            .arg(&kubectl)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let down = "lifecycle Pod adm-lifecycle-7d9f-abcde is on NotReady node debian-k3s-2 since 2026-11-01T07:01:00Z";
+    let not_automatic = "ADM does not move the lifecycle off a NotReady node automatically yet";
+
+    // The default command-scoped port-forward cannot reach the Pod.
+    let list = invoke(&["list"]);
+    assert!(!list.status.success());
+    let error = String::from_utf8_lossy(&list.stderr);
+    assert!(error.contains(down), "{error}");
+    assert!(error.contains(not_automatic), "{error}");
+    assert!(error.contains("no route to host"), "{error}");
+
+    let doctor = invoke(&["doctor", "--json"]);
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(report["lifecycle"]["status"], "unavailable", "{report}");
+    assert!(
+        report["lifecycle"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no route to host"),
+        "{report}"
+    );
+    assert_eq!(report["lifecycle"]["reason"], down, "{report}");
+    assert!(
+        report["lifecycle"]["action"]
+            .as_str()
+            .unwrap()
+            .contains(not_automatic),
+        "{report}"
+    );
+    assert_eq!(report["providers"]["status"], "unavailable", "{report}");
+    assert_eq!(report["cluster"][1]["ready"], false, "{report}");
+    let doctor = invoke(&["doctor"]);
+    assert!(doctor.status.success());
+    let text = String::from_utf8_lossy(&doctor.stdout);
+    assert!(text.contains(&format!("  Why: {down}")), "{text}");
+
+    // An explicit URL that refuses connections gets the same explanation.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let list = invoke(&["--lifecycle-url", &url, "list"]);
+    assert!(!list.status.success());
+    let error = String::from_utf8_lossy(&list.stderr);
+    assert!(error.contains(down), "{error}");
+    assert!(error.contains("Connection refused"), "{error}");
+
+    // A crash-looping lifecycle on a healthy node names the failing container.
+    fs::write(root.path().join("crashloop"), "").unwrap();
+    let list = invoke(&["list"]);
+    assert!(!list.status.success());
+    let error = String::from_utf8_lossy(&list.stderr);
+    assert!(
+        error.contains("lifecycle Pod adm-lifecycle-7d9f-abcde on node debian-k3s-1 is not ready: container lifecycle CrashLoopBackOff: back-off 5m0s restarting failed container"),
+        "{error}"
+    );
+    assert!(error.contains("adm system-log"), "{error}");
+    assert!(!error.contains(not_automatic), "{error}");
+}

@@ -79,6 +79,10 @@ pub struct Cli {
     pub lifecycle_fence: Option<lease::LeaseFence>,
     #[arg(skip)]
     pub lifecycle_operation_id: Option<String>,
+    /// Why the command-scoped lifecycle port-forward failed; only `adm doctor`
+    /// runs on without it, to report the cause.
+    #[arg(skip)]
+    pub lifecycle_connect_error: Option<String>,
     /// Runtime installation or development checkout containing the runner and terminal.
     #[arg(long, global = true, env = "ADM_PROJECT_DIR", default_value_os_t = default_project_dir())]
     pub project_dir: PathBuf,
@@ -330,6 +334,7 @@ impl Cli {
             runtime_status_port: self.runtime_status_port,
             lifecycle_fence: self.lifecycle_fence.clone(),
             lifecycle_operation_id: self.lifecycle_operation_id.clone(),
+            lifecycle_connect_error: None,
             project_dir: self.project_dir.clone(),
             command: Action::LifecycleServe {
                 host: "0.0.0.0".into(),
@@ -1210,7 +1215,13 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Action::Manifest(options) => print_json(&workspaces::manifest(&options.workspace()?)?),
         Action::List { all, json } => {
-            let items = cli.workspaces(*all)?;
+            let items = cli.workspaces(*all).map_err(|error| {
+                if diagnostics::is_lifecycle_transport_error(&error) {
+                    diagnostics::explain_unreachable_lifecycle(cli, error)
+                } else {
+                    error
+                }
+            })?;
             let reports = items
                 .iter()
                 .map(workspace_list_value)
@@ -1863,9 +1874,20 @@ fn main() {
                         command: Some(herdr::HerdrAction::RouteShell { .. }),
                     }
             ) {
-            let connection = setup_connection::connect(&cli)?;
-            cli.lifecycle_url = connection.url.clone();
-            Some(connection)
+            match setup_connection::connect(&cli) {
+                Ok(connection) => {
+                    cli.lifecycle_url = connection.url.clone();
+                    Some(connection)
+                }
+                Err(error) if matches!(cli.command, Action::Doctor { .. }) => {
+                    cli.lifecycle_connect_error = Some(format!("{error:#}"));
+                    None
+                }
+                Err(error) if matches!(cli.command, Action::List { .. }) => {
+                    return Err(diagnostics::explain_unreachable_lifecycle(&cli, error));
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };

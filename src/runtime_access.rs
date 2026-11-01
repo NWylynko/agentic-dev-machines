@@ -389,6 +389,7 @@ mod forward_pipe_tests {
             runtime_status_port: 7432,
             lifecycle_fence: None,
             lifecycle_operation_id: None,
+            lifecycle_connect_error: None,
             project_dir: PathBuf::new(),
             command: crate::Action::LifecycleServe {
                 host: "127.0.0.1".into(),
@@ -480,6 +481,7 @@ mod forward_pipe_tests {
             runtime_status_port: 7432,
             lifecycle_fence: None,
             lifecycle_operation_id: None,
+            lifecycle_connect_error: None,
             project_dir: project.clone(),
             command: crate::Action::Attach {
                 name: "demo".into(),
