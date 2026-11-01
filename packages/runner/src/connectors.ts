@@ -48,6 +48,51 @@ export type ConnectorStatus = {
   error?: string;
 };
 
+/** One MCP server tool as an agent tool; shared by connectors and the browser. */
+export function defineMcpTool(options: {
+  tool: Tool;
+  name: string;
+  description: string;
+  assertActive: (signal?: AbortSignal) => Promise<void>;
+  /** Returns the live client or throws the readable reason the tool is unavailable. */
+  prepare: (signal?: AbortSignal) => Promise<McpClient>;
+  /** The session died during a call; returns the error the agent sees. */
+  onLost: (client: McpClient, error: unknown) => unknown;
+}) {
+  const { tool } = options;
+  return defineTool({
+    name: options.name,
+    description: options.description,
+    parameters: {
+      ...tool.inputSchema,
+      type: "object",
+      properties: tool.inputSchema.properties ?? {},
+    } as never,
+    callers: ["model", "tools"],
+    replay: tool.annotations?.readOnlyHint ? "safe" : "unsafe",
+    execute: async (args, _api, context) => {
+      await options.assertActive(context.abortSignal);
+      const client = await options.prepare(context.abortSignal);
+      try {
+        const result = await client.callTool(
+          tool.name,
+          args as Record<string, unknown>,
+          { signal: context.abortSignal },
+        );
+        return {
+          output: toLlmContent(result),
+          isError: result.isError === true,
+        };
+      } catch (error) {
+        throw error instanceof McpSessionExpiredError ||
+          error instanceof McpConnectionClosedError
+          ? options.onLost(client, error)
+          : error;
+      }
+    },
+  });
+}
+
 class ConnectorSignInRequired extends Error {}
 
 export function connectorLifecycleFromEnvironment(options: {
@@ -294,18 +339,12 @@ export class WorkspaceConnectors {
     tool: Tool,
     name: string,
   ) {
-    return defineTool({
+    return defineMcpTool({
+      tool,
       name,
       description: `${connection.name} MCP connector: ${tool.description ?? tool.title ?? tool.name}`,
-      parameters: {
-        ...tool.inputSchema,
-        type: "object",
-        properties: tool.inputSchema.properties ?? {},
-      } as never,
-      callers: ["model", "tools"],
-      replay: tool.annotations?.readOnlyHint ? "safe" : "unsafe",
-      execute: async (args, _api, context) => {
-        await this.assertActive(context.abortSignal);
+      assertActive: this.assertActive,
+      prepare: async (signal) => {
         const client = connection.client;
         if (this.connections.get(connection.name) !== connection || !client)
           throw new Error(
@@ -313,33 +352,15 @@ export class WorkspaceConnectors {
               `MCP connector ${connection.name} changed; its tools refresh on the next turn`,
           );
         // Revalidates the connector: removal or sign-out fails this call.
-        await this.refreshAccessToken(
-          connection,
-          undefined,
-          context.abortSignal,
-        );
-        try {
-          const result = await client.callTool(
-            tool.name,
-            args as Record<string, unknown>,
-            { signal: context.abortSignal },
-          );
-          return {
-            output: toLlmContent(result),
-            isError: result.isError === true,
-          };
-        } catch (error) {
-          if (
-            error instanceof McpSessionExpiredError ||
-            error instanceof McpConnectionClosedError
-          ) {
-            connection.status = "error";
-            connection.error = `MCP connector ${connection.name} lost its session; it reconnects on the next turn`;
-            connection.client = undefined;
-            void client.close().catch(() => {});
-          }
-          throw error;
-        }
+        await this.refreshAccessToken(connection, undefined, signal);
+        return client;
+      },
+      onLost: (client, error) => {
+        connection.status = "error";
+        connection.error = `MCP connector ${connection.name} lost its session; it reconnects on the next turn`;
+        connection.client = undefined;
+        void client.close().catch(() => {});
+        return error;
       },
     });
   }

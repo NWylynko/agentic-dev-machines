@@ -955,6 +955,15 @@ fn print_summary_errors(status: &Value) {
                 .unwrap_or("the runtime did not report a cause")
         );
     }
+    let browser = &workspace["runtime_status"]["browser"];
+    if !browser.is_null() && browser["status"] != "connected" {
+        println!(
+            "Browser tools unavailable for {identity}: {}",
+            browser["error"]
+                .as_str()
+                .unwrap_or("the runtime did not report a cause")
+        );
+    }
     if let Some(error) = workspace["last_error"].as_str() {
         println!("Workspace failure for {identity}: {error}");
     }

@@ -67,6 +67,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { BotProfileDocument, botExtension } from "./bot.ts";
 import type { BotAgentManagement } from "./bot-management.ts";
+import { WorkspaceBrowser } from "./browser.ts";
 import { WorkspaceConnectors, type ConnectorLifecycle } from "./connectors.ts";
 import {
   applyGoal,
@@ -214,6 +215,7 @@ export class Workspace {
   private unsubscribe: () => void;
   private sandbox?: CodemodeSandbox;
   private connectors?: WorkspaceConnectors;
+  browser?: WorkspaceBrowser;
   private constructor(
     config: WorkspaceConfig,
     harness: Workspace["harness"],
@@ -426,6 +428,7 @@ export class Workspace {
     let kubeEnv: KubernetesExecutionEnv | undefined;
     let sandbox: CodemodeSandbox | undefined;
     let connectors: WorkspaceConnectors | undefined;
+    let browser: WorkspaceBrowser | undefined;
     let closeOpenedState: (() => Promise<void>) | undefined;
     try {
       if (config.role === "coding") {
@@ -454,6 +457,19 @@ export class Workspace {
           assertActive,
         );
         await connectors.reconcile();
+      }
+      if (
+        config.role === "coding" &&
+        config.environment === "pod" &&
+        !passive
+      ) {
+        // Pod coding workspaces only: bots never get a browser.
+        browser = new WorkspaceBrowser(
+          config.localRoot!,
+          registry,
+          assertActive,
+        );
+        await browser.ensureRunning();
       }
       if (config.role === "bot") {
         sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });
@@ -624,6 +640,7 @@ export class Workspace {
       openedWorkspace = workspace;
       workspace.resources = resources;
       workspace.agentsFile = agentsFile;
+      workspace.browser = browser;
       if (!passive) workspace.refreshExtensionRegistry();
       workspace.lastError = reportedError;
       workspace.localEnv = localEnv;
@@ -640,6 +657,7 @@ export class Workspace {
       for (const cleanup of [
         openedWorkspace ? () => openedWorkspace!.close(true) : closeOpenedState,
         openedWorkspace ? undefined : connectors?.close.bind(connectors),
+        openedWorkspace ? undefined : browser?.close.bind(browser),
         openedWorkspace ? undefined : sandbox?.close.bind(sandbox),
         openedWorkspace ? undefined : kubeEnv?.cleanup.bind(kubeEnv, context),
         openedWorkspace ? undefined : localEnv?.cleanup.bind(localEnv, context),
@@ -730,6 +748,7 @@ export class Workspace {
       tasks: inspection.tasks,
       error,
       connectors: this.connectors?.status() ?? [],
+      ...(this.browser ? { browser: this.browser.status() } : {}),
       ...(this.agentsFile?.status()
         ? { agentsFile: this.agentsFile.status() }
         : {}),
@@ -746,6 +765,7 @@ export class Workspace {
   ) {
     // Connector changes reach running agents at their next turn.
     await this.connectors?.reconcile();
+    await this.browser?.ensureRunning();
     return this.withAdmission(async () => {
       if (!this.config.model)
         throw new ApiError(
@@ -1873,6 +1893,7 @@ export class Workspace {
       () => this.harness.close(context),
       () => this.sandbox?.close(),
       () => this.connectors?.close(),
+      () => this.browser?.close(),
     ])
       await attempt(async () => {
         await cleanup();

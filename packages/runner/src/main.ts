@@ -1114,6 +1114,14 @@ async function runtimeStatusReport(workspace: Workspace) {
           })),
         }
       : {}),
+    ...(status.browser
+      ? {
+          browser: {
+            status: status.browser.status,
+            ...(status.browser.error ? { error: status.browser.error } : {}),
+          },
+        }
+      : {}),
     ...(status.agentsFile
       ? {
           agentsFile: {

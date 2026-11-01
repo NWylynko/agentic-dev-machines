@@ -1713,6 +1713,9 @@ fn collect_runtime_status(
                             .get("connectors")
                             .cloned()
                             .unwrap_or_else(|| Value::Array(Vec::new()));
+                        if let Some(browser) = report.get("browser") {
+                            status["browser"] = browser.clone();
+                        }
                         if let Some(agents_file) = report.get("agentsFile") {
                             status["agentsFile"] = agents_file.clone();
                         }
@@ -1774,6 +1777,18 @@ fn valid_runtime_status_report(report: &Value) -> bool {
     }
     if let Some(agents_file) = report.get("agentsFile")
         && !valid_agents_file_report(agents_file)
+    {
+        return false;
+    }
+    if let Some(browser) = report.get("browser")
+        && !browser.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .all(|key| ["status", "error"].contains(&key.as_str()))
+        } && ["connected", "error"].contains(&browser["status"].as_str().unwrap_or(""))
+            && browser.get("error").is_none_or(|error| {
+                error.as_str().is_some_and(|error| error.len() <= 2000)
+            }))
     {
         return false;
     }

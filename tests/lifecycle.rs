@@ -192,7 +192,7 @@ fn start_runtime_status_server(root: &Path) -> (u16, thread::JoinHandle<()>) {
                 write!(stream, "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
                 continue;
             }
-            let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"},"connectors":[{"name":"linear","status":"sign_in_required","error":"MCP connector linear needs sign-in: run adm mcp login linear"}],"agentsFile":{"source":"installation","status":"current","revision":3}}"#;
+            let body = r#"{"activity":{"status":"running"},"selectedModel":{"provider":"openai","id":"gpt-test"},"connectors":[{"name":"linear","status":"sign_in_required","error":"MCP connector linear needs sign-in: run adm mcp login linear"}],"browser":{"status":"error","error":"Browser tools stopped; they restart on the next turn."},"agentsFile":{"source":"installation","status":"current","revision":3}}"#;
             write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
         }
     });
@@ -1388,6 +1388,10 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         replacement_entry["runtime_status"]["connectors"],
         json!([{"name":"linear","status":"sign_in_required","error":"MCP connector linear needs sign-in: run adm mcp login linear"}]),
         "connector failures reach adm status"
+    );
+    assert_eq!(
+        replacement_entry["runtime_status"]["browser"]["status"], "error",
+        "the browser tool state reaches adm status"
     );
     assert_eq!(
         replacement_entry["runtime_status"]["agentsFile"]["revision"], 3,

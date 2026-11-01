@@ -41,8 +41,7 @@ export async function startPodLifecycle({
         return response.writeHead(403, headers).end(
           JSON.stringify({
             error: {
-              message:
-                "shared agents file is restricted to coding workspaces",
+              message: "shared agents file is restricted to coding workspaces",
             },
           }),
         );
@@ -137,7 +136,14 @@ export async function startPodRunner(
     name,
     role,
     model = true,
-  }: { id: string; name: string; role: "coding" | "bot"; model?: boolean },
+    env = {},
+  }: {
+    id: string;
+    name: string;
+    role: "coding" | "bot";
+    model?: boolean;
+    env?: Record<string, string>;
+  },
 ) {
   const directory = join(root, id);
   await mkdir(directory, { recursive: true });
@@ -180,7 +186,7 @@ export async function startPodRunner(
     ],
     {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, HOME: directory },
+      env: { ...process.env, HOME: directory, ...env },
     },
   );
   let errors = "";
