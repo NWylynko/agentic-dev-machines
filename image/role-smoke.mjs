@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -63,6 +63,41 @@ const smokeWorkspaceShellLocaleAndSudo = async () => {
   if (stderr !== "") throw new Error(`sudo printed warnings in a workspace container: ${stderr}`);
 };
 
+// `adm claude` (TASK-90) runs Claude Code under tmux as UID 1000, not as the root that installed it.
+const smokeClaudeCodeRunsAsTheWorkspaceUser = async () => {
+  const { stdout } = await execute("docker", ["run", "--rm", "--user", "1000:1000", "--entrypoint", "/bin/sh", image, "-ec", "claude --version && tmux -V && test -x /usr/local/bin/adm-claude"]);
+  if (!/\(Claude Code\)/.test(stdout)) throw new Error(`claude --version as UID 1000 printed ${JSON.stringify(stdout)}`);
+  if (!/^tmux \d/m.test(stdout)) throw new Error(`tmux -V printed ${JSON.stringify(stdout)}`);
+};
+
+// The session outlives its client and comes back on the next container start
+// (kill-server stands in for the Pod restart; /workspace is the kept volume).
+const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
+  const directory = await mkdtemp(join(tmpdir(), "adm-claude-smoke-"));
+  try {
+    await writeFile(join(directory, "workspace.json"), JSON.stringify({ id: "smoke", name: "claude-smoke", cwd: "/workspace" }));
+    await chmod(join(directory, "workspace.json"), 0o644);
+    const script = [
+      "adm-claude boot",
+      "! tmux has-session -t claude 2>/dev/null",
+      "adm-claude start",
+      "test -f /workspace/.adm/claude/enabled",
+      // Claude replaces tmux's exec of it straight away; wait for it to draw.
+      "i=0; until tmux capture-pane -p -t claude | grep -q .; do i=$((i+1)); [ $i -lt 100 ]; sleep 0.1; done",
+      'test "$(tmux display-message -p -t claude "#{pane_current_command}")" = claude',
+      'test "$(tmux show-environment -t claude CLAUDE_CONFIG_DIR)" = CLAUDE_CONFIG_DIR=/workspace/.adm/claude/config',
+      "adm-claude start",
+      'test "$(tmux list-sessions | wc -l)" = 1',
+      "tmux kill-server",
+      "adm-claude boot",
+      "tmux has-session -t claude",
+    ].join(" && ");
+    await execute("docker", ["run", "--rm", "--user", "1000:1000", "--tmpfs", "/workspace:uid=1000,gid=1000", "-v", `${join(directory, "workspace.json")}:/run/adm/workspace.json:ro`, "--entrypoint", "/bin/sh", image, "-ec", script]);
+  } finally {
+    await rm(directory, { recursive: true });
+  }
+};
+
 if (role === "adm-repositories") {
   await smokeImageShipsMtab();
   await run(["test -x /usr/local/bin/adm-repositories", "test -x /usr/local/bin/artifact-fs", "getent passwd 1000 >/dev/null", ...["sudo", "node", "chromium", "gh"].map(absent)].join(" && "));
@@ -72,6 +107,8 @@ if (role === "adm-repositories") {
 } else if (role === "adm-code") {
   await execute("docker", ["run", "--rm", image, "/usr/local/bin/adm-dev-entrypoint", "--check"]);
   await smokeWorkspaceShellLocaleAndSudo();
+  await smokeClaudeCodeRunsAsTheWorkspaceUser();
+  await smokeClaudeSessionSurvivesDetachAndRestart();
 } else if (role === "adm-bot") {
   await run(["test -x /usr/local/bin/adm-dev-entrypoint", 'test "$(locale charmap)" = UTF-8', "! command -v gh >/dev/null 2>&1", "! command -v chromium >/dev/null 2>&1", "test -x /usr/bin/zsh", "test -f /opt/adm/runner.mjs"].join(" && "));
 } else {

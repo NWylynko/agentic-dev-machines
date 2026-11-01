@@ -23,11 +23,18 @@ if [ "${1:-}" = "--check" ]; then
     test -x /usr/local/bin/adm-github-token
     test "$(command -v gh)" = /usr/local/bin/gh
     test -x /usr/bin/gh
+    test -x /usr/local/bin/adm-claude
   fi
   exit 0
 fi
 if [ "$#" -gt 0 ]; then
   exec "$@"
+fi
+# Bring back the Claude Code session of a workspace that ran `adm claude`
+# (TASK-90). A failure is logged and left for the next `adm claude`, which
+# shows it; the Pi agent still starts.
+if command -v adm-claude >/dev/null 2>&1; then
+  adm-claude boot || echo "adm-claude: Claude Code did not start; run adm claude NAME to see why" >&2
 fi
 exec node /opt/adm/runner.mjs \
   --host 0.0.0.0 \

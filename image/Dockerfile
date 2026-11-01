@@ -69,7 +69,9 @@ WORKDIR /
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/adm-dev-entrypoint"]
 
 FROM adm-workspace AS adm-code
-RUN apt-get update && apt-get install -y --no-install-recommends git chromium nano wget ca-certificates \
+# Claude Code for `adm claude` (TASK-90); pinned, since the Pod cannot auto-update a root-owned install.
+ARG CLAUDE_CODE_VERSION=2.1.316
+RUN apt-get update && apt-get install -y --no-install-recommends git chromium nano wget ca-certificates tmux \
  && install -d -m 0755 /etc/apt/keyrings \
  && wget -qO /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -82,7 +84,9 @@ COPY image/adm-github-token /usr/local/bin/adm-github-token
 # Ahead of /usr/bin/gh on PATH: gives gh the cluster's GitHub login (TASK-111).
 COPY image/adm-gh /usr/local/bin/gh
 COPY image/browser.mjs /opt/adm/browser.mjs
-RUN chmod 0755 /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/gh \
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && npm cache clean --force && claude --version
+COPY image/adm-claude /usr/local/bin/adm-claude
+RUN chmod 0755 /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/gh /usr/local/bin/adm-claude \
  && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential'
 
 FROM adm-workspace AS adm-bot

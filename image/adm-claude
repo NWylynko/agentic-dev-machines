@@ -1,0 +1,31 @@
+#!/bin/sh
+# adm claude (TASK-90): one long-lived Claude Code per workspace, with Remote
+# Control on, inside the tmux session "claude". It runs whether or not a
+# terminal is attached; detaching (Ctrl-b d) leaves it running.
+#   start   mark Claude enabled on the workspace volume; start it if not running
+#   attach  start, then attach this terminal
+#   boot    container start: start it only if it was ever enabled here
+set -eu
+state=/workspace/.adm/claude
+config=/run/adm/workspace.json
+action=${1:-}
+case "$action" in
+  start | attach | boot) ;;
+  *) echo "usage: adm-claude start|attach|boot" >&2; exit 2 ;;
+esac
+if [ "$action" = boot ] && [ ! -f "$state/enabled" ]; then exit 0; fi
+mkdir -p "$state/config"
+: > "$state/enabled"
+if ! tmux has-session -t claude 2>/dev/null; then
+  name=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).name' "$config")
+  cwd=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).cwd' "$config")
+  # The config dir is on the volume, so login, trust answers and
+  # conversations survive Pod restarts and moves.
+  tmux new-session -d -s claude -x 200 -y 50 -c "$cwd" \
+    -e "CLAUDE_CONFIG_DIR=$state/config" -e DISABLE_AUTOUPDATER=1 \
+    claude --remote-control "$name"
+fi
+if [ "$action" = attach ]; then
+  # kubectl exec passes no TERM; tmux needs one to draw the client.
+  TERM=xterm-256color exec tmux attach-session -t claude
+fi
