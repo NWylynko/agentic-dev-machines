@@ -320,10 +320,16 @@ function scheduleLeaseExpiry(expiresAt: number) {
   }, remaining);
   leaseExpiryTimer.unref();
 }
+// The lifecycle issues 300 s leases (TASK-91), and maintenance windows extend
+// them to at most 300 s. The bound allows 30 s of clock skew between the
+// lifecycle's node and this one; anything later is not a lease it issued.
+const RUNTIME_LEASE_MAX_DELAY_MS = 330_000;
 function leaseExpiryDelay(expiresAt: number): number | undefined {
   if (!Number.isSafeInteger(expiresAt)) return undefined;
   const remaining = expiresAt * 1000 - Date.now();
-  return remaining > 0 && remaining <= 301_000 ? remaining : undefined;
+  return remaining > 0 && remaining <= RUNTIME_LEASE_MAX_DELAY_MS
+    ? remaining
+    : undefined;
 }
 function fenceLost(error: unknown) {
   if (fenceShutdown) return fenceShutdown;
@@ -374,8 +380,9 @@ async function lifecycleRuntimeCall(
     );
   } catch (error) {
     if (signal?.aborted) throw error;
+    const cause = (error as Error & { cause?: { code?: string } }).cause;
     throw new TypeError(
-      `Workspace lifecycle ${action} request failed: ${(error as Error).message}`,
+      `Workspace lifecycle ${action} request failed: ${(error as Error).message}${cause?.code ? ` (${cause.code})` : ""}`,
     );
   }
   const value = (await response.json().catch(() => ({}))) as {
@@ -651,8 +658,14 @@ function startRuntimeLeaseRenewal() {
       }
       restoreLifecycleAvailability();
     } catch (error) {
-      if (isLifecycleUnavailable(error)) suspendLifecycleAvailability(error);
-      else await fenceLost(error);
+      // Only a rejection fences the runtime. An unreachable lifecycle leaves
+      // the lease to run out on its own deadline (TASK-91).
+      if (isLifecycleUnavailable(error)) {
+        process.stderr.write(
+          `Workspace lifecycle lease renewal failed, lifecycle unavailable; the lease is held until ${new Date(runtimeLease.expiresAt * 1000).toISOString()}: ${error instanceof ApiError ? `${error.status} ${error.code} ` : ""}${(error as Error).message}\n`,
+        );
+        suspendLifecycleAvailability(error);
+      } else await fenceLost(error);
     } finally {
       renewing = false;
     }

@@ -1591,6 +1591,17 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     .json()
     .unwrap();
     assert_eq!(runtime_lease["fencingToken"], 1, "{runtime_lease}");
+    // TASK-91: the runtime lease outlasts a five-minute lifecycle outage, so a
+    // lifecycle restart or a lost lifecycle node does not stop every workspace.
+    let lease_seconds = runtime_lease["expiresAt"].as_u64().unwrap()
+        - SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+    assert!(
+        (295..=300).contains(&lease_seconds),
+        "runtime lease lasts {lease_seconds}s: {runtime_lease}"
+    );
     // A newly booting Pod can start a bot's initial provider turn before its
     // Deployment becomes Ready. Its current Pod-bound lease is authoritative.
     {

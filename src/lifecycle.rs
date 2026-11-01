@@ -308,7 +308,10 @@ pub struct OperationReceipt {
     pub fencing_token: u64,
 }
 
-const RUNTIME_LEASE_SECONDS: u64 = 30;
+/// Long enough to ride out a lifecycle restart or the loss of the lifecycle node
+/// (TASK-91): runners stop on rejection, and on their own deadline only after
+/// five minutes without the lifecycle.
+const RUNTIME_LEASE_SECONDS: u64 = 300;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

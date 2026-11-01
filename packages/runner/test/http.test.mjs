@@ -1018,6 +1018,196 @@ test(
 );
 
 test(
+  "a running workspace outlives a lifecycle that answers 503 and then refuses connections, and stops only when the lifecycle rejects it",
+  { timeout: 90_000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-long-outage-"));
+    const tokenFile = join(directory, "service-account-token");
+    const workspaceConfigFile = join(directory, "workspace.json");
+    const repository = join(directory, "repository");
+    const started = join(directory, "tool-started");
+    const release = join(directory, "tool-release");
+    const id = "workspace-long-outage";
+    await writeFile(tokenFile, "long-outage-identity\n", { mode: 0o600 });
+    await writeFile(
+      workspaceConfigFile,
+      JSON.stringify({
+        id,
+        name: "long-outage",
+        role: "coding",
+        environment: "pod",
+        localRoot: repository,
+        model: { provider: "faux", id: "faux-1" },
+      }),
+    );
+    const holder = "a1b2c3d4-e5f6-47a8-9012-123456789abc";
+    // "ok", "unavailable" (503) or "forbidden" (403 on renewal). Refused
+    // connections are the control server not listening at all.
+    let mode = "ok";
+    let renewalWhileUnavailable;
+    const renewedWhileUnavailable = new Promise((resolve) => {
+      renewalWhileUnavailable = resolve;
+    });
+    const control = createServer(async (request, response) => {
+      let text = "";
+      for await (const chunk of request) text += chunk;
+      const body = text ? JSON.parse(text) : {};
+      const headers = { "content-type": "application/json" };
+      const renewal = request.url?.endsWith("/runtime/lease/renew");
+      if (mode === "unavailable") {
+        if (renewal) renewalWhileUnavailable();
+        response
+          .writeHead(503, headers)
+          .end(JSON.stringify({ error: { code: "SERVICE_UNAVAILABLE" } }));
+        return;
+      }
+      if (mode === "forbidden" && renewal) {
+        response.writeHead(403, headers).end(
+          JSON.stringify({
+            error: {
+              code: "RUNTIME_FORBIDDEN",
+              message: "runtime lease is held by another pod",
+            },
+          }),
+        );
+        return;
+      }
+      response.writeHead(200, headers).end(
+        JSON.stringify({
+          workspaceId: id,
+          holder: body.holder ?? holder,
+          fencingToken: 1,
+          // The real 300 s lease, issued by a lifecycle whose clock runs
+          // 10 s ahead of this node's.
+          expiresAt: Math.floor(Date.now() / 1000) + 310,
+          valid: true,
+          allowed: true,
+        }),
+      );
+    });
+    await new Promise((resolve) => control.listen(0, "127.0.0.1", resolve));
+    const port = control.address().port;
+    let runner;
+    t.after(async () => {
+      await runner?.stop();
+      await new Promise((resolve) => control.close(resolve));
+    });
+    runner = await startRunner(
+      join(directory, "state"),
+      {},
+      {
+        tokenFile,
+        workspaceConfigFile,
+        lifecycleUrl: `http://127.0.0.1:${port}`,
+        podUid: holder,
+      },
+    );
+    const waitForErrors = async (pattern) => {
+      while (!pattern.test(runner.errors))
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    };
+
+    const active = await runner.request(
+      `/v1/workspaces/${id}/input`,
+      "POST",
+      {
+        requestId: "turn-across-long-outage",
+        message:
+          "/faux " +
+          JSON.stringify({
+            calls: [
+              {
+                tool: "bash",
+                args: {
+                  command: `touch ${started}; while [ ! -e ${release} ]; do sleep 0.1; done; printf held > ${join(repository, "tool-finished")}`,
+                },
+              },
+            ],
+            answer: "The turn outlived the lifecycle outage.",
+          }),
+      },
+      undefined,
+      "long-outage-identity",
+    );
+    assert.equal(active.status, 202);
+    while (
+      !(await access(started).then(
+        () => true,
+        () => false,
+      ))
+    )
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+    mode = "unavailable";
+    await renewedWhileUnavailable;
+    await waitForErrors(/lease renewal failed, lifecycle unavailable.*503/);
+    // Then the lifecycle Pod is gone entirely: connections are refused.
+    await new Promise((resolve) => {
+      control.close(resolve);
+      control.closeAllConnections();
+    });
+    await waitForErrors(
+      /lease renewal failed, lifecycle unavailable.*ECONNREFUSED/,
+    );
+    const degraded = await fetch(`${runner.url}/health`);
+    assert.equal(degraded.status, 200);
+    assert.equal((await degraded.json()).status, "degraded");
+    assert.doesNotMatch(runner.errors, /lost its lifecycle fence/);
+
+    mode = "ok";
+    await new Promise((resolve) => control.listen(port, "127.0.0.1", resolve));
+    const resumed = await runner.request(
+      `/v1/workspaces/${id}/input`,
+      "POST",
+      {
+        requestId: "input-after-lifecycle-returns",
+        message: "Accepted once the lifecycle is back.",
+      },
+      undefined,
+      "long-outage-identity",
+    );
+    assert.equal(resumed.status, 202);
+    await writeFile(release, "");
+    // The tool finishes inside the same turn, and the input admitted after
+    // the outage is answered by it.
+    const toolResult = await nextEvent(
+      runner,
+      id,
+      (event) => event.kind === "tool" && event.data.name === "bash",
+      0,
+      false,
+      25_000,
+      "long-outage-identity",
+    );
+    assert.equal(toolResult.data.isError, false);
+    await nextEvent(
+      runner,
+      id,
+      (event) =>
+        event.kind === "assistant" &&
+        event.data.text.includes("Accepted once the lifecycle is back."),
+      toolResult.seq,
+      false,
+      25_000,
+      "long-outage-identity",
+    );
+    assert.equal(
+      await readFile(join(repository, "tool-finished"), "utf8"),
+      "held",
+    );
+
+    // A rejection, unlike unavailability, stops the runtime.
+    mode = "forbidden";
+    await waitForErrors(
+      /lost its lifecycle fence: runtime lease is held by another pod/,
+    );
+    const health = await fetch(`${runner.url}/health`);
+    assert.equal(health.status, 503);
+    assert.equal((await health.json()).status, "error");
+  },
+);
+
+test(
   "canceling a blocked authoritative check does not fence the workspace",
   { timeout: 15_000 },
   async (t) => {
