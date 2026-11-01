@@ -202,6 +202,24 @@ Bots discover all live coding agents with `listAgents` and address them by immut
 
 `adm list` shows persisted workspace phase alongside live Pod readiness and agent activity. The lifecycle service makes one bounded Pod-directory request and reads every Pod's runtime status at once under a 1-second collection bound, so one hung runtime delays a list by at most about a second. Runtime status (activity and selected model only) needs no token: the workspace NetworkPolicy admits port 7432 only from the lifecycle Pod and, for coding workspaces, bot Pods. A failed status read stays `unavailable` with its cause. `adm list --json` includes an `activity` object; add `--all` to include deleted workspaces. `adm status NAME` reports namespace, requested and selected model, resources, Pod readiness/node, activity, and available failure causes. `adm inspect NAME` provides the same labeled diagnostics, and JSON modes preserve the full payload. Deleted state takes precedence over any stale Pod/runtime report.
 
+## Claude Code
+
+```sh
+adm claude my-project --repo OWNER/REPO   # create if missing (any adm create option), then attach
+adm claude my-project                     # existing workspace: add Claude if needed, attach
+adm create my-project --claude --no-attach  # create with Claude running; print the ready record
+```
+
+Every coding image (`adm-code`) ships Claude Code (pinned, auto-update off) and tmux. `adm claude NAME` runs `adm-claude attach` in the dev container: it starts one `claude --remote-control NAME` in the tmux session `claude`, in the workspace's working directory, if none is running, then attaches your terminal. Detach with `Ctrl-b d`; Claude keeps running with no terminal attached, so the Claude desktop/mobile apps and claude.ai/code can keep using it through Remote Control. Without a terminal, or with `--no-attach`, the command only starts Claude and prints the workspace JSON.
+
+A bare `adm claude NAME` on an existing workspace never creates anything. Passing any create option (`--repo`, `--cpu`, …) always goes through create admission: the same spec re-admits the existing workspace, a changed one is refused with the usual "already exists" error. Bots are refused.
+
+Claude's config dir is `/workspace/.adm/claude/config` (`CLAUDE_CONFIG_DIR`) on the private volume, so its login, folder-trust answer, settings and conversations survive Pod restarts and moves. `/workspace/.adm/claude/enabled` marks that the workspace runs Claude; the container entrypoint then starts the session again on every Pod start (`adm-claude boot`, failures go to the container log and the next `adm claude` shows them). After a restart Claude starts a new conversation; use `/resume` for the previous one. If you exit Claude, the session ends and the next `adm claude` starts a new one.
+
+Claude Code runs **alongside** the Pi agent, in the same Pod and the same checkout: both can edit the same files at the same time and neither knows about the other. `adm prompt`, `adm history`, `adm attach` and bots keep driving Pi only. Claude is not fenced by the runtime lease.
+
+Login is still per workspace for now: on first attach Claude asks for its theme, a login (`/login`, copy-code flow) and whether to trust the folder. Remote Control needs that full claude.ai login; `claude setup-token` / `CLAUDE_CODE_OAUTH_TOKEN` tokens are refused for Remote Control ([research/claude-code](../research/claude-code/README.md)). Shared `adm login claude` and the installation MCP connectors for Claude are not built yet.
+
 ## MCP connectors
 
 An MCP connector is a remote MCP server shared by every coding agent and bot in the installation. Add one and sign in with the browser:

@@ -41,6 +41,7 @@ adm create my-project --repo OWNER/REPO
 adm list                     # every workspace, its node and what the agent is doing
 adm attach my-project        # talk to the agent
 adm shell my-project         # zsh in the workspace, starting in the repo
+adm claude my-project        # Claude Code in the workspace, also reachable from the Claude apps
 adm port my-project 3000     # forward a dev server to localhost
 adm destroy my-project
 ```
@@ -56,6 +57,7 @@ On another laptop, `adm connect` uses an existing installation without installin
 - **Repositories:** `adm repos clone OWNER/REPO` registers a repo once and it shows up in every coding workspace under `/repos`, fetched the first time you open it. `adm create --repo OWNER/REPO --branch feature/x` starts on a branch, and `--new-repo OWNER/NAME` creates a new private GitHub repo. See [finding your repositories](docs/operations.md#find-your-repositories).
 - **MCP servers:** `adm mcp add NAME URL` gives every agent a remote MCP server, signed in through your browser. See [MCP connectors](docs/operations.md#mcp-connectors).
 - **Shared instructions:** `adm agents-file` edits one `AGENTS.md` that is prepended for every coding agent. See [shared agents file](docs/operations.md#shared-agents-file).
+- **Claude Code:** `adm claude my-project` creates the workspace if needed and attaches to a Claude Code that keeps running with Remote Control on, next to the Pi agent. See [Claude Code](docs/operations.md#claude-code).
 - **Bots:** `adm create supervisor --role bot` runs an agent that watches and directs your coding agents. See [bot workspaces](docs/operations.md#bot-workspaces).
 - **Herdr:** `adm create my-project --herdr` opens the workspace in a new Herdr space. Optional close-event cleanup destroys the workspace when you close the space. See [Herdr](docs/operations.md#herdr-ownership-and-deletion).
 - **Troubleshooting:** `adm doctor` checks the client, cluster and providers, and `adm system-log` merges the controller's logs. See [errors and recovery](docs/operations.md#errors-and-recovery).
