@@ -59,6 +59,8 @@ function run(command, args, env, input = "") {
     child.stdout.on("data", (chunk) => (stdout += chunk));
     child.stderr.on("data", (chunk) => (stderr += chunk));
     child.on("error", reject);
+    // gh exits without reading stdin; a child that is already gone when Node writes is not a failure.
+    child.stdin.on("error", (error) => error.code === "EPIPE" || reject(error));
     child.on("exit", (code) => resolve({ code, stdout, stderr }));
     child.stdin.end(input);
   });
