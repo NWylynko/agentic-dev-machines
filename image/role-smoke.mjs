@@ -98,6 +98,23 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
   }
 };
 
+// The bundled Playwright MCP, as the runner starts it (packages/runner/src/browser.ts): over stdio as
+// UID 1000 with the Pod's dropped capabilities, driving system chromium to a data: page.
+const smokeBrowserMcp = async () => {
+  const script = `
+    import { McpClient, StdioTransport, toLlmContent } from "/opt/adm/node_modules/@earendil-works/pi-mcp/dist/index.js";
+    const client = new McpClient({ name: "smoke", version: "1" });
+    await client.connect(new StdioTransport({ command: process.execPath, args: ["/opt/adm/node_modules/@playwright/mcp/cli.js", "--headless", "--isolated", "--no-sandbox", "--executable-path", "/usr/bin/chromium", "--output-dir", "/tmp/browser"] }));
+    const names = (await client.listTools()).map((tool) => tool.name);
+    if (!names.includes("browser_navigate")) throw new Error("no browser_navigate in " + names);
+    const result = await client.callTool("browser_navigate", { url: "data:text/html,<title>adm-smoke-title</title>" });
+    const text = toLlmContent(result);
+    await client.close();
+    if (!JSON.stringify(text).includes("adm-smoke-title")) throw new Error("navigate returned " + JSON.stringify(text));
+  `;
+  await execute("docker", ["run", "--rm", "--user", "1000:1000", "--cap-drop", "ALL", ...workspaceCapabilities.flatMap((capability) => ["--cap-add", capability]), "-e", "HOME=/tmp", "--entrypoint", "node", image, "--input-type=module", "-e", script], { maxBuffer: 1024 * 1024 });
+};
+
 if (role === "adm-repositories") {
   await smokeImageShipsMtab();
   await run(["test -x /usr/local/bin/adm-repositories", "test -x /usr/local/bin/artifact-fs", "getent passwd 1000 >/dev/null", ...["sudo", "node", "chromium", "gh"].map(absent)].join(" && "));
@@ -109,6 +126,7 @@ if (role === "adm-repositories") {
   await smokeWorkspaceShellLocaleAndSudo();
   await smokeClaudeCodeRunsAsTheWorkspaceUser();
   await smokeClaudeSessionSurvivesDetachAndRestart();
+  await smokeBrowserMcp();
 } else if (role === "adm-bot") {
   await run(["test -x /usr/local/bin/adm-dev-entrypoint", 'test "$(locale charmap)" = UTF-8', "! command -v gh >/dev/null 2>&1", "! command -v chromium >/dev/null 2>&1", "test -x /usr/bin/zsh", "test -f /opt/adm/runner.mjs"].join(" && "));
 } else {
