@@ -14,7 +14,7 @@ Sources: Claude Code 2.1.314 (native binary on this host) and 2.1.316 (npm), run
 
 - Stored as `$CLAUDE_CONFIG_DIR/.credentials.json` → `{"claudeAiOauth":{"accessToken","refreshToken","expiresAt"(ms),"scopes":[…],"subscriptionType"}}`, plus account info (`oauthAccount.organizationUuid`, `accountUuid`, …) in `$CLAUDE_CONFIG_DIR/.claude.json`.
 - Refresh tokens are single use: the binary's own message for `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` is "was used for this attempt and cannot be used again". Claude Code's guard against two processes refreshing at once is a file lock (`.oauth_refresh.lock`) in the config dir, so it only protects processes sharing one disk. Copying one login into several Pods means the first Pod to refresh logs every other Pod out.
-- It is the same OAuth client and scopes Pi already uses for `adm login anthropic` (`pi-ai/dist/auth/oauth/anthropic.js`: same client ID, `user:profile user:inference user:sessions:claude_code user:mcp_servers …`, copy-code flow for headless login). The provider-auth authority already holds that kind of refresh token and refreshes it centrally.
+- It is the same OAuth client and scopes Pi already uses for `adm login anthropic` (`pi-ai/dist/auth/oauth/anthropic.js`: same client ID, `user:profile user:inference user:sessions:claude_code user:mcp_servers …`, copy-code flow for headless login). Even so, `adm login claude` is a **separate login** (Nick, 2026-11-01): its own credential in the authority, never shared with Pi's `adm login anthropic`, and logging in or out of one never touches the other. The authority's existing central refresh is the pattern to copy, not the credential to reuse.
 
 ## Route that avoids collisions (authority keeps the refresh token)
 
@@ -23,7 +23,7 @@ Verified offline, not yet with a real account:
 - A `.credentials.json` with **no `refreshToken`**, a future `expiresAt` and the full scopes passes the full-scope check: `claude remote-control` moves on to the organization check ("Unable to determine your organization…", which needs `oauthAccount.organizationUuid` in `.claude.json`; the authority can read it from `GET https://api.anthropic.com/api/oauth/profile` with the access token, the endpoint Claude Code itself calls).
 - A running Claude Code re-reads the file when its mtime changes (it stats `.credentials.json`, clears its token cache and emits a credentials-changed event), and its refresh path first re-reads the file under the lock and returns "not needed" when the token on disk is still >5 min from expiry.
 
-So a Pod-side writer that replaces the file with a fresh access token (from a `/v1/runtime/...` route) before `expiresAt − 5 min` keeps Claude logged in without any Pod holding a refresh token. Still to verify live: a real login through Pi's flow, the bridge staying up across a file swap, and the failure Claude shows when the Pod writer is late (it has nothing to refresh with, so it should surface "login expired").
+So a Pod-side writer that replaces the file with a fresh access token (from a `/v1/runtime/...` route) before `expiresAt − 5 min` keeps Claude logged in without any Pod holding a refresh token. Still to verify live: a real login through `adm login claude`, the bridge staying up across a file swap, and the failure Claude shows when the Pod writer is late (it has nothing to refresh with, so it should surface "login expired").
 
 ## MCP: `headersHelper`, no proxy needed
 
