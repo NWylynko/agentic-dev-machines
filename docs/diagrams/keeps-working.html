@@ -1,0 +1,23 @@
+<!doctype html><meta charset="utf-8"><meta name="size" content="1000x370"><link rel="stylesheet" href="style.css">
+<style>
+.steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; position: relative; }
+.step { text-align: left; }
+.step .n { width: 26px; height: 26px; border-radius: 50%; background: var(--panel); border: 1px solid var(--line); display: grid; place-items: center; font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+.step .what { font-weight: 600; margin-bottom: 6px; }
+.step .desc { color: var(--muted); font-size: 13px; margin-top: 6px; }
+.bar { height: 10px; border-radius: 99px; margin: 22px 0 8px; position: relative; display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.bar div { border-radius: 99px; }
+.legend { display: flex; gap: 22px; color: var(--muted); font-size: 13px; }
+</style>
+<div class="card">
+  <p class="title">Disconnect any time</p>
+  <p class="subtitle">The conversation lives in the workspace, not in your terminal.</p>
+  <div class="steps">
+    <div class="step"><div class="n">1</div><div class="what">Create</div><code>adm create my-app</code><div class="desc">Checks out the repo and opens the agent.</div></div>
+    <div class="step"><div class="n">2</div><div class="what">Give it work</div><code>adm attach my-app</code><div class="desc">Prompt it like any coding agent.</div></div>
+    <div class="step"><div class="n">3</div><div class="what">Walk away</div><code>ctrl+d</code> · close the lid<div class="desc">The agent keeps going in its Pod.</div></div>
+    <div class="step"><div class="n">4</div><div class="what">Come back</div><code>adm attach my-app</code><div class="desc">Full history, from any device.</div></div>
+  </div>
+  <div class="bar"><div style="background:var(--line)"></div><div style="background:var(--green)"></div><div style="background:var(--green)"></div><div style="background:var(--green)"></div></div>
+  <div class="legend"><span><span class="dot" style="background:var(--green)"></span>agent working</span><span><span class="dot" style="background:var(--line)"></span>setting up</span></div>
+</div>

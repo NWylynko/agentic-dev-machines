@@ -96,6 +96,12 @@ adm create feature-work --repo OWNER/REPO --branch feature/work
 adm create release-fix --repo OWNER/REPO --branch fix/release --base origin/release
 ```
 
+To start a brand-new app, `--new-repo OWNER/REPO` creates an empty private GitHub repository with the cluster GitHub login (one empty commit on `main`), registers it, and opens the workspace in `/repos/OWNER/REPO`, where scaffolding such as `npx create-next-app .` works. `--repo` never creates a repository; a name that does not exist is an error.
+
+```sh
+adm create my-new-app --new-repo OWNER/my-new-app
+```
+
 Branch validation and checkout happen inside the owning Pod, in staging before the repository is published at `/repos/OWNER/REPO`. A missing base fails creation without publishing a checkout. The persisted creation choices include branch and base; retries with changed choices are rejected. To retry a failed create, repeat the same command and options; the workspace ID, namespace, private volume, published files, edits and branch changes are retained. Passing the original `--operation-id` from `adm status NAME --json` (`workspace.creation_operation_id`) also replays that operation. If another create attempt is still running, the error identifies its operation instead of starting another provisioner. Deleting the workspace ends this retry path; creating the name again allocates a new identity.
 
 `adm shell NAME` opens an interactive zsh login shell with pinned Oh My Zsh at the workspace's selected working directory (`/repos` by default, or the selected repository root). `SHELL` is `/usr/bin/zsh`, which is also the workspace user's login shell. The editable startup file is `~/.zshrc`. That path is `/workspace/.adm/zsh/.zshrc` on the private volume: the image symlinks `~/.zshrc` there, the file is seeded once, and edits survive Pod replacement. History lives in the same directory. Interactive shells include `$HOME/.local/bin` on `PATH`. A managed shell keeps its `adm` client ahead of that directory. Shell startup never downloads updates. For a catalog workspace, `pwd -P` may show its backing storage path under `/workspace/.adm`; that is the same directory through the `/repos` view. Commands supplied to `adm shell NAME -- COMMAND...` or `adm exec` run as given. They do not source `~/.zshrc`, and they do not gain the interactive `PATH`.

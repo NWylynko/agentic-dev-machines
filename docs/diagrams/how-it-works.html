@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><meta name="size" content="1000x420"><link rel="stylesheet" href="style.css">
+<style>
+.laptop { width: 230px; }
+.prompt { background: #15161e; border-radius: 8px; padding: 10px 12px; margin-top: 6px; }
+.prompt .p { color: var(--green); }
+.cluster { width: 470px; }
+.ws { display: flex; align-items: center; justify-content: space-between; background: #1e1f29; border: 1px solid var(--line); border-radius: 10px; padding: 11px 14px; margin-top: 10px; }
+.ws:first-of-type { margin-top: 0; }
+.ws .name { font-weight: 600; }
+.ws .state { color: var(--muted); font-size: 13px; }
+.tag { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 99px; margin-left: 10px; }
+</style>
+<div class="card">
+  <p class="title">Your laptop is just a terminal</p>
+  <p class="subtitle">Every agent runs in its own Pod in your cluster. Close the lid and they keep working.</p>
+  <div class="row">
+    <div class="box laptop">
+      <div class="label">Your laptop</div>
+      <div class="prompt mono"><span class="p">$</span> adm attach my-app</div>
+      <div class="prompt mono"><span class="p">$</span> adm list</div>
+    </div>
+    <div class="arrow"><div>temporary port-forward</div><div class="shaft"></div><div>per command</div></div>
+    <div class="box cluster">
+      <div class="label">Your Kubernetes cluster</div>
+      <div class="ws"><div class="row"><span class="dot pulse" style="background:var(--green)"></span><span class="name">my-app</span><span class="tag" style="background:#50fa7b22;color:var(--green)">coding</span></div><span class="state">agent working…</span></div>
+      <div class="ws"><div class="row"><span class="dot pulse" style="background:var(--green)"></span><span class="name">api-fix</span><span class="tag" style="background:#50fa7b22;color:var(--green)">coding</span></div><span class="state">agent working…</span></div>
+      <div class="ws"><div class="row"><span class="dot" style="background:var(--purple)"></span><span class="name">supervisor</span><span class="tag" style="background:#bd93f922;color:var(--purple)">bot</span></div><span class="state">watching coding agents</span></div>
+    </div>
+  </div>
+</div>

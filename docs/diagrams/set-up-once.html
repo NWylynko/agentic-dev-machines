@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><meta name="size" content="1000x412"><link rel="stylesheet" href="style.css">
+<style>
+.cmds { width: 330px; display: grid; gap: 10px; }
+.cmd { display: flex; justify-content: space-between; align-items: center; }
+.cmd .what { color: var(--muted); font-size: 13px; }
+.wss { flex: none; width: 400px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.ws { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+.ws .name { font-weight: 600; margin-bottom: 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 99px; }
+</style>
+<div class="card">
+  <p class="title">Set up once, every workspace gets it</p>
+  <p class="subtitle">Logins and settings live with the cluster controller. Long-lived credentials never enter a workspace.</p>
+  <div class="row">
+    <div class="cmds">
+      <div class="box cmd"><code>adm login</code><span class="what">model provider</span></div>
+      <div class="box cmd"><code>adm repos login</code><span class="what">GitHub, git, gh</span></div>
+      <div class="box cmd"><code>adm mcp add</code><span class="what">MCP servers</span></div>
+      <div class="box cmd"><code>adm agents-file</code><span class="what">shared AGENTS.md</span></div>
+    </div>
+    <div class="arrow"><div>short-lived tokens</div><div class="shaft"></div><div>per request</div></div>
+    <div class="wss">
+      <div class="ws"><div class="name">my-app</div><div class="chips"><span class="chip" style="background:#8be9fd22;color:var(--cyan)">model</span><span class="chip" style="background:#ff79c622;color:var(--pink)">GitHub</span><span class="chip" style="background:#f1fa8c22;color:var(--yellow)">MCP</span><span class="chip" style="background:#ffb86c22;color:var(--orange)">AGENTS.md</span></div></div>
+      <div class="ws"><div class="name">api-fix</div><div class="chips"><span class="chip" style="background:#8be9fd22;color:var(--cyan)">model</span><span class="chip" style="background:#ff79c622;color:var(--pink)">GitHub</span><span class="chip" style="background:#f1fa8c22;color:var(--yellow)">MCP</span><span class="chip" style="background:#ffb86c22;color:var(--orange)">AGENTS.md</span></div></div>
+      <div class="ws"><div class="name">docs</div><div class="chips"><span class="chip" style="background:#8be9fd22;color:var(--cyan)">model</span><span class="chip" style="background:#ff79c622;color:var(--pink)">GitHub</span><span class="chip" style="background:#f1fa8c22;color:var(--yellow)">MCP</span><span class="chip" style="background:#ffb86c22;color:var(--orange)">AGENTS.md</span></div></div>
+      <div class="ws"><div class="name">supervisor <span style="color:var(--purple);font-size:12px">bot</span></div><div class="chips"><span class="chip" style="background:#8be9fd22;color:var(--cyan)">model</span><span class="chip" style="background:#f1fa8c22;color:var(--yellow)">MCP</span></div></div>
+    </div>
+  </div>
+</div>
