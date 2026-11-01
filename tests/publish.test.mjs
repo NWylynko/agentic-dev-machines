@@ -93,6 +93,8 @@ if arguments[0] == "api":
         base, head = path[len("compare/"):].split("...")
         commits = state["commits"]
         def resolve(ref):
+            if ref == "main":
+                return commits[-1]
             if ref in commits:
                 return ref
             release = state["releases"].get(ref)
@@ -269,6 +271,20 @@ test("a main build unrelated to the current default publishes without replacing 
   assert.equal(state.latest, "sha-0123456789ab");
   assert.equal(state.releases["sha-999999999999"].latestFlag, "false");
   assert.equal(state.releases["sha-999999999999"].target, unrelatedCommit);
+});
+
+test("a main build replaces a default download whose commit was rewritten out of main", async (t) => {
+  const fixture = await releaseFixture(t);
+  await fixture.artifacts("rewritten");
+  await fixture.publish(unrelatedCommit);
+  await fixture.state((state) => {
+    state.latest = "sha-999999999999";
+  });
+  await fixture.artifacts("main");
+  await fixture.publish(newerCommit);
+  const state = await fixture.state();
+  assert.equal(state.latest, "sha-0123456789ab");
+  assert.equal(state.releases["sha-0123456789ab"].latestFlag, "true");
 });
 
 test("version tags stay pinned and never replace the default download", async (t) => {
