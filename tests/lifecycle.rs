@@ -3407,6 +3407,10 @@ fn failover_moves_adm_pods_and_the_lifecycle_off_a_dead_node_and_releases_only_t
             pod("adm-system", "adm-failover-5c4b-fghij", "dead-node",
                 json!({"app.kubernetes.io/name":"adm-failover"})),
             pod("adm-ws-dead", "workspace-1", "dead-node", workspace_labels("ws-dead")),
+            pod("adm-ws-dead", "docker-1", "dead-node",
+                json!({"app.kubernetes.io/managed-by":"adm","adm.dev/docker-engine-of":"ws-dead"})),
+            pod("adm-ws-healthy", "docker-3", "healthy-node",
+                json!({"app.kubernetes.io/managed-by":"adm","adm.dev/docker-engine-of":"ws-healthy"})),
             pod("adm-ws-flapping", "workspace-2", "flapping-node", workspace_labels("ws-flapping")),
             pod("adm-ws-healthy", "workspace-3", "healthy-node", workspace_labels("ws-healthy")),
             pod("other-app", "database-0", "dead-node", json!({"app":"database"})),
@@ -3470,6 +3474,7 @@ fn failover_moves_adm_pods_and_the_lifecycle_off_a_dead_node_and_releases_only_t
         deleted,
         [
             "pods adm-system/adm-lifecycle-7d9f-abcde",
+            "pods adm-ws-dead/docker-1",
             "pods adm-ws-dead/workspace-1",
             "volumeattachments csi-lifecycle",
             "volumeattachments csi-ws-dead",
@@ -3499,7 +3504,7 @@ fn failover_moves_adm_pods_and_the_lifecycle_off_a_dead_node_and_releases_only_t
             .unwrap()
             .lines()
             .count(),
-        4
+        5
     );
     // Every action names the workspace (or adm-lifecycle), node, PV and how
     // long the node has been NotReady.
@@ -3509,6 +3514,12 @@ fn failover_moves_adm_pods_and_the_lifecycle_off_a_dead_node_and_releases_only_t
     );
     assert!(
         logs.contains("force deleting Pod adm-ws-dead/workspace-1 of workspace ws-dead"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains(
+            "force deleting Pod adm-ws-dead/docker-1 of docker engine of workspace ws-dead"
+        ),
         "{logs}"
     );
     assert!(

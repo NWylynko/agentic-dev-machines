@@ -85,6 +85,10 @@ COPY image/adm-github-token /usr/local/bin/adm-github-token
 COPY image/adm-gh /usr/local/bin/gh
 COPY image/browser.mjs /opt/adm/browser.mjs
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && npm cache clean --force && claude --version
+# Docker CLI, compose and buildx (static binaries), for the workspace's Docker engine Pod
+# through DOCKER_HOST; same release as the engine image pinned in src/workspaces.rs.
+COPY --from=docker.io/library/docker:29.9.3-cli@sha256:2357639ad1ea7d0194134bf3292622fd4e562483966ed674e5d7c945b5f3b28d /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker.io/library/docker:29.9.3-cli@sha256:2357639ad1ea7d0194134bf3292622fd4e562483966ed674e5d7c945b5f3b28d /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
 COPY image/adm-claude /usr/local/bin/adm-claude
 COPY image/adm-claude-mcp /usr/local/bin/adm-claude-mcp
 COPY image/adm-claude-credentials /usr/local/bin/adm-claude-credentials

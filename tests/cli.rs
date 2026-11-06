@@ -2415,6 +2415,32 @@ fn port_lan_publishes_non_loopback_urls_and_bind_is_passed_through() {
     assert!(!default_err.contains("no authentication"), "{default_err}");
 }
 
+#[test]
+fn port_docker_forwards_from_the_docker_engine_not_the_workspace() {
+    let root = fixture();
+    assert_ok(adm(
+        root.path(),
+        &["create", "preview", "--no-repositories"],
+    ));
+    fs::write(root.path().join("port-forward-exit"), "1").unwrap();
+    let docker = adm(root.path(), &["port", "preview", "8080", "--docker"]);
+    assert!(
+        docker.status.success(),
+        "{}",
+        String::from_utf8_lossy(&docker.stderr)
+    );
+    let args = port_forward_args(root.path());
+    assert!(
+        args.iter().any(|arg| arg == "deployment/docker"),
+        "{args:?}"
+    );
+    assert!(
+        !args.iter().any(|arg| arg == "deployment/workspace"),
+        "{args:?}"
+    );
+    assert!(args.iter().any(|arg| arg == "8080:8080"), "{args:?}");
+}
+
 fn port_forward_args(root: &Path) -> Vec<String> {
     serde_json::from_slice(&fs::read(root.join("port-forward-args.json")).unwrap()).unwrap()
 }
@@ -4679,6 +4705,148 @@ fn manifest_gives_the_workspace_unattended_container_administration() {
     assert_eq!(deployment["spec"]["strategy"]["type"], "Recreate");
     assert!(pod["containers"].as_array().unwrap().len() == 1);
     assert_eq!(pod["initContainers"][0]["command"][1], "plain");
+}
+
+/// Docker for coding workspaces: a rootless dockerd in its own
+/// user-namespaced Pod, so nothing the agent runs in a container gets the
+/// node or the agent's credentials. It shares only the private work volume
+/// (same node, RWO) and talks to the dev container over a socket on it.
+#[test]
+fn manifest_runs_docker_in_a_separate_user_namespaced_engine_pod() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = assert_ok(adm(root.path(), &["manifest", "example"]));
+    let items = manifest["items"].as_array().unwrap();
+    let find = |kind: &str, name: &str| {
+        items
+            .iter()
+            .find(|item| item["kind"] == kind && item["metadata"]["name"] == name)
+            .unwrap_or_else(|| panic!("missing {kind} {name}"))
+    };
+    let workspace = find("Deployment", "workspace");
+    let engine = find("Deployment", "docker");
+    let id = workspace["metadata"]["labels"]["adm.dev/workspace-id"]
+        .as_str()
+        .unwrap();
+    // The engine must never be mistaken for the workspace Pod, whose lookups
+    // key on adm.dev/workspace-id; failover finds it by docker-engine-of.
+    let engine_labels = &engine["spec"]["template"]["metadata"]["labels"];
+    assert_eq!(engine_labels["app.kubernetes.io/managed-by"], "adm");
+    assert_eq!(engine_labels["adm.dev/docker-engine-of"], id);
+    assert!(engine_labels.get("adm.dev/workspace-id").is_none());
+    assert!(engine_labels.get("adm.dev/role").is_none());
+    assert_eq!(engine["spec"]["selector"]["matchLabels"], *engine_labels);
+    assert_eq!(engine["spec"]["strategy"]["type"], "Recreate");
+
+    let pod = &engine["spec"]["template"]["spec"];
+    assert_eq!(pod["hostUsers"], false);
+    assert_eq!(pod["automountServiceAccountToken"], false);
+    assert_eq!(pod["enableServiceLinks"], false);
+    let required =
+        &pod["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0];
+    assert_eq!(required["topologyKey"], "kubernetes.io/hostname");
+    assert_eq!(
+        required["labelSelector"]["matchLabels"]["adm.dev/workspace-id"],
+        id
+    );
+    assert_eq!(
+        required["labelSelector"]["matchLabels"]["adm.dev/role"],
+        "coding"
+    );
+    let containers = pod["containers"].as_array().unwrap();
+    assert_eq!(containers.len(), 1);
+    let docker = &containers[0];
+    assert!(
+        docker["image"]
+            .as_str()
+            .unwrap()
+            .starts_with("docker.io/library/docker:29.9.3-dind-rootless@sha256:"),
+        "{}",
+        docker["image"]
+    );
+    assert_eq!(docker["securityContext"]["privileged"], true);
+    assert_eq!(docker["securityContext"]["procMount"], "Unmasked");
+    assert_eq!(docker["securityContext"]["runAsUser"], 1000);
+    let args = docker["args"].as_array().unwrap();
+    assert!(
+        args.iter()
+            .any(|a| a == "--host=unix:///workspace/.adm/docker/docker.sock")
+    );
+    assert!(
+        args.iter()
+            .any(|a| a == "--data-root=/workspace/.adm/docker/data")
+    );
+    let mounts = docker["volumeMounts"].as_array().unwrap();
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m["name"] == "work" && m["mountPath"] == "/workspace")
+    );
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        assert!(mounts.iter().any(|m| m["mountPath"] == file), "{file}");
+    }
+    // Nothing else from the workspace reaches the engine.
+    let volumes = pod["volumes"].as_array().unwrap();
+    for volume in volumes {
+        assert!(
+            volume["projected"].is_null() && volume["secret"].is_null(),
+            "{volume}"
+        );
+        assert_ne!(
+            volume["persistentVolumeClaim"]["claimName"],
+            "repository-bases"
+        );
+    }
+    // A user-namespaced Pod maps only 65536 IDs, so the rootless range must fit.
+    let ids = find("ConfigMap", "docker-engine-ids");
+    assert_eq!(ids["data"]["subid"], "rootless:1001:64535\n");
+
+    // The workspace Pod prefers the engine's node so the RWO volume follows.
+    let preferred = &workspace["spec"]["template"]["spec"]["affinity"]["podAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"]
+        [0];
+    assert_eq!(
+        preferred["podAffinityTerm"]["labelSelector"]["matchLabels"]["adm.dev/docker-engine-of"],
+        id
+    );
+    let dev = &workspace["spec"]["template"]["spec"]["containers"][0];
+    let env = dev["env"].as_array().unwrap();
+    let value = |name: &str| {
+        env.iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("missing env {name}"))["value"]
+            .clone()
+    };
+    assert_eq!(
+        value("DOCKER_HOST"),
+        "unix:///workspace/.adm/docker/docker.sock"
+    );
+    assert_eq!(value("TESTCONTAINERS_HOST_OVERRIDE"), "docker");
+
+    // Published ports answer at docker:PORT from the dev container.
+    let service = find("Service", "docker");
+    assert_eq!(service["spec"]["clusterIP"], "None");
+    assert_eq!(service["spec"]["selector"], *engine_labels);
+    let policy = find("NetworkPolicy", "docker-engine");
+    assert_eq!(policy["spec"]["podSelector"]["matchLabels"], *engine_labels);
+    let from = &policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"];
+    assert_eq!(from["adm.dev/workspace-id"], id);
+    assert_eq!(from["adm.dev/role"], "coding");
+    let dev_policy = find("NetworkPolicy", "docker-engine-egress");
+    assert_eq!(
+        dev_policy["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"],
+        *engine_labels
+    );
+    assert_eq!(
+        dev_policy["spec"]["policyTypes"],
+        serde_json::json!(["Egress"])
+    );
+}
+
+#[test]
+fn bots_get_no_docker_engine() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = assert_ok(adm(root.path(), &["manifest", "helper", "--role", "bot"]));
+    let text = manifest.to_string();
+    assert!(!text.contains("docker"), "{text}");
 }
 
 #[test]

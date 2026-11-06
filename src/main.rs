@@ -166,6 +166,9 @@ pub enum Action {
         /// Bind 0.0.0.0 and print every address other devices on this network can open.
         #[arg(long, conflicts_with = "bind")]
         lan: bool,
+        /// Forward a port published by a Docker container, from the workspace's Docker engine.
+        #[arg(long)]
+        docker: bool,
     },
     /// Send work without keeping a terminal attached.
     Prompt {
@@ -1427,6 +1430,7 @@ fn run(cli: &Cli) -> Result<()> {
             local_port,
             bind,
             lan,
+            docker,
         } => {
             let workspace = cli.active_workspace(name)?;
             anyhow::ensure!(workspace.role == "coding", "bots have no development ports");
@@ -1440,7 +1444,11 @@ fn run(cli: &Cli) -> Result<()> {
                     "port-forward",
                     "-n",
                     &workspace.namespace,
-                    "deployment/workspace",
+                    if *docker {
+                        "deployment/docker"
+                    } else {
+                        "deployment/workspace"
+                    },
                     "--address",
                     bind,
                     &format!("{local}:{port}"),

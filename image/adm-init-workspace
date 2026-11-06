@@ -13,7 +13,8 @@ if [ ! -e /workspace/.adm/zsh/.zshrc ]; then
   install -m 0644 /usr/local/share/adm/zshrc /workspace/.adm/zsh/.zshrc
 fi
 touch /workspace/.adm/zsh/.zsh_history
-chown -R 1000:1000 /workspace
+# Not the Docker engine's data: its layers belong to the engine's rootless subordinate IDs.
+find /workspace -path /workspace/.adm/docker/data -prune -o -exec chown -h 1000:1000 {} +
 chmod 755 /workspace /workspace/.adm /workspace/.adm/catalog /workspace/.adm/git
 chmod 700 /workspace/.adm/repositories /workspace/.adm/views
 chmod 700 /workspace/.adm/zsh /workspace/.adm/zsh/custom /workspace/.adm/zsh/cache

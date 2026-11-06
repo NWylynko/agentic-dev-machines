@@ -95,9 +95,13 @@ fn sweep_down_nodes(cli: &crate::Cli) -> Result<()> {
         };
         let labels = &pod["metadata"]["labels"];
         let owner = if labels["app.kubernetes.io/managed-by"] == "adm" {
-            match labels["adm.dev/workspace-id"].as_str() {
-                Some(id) => format!("workspace {id}"),
-                None => continue,
+            match (
+                labels["adm.dev/workspace-id"].as_str(),
+                labels["adm.dev/docker-engine-of"].as_str(),
+            ) {
+                (Some(id), _) => format!("workspace {id}"),
+                (None, Some(id)) => format!("docker engine of workspace {id}"),
+                (None, None) => continue,
             }
         } else if namespace == lifecycle_namespace
             && labels["app.kubernetes.io/name"] == "adm-lifecycle"

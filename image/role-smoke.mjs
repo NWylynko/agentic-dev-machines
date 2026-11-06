@@ -63,6 +63,32 @@ const smokeWorkspaceShellLocaleAndSudo = async () => {
   if (stderr !== "") throw new Error(`sudo printed warnings in a workspace container: ${stderr}`);
 };
 
+// Coding workspaces drive their Docker engine Pod through DOCKER_HOST, a socket on the work
+// volume; here the host daemon's socket stands in for it. The CLI runs as UID 1000.
+const smokeDockerCliDrivesTheEngine = async () => {
+  const socket = "/var/run/docker.sock";
+  if (!existsSync(socket)) return console.warn("adm-code smoke: SKIPPED the Docker CLI check, no Docker socket on this host");
+  const { stdout } = await execute("docker", ["run", "--rm", "--user", `1000:${(await execute("stat", ["-c", "%g", socket])).stdout.trim()}`, "--mount", `type=bind,src=${socket},dst=/workspace/.adm/docker/docker.sock`, "-e", "DOCKER_HOST=unix:///workspace/.adm/docker/docker.sock", "--entrypoint", "/bin/sh", image, "-ec", "docker version --format 'server {{.Server.Version}}' && docker compose version && docker buildx version"]);
+  for (const expected of [/^server \d/m, /Docker Compose version v\d/, /github.com\/docker\/buildx v0/]) if (!expected.test(stdout)) throw new Error(`Docker CLI as UID 1000 printed ${JSON.stringify(stdout)}, expected ${expected}`);
+};
+
+// The engine stores image layers under /workspace/.adm/docker with its rootless subordinate
+// UIDs; the initializer runs on every Pod start and must not reset their ownership.
+const smokeInitLeavesDockerDataAlone = async () => {
+  const volume = `adm-code-init-${process.pid}`;
+  const onVolume = (user, script) => execute("docker", ["run", "--rm", "--network", "none", "--user", user, "--mount", `type=volume,src=${volume},dst=/workspace`, "--entrypoint", "/bin/sh", image, "-ec", script]);
+  await execute("docker", ["volume", "create", volume]);
+  try {
+    await onVolume("0", "mkdir -p /workspace/.adm/docker/data/layer /workspace/project && touch /workspace/.adm/docker/data/layer/file /workspace/project/file && chown 1000:1000 /workspace/.adm/docker && chown -R 2070:2070 /workspace/.adm/docker/data && chown 5000:5000 /workspace/project/file");
+    await onVolume("0", "/usr/local/bin/adm-init-workspace plain");
+    const { stdout } = await onVolume("0", "stat -c '%n %u:%g' /workspace/.adm/docker /workspace/.adm/docker/data/layer/file /workspace/project/file");
+    const expected = "/workspace/.adm/docker 1000:1000\n/workspace/.adm/docker/data/layer/file 2070:2070\n/workspace/project/file 1000:1000\n";
+    if (stdout !== expected) throw new Error(`after adm-init-workspace:\n${stdout}expected:\n${expected}`);
+  } finally {
+    await execute("docker", ["volume", "rm", "-f", volume]).catch(() => {});
+  }
+};
+
 // `adm claude` (TASK-90) runs Claude Code under tmux as UID 1000, not as the root that installed it.
 const smokeClaudeCodeRunsAsTheWorkspaceUser = async () => {
   const { stdout } = await execute("docker", ["run", "--rm", "--user", "1000:1000", "--entrypoint", "/bin/sh", image, "-ec", "claude --version && tmux -V && test -x /usr/local/bin/adm-claude && test -x /usr/local/bin/adm-claude-mcp && test -x /usr/local/bin/adm-claude-credentials"]);
@@ -148,6 +174,8 @@ if (role === "adm-repositories") {
   await smokeClaudeCodeRunsAsTheWorkspaceUser();
   await smokeClaudeSessionSurvivesDetachAndRestart();
   await smokeBrowserMcp();
+  await smokeDockerCliDrivesTheEngine();
+  await smokeInitLeavesDockerDataAlone();
 } else if (role === "adm-bot") {
   await run(["test -x /usr/local/bin/adm-dev-entrypoint", 'test "$(locale charmap)" = UTF-8', "! command -v gh >/dev/null 2>&1", "! command -v chromium >/dev/null 2>&1", "test -x /usr/bin/zsh", "test -f /opt/adm/runner.mjs"].join(" && "));
 } else {

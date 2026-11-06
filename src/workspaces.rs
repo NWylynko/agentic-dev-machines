@@ -1496,6 +1496,54 @@ fn kubectl_with_timeout(
     Ok(output.stdout)
 }
 
+/// Rootless dockerd for coding workspaces' Docker engine Pod. Pinned by
+/// digest like the other upstream binaries the images carry.
+pub const DOCKER_ENGINE_IMAGE: &str = "docker.io/library/docker:29.9.3-dind-rootless@sha256:e3d0fa70055956693134873845b743bbe35b5199c68a52347032ae3e5dbac9a0";
+pub const DOCKER_SOCKET: &str = "unix:///workspace/.adm/docker/docker.sock";
+
+/// The engine's labels deliberately omit `adm.dev/workspace-id` and
+/// `adm.dev/role`: every workspace Pod lookup keys on those, and the engine
+/// must never be taken for the workspace runtime.
+fn docker_engine_labels(w: &Workspace) -> Value {
+    json!({"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/docker-engine-of":w.id})
+}
+
+/// The Docker engine of a coding workspace: rootless dockerd in its own
+/// user-namespaced Pod (`hostUsers: false`), so its privilege, and anything a
+/// container breaks out to, maps to an unprivileged range on the node. It has
+/// no Kubernetes or lifecycle token and no repository bases; it shares only
+/// the private work volume, on the workspace Pod's node (RWO), and serves the
+/// dev container over a socket on that volume. The workspace Pod itself
+/// cannot be user-namespaced: the NFS repository bases refuse idmapped mounts.
+fn docker_engine_items(w: &Workspace) -> Vec<Value> {
+    let labels = docker_engine_labels(w);
+    let workspace_selector = json!({"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/workspace-id":w.id,"adm.dev/role":"coding"});
+    let ids = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"docker-engine-ids","namespace":w.namespace,"labels":labels},"data":{"subid":"rootless:1001:64535\n"}});
+    let socket_check = json!({"exec":{"command":["docker",format!("--host={DOCKER_SOCKET}"),"version"]},"periodSeconds":5});
+    let prepare = json!({"name":"prepare","image":DOCKER_ENGINE_IMAGE,"imagePullPolicy":"IfNotPresent","command":["sh","-euc","mkdir -p /workspace/.adm/docker && chown 1000:1000 /workspace/.adm/docker"],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
+    let docker = json!({"name":"docker","image":DOCKER_ENGINE_IMAGE,"imagePullPolicy":"IfNotPresent",
+        "args":["dockerd",format!("--host={DOCKER_SOCKET}"),"--data-root=/workspace/.adm/docker/data"],
+        "env":[{"name":"DOCKER_TLS_CERTDIR","value":""}],
+        "securityContext":{"privileged":true,"procMount":"Unmasked","runAsUser":1000,"runAsGroup":1000},
+        "resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},
+        "readinessProbe":socket_check,
+        "volumeMounts":[
+            {"name":"work","mountPath":"/workspace"},
+            {"name":"ids","mountPath":"/etc/subuid","subPath":"subid","readOnly":true},
+            {"name":"ids","mountPath":"/etc/subgid","subPath":"subid","readOnly":true},
+            {"name":"home","mountPath":"/home/rootless"}]});
+    let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"docker","namespace":w.namespace,"labels":labels},"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{
+        "hostUsers":false,"automountServiceAccountToken":false,"enableServiceLinks":false,"terminationGracePeriodSeconds":30,
+        "affinity":{"podAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"labelSelector":{"matchLabels":workspace_selector},"topologyKey":"kubernetes.io/hostname"}]}},
+        "initContainers":[prepare],"containers":[docker],
+        "volumes":[{"name":"work","persistentVolumeClaim":{"claimName":"work"}},{"name":"ids","configMap":{"name":"docker-engine-ids"}},{"name":"home","emptyDir":{}}]}}}});
+    // Headless, so docker:PORT reaches any port a container publishes.
+    let service = json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"docker","namespace":w.namespace,"labels":labels},"spec":{"clusterIP":"None","selector":labels}});
+    let ingress = json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"docker-engine","namespace":w.namespace,"labels":labels},"spec":{"podSelector":{"matchLabels":labels},"policyTypes":["Ingress"],"ingress":[{"from":[{"podSelector":{"matchLabels":workspace_selector}}]}]}});
+    let egress = json!({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"docker-engine-egress","namespace":w.namespace,"labels":labels},"spec":{"podSelector":{"matchLabels":workspace_selector},"policyTypes":["Egress"],"egress":[{"to":[{"podSelector":{"matchLabels":labels}}]}]}});
+    vec![ids, deployment, service, ingress, egress]
+}
+
 fn labels(w: &Workspace) -> Value {
     json!({"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/workspace-id":w.id,"adm.dev/role":w.role})
 }
@@ -1562,6 +1610,12 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         {"name":"ADM_LIFECYCLE_URL","value":lifecycle_url},
         {"name":"ADM_POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}
     ]);
+    if w.role == "coding" {
+        let env = dev["env"].as_array_mut().unwrap();
+        env.push(json!({"name":"DOCKER_HOST","value":DOCKER_SOCKET}));
+        // Testcontainers otherwise looks for published ports on localhost.
+        env.push(json!({"name":"TESTCONTAINERS_HOST_OVERRIDE","value":"docker"}));
+    }
     for reference in &w.credential_env {
         dev["env"].as_array_mut().unwrap().push(json!({"name":reference.name,"valueFrom":{"secretKeyRef":{"name":reference.secret_name,"key":reference.key}}}));
     }
@@ -1591,6 +1645,11 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     }
     let init = json!({"name":"initialize","image":w.workspace_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
     let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"serviceAccountName":"adm-runtime","automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
+    let mut deployment = deployment;
+    if w.role == "coding" {
+        // Follow the engine's node when rescheduled, where the RWO volume is attached.
+        deployment["spec"]["template"]["spec"]["affinity"] = json!({"podAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"labelSelector":{"matchLabels":docker_engine_labels(w)},"topologyKey":"kubernetes.io/hostname"}}]}});
+    }
     let mut ingress = vec![
         json!({"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":lifecycle_namespace}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"adm-lifecycle"}}}],"ports":[{"protocol":"TCP","port":7432}]}),
     ];
@@ -1608,6 +1667,9 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     items.extend([runtime_config, claim]);
     items.extend(bases_items);
     items.extend([service, deployment, network]);
+    if w.role == "coding" {
+        items.extend(docker_engine_items(w));
+    }
     Ok(json!({"apiVersion":"v1","kind":"List","items":items}))
 }
 
