@@ -106,3 +106,10 @@ Dated log of what each ticket changed, the gotchas found, and what was still to 
 - `adm update` is exempt through `x-adm-release-update`: its new client talks to the old lifecycle until the rollout. An old client's `adm update --workspace NAME` resolves names before installing and so is turned away; plain `adm update` first, then `--workspace`.
 - Test: `lifecycle_turns_away_operator_clients_from_another_release_with_adm_update`, and the update test runs against a lifecycle on an older release and checks `ADM_RELEASE` on the new Deployment.
 - Not yet verified live: the first rollout of this release turns away every installed client, which all predate the header.
+
+## 2026-11-06 — bot-created coding agents
+
+- Live: a bot's `createAgent` for `clubhouse-local` (`3f1ada9e…`, `--repo nwylynko/clubhouse`) failed while Nick's own `adm create` worked. The private-checkout clone ran as soon as the Pod was `Running`, before the runner held its lease; `adm-github-token` was refused (`check_runtime_owner`: no `runtime_leases` row), git failed, the workspace went `failed`, and a failed workspace's `/v1/provider-auth/catalog` answers 400, so the agent sat in `needs_model` with `Shared provider catalogue failed (400)`. Any `adm create --repo` of a private repo hit the same race; Nick's workspaces used the lazy `/repos` catalog instead.
+- Fix: `create_persisted` waits for deployment readiness (Pod Ready = lease held) before `prepare_repository`. The `cli.rs` fake kubectl refuses the clone until the namespace's `available` wait has run.
+- Bots could not name the release's images (the tool required `image`, and `workspace_image`/`repositories_image` defaulted to `:latest`). setup/update now give the lifecycle container `ADM_CODE_IMAGE`, `ADM_WORKSPACE_IMAGE`, `ADM_REPOSITORIES_IMAGE` from the release dir; a bot create fills `image` when omitted and always takes the release's init and repositories images (`apply_release_images_to_bot_create`). An unreleased lifecycle has no image env and requires the bot to name `image`. Test: `bot_created_coding_agents_run_the_cluster_release_images`.
+- Not yet verified live: needs a release and `adm update`.
