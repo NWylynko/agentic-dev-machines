@@ -1922,27 +1922,6 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
                 Ok(())
             },
         )?;
-        if let Some(repository) = &w.repository {
-            // Wait for the Pod to run so the private checkout exists before readiness.
-            lifecycle_stage(cli, "create", &w.name, "waiting for workspace Pod", || {
-                kubectl(
-                    cli,
-                    &[
-                        "wait",
-                        "--for=jsonpath={.status.phase}=Running",
-                        "pod",
-                        "-l",
-                        &format!("adm.dev/workspace-id={}", w.id),
-                        "-n",
-                        &w.namespace,
-                        "--timeout=180s",
-                    ],
-                    None,
-                )?;
-                Ok(())
-            })?;
-            prepare_repository(cli, &w, repository)?;
-        }
         lifecycle_stage(
             cli,
             "create",
@@ -1964,6 +1943,12 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
                 Ok(())
             },
         )?;
+        // The checkout is cloned only once the runner holds its lease: Pod
+        // readiness waits for it, and git's credential helper gets the GitHub
+        // token from the lifecycle only for the lease holder.
+        if let Some(repository) = &w.repository {
+            prepare_repository(cli, &w, repository)?;
+        }
         w.phase = "ready".into();
         store.admit_if_provisioning(&w, || Ok(()))?;
         Ok(())

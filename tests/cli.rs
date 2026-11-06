@@ -604,6 +604,9 @@ elif args[0] == 'wait':
     ready_failure = pathlib.Path(__file__).parent / 'fail-ready-once'
     if ready_failure.exists() and '--for=condition=available' in args:
         ready_failure.unlink(); print('deployment did not become available',file=sys.stderr); sys.exit(1)
+    if '--for=condition=available' in args:
+        # The workspace Pod is Ready only once its runner holds the lifecycle lease.
+        pathlib.Path(__file__).parent.joinpath('runtime-lease-' + args[args.index('-n') + 1]).write_text('held')
     print('condition met')
 elif args and args[0] == 'exec':
     (pathlib.Path(__file__).parent / 'exec-args.json').write_text(json.dumps(args))
@@ -622,6 +625,11 @@ elif args and args[0] == 'exec':
         repos = pathlib.Path(exec_root) / namespace / 'repos'
         repos.mkdir(parents=True, exist_ok=True)
         command = args[args.index('--') + 1:]
+        if 'adm-repository' in command and not pathlib.Path(__file__).parent.joinpath('runtime-lease-' + namespace).exists():
+            # git's credential helper asks the lifecycle for the GitHub token, which only a lease holder gets.
+            print('adm-github-token: runtime caller is not authorized for workspace: Query returned no rows', file=sys.stderr)
+            print("fatal: could not read Username for 'https://github.com': No such device or address", file=sys.stderr)
+            sys.exit(128)
         command = [item.replace('/repos', str(repos)) for item in command]
         if command[:2] == ['node', '/opt/adm/browser.mjs']:
             # Stands in for Chromium. A failed screenshot write still exits 0,
@@ -1148,16 +1156,6 @@ fn shell_uses_public_cwd_as_an_argument_and_preserves_explicit_command_argv() {
 #[test]
 fn create_prepares_a_private_public_repository_inside_each_workspace_pod() {
     let root = fixture();
-    let kubectl_parser = Command::new("which")
-        .arg("kubectl")
-        .output()
-        .expect("find real kubectl parser");
-    assert!(kubectl_parser.status.success(), "kubectl must be installed");
-    fs::write(
-        root.path().join("real-kubectl-parser"),
-        String::from_utf8(kubectl_parser.stdout).unwrap(),
-    )
-    .unwrap();
     let upstreams = root.path().join("upstreams");
     let upstream = upstreams.join("owner/project.git");
     let rewrite = format!("url.file://{}/.insteadOf", upstreams.display());
@@ -1246,13 +1244,6 @@ fn create_prepares_a_private_public_repository_inside_each_workspace_pod() {
             "owner/project",
         ],
     ));
-    let parser_result = fs::read_to_string(root.path().join("real-kubectl-result"))
-        .expect("the public create command must pass its Pod wait through real kubectl");
-    assert!(
-        parser_result.contains("connection refused")
-            && !parser_result.contains("unexpected path string"),
-        "kubectl must parse the wait expression before reaching the unreachable API: {parser_result}"
-    );
     assert_eq!(created["repository"], "owner/project");
     assert_eq!(created["cwd"], "/repos/owner/project");
     assert_eq!(created["phase"], "ready");
@@ -1617,14 +1608,11 @@ fn repository_branch_retries_preserve_identity_edits_and_reject_changed_choices(
     assert!(!adm(root.path(), &args).status.success());
     let failed = assert_ok(adm(root.path(), &["list", "--json"]));
     let original = &failed[0];
+    assert_eq!(original["phase"], "failed");
     let checkout = repository_checkout(root.path(), original);
-    assert_eq!(
-        repository_git(&checkout, &["branch", "--show-current"]),
-        "feature/retry"
-    );
-    fs::write(checkout.join("README.md"), "private local edits\n").unwrap();
-    fs::write(checkout.join("untracked.txt"), "unfinished work\n").unwrap();
-    repository_git(&checkout, &["switch", "-c", "user-progress"]);
+    // The checkout waits for readiness (the runner's lease), so a Pod that never
+    // became ready has none yet; the same-spec retry clones it into the same workspace.
+    assert!(!checkout.exists());
     for (branch, base) in [
         ("feature/different", "origin/existing-feature"),
         ("feature/retry", "trunk"),
@@ -1650,6 +1638,13 @@ fn repository_branch_retries_preserve_identity_edits_and_reject_changed_choices(
         );
     }
     let retried = assert_ok(adm(root.path(), &args));
+    assert_eq!(
+        repository_git(&checkout, &["branch", "--show-current"]),
+        "feature/retry"
+    );
+    fs::write(checkout.join("README.md"), "private local edits\n").unwrap();
+    fs::write(checkout.join("untracked.txt"), "unfinished work\n").unwrap();
+    repository_git(&checkout, &["switch", "-c", "user-progress"]);
     assert_eq!(
         retried["creation_operation_id"],
         original["creation_operation_id"]
