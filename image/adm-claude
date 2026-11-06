@@ -19,7 +19,17 @@ mkdir -p "$state/config"
 # Installation MCP connectors, refreshed on every start and attach. Tokens are
 # fetched per connection by its headersHelper; none are written here.
 adm-claude-mcp config "$state/mcp.json"
-if ! tmux has-session -t claude 2>/dev/null; then
+# The installation's Claude login (adm login claude): an access token only,
+# rewritten before it expires by the claude-credentials session, whose log is
+# $state/credentials.log. Without a login this fails and Claude does not start.
+# "=NAME" matches the session exactly: plain "claude" would prefix-match
+# "claude-credentials".
+if ! tmux has-session -t =claude-credentials 2>/dev/null; then
+  adm-claude-credentials write "$state/config"
+  tmux new-session -d -s claude-credentials \
+    "exec adm-claude-credentials loop '$state/config' >> '$state/credentials.log' 2>&1"
+fi
+if ! tmux has-session -t =claude 2>/dev/null; then
   name=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).name' "$config")
   cwd=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).cwd' "$config")
   # The config dir is on the volume, so login, trust answers and
@@ -30,5 +40,5 @@ if ! tmux has-session -t claude 2>/dev/null; then
 fi
 if [ "$action" = attach ]; then
   # kubectl exec passes no TERM; tmux needs one to draw the client.
-  TERM=xterm-256color exec tmux attach-session -t claude
+  TERM=xterm-256color exec tmux attach-session -t =claude
 fi

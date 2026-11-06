@@ -87,7 +87,8 @@ COPY image/browser.mjs /opt/adm/browser.mjs
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && npm cache clean --force && claude --version
 COPY image/adm-claude /usr/local/bin/adm-claude
 COPY image/adm-claude-mcp /usr/local/bin/adm-claude-mcp
-RUN chmod 0755 /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp \
+COPY image/adm-claude-credentials /usr/local/bin/adm-claude-credentials
+RUN chmod 0755 /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials \
  && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential'
 
 FROM adm-workspace AS adm-bot
