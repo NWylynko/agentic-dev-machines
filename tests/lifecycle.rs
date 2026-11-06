@@ -4568,3 +4568,130 @@ fn registered_repositories_get_one_shared_base_that_workspaces_mount_read_only()
     stop_http_stub(runner_port, runner_server);
     stop_http_stub(authority_port, authority_server);
 }
+
+/// TASK-91 scope 3: once a workspace's lease holder Pod is gone (failover force
+/// deleted it, or it was evicted), the replacement Pod claims the lease at once
+/// and the old holder's renewal is rejected, instead of waiting out 300 s.
+#[test]
+fn a_moved_workspace_claims_its_lease_at_once_and_the_old_holder_is_revoked() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("storage-release"), "go").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let _service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    let operation_id = "3c1d7a52-0e8b-4f6e-a1d4-7b9e2c5f8a31";
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&json!({"operationId":operation_id,"kind":"create","spec":workspace_spec("moved")})),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap();
+    let receipt: Value = wait_for(|| {
+        request_with_token(
+            &url,
+            "GET",
+            &format!("/v1/operations/{operation_id}"),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .ok()
+        .and_then(|response| response.json::<Value>().ok())
+        .filter(|receipt| receipt["status"] == "completed")
+    });
+    let workspace_id = receipt["workspaceId"].as_str().unwrap();
+    let workspace: Value = request_with_token(
+        &url,
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}"),
+        None,
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    let namespace = workspace["namespace"].as_str().unwrap();
+    let lease_path = format!("/v1/workspaces/{workspace_id}/runtime/lease");
+    let renew_path = format!("/v1/workspaces/{workspace_id}/runtime/lease/renew");
+    let old_pod = "0d4c2a7e-5b19-4f3a-8e61-2c7d9b0f4a18";
+    let new_pod = "9e7b3f15-2a6c-4d08-b4e9-6f1a8c3d2e57";
+    let old_token = format!("target-token:{namespace}:{old_pod}");
+    let new_token = format!("target-token:{namespace}:{new_pod}");
+    fs::write(root.path().join("expected-namespace"), namespace).unwrap();
+    // The Pod create's rollout started holds the lease; this test's old Pod
+    // replaces it the same way a moved Pod would.
+    fs::write(root.path().join("expected-pod-uid"), old_pod).unwrap();
+    let old_lease: Value = request_with_token(
+        &url,
+        "POST",
+        &lease_path,
+        Some(&json!({"holder":old_pod})),
+        Some(&old_token),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert!(old_lease["fencingToken"].is_u64(), "{old_lease}");
+    // While the old holder's Pod still exists, a second Pod is refused.
+    let refused = request_with_token(
+        &url,
+        "POST",
+        &lease_path,
+        Some(&json!({"holder":new_pod})),
+        Some(&new_token),
+    )
+    .unwrap();
+    assert_eq!(refused.status(), 403, "{}", refused.text().unwrap());
+    // The old Pod is force deleted; its replacement is the only Pod left.
+    fs::write(root.path().join("expected-pod-uid"), new_pod).unwrap();
+    let claimed = request_with_token(
+        &url,
+        "POST",
+        &lease_path,
+        Some(&json!({"holder":new_pod})),
+        Some(&new_token),
+    )
+    .unwrap();
+    let status = claimed.status();
+    let new_lease: Value = claimed.json().unwrap();
+    assert_eq!(status, 200, "{new_lease}\n{}", service_log(root.path()));
+    assert!(new_lease["fencingToken"].as_u64() > old_lease["fencingToken"].as_u64());
+    let renewal = request_with_token(
+        &url,
+        "POST",
+        &renew_path,
+        Some(&json!({"holder":old_pod,"fencingToken":old_lease["fencingToken"]})),
+        Some(&old_token),
+    )
+    .unwrap();
+    assert_eq!(renewal.status(), 403, "{}", renewal.text().unwrap());
+    let reclaim = request_with_token(
+        &url,
+        "POST",
+        &lease_path,
+        Some(&json!({"holder":old_pod})),
+        Some(&old_token),
+    )
+    .unwrap();
+    assert_eq!(reclaim.status(), 403, "{}", reclaim.text().unwrap());
+    assert!(
+        service_log(root.path()).contains(&format!(
+            "revoked runtime lease of workspace {workspace_id} holder {old_pod}"
+        )),
+        "{}",
+        service_log(root.path())
+    );
+    stop_http_stub(runner_port, runner);
+}

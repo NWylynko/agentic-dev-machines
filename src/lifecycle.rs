@@ -1302,8 +1302,18 @@ fn route(
                     request.fencing_token.is_none(),
                     "lease acquisition must not include fencingToken"
                 );
-                let (fencing_token, expires_at) =
-                    store.claim_runtime_lease(id, &request.holder, RUNTIME_LEASE_SECONDS)?;
+                let claim = match store.claim_runtime_lease(
+                    id,
+                    &request.holder,
+                    RUNTIME_LEASE_SECONDS,
+                ) {
+                    Err(error) if format!("{error:#}").contains("held by another pod") => {
+                        revoke_lease_of_moved_workspace(cli, &mut store, id, &request.holder)?;
+                        store.claim_runtime_lease(id, &request.holder, RUNTIME_LEASE_SECONDS)
+                    }
+                    claim => claim,
+                };
+                let (fencing_token, expires_at) = claim?;
                 serde_json::json!({"workspaceId":id,"holder":request.holder,"fencingToken":fencing_token,"expiresAt":expires_at})
             }
             ("POST", "lease/renew") => {
@@ -1869,6 +1879,56 @@ fn pod_runtime_status(pod: &Value) -> Value {
         "containerReason":container_reason,
         "error":if failed { pod["status"]["message"].as_str().or(pod["status"]["reason"].as_str()) } else { None },
     })
+}
+
+/// TASK-91: a workspace whose lease holder Pod no longer exists has moved
+/// (adm-failover force deleted it, an eviction, `kubectl delete pod`). Revoke
+/// the old holder so the replacement claims now instead of crash-looping until
+/// the 300 s lease runs out; a partitioned old runner gets 403 on its next renew.
+/// While the holder Pod still exists, nothing is revoked and the claim stays 403.
+fn revoke_lease_of_moved_workspace(
+    cli: &crate::Cli,
+    store: &mut WorkspaceStore,
+    workspace_id: &str,
+    new_holder: &str,
+) -> Result<()> {
+    let Some(old_holder) = store.runtime_lease_holder(workspace_id)? else {
+        return Ok(());
+    };
+    let workspace = store.find(workspace_id)?;
+    let pods: Value = serde_json::from_slice(&crate::workspaces::kubectl(
+        cli,
+        &[
+            "get",
+            "pods",
+            "-n",
+            &workspace.namespace,
+            "-l",
+            &format!("adm.dev/workspace-id={workspace_id}"),
+            "-o",
+            "json",
+        ],
+        None,
+    )?)
+    .context("decode workspace Pod list")?;
+    let holder_pod_exists = pods["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|pod| pod["metadata"]["uid"] == old_holder.as_str());
+    if holder_pod_exists {
+        return Ok(());
+    }
+    if store.revoke_runtime_lease_of_holder(
+        workspace_id,
+        &old_holder,
+        &format!("moved-to:{new_holder}"),
+    )? {
+        eprintln!(
+            "adm lifecycle: revoked runtime lease of workspace {workspace_id} holder {old_holder}: its Pod is gone; Pod {new_holder} takes over"
+        );
+    }
+    Ok(())
 }
 
 fn authorize_runtime(

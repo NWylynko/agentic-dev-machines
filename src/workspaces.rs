@@ -783,7 +783,7 @@ impl WorkspaceStore {
             .is_some();
         ensure!(
             !revoked,
-            "runtime Pod lease was explicitly revoked for image update"
+            "runtime Pod lease was explicitly revoked (image update or workspace moved)"
         );
         tx.execute(
             "INSERT INTO runtime_leases(workspace_id,holder,fencing_token,expires_at,lifecycle_fencing_token) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workspace_id) DO UPDATE SET holder=excluded.holder,fencing_token=excluded.fencing_token,expires_at=excluded.expires_at,lifecycle_fencing_token=excluded.lifecycle_fencing_token WHERE runtime_leases.lifecycle_fencing_token<=excluded.lifecycle_fencing_token",
@@ -870,6 +870,50 @@ impl WorkspaceStore {
         }
         tx.commit()?;
         Ok(expires_at)
+    }
+    pub fn runtime_lease_holder(&self, workspace_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT holder FROM runtime_leases WHERE workspace_id=?1",
+                [workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    /// Revokes `holder`'s lease only if it is still the current holder, so a
+    /// claim that raced in between is never revoked (TASK-91). Returns whether
+    /// it revoked.
+    pub fn revoke_runtime_lease_of_holder(
+        &mut self,
+        workspace_id: &str,
+        holder: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure_store_fence(&transaction, self.fencing_token)?;
+        let fencing_token = transaction
+            .query_row(
+                "SELECT fencing_token FROM runtime_leases WHERE workspace_id=?1 AND holder=?2",
+                params![workspace_id, holder],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(fencing_token) = fencing_token else {
+            return Ok(false);
+        };
+        transaction.execute(
+            "INSERT INTO runtime_lease_revocations(workspace_id,holder,fencing_token,operation_id) VALUES(?1,?2,?3,?4) ON CONFLICT(workspace_id,holder) DO UPDATE SET fencing_token=excluded.fencing_token,operation_id=excluded.operation_id",
+            params![workspace_id, holder, fencing_token, reason],
+        )?;
+        transaction.execute(
+            "UPDATE runtime_leases SET expires_at=?3,lifecycle_fencing_token=?4 WHERE workspace_id=?1 AND holder=?2 AND lifecycle_fencing_token<=?4",
+            params![workspace_id, holder, now().saturating_sub(1) as i64, self.fencing_token as i64],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
     pub fn revoke_runtime_lease_for_update(
         &mut self,
