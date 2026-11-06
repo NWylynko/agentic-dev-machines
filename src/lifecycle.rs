@@ -697,6 +697,7 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
                     | "/v1/runtime/connectors/token"
             ))
         || (method == "GET" && path == "/v1/runtime/agents-file")
+        || is_claude_credentials_route(method, path)
         || (method == "GET" && path == "/v1/runtime/repos/token")
         || (method == "GET" && path == "/v1/runtime/repos/registry")
         || (method == "POST" && path == "/v1/runtime/repos/rejected")
@@ -923,6 +924,7 @@ fn route(
         || path == "/v1/runtime/agents-file"
         || path.starts_with("/v1/repos/")
         || path.starts_with("/v1/runtime/repos/")
+        || is_claude_credentials_route(method, path)
     {
         cli.check_lifecycle_fence()?;
     }
@@ -971,6 +973,20 @@ fn route(
         ensure!(
             caller.role == "coding",
             "the GitHub login is restricted to coding workspaces"
+        );
+        return proxy_provider_auth(method, path, body);
+    }
+    // Claude Code's shared login (TASK-90): an access token, never the refresh
+    // token, and only for coding Pods; bots run no Claude.
+    if is_claude_credentials_route(method, path) {
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
+        ensure!(
+            matches!(caller.phase.as_str(), "provisioning" | "ready"),
+            "workspace lifecycle is not active for provider requests"
+        );
+        ensure!(
+            caller.role == "coding",
+            "Claude Code is restricted to coding workspaces"
         );
         return proxy_provider_auth(method, path, body);
     }
@@ -1287,6 +1303,7 @@ pub(crate) fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Resu
         ) || path.starts_with("/v1/provider-auth/login/") && login_route
             || is_connector_route(method, path)
             || is_agents_file_route(method, path)
+            || is_claude_credentials_route(method, path)
             || is_repos_route(method, path),
         "unknown provider auth route"
     );
@@ -1354,6 +1371,10 @@ fn is_repos_route(method: &str, path: &str) -> bool {
                 None => method == "DELETE" && uuid::Uuid::parse_str(tail).is_ok(),
             }),
     }
+}
+
+fn is_claude_credentials_route(method: &str, path: &str) -> bool {
+    method == "POST" && path == "/v1/runtime/claude/credentials"
 }
 
 fn is_agents_file_route(method: &str, path: &str) -> bool {

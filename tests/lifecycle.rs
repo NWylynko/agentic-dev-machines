@@ -1777,6 +1777,23 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             Some("synthetic-lifecycle-token"),
         )
         .unwrap();
+        // Claude Code's shared login, as access tokens only (TASK-90).
+        let claude_runtime = request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/claude/credentials",
+            Some(&json!({})),
+            Some("runtime-token"),
+        )
+        .unwrap();
+        let claude_operator = request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/claude/credentials",
+            Some(&json!({})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
         // The cluster repository registry a coding Pod's sidecar reads (TASK-112).
         database
             .execute(
@@ -1885,7 +1902,19 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             403,
             "the operator credential is not a Pod identity and cannot read the token"
         );
-        assert_eq!(received.len(), 11, "{received:#?}");
+        assert_eq!(
+            claude_runtime.status(),
+            200,
+            "a coding Pod can fetch Claude Code's access token: {}",
+            claude_runtime.text().unwrap()
+        );
+        assert_eq!(
+            claude_operator.status(),
+            403,
+            "the operator credential is not a Pod identity"
+        );
+        assert_eq!(received.len(), 12, "{received:#?}");
+        assert!(received[11].starts_with("POST /v1/runtime/claude/credentials "));
         assert!(received[2].starts_with("POST /v1/runtime/connectors/catalog "));
         assert!(received[5].starts_with("POST /v1/connectors/linear/sign-in "));
         assert!(received[6].starts_with("GET /v1/agents-file "));
