@@ -3298,8 +3298,212 @@ fn kubernetes_time(unix: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// A kubectl for `adm failover-serve` (TASK-91): serves nodes, Pods,
+/// VolumeAttachments, PersistentVolumes and ADM namespaces from `cluster.json`
+/// and really removes what it deletes, under one flock, so concurrent sweeps
+/// race on the same state. Each delete that removed something is appended to
+/// `deleted`.
+const FAILOVER_KUBECTL: &str = r##"#!/usr/bin/env python3
+import fcntl, json, os, pathlib, sys
+root=pathlib.Path(__file__).parent
+args=[arg for arg in sys.argv[1:] if not arg.startswith('--request-timeout=')]
+with (root/'fixture.lock').open('a') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    state=json.loads((root/'cluster.json').read_text())
+    with (root/'kubectl-invocations').open('a') as log: log.write(json.dumps(args)+'\n')
+    def listing(items): print(json.dumps({'kind':'List','items':items}))
+    def delete(kind, name, namespace=None):
+        before=len(state[kind])
+        state[kind]=[item for item in state[kind] if not (item['metadata']['name']==name and item['metadata'].get('namespace')==namespace)]
+        if len(state[kind])==before:
+            if '--ignore-not-found' not in args:
+                print('Error from server (NotFound): '+kind+' "'+name+'" not found',file=sys.stderr); sys.exit(1)
+            return
+        with (root/'deleted').open('a') as deleted: deleted.write(kind+' '+(namespace+'/' if namespace else '')+name+'\n')
+        scratch=root/('cluster.json.'+str(os.getpid()))
+        scratch.write_text(json.dumps(state)); os.replace(scratch, root/'cluster.json')
+    if args==['get','nodes','-o','json']: listing(state['nodes'])
+    elif args==['get','pods','--all-namespaces','-o','json']: listing(state['pods'])
+    elif args==['get','volumeattachments','-o','json']: listing(state['volumeattachments'])
+    elif args==['get','pv','-o','json']: listing(state['pvs'])
+    elif args==['get','namespaces','-l','app.kubernetes.io/managed-by=adm','-o','json']:
+        listing([item for item in state['namespaces'] if item['metadata'].get('labels',{}).get('app.kubernetes.io/managed-by')=='adm'])
+    elif args[:2]==['delete','pod'] and args[3]=='-n' and args[5:]==['--grace-period=0','--force','--wait=false','--ignore-not-found']:
+        delete('pods', args[2], args[4])
+    elif args[:2]==['delete','volumeattachment'] and args[3:]==['--wait=false','--ignore-not-found']:
+        delete('volumeattachments', args[2])
+    else:
+        print('unexpected kubectl command: '+repr(args),file=sys.stderr); sys.exit(1)
+"##;
+
+/// TASK-91 scope 2: the stateless `adm-failover` sweep moves ADM workspace
+/// Pods and the lifecycle Pod off a node NotReady for over 180 s and releases
+/// only their VolumeAttachments there, so their RWO volumes attach elsewhere.
+/// Two replicas sweep without a lock, so two concurrent sweeps must converge.
 #[test]
-fn workspace_pods_on_a_node_down_for_three_minutes_are_moved_to_a_healthy_node() {
+fn failover_moves_adm_pods_and_the_lifecycle_off_a_dead_node_and_releases_only_their_volumes() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("kubectl"), FAILOVER_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let node = |name: &str, status: &str, since: u64| {
+        json!({"metadata":{"name":name},"status":{"conditions":[
+            {"type":"Ready","status":status,"lastTransitionTime":kubernetes_time(since)}]}})
+    };
+    let pod = |namespace: &str, name: &str, node: &str, labels: Value| json!({"metadata":{"name":name,"namespace":namespace,"labels":labels},"spec":{"nodeName":node}});
+    let workspace_labels =
+        |id: &str| json!({"app.kubernetes.io/managed-by":"adm","adm.dev/workspace-id":id});
+    let attachment = |name: &str, pv: &str, node: &str| json!({"metadata":{"name":name},"spec":{"nodeName":node,"source":{"persistentVolumeName":pv}}});
+    let pv = |name: &str, namespace: &str, claim: &str| json!({"metadata":{"name":name},"spec":{"claimRef":{"namespace":namespace,"name":claim}}});
+    let namespace = |name: &str, labels: Value| json!({"metadata":{"name":name,"labels":labels}});
+    let cluster = json!({
+        "nodes": [
+            // Down for four minutes: past the three-minute move threshold.
+            node("dead-node", "Unknown", now - 240),
+            // Down for one minute: not moved yet.
+            node("flapping-node", "Unknown", now - 60),
+            node("healthy-node", "True", now - 86_400),
+        ],
+        "pods": [
+            pod("adm-system", "adm-lifecycle-7d9f-abcde", "dead-node",
+                json!({"app.kubernetes.io/name":"adm-lifecycle"})),
+            pod("adm-system", "adm-failover-5c4b-fghij", "dead-node",
+                json!({"app.kubernetes.io/name":"adm-failover"})),
+            pod("adm-ws-dead", "workspace-1", "dead-node", workspace_labels("ws-dead")),
+            pod("adm-ws-flapping", "workspace-2", "flapping-node", workspace_labels("ws-flapping")),
+            pod("adm-ws-healthy", "workspace-3", "healthy-node", workspace_labels("ws-healthy")),
+            pod("other-app", "database-0", "dead-node", json!({"app":"database"})),
+        ],
+        "namespaces": [
+            namespace("adm-ws-dead", workspace_labels("ws-dead")),
+            namespace("adm-ws-flapping", workspace_labels("ws-flapping")),
+            namespace("adm-ws-healthy", workspace_labels("ws-healthy")),
+            namespace("other-app", json!({})),
+        ],
+        "pvs": [
+            pv("pvc-lifecycle", "adm-system", "adm-lifecycle-state"),
+            pv("pvc-ws-dead", "adm-ws-dead", "work"),
+            pv("pvc-ws-flapping", "adm-ws-flapping", "work"),
+            pv("pvc-ws-healthy", "adm-ws-healthy", "work"),
+            pv("pvc-database", "other-app", "data"),
+        ],
+        "volumeattachments": [
+            attachment("csi-lifecycle", "pvc-lifecycle", "dead-node"),
+            attachment("csi-ws-dead", "pvc-ws-dead", "dead-node"),
+            attachment("csi-ws-flapping", "pvc-ws-flapping", "flapping-node"),
+            attachment("csi-ws-healthy", "pvc-ws-healthy", "healthy-node"),
+            attachment("csi-database", "pvc-database", "dead-node"),
+        ],
+    });
+    fs::write(root.path().join("cluster.json"), cluster.to_string()).unwrap();
+    let sweep = || {
+        Command::new(env!("CARGO_BIN_EXE_adm"))
+            .args(["--kubectl"])
+            .arg(root.path().join("kubectl"))
+            .args([
+                "--lifecycle-namespace",
+                "adm-system",
+                "failover-serve",
+                "--once",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let (first, second) = (sweep(), sweep());
+    let (first, second) = (
+        first.wait_with_output().unwrap(),
+        second.wait_with_output().unwrap(),
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(first.status.success(), "{logs}");
+    assert!(second.status.success(), "{logs}");
+    let mut deleted: Vec<String> = fs::read_to_string(root.path().join("deleted"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    deleted.sort();
+    assert_eq!(
+        deleted,
+        [
+            "pods adm-system/adm-lifecycle-7d9f-abcde",
+            "pods adm-ws-dead/workspace-1",
+            "volumeattachments csi-lifecycle",
+            "volumeattachments csi-ws-dead",
+        ],
+        "{logs}"
+    );
+    let remaining: Value =
+        serde_json::from_str(&fs::read_to_string(root.path().join("cluster.json")).unwrap())
+            .unwrap();
+    let names = |kind: &str| -> Vec<String> {
+        remaining[kind]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["metadata"]["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        names("volumeattachments"),
+        ["csi-ws-flapping", "csi-ws-healthy", "csi-database"]
+    );
+    // A second sweep after both finished changes nothing.
+    let again = sweep().wait_with_output().unwrap();
+    assert!(again.status.success());
+    assert_eq!(
+        fs::read_to_string(root.path().join("deleted"))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+    // Every action names the workspace (or adm-lifecycle), node, PV and how
+    // long the node has been NotReady.
+    assert!(
+        logs.contains("adm failover: node dead-node NotReady for 24"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("force deleting Pod adm-ws-dead/workspace-1 of workspace ws-dead"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("force deleting Pod adm-system/adm-lifecycle-7d9f-abcde of adm-lifecycle"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains(
+            "deleting VolumeAttachment csi-ws-dead of PV pvc-ws-dead (workspace ws-dead)"
+        ),
+        "{logs}"
+    );
+    assert!(
+        logs.contains(
+            "deleting VolumeAttachment csi-lifecycle of PV pvc-lifecycle (adm-lifecycle)"
+        ),
+        "{logs}"
+    );
+}
+
+/// The lifecycle keeps no failover loop of its own (TASK-91): recovery must not
+/// depend on the thing being recovered.
+#[test]
+fn the_lifecycle_runs_no_node_failover_sweep() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let (runner_url, runner_port, runner) = start_runner_stub();
@@ -3311,57 +3515,24 @@ fn workspace_pods_on_a_node_down_for_three_minutes_are_moved_to_a_healthy_node()
     )
     .unwrap();
     fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
-    let namespace = |name: &str, id: &str| {
-        json!({"kind":"Namespace","metadata":{"name":name,"labels":{
-            "app.kubernetes.io/managed-by":"adm","adm.dev/workspace-id":id}}})
-    };
-    fs::write(
-        root.path().join("cluster.json"),
-        json!({
-            "adm-on-dead-node": namespace("adm-on-dead-node", "dead"),
-            "adm-on-flapping-node": namespace("adm-on-flapping-node", "flapping"),
-            "adm-on-healthy-node": namespace("adm-on-healthy-node", "healthy"),
-        })
-        .to_string(),
-    )
-    .unwrap();
-    fs::write(root.path().join("pod-node-adm-on-dead-node"), "dead-node").unwrap();
-    fs::write(
-        root.path().join("pod-node-adm-on-flapping-node"),
-        "flapping-node",
-    )
-    .unwrap();
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let node = |name: &str, status: &str, since: u64| {
-        json!({"metadata":{"name":name},"status":{"conditions":[
-            {"type":"Ready","status":status,"lastTransitionTime":kubernetes_time(since)}]}})
-    };
-    fs::write(
-        root.path().join("nodes.json"),
-        json!({"kind":"NodeList","items":[
-            // Down for four minutes: past the three-minute move threshold.
-            node("dead-node", "Unknown", now - 240),
-            // Down for one minute: not moved yet.
-            node("flapping-node", "Unknown", now - 60),
-            node("test-node", "True", now - 86_400),
-        ]})
-        .to_string(),
-    )
-    .unwrap();
     let (url, port) = lifecycle_url();
     fs::write(root.path().join("lifecycle-url"), &url).unwrap();
     let _service = start_service(root.path(), port);
-    let deleted = wait_for(|| fs::read_to_string(root.path().join("deleted-pods")).ok());
-    // A force delete releases the Pod object stuck on the unreachable node so the
-    // workspace Deployment schedules a replacement on a healthy node, where the
-    // replicated volume reattaches. Lease fencing keeps the old runtime from
-    // owning the workspace again if the node returns.
-    assert_eq!(
-        deleted,
-        "workspace-pod -n adm-on-dead-node --grace-period=0 --force --wait=false\n"
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    // The old sweep ran at start and every 10 s; wait one lease renewal (every 5 s) past start.
+    let renewals = |root: &Path| {
+        kubectl_invocations(root)
+            .iter()
+            .filter(|args| args.first().map(String::as_str) == Some("replace"))
+            .count()
+    };
+    wait_for(|| (renewals(root.path()) >= 1).then_some(()));
+    assert!(
+        !kubectl_invocations(root.path())
+            .iter()
+            .any(|args| args.starts_with(&["get".to_owned(), "nodes".to_owned()])),
+        "{:#?}",
+        kubectl_invocations(root.path())
     );
     stop_http_stub(runner_port, runner);
 }
@@ -3378,15 +3549,13 @@ fn kubectl_invocations(root: &Path) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The lease renewal loop and the node failover loop run kubectl on their own
+/// The lease renewal loop runs kubectl on its own
 /// schedule, whatever requests arrive.
 fn is_background_kubectl(args: &[String]) -> bool {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     matches!(
         args.as_slice(),
-        ["get", "lease", "adm-lifecycle-owner", "-n", _, "-o", "json"]
-            | ["replace", "-f", "-"]
-            | ["get", "nodes", "-o", "json"]
+        ["get", "lease", "adm-lifecycle-owner", "-n", _, "-o", "json"] | ["replace", "-f", "-"]
     )
 }
 

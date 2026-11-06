@@ -1,6 +1,7 @@
 mod agents_file;
 mod connectors;
 mod diagnostics;
+mod failover;
 mod herdr;
 mod lease;
 mod lifecycle;
@@ -195,6 +196,13 @@ pub enum Action {
         host: String,
         #[arg(long, default_value_t = 7433)]
         port: u16,
+    },
+    /// Run the in-cluster node failover sweep (the adm-failover Deployment).
+    #[command(hide = true)]
+    FailoverServe {
+        /// Sweep once and exit.
+        #[arg(long)]
+        once: bool,
     },
     /// Keep a foreground loopback connection to the lifecycle service.
     LifecycleForward,
@@ -1488,6 +1496,7 @@ fn run(cli: &Cli) -> Result<()> {
         Action::LifecycleServe { host, port } => {
             lifecycle::serve(cli.clone_for_lifecycle(), host, *port)
         }
+        Action::FailoverServe { once } => failover::serve_failover(cli, *once),
         Action::LifecycleForward => setup_connection::serve(cli),
         Action::Stop => anyhow::bail!(
             "there is no host agent runner to stop; workspace Pods own agent execution"
@@ -1932,6 +1941,7 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
                 | Action::Update { .. }
                 | Action::UpdateServices { .. }
                 | Action::LifecycleServe { .. }
+                | Action::FailoverServe { .. }
                 | Action::LifecycleForward
                 | Action::Manifest(_)
                 | Action::Start
