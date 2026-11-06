@@ -37,7 +37,73 @@ type AuthorityOptions = {
   refreshScheduler?: ProviderRefreshScheduler;
   /** Per-provider catalog budget. Tests use a short one; production is 10s. */
   catalogProviderTimeoutMs?: number;
+  /** `adm login claude`'s OAuth flow; defaults to Pi's anthropic flow (Claude Code's client). Tests inject one. */
+  claudeOAuth?: any;
+  /** Anthropic's account profile endpoint, read for Claude Pods' `.claude.json`. */
+  claudeProfileUrl?: string;
 };
+
+// `adm login claude` (TASK-90): Claude Code's own login, stored under its own
+// provider ID so it never shares Pi's `anthropic` credential. Same OAuth client
+// and scopes as Claude Code; Remote Control refuses setup-tokens, so this is
+// the full login, refreshed only here (research/claude-code/README.md).
+const CLAUDE_PROVIDER_ID = "claude";
+const CLAUDE_CODE_SCOPES = [
+  "user:inference",
+  "user:profile",
+  "user:sessions:claude_code",
+  "user:mcp_servers",
+  "user:file_upload",
+];
+const CLAUDE_SUBSCRIPTION_TYPES: Record<string, string> = {
+  claude_max: "max",
+  claude_pro: "pro",
+  claude_team: "team",
+  claude_enterprise: "enterprise",
+};
+// A Pod rewrites its file 10 min before expiry; Claude itself tries to
+// refresh (and, with no refresh token, fails) 5 min before. Every token handed
+// to a Pod lasts longer than that.
+const CLAUDE_POD_MIN_VALIDITY_MS = 15 * 60 * 1000;
+
+function registerClaudeCodeProvider(runtime: any, claudeOAuth?: any) {
+  const oauth = claudeOAuth ?? runtime.getProvider("anthropic")?.auth.oauth;
+  if (!oauth)
+    throw new Error("Pi has no anthropic OAuth flow for adm login claude");
+  const unsupported = () => {
+    throw new Error("the claude provider only holds Claude Code's login");
+  };
+  runtime.registerNativeProvider({
+    id: CLAUDE_PROVIDER_ID,
+    name: "Claude Code",
+    auth: {
+      oauth: {
+        name: "Claude Code",
+        isSubscription: true,
+        // The browser callback would land on provider-auth's own loopback,
+        // so always take the copy-code flow.
+        login: (interaction: any, options: any) =>
+          oauth.login(
+            {
+              ...interaction,
+              prompt: (prompt: any) =>
+                prompt.type === "select" &&
+                prompt.options?.some((option: any) => option.id === "copy_code")
+                  ? Promise.resolve("copy_code")
+                  : interaction.prompt(prompt),
+            },
+            options,
+          ),
+        refresh: (credential: any, signal: AbortSignal) =>
+          oauth.refresh(credential, signal),
+        toAuth: (credential: any) => oauth.toAuth(credential),
+      },
+    },
+    getModels: () => [],
+    stream: unsupported,
+    streamSimple: unsupported,
+  });
+}
 
 export type ProviderRefreshScheduler = {
   now(): number;
@@ -344,6 +410,8 @@ export async function createProviderAuthAuthority({
   log: writeLog,
   refreshScheduler = systemProviderRefreshScheduler,
   catalogProviderTimeoutMs = CATALOG_PROVIDER_TIMEOUT_MS,
+  claudeOAuth,
+  claudeProfileUrl = "https://api.anthropic.com/api/oauth/profile",
 }: AuthorityOptions) {
   const log = createProviderAuthLog(writeLog);
   const authDirectory = dirname(authPath);
@@ -372,6 +440,7 @@ export async function createProviderAuthAuthority({
     allowModelNetwork: false,
     refreshOnCreate: false,
   });
+  registerClaudeCodeProvider(runtime, claudeOAuth);
   configure?.(runtime);
   const connectors = await createConnectorAuthority({
     statePath: join(authDirectory, "connectors.json"),
@@ -581,6 +650,55 @@ export async function createProviderAuthAuthority({
     return runtime.getAuth(providerId);
   }
 
+  // What a Claude Pod writes into CLAUDE_CONFIG_DIR (TASK-90): a current
+  // access token and the account, never the refresh token. Refreshes first
+  // when the token would not last CLAUDE_POD_MIN_VALIDITY_MS.
+  async function claudePodCredentials() {
+    const stored = await readStoredCredential(CLAUDE_PROVIDER_ID);
+    if (stored?.type !== "oauth")
+      throw new ProviderAuthRequestError(
+        "Claude Code is not logged in to this installation: run adm login claude",
+      );
+    const credential =
+      stored.expires < Date.now() + CLAUDE_POD_MIN_VALIDITY_MS
+        ? await refreshProviderCredential(
+            CLAUDE_PROVIDER_ID,
+            "request",
+            CLAUDE_POD_MIN_VALIDITY_MS,
+          )
+        : stored;
+    const response = await fetch(claudeProfileUrl, {
+      headers: { authorization: `Bearer ${credential.access}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      log("error", "claude_profile_failed", { status: response.status });
+      throw new ProviderAuthRequestError(
+        `Claude Code account profile request failed (${response.status})` +
+          (response.status === 401 ? ": run adm login claude" : ""),
+      );
+    }
+    const profile = (await response.json()) as any;
+    log("info", "claude_credentials_issued", {
+      expires: new Date(credential.expires).toISOString(),
+    });
+    return {
+      accessToken: credential.access,
+      expiresAt: credential.expires,
+      scopes: CLAUDE_CODE_SCOPES,
+      subscriptionType:
+        CLAUDE_SUBSCRIPTION_TYPES[profile.organization?.organization_type] ??
+        null,
+      oauthAccount: {
+        accountUuid: profile.account?.uuid,
+        emailAddress: profile.account?.email,
+        organizationUuid: profile.organization?.uuid,
+        displayName: profile.account?.display_name || undefined,
+        accountCreatedAt: profile.account?.created_at,
+      },
+    };
+  }
+
   function publish(operation: LoginOperation, value: unknown) {
     const waiter = operation.waiters.shift();
     if (waiter) waiter(value);
@@ -756,6 +874,11 @@ export async function createProviderAuthAuthority({
       if (await agentsFile.handle(request, response, url)) return;
       if (await github.handle(request, response, url)) return;
       if (await connectors.handle(request, response, url)) return;
+      if (
+        request.method === "POST" &&
+        url.pathname === "/v1/runtime/claude/credentials"
+      )
+        return send(response, 200, await claudePodCredentials());
       if (
         request.method === "POST" &&
         url.pathname === "/v1/provider-auth/catalog"
