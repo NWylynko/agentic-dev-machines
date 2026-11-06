@@ -41,6 +41,7 @@ adm create my-project --repo OWNER/REPO
 adm list                     # every workspace, its node and what the agent is doing
 adm attach my-project        # talk to the agent
 adm shell my-project         # zsh in the workspace, starting in the repo
+adm login claude             # once: Claude Code's login for every workspace
 adm claude my-project        # Claude Code in the workspace, also reachable from the Claude apps
 adm port my-project 3000     # forward a dev server to localhost
 adm destroy my-project
