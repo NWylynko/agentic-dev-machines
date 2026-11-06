@@ -314,7 +314,7 @@ elif args[:3] == ['get','deployment','adm-lifecycle']:
 elif args[:3] == ['get','pvc','adm-lifecycle-state']:
     print(json.dumps({'metadata':{'name':'adm-lifecycle-state','namespace':'adm-system'},'spec':{'storageClassName':'lifecycle-storage'}}))
 elif args[:2] == ['create','--dry-run=client']:
-    for item in [{'kind':'Namespace','metadata':{'name':'adm-system'}},{'kind':'PersistentVolumeClaim','metadata':{'name':'adm-lifecycle-state','namespace':'adm-system'},'spec':{}},{'kind':'PersistentVolumeClaim','metadata':{'name':'adm-repository-bases','namespace':'adm-system'},'spec':{}},{'kind':'Deployment','metadata':{'name':'adm-lifecycle','namespace':'adm-system'},'spec':{'template':{'spec':{'initContainers':[{'name':'init','image':'unset'}],'containers':[{'name':'lifecycle','image':'unset'}]}}}}]:
+    for item in [{'kind':'Namespace','metadata':{'name':'adm-system'}},{'kind':'PersistentVolumeClaim','metadata':{'name':'adm-lifecycle-state','namespace':'adm-system'},'spec':{}},{'kind':'PersistentVolumeClaim','metadata':{'name':'adm-repository-bases','namespace':'adm-system'},'spec':{}},{'kind':'Deployment','metadata':{'name':'adm-lifecycle','namespace':'adm-system'},'spec':{'template':{'spec':{'initContainers':[{'name':'init','image':'unset'}],'containers':[{'name':'lifecycle','image':'unset'}]}}}},{'kind':'Deployment','metadata':{'name':'adm-failover','namespace':'adm-system'},'spec':{'template':{'spec':{'containers':[{'name':'failover','image':'unset'}]}}}}]:
         print(json.dumps(item))
 elif args[:4] == ['-n','adm-system','get','secret']:
     print('secret/adm-lifecycle-token' if '--ignore-not-found' in args else (root/'token').read_text().strip())

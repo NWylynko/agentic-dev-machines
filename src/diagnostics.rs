@@ -311,7 +311,7 @@ pub fn diagnose_unreachable_lifecycle(cli: &Cli) -> LifecycleUnreachable {
                 "lifecycle Pod {name} is on NotReady node {node} since {since}"
             ));
             actions.push(format!(
-                "bring node {node} back to Ready. ADM does not move the lifecycle off a NotReady node automatically yet, so it stays unreachable until then. Workspaces on other nodes keep running turns for up to 5 min after the lifecycle became unreachable; new input waits for it"
+                "adm-failover moves the lifecycle to a healthy node once {node} has been NotReady for 3 min; its volume then takes a few minutes to attach there (`adm system-log --service failover`). If both adm-failover replicas are down too, bring node {node} back to Ready. Workspaces on other nodes keep running turns for up to 5 min after the lifecycle became unreachable; new input waits for it"
             ));
             continue;
         }

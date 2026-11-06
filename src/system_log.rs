@@ -1,7 +1,6 @@
 //! `adm system-log` (TASK-109): the logs of the cluster-owned ADM services,
 //! read with the client's kubeconfig, merged in time order and prefixed with
-//! their service. Add new cluster services (e.g. TASK-91's failover) to
-//! `ADM_SYSTEM_LOG_SERVICES`.
+//! their service. Add new cluster services to `ADM_SYSTEM_LOG_SERVICES`.
 use crate::Cli;
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Write};
@@ -10,9 +9,16 @@ use std::sync::mpsc;
 use std::thread;
 
 /// Service name, workload and container of every cluster-owned ADM service.
+/// adm-failover runs two replicas (TASK-91), so it is selected by label to read
+/// both rather than one Pod of the Deployment.
 const ADM_SYSTEM_LOG_SERVICES: &[(&str, &str, &str)] = &[
     ("lifecycle", "deployment/adm-lifecycle", "lifecycle"),
     ("provider-auth", "deployment/adm-lifecycle", "provider-auth"),
+    (
+        "failover",
+        "--selector=app.kubernetes.io/name=adm-failover",
+        "failover",
+    ),
 ];
 
 pub fn run(cli: &Cli, service: Option<&str>, since: &str, follow: bool) -> Result<()> {

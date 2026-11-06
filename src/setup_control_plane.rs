@@ -96,6 +96,18 @@ pub fn install(cli: &Cli, image: &str, storage_class: &str) -> Result<()> {
             container["image"] = json!(image);
         }
     }
+    let failover = resources
+        .iter_mut()
+        .find(|resource| {
+            resource["kind"] == "Deployment" && resource["metadata"]["name"] == "adm-failover"
+        })
+        .context("lifecycle manifest has no adm-failover Deployment")?;
+    for container in failover["spec"]["template"]["spec"]["containers"]
+        .as_array_mut()
+        .context("adm-failover Deployment has no containers")?
+    {
+        container["image"] = json!(image);
+    }
 
     eprintln!("adm: setup: provisioning lifecycle control plane");
     workspaces::kubectl(

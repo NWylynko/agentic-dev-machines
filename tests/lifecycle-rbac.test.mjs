@@ -58,13 +58,14 @@ test("lifecycle may request tokens only for workspace runtime service accounts",
     ),
     "the lifecycle controller must not mint additional RBAC grants",
   );
-  const nodeRules = role.rules.filter((rule) =>
-    rule.resources.includes("nodes"),
-  );
-  assert.deepEqual(
-    nodeRules.map((rule) => [rule.apiGroups, rule.resources, rule.verbs]),
-    [[[""], ["nodes"], ["get", "list"]]],
-    "moving workspaces off down nodes (TASK-82) reads node readiness and never changes nodes",
+  assert.ok(
+    role.rules.every(
+      (rule) =>
+        !rule.resources.includes("nodes") &&
+        !rule.resources.includes("volumeattachments") &&
+        !(rule.resources.includes("pods") && rule.verbs.includes("delete")),
+    ),
+    "node failover belongs to adm-failover, not the lifecycle (TASK-91)",
   );
 });
 
@@ -171,4 +172,66 @@ test("the lifecycle container requests CPU so a busy node schedules it fairly (T
     controller.resources?.requests?.cpu,
     "the lifecycle container needs a CPU request",
   );
+});
+
+test("adm-failover is a stateless two-replica Deployment on separate nodes with only failover RBAC (TASK-91)", async () => {
+  const documents = YAML.parseAllDocuments(
+    await readFile(
+      new URL("../deploy/lifecycle/control-plane.yaml", import.meta.url),
+      "utf8",
+    ),
+  ).map((document) => document.toJSON());
+  const deployment = documents.find(
+    (document) =>
+      document.kind === "Deployment" &&
+      document.metadata.name === "adm-failover",
+  );
+  assert.ok(deployment, "control plane needs an adm-failover Deployment");
+  assert.equal(deployment.spec.replicas, 2);
+  const pod = deployment.spec.template.spec;
+  assert.equal(pod.serviceAccountName, "adm-failover");
+  assert.ok(
+    (pod.volumes ?? []).every((volume) => !volume.persistentVolumeClaim),
+    "adm-failover must not depend on a volume that can be stranded on a dead node",
+  );
+  const [term] =
+    pod.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution;
+  assert.equal(term.topologyKey, "kubernetes.io/hostname");
+  assert.deepEqual(term.labelSelector.matchLabels, {
+    "app.kubernetes.io/name": "adm-failover",
+  });
+  const [container] = pod.containers;
+  assert.deepEqual(container.command, ["adm"]);
+  assert.deepEqual(container.args, ["failover-serve"]);
+  const lifecycle = documents.find(
+    (document) =>
+      document.kind === "Deployment" &&
+      document.metadata.name === "adm-lifecycle",
+  );
+  assert.equal(
+    container.image,
+    lifecycle.spec.template.spec.containers[0].image,
+  );
+  const role = documents.find(
+    (document) =>
+      document.kind === "ClusterRole" &&
+      document.metadata.name === "adm-failover",
+  );
+  assert.deepEqual(
+    role.rules.map((rule) => [rule.apiGroups, rule.resources, rule.verbs]),
+    [
+      [[""], ["nodes"], ["get", "list"]],
+      [[""], ["pods"], ["get", "list", "delete"]],
+      [[""], ["namespaces", "persistentvolumes"], ["get", "list"]],
+      [["storage.k8s.io"], ["volumeattachments"], ["get", "list", "delete"]],
+    ],
+  );
+  const binding = documents.find(
+    (document) =>
+      document.kind === "ClusterRoleBinding" &&
+      document.metadata.name === "adm-failover",
+  );
+  assert.deepEqual(binding.subjects, [
+    { kind: "ServiceAccount", name: "adm-failover", namespace: "adm-system" },
+  ]);
 });

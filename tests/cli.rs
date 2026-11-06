@@ -4810,6 +4810,7 @@ container = args[args.index('-c') + 1]
 lines = {
     'lifecycle': ['2026-10-30T14:00:01Z lifecycle listening', '2026-10-30T14:00:03.5Z lease renewed'],
     'provider-auth': ['2026-10-30T14:00:01.25Z {"event":"refresh_started"}', '2026-10-30T14:00:02.000000001Z {"event":"refresh_succeeded"}'],
+    'failover': ['2026-10-30T14:00:02.5Z adm failover: sweeping'],
 }[container]
 for line in lines:
     print(line, flush=True)
@@ -4854,19 +4855,25 @@ for line in lines:
             "lifecycle     2026-10-30T14:00:01Z lifecycle listening\n",
             "provider-auth 2026-10-30T14:00:01.25Z {\"event\":\"refresh_started\"}\n",
             "provider-auth 2026-10-30T14:00:02.000000001Z {\"event\":\"refresh_succeeded\"}\n",
+            "failover      2026-10-30T14:00:02.5Z adm failover: sweeping\n",
             "lifecycle     2026-10-30T14:00:03.5Z lease renewed\n",
         )
     );
     let calls = invocations();
-    assert_eq!(calls.len(), 2, "{calls:?}");
-    for (call, container) in calls.iter().zip(["lifecycle", "provider-auth"]) {
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    // adm-failover runs two replicas (TASK-91), so it is read by label, not one Pod.
+    for (call, (workload, container)) in calls.iter().zip([
+        ("--selector=app.kubernetes.io/name=adm-failover", "failover"),
+        ("deployment/adm-lifecycle", "lifecycle"),
+        ("deployment/adm-lifecycle", "provider-auth"),
+    ]) {
         assert_eq!(
             call["args"],
             serde_json::json!([
                 "logs",
                 "-n",
                 "adm-test",
-                "deployment/adm-lifecycle",
+                workload,
                 "-c",
                 container,
                 "--timestamps",
@@ -5492,7 +5499,7 @@ else:
             .unwrap()
     };
     let down = "lifecycle Pod adm-lifecycle-7d9f-abcde is on NotReady node debian-k3s-2 since 2026-11-01T07:01:00Z";
-    let not_automatic = "ADM does not move the lifecycle off a NotReady node automatically yet";
+    let not_automatic = "adm-failover moves the lifecycle to a healthy node once debian-k3s-2 has been NotReady for 3 min";
 
     // The default command-scoped port-forward cannot reach the Pod.
     let list = invoke(&["list"]);

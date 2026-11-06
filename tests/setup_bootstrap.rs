@@ -65,7 +65,8 @@ fn setup_installs_connects_and_reuses_the_controller_without_manual_credentials(
         {"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"adm-lifecycle-state","namespace":"adm-system"},"spec":{"storageClassName":"adm-replicated"}},
         {"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"adm-repository-bases","namespace":"adm-system"},"spec":{"accessModes":["ReadWriteMany"],"storageClassName":"adm-replicated"}},
         {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"adm-lifecycle","namespace":"adm-system"},"spec":{"template":{"spec":{"initContainers":[{"name":"prepare-state","image":"old-image"}],"containers":[{"name":"lifecycle","image":"old-image"}]}}}},
-        {"apiVersion":"v1","kind":"Service","metadata":{"name":"adm-lifecycle","namespace":"adm-system"}}
+        {"apiVersion":"v1","kind":"Service","metadata":{"name":"adm-lifecycle","namespace":"adm-system"}},
+        {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"adm-failover","namespace":"adm-system"},"spec":{"template":{"spec":{"containers":[{"name":"failover","image":"old-image"}]}}}}
     ]});
     fs::write(root.path().join("manifest.json"), manifest.to_string()).unwrap();
     let kubectl = root.path().join("bin/kubectl");
@@ -168,6 +169,14 @@ else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
     );
     assert_eq!(
         pod["initContainers"][0]["image"],
+        "ghcr.io/nwylynko/agentic-dev-machines/adm-control:latest"
+    );
+    // TASK-91: setup and update apply the failover Deployment on the same image.
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item["kind"] == "Deployment" && item["metadata"]["name"] == "adm-failover")
+            .unwrap()["spec"]["template"]["spec"]["containers"][0]["image"],
         "ghcr.io/nwylynko/agentic-dev-machines/adm-control:latest"
     );
     assert_eq!(
