@@ -103,34 +103,19 @@ async function expectNamespaceAbsent(namespace) {
 }
 
 function pointManifestAtWorkspace(manifest, workspace) {
-  const items = manifest.items;
-  assert.ok(Array.isArray(items), "adm manifest must return a Kubernetes List");
-  for (const item of items) {
-    if (item.kind === "Namespace") item.metadata.name = workspace.namespace;
-    if (item.metadata?.namespace) item.metadata.namespace = workspace.namespace;
-    if (item.metadata?.labels?.["adm.dev/workspace-id"] !== undefined) {
-      item.metadata.labels["adm.dev/workspace-id"] = workspace.id;
-      item.metadata.labels["app.kubernetes.io/managed-by"] = "adm";
-    }
-    if (
-      item.spec?.selector?.matchLabels?.["adm.dev/workspace-id"] !== undefined
-    ) {
-      item.spec.selector.matchLabels["adm.dev/workspace-id"] = workspace.id;
-    }
-    if (
-      item.spec?.template?.metadata?.labels?.["adm.dev/workspace-id"] !==
-      undefined
-    ) {
-      item.spec.template.metadata.labels["adm.dev/workspace-id"] = workspace.id;
-    }
-    if (
-      item.spec?.podSelector?.matchLabels?.["adm.dev/workspace-id"] !==
-      undefined
-    ) {
-      item.spec.podSelector.matchLabels["adm.dev/workspace-id"] = workspace.id;
-    }
-  }
-  return manifest;
+  assert.ok(
+    Array.isArray(manifest.items),
+    "adm manifest must return a Kubernetes List",
+  );
+  const namespace = manifest.items.find((item) => item.kind === "Namespace");
+  const generatedId = namespace.metadata.labels["adm.dev/workspace-id"];
+  // The generated ID is in labels, selectors and affinities across the List
+  // (workspace and Docker engine alike); the namespace name derives from it.
+  return JSON.parse(
+    JSON.stringify(manifest)
+      .replaceAll(namespace.metadata.name, workspace.namespace)
+      .replaceAll(generatedId, workspace.id),
+  );
 }
 
 async function assertOwnedNamespace(workspace) {
@@ -202,14 +187,22 @@ if (!enabled) {
       "adm manifest",
     );
     const dryRun = pointManifestAtWorkspace(generated, first);
-    const kinds = dryRun.items.map((item) => item.kind).sort();
+    const kinds = [...new Set(dryRun.items.map((item) => item.kind))].sort();
     assert.deepEqual(kinds, [
       "ConfigMap",
       "Deployment",
       "Namespace",
       "NetworkPolicy",
       "PersistentVolumeClaim",
+      "Service",
+      "ServiceAccount",
     ]);
+    assert.ok(
+      dryRun.items.some(
+        (item) => item.kind === "Deployment" && item.metadata.name === "docker",
+      ),
+      "coding workspaces get a Docker engine Deployment",
+    );
     await kubectlRun(
       ["apply", "--dry-run=server", "-f", "-"],
       JSON.stringify(dryRun),

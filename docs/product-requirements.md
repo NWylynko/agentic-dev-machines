@@ -181,7 +181,9 @@ The old shell process does not move to the new runtime. An interrupted tool comm
 
 ### Browser automation and development ports
 
-Development workspaces must support browser automation and access to their running sites or selected ports from client laptops. The browser location, automation integration, and port transport are implementation choices; Docker builds and other additional workloads have not been selected as requirements.
+Development workspaces must support browser automation and access to their running sites or selected ports from client laptops. The browser location, automation integration, and port transport are implementation choices.
+
+Coding workspaces must run Docker for local development (`docker`, `docker compose`, `docker build`) without giving the agent the node or any cluster credential.
 
 Preview connections should resolve the workspace's current runtime so replacement does not require finding a new Pod address. Exact URLs and reconnection behavior depend on the chosen transport. Removing a workspace must remove its routes or forwards too. Preview access does not grant access to another workspace's files. Browser capabilities for bots are not implied by this development-workspace requirement.
 

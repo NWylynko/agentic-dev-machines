@@ -289,12 +289,13 @@ Kubernetes resolves shell commands and port forwards against `deployment/workspa
 adm port my-project 3000 --local-port 3000
 adm port my-project 3000 --lan
 adm port my-project 3000 --bind 192.168.1.5
+adm port my-project 8080 --docker   # a port published by a Docker container
 adm browser my-project http://127.0.0.1:3000 --screenshot ./preview.png
 ```
 
 The screenshot path is on the client running `adm`. Chromium writes it inside the workspace Pod, and adm copies the PNG back. Chromium's dbus and zygote startup lines are hidden unless you pass `--verbose`. A missing screenshot or a Chromium failure exits non-zero.
 
-`adm port` forwards a workspace port only while the command runs and closes it on Ctrl-C. It does not create a cluster Service. The default bind is loopback; open `http://127.0.0.1:3000` on the device running adm. `--lan` binds `0.0.0.0` and prints each non-loopback address on that device, with a warning that anyone on the network can open the port with no authentication. `--bind ADDR` listens on that address, including a LAN or Tailscale IP. A failed forward reports interruption; rerunning it resolves the current runtime.
+`adm port` forwards a workspace port only while the command runs and closes it on Ctrl-C. It does not create a cluster Service. The default bind is loopback; open `http://127.0.0.1:3000` on the device running adm. `--lan` binds `0.0.0.0` and prints each non-loopback address on that device, with a warning that anyone on the network can open the port with no authentication. `--bind ADDR` listens on that address, including a LAN or Tailscale IP. A failed forward reports interruption; rerunning it resolves the current runtime. Ports published by Docker containers live in the workspace's Docker engine Pod, not the dev container: forward them with `--docker`, and reach them from inside the workspace at `http://docker:PORT`, not `localhost`.
 
 ## Herdr ownership and deletion
 
