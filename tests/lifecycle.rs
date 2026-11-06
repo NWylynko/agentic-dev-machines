@@ -3847,6 +3847,8 @@ struct MaintenanceFixture {
     port: u16,
     _service: ServiceProcess,
     runner: Option<(u16, thread::JoinHandle<()>)>,
+    /// The cluster's release (`ADM_RELEASE`), which `admin` claims as its own.
+    release: Option<String>,
 }
 
 impl Drop for MaintenanceFixture {
@@ -3858,8 +3860,21 @@ impl Drop for MaintenanceFixture {
 }
 
 fn start_maintenance_fixture() -> MaintenanceFixture {
+    start_maintenance_fixture_on_release(None)
+}
+
+/// A lifecycle installed from `release`, which turns away operator clients
+/// from any other release.
+fn start_maintenance_fixture_on_release(release: Option<&str>) -> MaintenanceFixture {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
+    if let Some(release) = release {
+        fs::write(
+            root.path().join("service-env.json"),
+            json!([["ADM_RELEASE", release]]).to_string(),
+        )
+        .unwrap();
+    }
     let (runner_url, runner_port, runner) = start_runner_stub();
     fs::write(root.path().join("runner-url"), &runner_url).unwrap();
     fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
@@ -3880,19 +3895,34 @@ fn start_maintenance_fixture() -> MaintenanceFixture {
         port,
         _service: service,
         runner: Some((runner_port, runner)),
+        release: release.map(str::to_owned),
     }
 }
 
 impl MaintenanceFixture {
     fn admin(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
-        let response = request_with_token(
-            &self.url,
-            method,
-            path,
-            body,
-            Some("synthetic-lifecycle-token"),
-        )
-        .unwrap();
+        self.admin_from_release(self.release.as_deref(), method, path, body)
+    }
+
+    /// An operator request from a client on `release`; `None` is a client
+    /// that predates release checks and sends no release at all.
+    fn admin_from_release(
+        &self,
+        release: Option<&str>,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        let mut request = reqwest::blocking::Client::new()
+            .request(method.parse().unwrap(), format!("{}{path}", self.url))
+            .bearer_auth("synthetic-lifecycle-token");
+        if let Some(release) = release {
+            request = request.header("x-adm-release", release);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().unwrap();
         let status = response.status().as_u16();
         (status, response.json().unwrap_or(Value::Null))
     }
@@ -4136,13 +4166,17 @@ fn proxy_lifecycle_connection(root: &Path, mut client: std::net::TcpStream, upst
     log("forwarded");
 }
 
-/// Runs the managed `adm __update-services` step of `adm update` against the
-/// fixture through `proxy`, with the client's own state in `client-state`.
+/// Runs the managed `adm __update-services` step of `adm update` to release
+/// v9.9.9 against the fixture through `proxy`.
 fn run_adm_update_services(fixture: &MaintenanceFixture, proxy: u16) -> std::process::Output {
-    let root = fixture.root.path();
-    let release = root.join("release");
+    run_released_adm(fixture, "v9.9.9", proxy, &["__update-services"])
+}
+
+/// An installed release directory, as `install.sh` lays one out.
+fn write_release_dir(root: &Path, version: &str) -> std::path::PathBuf {
+    let release = root.join(format!("release-{version}"));
     fs::create_dir_all(&release).unwrap();
-    fs::write(release.join("VERSION"), "v9.9.9\n").unwrap();
+    fs::write(release.join("VERSION"), format!("{version}\n")).unwrap();
     for (name, image) in [
         ("CONTROL_IMAGE", "adm-control"),
         ("REPOSITORIES_IMAGE", "adm-repositories"),
@@ -4152,10 +4186,23 @@ fn run_adm_update_services(fixture: &MaintenanceFixture, proxy: u16) -> std::pro
     ] {
         fs::write(
             release.join(name),
-            format!("ghcr.io/example/{image}:v9.9.9\n"),
+            format!("ghcr.io/example/{image}:{version}\n"),
         )
         .unwrap();
     }
+    release
+}
+
+/// Runs the `adm` of release `version` against the fixture through `proxy`,
+/// with the client's own state in `client-state`.
+fn run_released_adm(
+    fixture: &MaintenanceFixture,
+    version: &str,
+    proxy: u16,
+    arguments: &[&str],
+) -> std::process::Output {
+    let root = fixture.root.path();
+    let release = write_release_dir(root, version);
     fs::write(root.join("kubeconfig"), "").unwrap();
     Command::new(env!("CARGO_BIN_EXE_adm"))
         .env_clear()
@@ -4174,7 +4221,7 @@ fn run_adm_update_services(fixture: &MaintenanceFixture, proxy: u16) -> std::pro
         .arg(root.join("token"))
         .args(["--project-dir"])
         .arg(&release)
-        .arg("__update-services")
+        .args(arguments)
         .output()
         .unwrap()
 }
@@ -4208,7 +4255,9 @@ fn update_report(fixture: &MaintenanceFixture, output: &std::process::Output) ->
 #[test]
 fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_window() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let fixture = start_maintenance_fixture();
+    // The cluster runs an older release than the updating client, which every
+    // other command would be turned away for. `adm update` is the way out.
+    let fixture = start_maintenance_fixture_on_release(Some("v9.9.8"));
     let proxy = start_lifecycle_proxy(fixture.root.path(), fixture.port);
     let (workspace_id, pod_uid, lease) = fixture.leased_workspace("through-update");
     let (_, workspace_before_update) =
@@ -4300,6 +4349,19 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
         pod["initContainers"][0]["image"],
         "ghcr.io/example/adm-control:v9.9.9"
     );
+    let lifecycle_container = pod["containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|container| container["name"] == "lifecycle")
+        .unwrap();
+    assert!(
+        lifecycle_container["env"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name":"ADM_RELEASE","value":"v9.9.9"})),
+        "the updated lifecycle knows its release, to turn away other clients: {lifecycle_container}"
+    );
     assert!(
         pod["containers"]
             .as_array()
@@ -4330,6 +4392,54 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
         rejections.is_empty(),
         "the workspace runtime was rejected: {rejections:#?}"
     );
+}
+
+/// The client picks a new workspace's images, so a client on another release
+/// than the cluster creates workspaces from that release's images (live: a
+/// Nov 3 client made a workspace without the Docker CLI on a cluster that ran
+/// the Docker engine). The lifecycle turns such clients away and tells them to
+/// run `adm update`. Clients from before release checks send no release.
+#[test]
+fn lifecycle_turns_away_operator_clients_from_another_release_with_adm_update() {
+    let fixture = start_maintenance_fixture_on_release(Some("sha-new"));
+    let proxy = start_lifecycle_proxy(fixture.root.path(), fixture.port);
+
+    let (status, rejected) = fixture.admin_from_release(None, "GET", "/v1/workspaces", None);
+    assert_eq!(status, 426, "{rejected}");
+    let message = rejected["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("sha-new") && message.contains("run `adm update`"),
+        "{message}"
+    );
+
+    let older = run_released_adm(&fixture, "sha-old", proxy, &["list", "--json"]);
+    let stderr = String::from_utf8_lossy(&older.stderr);
+    assert!(!older.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("adm sha-old")
+            && stderr.contains("cluster runs sha-new")
+            && stderr.contains("run `adm update`"),
+        "{stderr}"
+    );
+    assert!(
+        service_log(fixture.root.path()).contains("turned away adm sha-old"),
+        "the lifecycle logs each client it turns away"
+    );
+
+    let same = run_released_adm(&fixture, "sha-new", proxy, &["list", "--json"]);
+    assert!(
+        same.status.success(),
+        "{}",
+        String::from_utf8_lossy(&same.stderr)
+    );
+
+    // Workspace runtimes are not clients: their routes never check a release.
+    let (workspace_id, pod_uid, lease) = fixture.leased_workspace("runtime-on-any-release");
+    let (status, renewed) = fixture.runtime(
+        &format!("/v1/workspaces/{workspace_id}/runtime/lease/renew"),
+        &json!({"holder":pod_uid,"fencingToken":lease["fencingToken"]}),
+    );
+    assert_eq!(status, 200, "{renewed}");
 }
 
 /// TASK-92: once `extend` succeeded, a failed controller verification still

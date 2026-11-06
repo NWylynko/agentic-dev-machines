@@ -94,6 +94,9 @@ pub fn install(cli: &Cli, image: &str, storage_class: &str) -> Result<()> {
         );
         for container in containers {
             container["image"] = json!(image);
+            if container["name"] == "lifecycle" {
+                crate::client_release::set_lifecycle_release(container, &cli.project_dir)?;
+            }
         }
     }
     let failover = resources

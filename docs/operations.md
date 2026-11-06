@@ -48,6 +48,8 @@ After verification and image publishing pass on all native client runners, a `ma
 
 The installer consumes the latest successful `main` release automatically. Optional `v*` tags also publish pinned releases; they do not change the installer's latest release. Rerunning the same build preserves published assets. An older or unrelated main build is published under its own tag and is not promoted over a newer published build. A draft left by a failed publish is not reused; delete that draft before rerunning the build. Markdown-only pushes skip publication; a manual Build run on `main` can publish that commit when needed.
 
+The client and the cluster must run the same release, because the client picks a new workspace's images. Once the cluster is updated, every other client gets ``this is adm sha-X, but the cluster runs sha-Y; run `adm update` ``. `adm update` always gets through. Clients from before this check send no release and get the same message.
+
 The installer preserves settings and leaves services running on updates. Rerun `adm setup` and select the desired image to update the controller and its management connection. Setup retains its existing credential and PVC; its StorageClass cannot be changed in place. Existing workspace Pods keep their own image and storage settings.
 
 The workflow token needs package write access; the first push creates the GHCR package. If that package is private, the cluster needs a pull credential. A node that cannot pull from GHCR still needs the image imported locally.

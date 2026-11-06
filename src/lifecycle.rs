@@ -464,16 +464,23 @@ pub fn serve(mut cli: crate::Cli, bind: &str, port: u16) -> Result<()> {
             eprintln!("adm repository bases startup preparation failed: {error:#}");
         }
     });
+    let release: Arc<Option<String>> =
+        Arc::new(crate::client_release::lifecycle_release_from_env());
     eprintln!("adm lifecycle ready on {bind}:{port}");
     for incoming in listener.incoming() {
         let mut stream = incoming?;
         let request_cli = cli.clone_for_lifecycle();
         let request_wake = wake.clone();
         let request_token = token.clone();
+        let request_release = release.clone();
         thread::spawn(move || {
-            if let Err(error) =
-                handle_http(&request_cli, &request_wake, &request_token, &mut stream)
-            {
+            if let Err(error) = handle_http(
+                &request_cli,
+                &request_wake,
+                &request_token,
+                request_release.as_deref(),
+                &mut stream,
+            ) {
                 eprintln!("adm lifecycle request failed: {error:#}");
             }
         });
@@ -580,6 +587,7 @@ fn handle_http(
     cli: &crate::Cli,
     wake: &mpsc::Sender<String>,
     token: &str,
+    release: Option<&str>,
     stream: &mut TcpStream,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -590,6 +598,8 @@ fn handle_http(
     let path = parts.next().unwrap_or("");
     let mut content_length = 0usize;
     let mut authorization = String::new();
+    let mut client_release = None;
+    let mut release_update = false;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -599,6 +609,15 @@ fn handle_http(
         let lower = line.to_ascii_lowercase();
         if let Some(value) = lower.strip_prefix("content-length:") {
             content_length = value.trim().parse()?;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            if name == crate::client_release::RELEASE_HEADER {
+                client_release = Some(value.trim().to_owned());
+            }
+            if name == crate::client_release::RELEASE_UPDATE_HEADER {
+                release_update = true;
+            }
         }
         if lower.starts_with("authorization:") {
             authorization = line
@@ -612,7 +631,22 @@ fn handle_http(
     reader.read_exact(&mut bytes)?;
     let public_health = method == "GET" && path == "/health";
     let runtime_route = is_runtime_auth_route(method, path) && authorization.starts_with("Bearer ");
-    let response = if public_health || authorization == format!("Bearer {token}") || runtime_route {
+    let operator = authorization == format!("Bearer {token}");
+    let other_release = (operator && !public_health)
+        .then(|| {
+            crate::client_release::reject_other_client_release(
+                release,
+                client_release.as_deref(),
+                release_update,
+            )
+        })
+        .flatten();
+    let response = if let Some(message) = other_release {
+        Ok((
+            426,
+            serde_json::json!({"error":{"code":"CLIENT_RELEASE_MISMATCH","message":message}}),
+        ))
+    } else if public_health || operator || runtime_route {
         route(cli, wake, method, path, &bytes, &authorization)
     } else {
         Ok((
@@ -640,6 +674,7 @@ fn handle_http(
         404 => "Not Found",
         409 => "Conflict",
         410 => "Gone",
+        426 => "Upgrade Required",
         403 => "Forbidden",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
@@ -818,6 +853,7 @@ fn request_with_token_timeout(
     if let Some(body) = body {
         request = request.json(body);
     }
+    let request = crate::client_release::with_client_release_headers(request);
     let response = request.send().context(
         "lifecycle service unavailable; run `adm doctor` for control-plane installation and connection steps",
     )?;
@@ -2174,7 +2210,7 @@ mod provider_auth_wait_tests {
                 response
             });
             let (mut stream, _) = listener.accept().unwrap();
-            handle_http(&cli, &wake, "lifecycle-admin-secret", &mut stream).unwrap();
+            handle_http(&cli, &wake, "lifecycle-admin-secret", None, &mut stream).unwrap();
             drop(stream);
             assert!(
                 client

@@ -98,3 +98,11 @@ Dated log of what each ticket changed, the gotchas found, and what was still to 
 - Do not claim transparent process recovery or filesystem durability that has not been demonstrated end to end.
 - Keep implementations simple, colocate feature code, and write end-to-end tests first for behavior changes. Verify the expected failure before implementing a change, and keep failures visible in status and logs.
 - Use the operator's chosen secret source and inject credentials only into the runtime that needs them; commit schema only. Never store real keys in repository env files, ADM config, or service units.
+
+## 2026-11-06 — client release check
+
+- Live: workspace `test` was created by a client still on `sha-dceed395a0bf` while the lifecycle ran `sha-2679211ef610`. The engine Pod existed, but the dev container had the old `adm-code` image without the Docker CLI, because the client picks a new workspace's images.
+- The lifecycle now turns away operator clients from any other release with 426 and "run `adm update`" (`src/client_release.rs`). Nick chose an exact release match over a hand-bumped compatibility number: forgetting to bump would bring the bug back silently.
+- `adm update` is exempt through `x-adm-release-update`: its new client talks to the old lifecycle until the rollout. An old client's `adm update --workspace NAME` resolves names before installing and so is turned away; plain `adm update` first, then `--workspace`.
+- Test: `lifecycle_turns_away_operator_clients_from_another_release_with_adm_update`, and the update test runs against a lifecycle on an older release and checks `ADM_RELEASE` on the new Deployment.
+- Not yet verified live: the first rollout of this release turns away every installed client, which all predate the header.

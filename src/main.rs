@@ -1,4 +1,5 @@
 mod agents_file;
+mod client_release;
 mod connectors;
 mod diagnostics;
 mod failover;
@@ -1886,6 +1887,13 @@ fn main() {
     let matches = Cli::help_command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).expect("validated CLI arguments");
     if let Err(error) = configure_defaults(&mut cli, &matches).and_then(|()| {
+        client_release::identify_client_release(
+            &cli.project_dir,
+            matches!(
+                cli.command,
+                Action::Update { .. } | Action::UpdateServices { .. }
+            ),
+        )?;
         if let Action::Create(options) | Action::Claude(options) = &cli.command {
             workspaces::validate_name(&options.name)?;
         }
