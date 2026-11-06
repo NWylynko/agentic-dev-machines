@@ -1,0 +1,71 @@
+#!/usr/bin/env node
+// Installation MCP connectors for Claude Code (TASK-90). The Pod never holds a
+// connector grant: `config FILE` writes Claude's MCP config from the
+// token-free runtime catalog, and each server's `headersHelper` runs
+// `adm-claude-mcp headers`, which asks the lifecycle for a current access
+// token. Claude runs the helper on every connection and again after a 401/403,
+// so a removed or signed-out connector fails on its next use.
+(async () => {
+  const fs = process.getBuiltinModule("node:fs");
+  const fail = (message) => {
+    process.stderr.write(`adm-claude-mcp: ${message}\n`);
+    process.exit(1);
+  };
+  const base = process.env.ADM_LIFECYCLE_URL;
+  const tokenFile =
+    process.env.ADM_LIFECYCLE_TOKEN_FILE ||
+    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+  if (!base) fail("ADM_LIFECYCLE_URL is not set");
+  const request = async (path, body) => {
+    let identity;
+    try {
+      identity = fs.readFileSync(tokenFile, "utf8").trim();
+    } catch (error) {
+      fail(`cannot read the Pod identity token (${error.code ?? error.message})`);
+    }
+    let response;
+    try {
+      response = await fetch(
+        `${base.replace(/\/$/, "")}/v1/runtime/connectors/${path}`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${identity}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+          // Claude gives a headersHelper 10 s.
+          signal: AbortSignal.timeout(8_000),
+        },
+      );
+    } catch (error) {
+      fail(`cannot reach the lifecycle controller (${error.message})`);
+    }
+    const value = await response.json().catch(() => ({}));
+    if (!response.ok)
+      fail(value.error?.message ?? `MCP connector ${path} failed (${response.status})`);
+    return value;
+  };
+  const [action, file] = process.argv.slice(2);
+  if (action === "headers") {
+    const name = process.env.CLAUDE_CODE_MCP_SERVER_NAME;
+    if (!name) fail("CLAUDE_CODE_MCP_SERVER_NAME is not set");
+    const { accessToken } = await request("token", { name });
+    if (typeof accessToken !== "string" || !accessToken)
+      fail(`no access token for ${name}; run adm mcp login ${name}`);
+    process.stdout.write(JSON.stringify({ Authorization: `Bearer ${accessToken}` }));
+  } else if (action === "config" && file) {
+    const catalog = await request("catalog", {});
+    if (!Array.isArray(catalog)) fail("the lifecycle returned an invalid catalog");
+    // Every connector, signed in or not: one signed in later works on Claude's
+    // next connection without rewriting the config.
+    const mcpServers = Object.fromEntries(
+      catalog.map((entry) => [
+        entry.name,
+        { type: "http", url: entry.url, headersHelper: "adm-claude-mcp headers" },
+      ]),
+    );
+    fs.writeFileSync(`${file}.tmp`, `${JSON.stringify({ mcpServers }, null, 2)}\n`);
+    fs.renameSync(`${file}.tmp`, file);
+  } else fail("usage: adm-claude-mcp config FILE | headers");
+})();

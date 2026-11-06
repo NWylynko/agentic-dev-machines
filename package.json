@@ -12,7 +12,7 @@
   },
   "scripts": {
     "postinstall": "node scripts/patch-pi-interactive.mjs",
-    "test": "node --test packages/runner/test/*.test.mjs image/browser.test.mjs image/secret-scan.test.mjs image/github-credential.test.mjs tests/lifecycle-rbac.test.mjs && node --import tsx --test packages/terminal/test/*.test.ts",
+    "test": "node --test packages/runner/test/*.test.mjs image/browser.test.mjs image/secret-scan.test.mjs image/github-credential.test.mjs image/claude-mcp.test.mjs tests/lifecycle-rbac.test.mjs && node --import tsx --test packages/terminal/test/*.test.ts",
     "test:runner": "node --test packages/runner/test/*.test.mjs",
     "test:terminal": "node --import tsx --test packages/terminal/test/*.test.ts",
     "test:install": "node --test tests/install.test.mjs",

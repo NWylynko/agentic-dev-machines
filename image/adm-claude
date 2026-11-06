@@ -16,6 +16,9 @@ esac
 if [ "$action" = boot ] && [ ! -f "$state/enabled" ]; then exit 0; fi
 mkdir -p "$state/config"
 : > "$state/enabled"
+# Installation MCP connectors, refreshed on every start and attach. Tokens are
+# fetched per connection by its headersHelper; none are written here.
+adm-claude-mcp config "$state/mcp.json"
 if ! tmux has-session -t claude 2>/dev/null; then
   name=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).name' "$config")
   cwd=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).cwd' "$config")
@@ -23,7 +26,7 @@ if ! tmux has-session -t claude 2>/dev/null; then
   # conversations survive Pod restarts and moves.
   tmux new-session -d -s claude -x 200 -y 50 -c "$cwd" \
     -e "CLAUDE_CONFIG_DIR=$state/config" -e DISABLE_AUTOUPDATER=1 \
-    claude --remote-control "$name"
+    claude --remote-control "$name" --mcp-config "$state/mcp.json"
 fi
 if [ "$action" = attach ]; then
   # kubectl exec passes no TERM; tmux needs one to draw the client.

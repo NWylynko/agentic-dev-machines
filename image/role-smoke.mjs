@@ -65,7 +65,7 @@ const smokeWorkspaceShellLocaleAndSudo = async () => {
 
 // `adm claude` (TASK-90) runs Claude Code under tmux as UID 1000, not as the root that installed it.
 const smokeClaudeCodeRunsAsTheWorkspaceUser = async () => {
-  const { stdout } = await execute("docker", ["run", "--rm", "--user", "1000:1000", "--entrypoint", "/bin/sh", image, "-ec", "claude --version && tmux -V && test -x /usr/local/bin/adm-claude"]);
+  const { stdout } = await execute("docker", ["run", "--rm", "--user", "1000:1000", "--entrypoint", "/bin/sh", image, "-ec", "claude --version && tmux -V && test -x /usr/local/bin/adm-claude && test -x /usr/local/bin/adm-claude-mcp"]);
   if (!/\(Claude Code\)/.test(stdout)) throw new Error(`claude --version as UID 1000 printed ${JSON.stringify(stdout)}`);
   if (!/^tmux \d/m.test(stdout)) throw new Error(`tmux -V printed ${JSON.stringify(stdout)}`);
 };
@@ -78,10 +78,16 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
     await writeFile(join(directory, "workspace.json"), JSON.stringify({ id: "smoke", name: "claude-smoke", cwd: "/workspace" }));
     await chmod(join(directory, "workspace.json"), 0o644);
     const script = [
+      // A lifecycle with no connectors: adm-claude writes Claude's MCP config from its catalog.
+      `(node -e 'require("http").createServer((q, s) => s.end("[]")).listen(7433, "127.0.0.1")' &)`,
+      "echo identity > /tmp/identity",
+      "export ADM_LIFECYCLE_URL=http://127.0.0.1:7433 ADM_LIFECYCLE_TOKEN_FILE=/tmp/identity",
+      "i=0; until node -e 'fetch(\"http://127.0.0.1:7433\").catch(() => process.exit(1))'; do i=$((i+1)); [ $i -lt 100 ]; sleep 0.1; done",
       "adm-claude boot",
       "! tmux has-session -t claude 2>/dev/null",
       "adm-claude start",
       "test -f /workspace/.adm/claude/enabled",
+      `test "$(cat /workspace/.adm/claude/mcp.json | tr -d ' \\n')" = '{"mcpServers":{}}'`,
       // Claude replaces tmux's exec of it straight away; wait for it to draw.
       "i=0; until tmux capture-pane -p -t claude | grep -q .; do i=$((i+1)); [ $i -lt 100 ]; sleep 0.1; done",
       'test "$(tmux display-message -p -t claude "#{pane_current_command}")" = claude',
