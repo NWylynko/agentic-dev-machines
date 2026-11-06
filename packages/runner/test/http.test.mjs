@@ -3683,7 +3683,6 @@ test(
           "createAgent",
           {
             name: "new-agent",
-            image: "adm-dev:0.1.0",
             storageClass: "fast",
             storageSize: "10Gi",
             cpu: "2",
@@ -3704,6 +3703,8 @@ test(
     assert.equal(createSpec.branch, "feature/bot-work");
     assert.equal(createSpec.base, "origin/release");
     assert.equal(createSpec.cwd, "/repos/owner/project");
+    // The lifecycle fills the image from the cluster's release.
+    assert.equal("image" in createSpec, false);
     const operation = JSON.parse(
       (
         await call(

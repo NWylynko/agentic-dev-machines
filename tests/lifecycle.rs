@@ -4362,6 +4362,18 @@ fn adm_update_waits_for_the_replaced_lifecycle_and_completes_its_maintenance_win
             .contains(&json!({"name":"ADM_RELEASE","value":"v9.9.9"})),
         "the updated lifecycle knows its release, to turn away other clients: {lifecycle_container}"
     );
+    for (variable, role) in [
+        ("ADM_CODE_IMAGE", "adm-code"),
+        ("ADM_WORKSPACE_IMAGE", "adm-workspace"),
+        ("ADM_REPOSITORIES_IMAGE", "adm-repositories"),
+    ] {
+        assert!(
+            lifecycle_container["env"].as_array().unwrap().contains(
+                &json!({"name":variable,"value":format!("ghcr.io/example/{role}:v9.9.9")})
+            ),
+            "the updated lifecycle creates bots' coding agents from its release: {lifecycle_container}"
+        );
+    }
     assert!(
         pod["containers"]
             .as_array()
@@ -5011,6 +5023,164 @@ fn a_moved_workspace_claims_its_lease_at_once_and_the_old_holder_is_revoked() {
         )),
         "{}",
         service_log(root.path())
+    );
+    stop_http_stub(runner_port, runner);
+}
+
+/// A bot creates coding agents without knowing which images the cluster's
+/// release ships, so the lifecycle fills them from its own release: the
+/// coding image when the bot names none, and always the init and
+/// repositories images, which a bot never chooses.
+#[test]
+fn bot_created_coding_agents_run_the_cluster_release_images() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("service-env.json"),
+        json!([
+            ["ADM_CODE_IMAGE", "ghcr.io/example/adm-code:v9.9.9"],
+            [
+                "ADM_WORKSPACE_IMAGE",
+                "ghcr.io/example/adm-workspace:v9.9.9"
+            ],
+            [
+                "ADM_REPOSITORIES_IMAGE",
+                "ghcr.io/example/adm-repositories:v9.9.9"
+            ]
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("storage-release"), "go").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let _service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+
+    let completed_workspace = |operation_id: &str| -> Value {
+        let receipt: Value = wait_for(|| {
+            request_with_token(
+                &url,
+                "GET",
+                &format!("/v1/operations/{operation_id}"),
+                None,
+                Some("synthetic-lifecycle-token"),
+            )
+            .ok()
+            .and_then(|response| response.json::<Value>().ok())
+            .filter(|receipt| receipt["status"] == "completed")
+        });
+        request_with_token(
+            &url,
+            "GET",
+            &format!(
+                "/v1/workspaces/{}",
+                receipt["workspaceId"].as_str().unwrap()
+            ),
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap()
+        .json()
+        .unwrap()
+    };
+
+    let bot_operation = "0d0b5f4c-0f42-4a8e-9d0e-6d1d6b1f2a01";
+    let mut bot_spec = workspace_spec("release-bot");
+    bot_spec["role"] = "bot".into();
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/operations",
+        Some(&json!({"operationId":bot_operation,"kind":"create","spec":bot_spec})),
+        Some("synthetic-lifecycle-token"),
+    )
+    .unwrap();
+    let bot = completed_workspace(bot_operation);
+    let bot_uid = "6a0f2a8e-2a7b-4d0c-9a51-1d0e5b6f7c01";
+    fs::write(
+        root.path().join("expected-bot-namespace"),
+        bot["namespace"].as_str().unwrap(),
+    )
+    .unwrap();
+    fs::write(root.path().join("expected-bot-pod-uid"), bot_uid).unwrap();
+    fs::write(root.path().join("expected-bot-token-uid"), bot_uid).unwrap();
+    // The fake TokenReview reads these for every token.
+    fs::write(root.path().join("expected-namespace"), "adm-none").unwrap();
+    fs::write(
+        root.path().join("expected-pod-uid"),
+        "00000000-0000-4000-8000-000000000000",
+    )
+    .unwrap();
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &format!(
+                "/v1/workspaces/{}/runtime/lease",
+                bot["id"].as_str().unwrap()
+            ),
+            Some(&json!({"holder":bot_uid})),
+            Some("bot-token"),
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+
+    let mut agent_spec = workspace_spec("release-agent");
+    let agent_spec_object = agent_spec.as_object_mut().unwrap();
+    agent_spec_object.remove("image");
+    agent_spec_object.insert(
+        "workspace_image".into(),
+        json!("ghcr.io/example/adm-workspace:latest"),
+    );
+    let agent_operation = "0d0b5f4c-0f42-4a8e-9d0e-6d1d6b1f2a02";
+    let admitted = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&json!({"operationId":agent_operation,"kind":"create","spec":agent_spec})),
+        Some("bot-token"),
+    )
+    .unwrap();
+    assert_eq!(admitted.status(), 202, "{}", admitted.text().unwrap());
+    let agent = completed_workspace(agent_operation);
+    assert_eq!(agent["image"], "ghcr.io/example/adm-code:v9.9.9");
+    assert_eq!(
+        agent["workspace_image"],
+        "ghcr.io/example/adm-workspace:v9.9.9"
+    );
+    assert_eq!(
+        agent["repositories_image"],
+        "ghcr.io/example/adm-repositories:v9.9.9"
+    );
+
+    let mut pinned_spec = workspace_spec("pinned-agent");
+    pinned_spec["image"] = json!("ghcr.io/example/adm-code:sha-pinned");
+    let pinned_operation = "0d0b5f4c-0f42-4a8e-9d0e-6d1d6b1f2a03";
+    request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&json!({"operationId":pinned_operation,"kind":"create","spec":pinned_spec})),
+        Some("bot-token"),
+    )
+    .unwrap();
+    let pinned = completed_workspace(pinned_operation);
+    assert_eq!(pinned["image"], "ghcr.io/example/adm-code:sha-pinned");
+    assert_eq!(
+        pinned["workspace_image"],
+        "ghcr.io/example/adm-workspace:v9.9.9"
     );
     stop_http_stub(runner_port, runner);
 }

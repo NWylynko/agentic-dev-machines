@@ -323,7 +323,13 @@ export function botExtension(
           "Create a coding-agent workspace through the durable lifecycle service. Creation choices are explicit and the operation receipt can be replayed after a lost acknowledgement.",
         parameters: Type.Object({
           name: Type.String({ minLength: 1, maxLength: 63 }),
-          image: Type.String({ minLength: 1 }),
+          image: Type.Optional(
+            Type.String({
+              minLength: 1,
+              description:
+                "Coding image. Omit it to run the cluster release's coding image.",
+            }),
+          ),
           storageClass: Type.String({ minLength: 1 }),
           storageSize: Type.String({ minLength: 1 }),
           cpu: Type.String({ minLength: 1 }),

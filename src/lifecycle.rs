@@ -1101,7 +1101,10 @@ fn route(
             caller.role == "bot",
             "runtime caller is not authorized for lifecycle operations"
         );
-        let value: Value = serde_json::from_slice(body)?;
+        let mut value: Value = serde_json::from_slice(body)?;
+        if value["kind"] == "create" {
+            crate::client_release::apply_release_images_to_bot_create(&mut value["spec"])?;
+        }
         let request = request_from_json(&value)?;
         match &request {
             OperationRequest::Create { spec, .. } => ensure!(
