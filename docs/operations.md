@@ -218,7 +218,9 @@ Claude's config dir is `/workspace/.adm/claude/config` (`CLAUDE_CONFIG_DIR`) on 
 
 Claude Code runs **alongside** the Pi agent, in the same Pod and the same checkout: both can edit the same files at the same time and neither knows about the other. `adm prompt`, `adm history`, `adm attach` and bots keep driving Pi only. Claude is not fenced by the runtime lease.
 
-Login is still per workspace for now: on first attach Claude asks for its theme, a login (`/login`, copy-code flow) and whether to trust the folder. Remote Control needs that full claude.ai login; `claude setup-token` / `CLAUDE_CODE_OAUTH_TOKEN` tokens are refused for Remote Control ([research/claude-code](../research/claude-code/README.md)). Shared `adm login claude` and the installation MCP connectors for Claude are not built yet.
+Login is still per workspace for now: on first attach Claude asks for its theme, a login (`/login`, copy-code flow) and whether to trust the folder. Remote Control needs that full claude.ai login; `claude setup-token` / `CLAUDE_CODE_OAUTH_TOKEN` tokens are refused for Remote Control ([research/claude-code](../research/claude-code/README.md)). Shared `adm login claude` is not built yet.
+
+Claude gets the installation MCP connectors (`adm mcp`). Every `adm-claude start`/`attach` rewrites `/workspace/.adm/claude/mcp.json` from the token-free catalog (`adm-claude-mcp config`) and Claude runs with `--mcp-config` on it. Each connector's `headersHelper` is `adm-claude-mcp headers`, which asks the lifecycle (`/v1/runtime/connectors/token`, Pod identity) for a current access token; Claude runs it on every connection and again after a 401/403, so no connector grant is ever written in the Pod. A connector that is signed out or removed fails on Claude's next connection to it, and one signed in later works from the next connection. Claude reads the config only when it starts: a connector **added** while Claude is running appears after Claude restarts (exit Claude, then `adm claude NAME`).
 
 ## Built-in browser
 

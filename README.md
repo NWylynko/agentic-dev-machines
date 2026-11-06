@@ -58,7 +58,7 @@ On another laptop, `adm connect` uses an existing installation without installin
 - **Browser:** coding agents have a built-in headless Chromium they drive with `browser_*` Playwright tools (navigate, snapshot, click, screenshot), including your dev servers on `localhost`. Bots do not get it. See [Built-in browser](docs/operations.md#built-in-browser).
 - **MCP servers:** `adm mcp add NAME URL` gives every agent a remote MCP server, signed in through your browser. See [MCP connectors](docs/operations.md#mcp-connectors).
 - **Shared instructions:** `adm agents-file` edits one `AGENTS.md` that is prepended for every coding agent. See [shared agents file](docs/operations.md#shared-agents-file).
-- **Claude Code:** `adm claude my-project` creates the workspace if needed and attaches to a Claude Code that keeps running with Remote Control on, next to the Pi agent. See [Claude Code](docs/operations.md#claude-code).
+- **Claude Code:** `adm claude my-project` creates the workspace if needed and attaches to a Claude Code that keeps running with Remote Control on, next to the Pi agent, with the installation MCP connectors. See [Claude Code](docs/operations.md#claude-code).
 - **Bots:** `adm create supervisor --role bot` runs an agent that watches and directs your coding agents. See [bot workspaces](docs/operations.md#bot-workspaces).
 - **Herdr:** `adm create my-project --herdr` opens the workspace in a new Herdr space. Optional close-event cleanup destroys the workspace when you close the space. See [Herdr](docs/operations.md#herdr-ownership-and-deletion).
 - **Troubleshooting:** `adm doctor` checks the client, cluster and providers, and `adm system-log` merges the controller's logs. See [errors and recovery](docs/operations.md#errors-and-recovery).
