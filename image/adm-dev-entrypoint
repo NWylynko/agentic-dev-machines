@@ -21,6 +21,8 @@ if [ "${1:-}" = "--check" ]; then
     test -f /opt/adm/browser.mjs
     test -x /usr/local/bin/adm-git-credential
     test -x /usr/local/bin/adm-github-token
+    test -x /usr/local/bin/adm-git-identity
+    test "$(git config --system --get include.path)" = /workspace/.adm/gitconfig
     test "$(command -v gh)" = /usr/local/bin/gh
     test -x /usr/bin/gh
     test -x /usr/local/bin/adm-claude
@@ -29,6 +31,12 @@ if [ "${1:-}" = "--check" ]; then
 fi
 if [ "$#" -gt 0 ]; then
   exec "$@"
+fi
+# Default Git author from the workspace's GitHub account. In the background:
+# GitHub being slow or the cluster not logged in must not hold up the runner.
+# The subshell hands it to Tini, which reaps it; the exec'd runner would not.
+if command -v adm-git-identity >/dev/null 2>&1; then
+  (adm-git-identity &)
 fi
 # Bring back the Claude Code session of a workspace that ran `adm claude`
 # (TASK-90). A failure is logged and left for the next `adm claude`, which

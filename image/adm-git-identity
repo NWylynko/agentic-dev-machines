@@ -1,0 +1,69 @@
+#!/usr/bin/env node
+// Default Git author for a coding workspace: the GitHub account its pushes
+// already authenticate as (a workspace GH_TOKEN Secret, else the cluster
+// login from `adm repos login github`). Run in the background at Pod start by
+// adm-dev-entrypoint. Writes user.name and user.email to
+// /workspace/.adm/gitconfig, which /etc/gitconfig includes at system scope, so
+// `git config --global` or a repository's own config still wins. The email is
+// GitHub's noreply address, which links commits to the account without
+// publishing a real address. On any failure the previous file is left as is.
+(async () => {
+  const { execFileSync } = process.getBuiltinModule("node:child_process");
+  const fs = process.getBuiltinModule("node:fs");
+  const path = process.getBuiltinModule("node:path");
+  const target = process.env.ADM_GIT_IDENTITY_FILE || "/workspace/.adm/gitconfig";
+  const api = (process.env.ADM_GITHUB_API_URL || "https://api.github.com").replace(/\/$/, "");
+  const fail = (message) => {
+    process.stderr.write(`adm-git-identity: ${message}; git commits need user.name and user.email set by hand\n`);
+    process.exit(1);
+  };
+  let token = process.env.GH_TOKEN || "";
+  if (!token) {
+    try {
+      token = execFileSync(path.join(path.dirname(process.argv[1]), "adm-github-token"), {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "inherit"],
+      }).trim();
+    } catch {
+      fail("no GitHub login for this workspace");
+    }
+  }
+  let user;
+  try {
+    const response = await fetch(`${api}/user`, {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "adm-git-identity",
+        authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) fail(`GitHub answered ${response.status} for the account`);
+    user = await response.json();
+  } catch (error) {
+    fail(`cannot ask GitHub for the account (${error.message})`);
+  }
+  const login = typeof user?.login === "string" ? user.login : "";
+  if (!/^[A-Za-z0-9-]+$/.test(login) || !Number.isSafeInteger(user.id))
+    fail("GitHub returned no account login and id");
+  // A profile name is free text; keep it to one printable line.
+  const name = (typeof user.name === "string" ? user.name : "").replace(/[\x00-\x1f\x7f]/g, " ").trim() || login;
+  const email = `${user.id}+${login}@users.noreply.github.com`;
+  const temporary = `${target}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(
+      temporary,
+      "# Written by adm-git-identity at every Pod start from the GitHub account this\n" +
+        "# workspace pushes as. Override with git config --global user.name/user.email.\n",
+      { mode: 0o644 },
+    );
+    // git config does the value quoting.
+    for (const [key, value] of [["user.name", name], ["user.email", email]])
+      execFileSync("git", ["config", "--file", temporary, key, value], { stdio: ["ignore", "ignore", "inherit"] });
+    fs.renameSync(temporary, target);
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    fail(`cannot write ${target} (${error.message})`);
+  }
+  process.stdout.write(`adm-git-identity: git commits default to ${name} <${email}>\n`);
+})();

@@ -81,6 +81,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git chromium na
  && rm -rf /var/lib/apt/lists/*
 COPY image/adm-git-credential /usr/local/bin/adm-git-credential
 COPY image/adm-github-token /usr/local/bin/adm-github-token
+COPY image/adm-git-identity /usr/local/bin/adm-git-identity
 # Ahead of /usr/bin/gh on PATH: gives gh the cluster's GitHub login (TASK-111).
 COPY image/adm-gh /usr/local/bin/gh
 COPY image/browser.mjs /opt/adm/browser.mjs
@@ -98,8 +99,9 @@ COPY image/adm-claude /usr/local/bin/adm-claude
 COPY image/adm-claude-mcp /usr/local/bin/adm-claude-mcp
 COPY image/adm-claude-credentials /usr/local/bin/adm-claude-credentials
 RUN chown root:root /usr/local/bin/artifact-fs \
- && chmod 0755 /usr/local/bin/artifact-fs /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials \
- && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential'
+ && chmod 0755 /usr/local/bin/artifact-fs /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/adm-git-identity /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials \
+ && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential' \
+ && git config --system include.path /workspace/.adm/gitconfig
 
 FROM adm-workspace AS adm-bot
 
