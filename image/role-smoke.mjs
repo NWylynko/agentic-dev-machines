@@ -170,6 +170,8 @@ if (role === "adm-repositories") {
   await run(["test -x /usr/local/bin/adm", "test -x /usr/local/bin/kubectl", "test -f /opt/adm/provider-auth.mjs", "test -x /usr/bin/gh", "test -d /opt/adm/node_modules", absent("chromium"), absent("sudo")].join(" && "));
 } else if (role === "adm-code") {
   await execute("docker", ["run", "--rm", image, "/usr/local/bin/adm-dev-entrypoint", "--check"]);
+  // The fsmonitor hook ArtifactFS writes into each shared git dir execs this path.
+  await run(["test -x /usr/local/bin/artifact-fs", "/usr/local/bin/artifact-fs --help >/dev/null"].join(" && "));
   await smokeWorkspaceShellLocaleAndSudo();
   await smokeClaudeCodeRunsAsTheWorkspaceUser();
   await smokeClaudeSessionSurvivesDetachAndRestart();

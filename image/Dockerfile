@@ -84,6 +84,11 @@ COPY image/adm-github-token /usr/local/bin/adm-github-token
 # Ahead of /usr/bin/gh on PATH: gives gh the cluster's GitHub login (TASK-111).
 COPY image/adm-gh /usr/local/bin/gh
 COPY image/browser.mjs /opt/adm/browser.mjs
+# `artifact-fs add-repo` sets core.fsmonitor in each shared git dir to a hook that
+# execs /usr/local/bin/artifact-fs fsmonitor-hook. The hook only reads ArtifactFS
+# state under /workspace/.adm/repositories, so the same pinned binary at the same
+# path lets git in this container use it instead of failing every command.
+COPY --from=go-build /go/bin/artifact-fs /usr/local/bin/artifact-fs
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && npm cache clean --force && claude --version
 # Docker CLI, compose and buildx (static binaries), for the workspace's Docker engine Pod
 # through DOCKER_HOST; same release as the engine image pinned in src/workspaces.rs.
@@ -92,7 +97,8 @@ COPY --from=docker.io/library/docker:29.9.3-cli@sha256:2357639ad1ea7d0194134bf32
 COPY image/adm-claude /usr/local/bin/adm-claude
 COPY image/adm-claude-mcp /usr/local/bin/adm-claude-mcp
 COPY image/adm-claude-credentials /usr/local/bin/adm-claude-credentials
-RUN chmod 0755 /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials \
+RUN chown root:root /usr/local/bin/artifact-fs \
+ && chmod 0755 /usr/local/bin/artifact-fs /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials \
  && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential'
 
 FROM adm-workspace AS adm-bot
