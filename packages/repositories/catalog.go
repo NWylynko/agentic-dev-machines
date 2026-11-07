@@ -281,9 +281,8 @@ func (node *repositoryLoopbackNode) Open(ctx context.Context, flags uint32) (fs.
 		return nil, 0, fs.ToErrno(err)
 	}
 	defer unix.Close(baseFD)
-	flags &^= syscall.O_APPEND
 	fd, err := unix.Openat2(baseFD, relativePath, &unix.OpenHow{
-		Flags:   uint64(flags) | unix.O_CLOEXEC,
+		Flags:   backingOpenHowFlags(flags),
 		Resolve: unix.RESOLVE_NO_SYMLINKS,
 	})
 	if err != nil {
@@ -292,6 +291,21 @@ func (node *repositoryLoopbackNode) Open(ctx context.Context, flags uint32) (fs.
 		return nil, 0, fs.ToErrno(err)
 	}
 	return fs.NewLoopbackFile(fd), 0, 0
+}
+
+// backingOpenFlags are the open flags forwarded to openat2 for a backing
+// file. FUSE passes on the kernel's file flags, which can carry internal bits
+// such as __FMODE_EXEC (0x20, set when execve opens the file). open(2)
+// ignores unknown bits, but openat2 rejects them with EINVAL, so every program
+// run from /repos failed with "invalid argument" until only the flags openat2
+// knows were kept. O_APPEND is left out, as go-fuse's loopback does, because
+// FUSE writes already carry their offset.
+const backingOpenFlags = unix.O_ACCMODE | unix.O_CREAT | unix.O_EXCL | unix.O_NOCTTY | unix.O_TRUNC |
+	unix.O_NONBLOCK | unix.O_DSYNC | unix.O_SYNC | unix.O_ASYNC | unix.O_DIRECT | unix.O_LARGEFILE |
+	unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_NOATIME | unix.O_PATH | unix.O_TMPFILE
+
+func backingOpenHowFlags(flags uint32) uint64 {
+	return uint64(flags)&backingOpenFlags | unix.O_CLOEXEC
 }
 
 func lookupRepositoryChild(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

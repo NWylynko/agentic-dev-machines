@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // This is an actual filesystem and Git integration test. Run it in the
@@ -95,6 +97,15 @@ func TestRepositoryFilesystem(t *testing.T) {
 	git(t, projectA, "config", "user.email", "a@example.invalid")
 	write(t, filepath.Join(projectA, "README.md"), "private A\n")
 	write(t, filepath.Join(projectA, "untracked.txt"), "private untracked\n")
+	// execve opens with the kernel's __FMODE_EXEC bit, which openat2 rejects.
+	script := filepath.Join(projectA, "run.sh")
+	write(t, script, "#!/bin/sh\necho ran\n")
+	if err := os.Chmod(script, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(script).CombinedOutput(); err != nil || string(output) != "ran\n" {
+		t.Fatalf("run a script from the catalog: output=%q err=%v", output, err)
+	}
 	if err := os.Symlink("README.md", filepath.Join(projectA, "inside-link")); err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +212,30 @@ func logRepositoryDiskUse(t *testing.T, stage string, configs ...Config) {
 		total += workspace
 	}
 	t.Logf("disk use stage=%q total_private_state_and_git=%d KiB", stage, total)
+}
+
+func TestBackingOpenKeepsOnlyFlagsOpenat2Accepts(t *testing.T) {
+	const fmodeExec = 0x20 // the kernel's __FMODE_EXEC, as FUSE forwards it for execve
+	path := filepath.Join(t.TempDir(), "tool")
+	write(t, path, "#!/bin/sh\n")
+	if _, err := unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{Flags: unix.O_RDONLY | fmodeExec | unix.O_CLOEXEC}); err != unix.EINVAL {
+		t.Fatalf("openat2 with __FMODE_EXEC: want EINVAL (the bug this guards), got %v", err)
+	}
+	fd, err := unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{Flags: backingOpenHowFlags(unix.O_RDONLY | unix.O_LARGEFILE | fmodeExec), Resolve: unix.RESOLVE_NO_SYMLINKS})
+	if err != nil {
+		t.Fatalf("open for exec: %v", err)
+	}
+	unix.Close(fd)
+	for _, c := range []struct{ in, want uint64 }{
+		{unix.O_RDONLY | fmodeExec, unix.O_RDONLY},
+		{unix.O_WRONLY | unix.O_CREAT | unix.O_TRUNC | unix.O_EXCL, unix.O_WRONLY | unix.O_CREAT | unix.O_TRUNC | unix.O_EXCL},
+		{unix.O_RDWR | unix.O_APPEND | unix.O_NOFOLLOW, unix.O_RDWR | unix.O_NOFOLLOW},
+		{unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NONBLOCK, unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NONBLOCK},
+	} {
+		if got := backingOpenHowFlags(uint32(c.in)); got != c.want|unix.O_CLOEXEC {
+			t.Errorf("backingOpenHowFlags(%#x) = %#x, want %#x", c.in, got, c.want|unix.O_CLOEXEC)
+		}
+	}
 }
 
 func TestCatalogValidationRejectsUnsafeNamespaces(t *testing.T) {
