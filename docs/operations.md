@@ -24,6 +24,8 @@ Use `adm login [PROVIDER]` to authenticate once for every existing and new works
 
 Choose a default model in `adm setup`, or select one explicitly with `--model PROVIDER/MODEL_ID` when creating an agent workspace. `faux/faux-1` is a deterministic local test provider and is available only when explicitly selected. It does not call an external model.
 
+Workspace clocks use the timezone chosen in `adm setup` (an IANA name such as `America/Toronto`), or this machine's timezone when setup has none; `adm create --timezone ZONE` overrides it for one workspace. The lifecycle sets it as `TZ` in the agent container. A workspace made before this setting runs in UTC until `adm update --workspace NAME` rolls it, which also applies the current timezone.
+
 ```sh
 adm status my-project
 adm attach my-project

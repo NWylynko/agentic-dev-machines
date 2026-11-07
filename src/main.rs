@@ -2053,6 +2053,13 @@ fn configure_defaults(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<()> {
             {
                 options.storage_class = storage_class;
             }
+            if options.timezone.is_none() {
+                // storage_class has already moved out of config.
+                options.timezone = config.timezone.clone().or_else(setup::local_timezone);
+            }
+            if let Some(timezone) = &options.timezone {
+                setup::validate_timezone(timezone)?;
+            }
             if options.model.is_none() {
                 options.model = config.model;
             }

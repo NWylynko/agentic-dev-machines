@@ -29,7 +29,7 @@ This installs the release CLI, workspace runtime and terminal into `~/.local/bin
 You need `kubectl` access to a cluster with a [StorageClass](deploy/storage.md) configured.
 
 ```sh
-adm setup                 # pick images, storage class and default model; install the controller
+adm setup                 # pick images, storage class, default model and timezone; install the controller
 adm login                 # sign in to a model provider, once for the whole installation
 adm repos login           # connect GitHub so every workspace can clone, push and use gh
 adm create my-project --repo OWNER/REPO

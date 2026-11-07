@@ -58,6 +58,9 @@ pub enum OperationRequest {
         workspace_image: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repositories_image: Option<String>,
+        /// The client's workspace timezone; absent keeps the workspace's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timezone: Option<String>,
     },
 }
 
@@ -94,6 +97,8 @@ pub struct CreateIntent {
     #[serde(default = "default_cwd")]
     pub cwd: String,
     pub model: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default)]
     pub credential_env: Vec<crate::workspaces::CredentialEnvRef>,
     #[serde(default)]
@@ -125,6 +130,7 @@ impl CreateIntent {
             base: workspace.base.clone(),
             cwd: workspace.cwd.clone(),
             model: workspace.model.clone(),
+            timezone: workspace.timezone.clone(),
             credential_env: workspace.credential_env.clone(),
             herdr_space: workspace.herdr_space.clone(),
         }
@@ -224,6 +230,9 @@ impl CreateIntent {
                 && model["id"].as_str().is_some_and(|s| !s.is_empty())),
             "model must contain provider and id"
         );
+        if let Some(timezone) = &self.timezone {
+            crate::setup::validate_timezone(timezone)?;
+        }
         ensure!(
             self.model.as_ref().is_none_or(|model| {
                 model.as_object().is_some_and(|model| {
@@ -258,6 +267,7 @@ impl CreateIntent {
             base: self.base,
             cwd: self.cwd,
             model: self.model,
+            timezone: self.timezone,
             credential_env: self.credential_env,
             herdr_space: self.herdr_space,
             created_at: crate::workspaces::now(),
@@ -415,6 +425,7 @@ pub fn admit(store: &mut WorkspaceStore, request: &OperationRequest) -> Result<O
         OperationRequest::Update {
             workspace_id,
             image,
+            timezone,
             ..
         } => {
             ensure!(
@@ -422,6 +433,9 @@ pub fn admit(store: &mut WorkspaceStore, request: &OperationRequest) -> Result<O
                 "workspaceId must be an immutable workspace UUID"
             );
             ensure!(!image.trim().is_empty(), "update request needs an image");
+            if let Some(timezone) = timezone {
+                crate::setup::validate_timezone(timezone)?;
+            }
         }
     }
     store.admit_lifecycle_operation(request)

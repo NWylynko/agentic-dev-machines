@@ -598,6 +598,8 @@ fn upgrade_selected(
     version: &str,
     operation_id: Option<&str>,
 ) -> Result<()> {
+    // The same timezone adm create would give a new workspace.
+    let timezone = crate::setup::workspace_timezone(&crate::setup::read_config()?);
     for (index, name) in names.iter().enumerate() {
         let workspace = cli.active_workspace(name)?;
         ensure!(
@@ -632,6 +634,7 @@ fn upgrade_selected(
                     .to_owned(),
                     workspace_image: Some(images.workspace.clone()),
                     repositories_image: Some(images.repositories.clone()),
+                    timezone: timezone.clone(),
                 },
             )?),
         )?;

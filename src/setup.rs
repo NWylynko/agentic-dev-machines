@@ -18,6 +18,9 @@ pub struct Config {
     pub storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// IANA timezone for workspace clocks (TZ in each workspace Pod).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<LifecycleConfig>,
 }
@@ -62,6 +65,46 @@ fn validate_value(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+/// An IANA zone name such as America/Toronto or UTC. The workspace image has
+/// tzdata, so the name only has to be well formed here; glibc falls back to
+/// UTC for a name it cannot find.
+pub fn validate_timezone(timezone: &str) -> Result<()> {
+    ensure!(
+        !timezone.is_empty()
+            && timezone.len() <= 64
+            && timezone
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/_+-".contains(&byte))
+            && timezone.starts_with(|c: char| c.is_ascii_alphabetic())
+            && !timezone.split('/').any(str::is_empty),
+        "timezone must be an IANA zone name such as America/Toronto or UTC"
+    );
+    Ok(())
+}
+
+/// This machine's IANA timezone: TZ when it names a zone, else the zone
+/// /etc/localtime links to (Linux and macOS).
+pub fn local_timezone() -> Option<String> {
+    let from_env = std::env::var("TZ")
+        .ok()
+        .map(|tz| tz.trim_start_matches(':').to_owned());
+    let from_link = || {
+        let target = fs::read_link("/etc/localtime").ok()?;
+        let target = target.to_str()?;
+        Some(target.split_once("zoneinfo/")?.1.to_owned())
+    };
+    from_env
+        .filter(|tz| validate_timezone(tz).is_ok())
+        .or_else(from_link)
+        .filter(|tz| validate_timezone(tz).is_ok())
+}
+
+/// The timezone a new or updated workspace gets: the one chosen in adm setup,
+/// else this machine's.
+pub fn workspace_timezone(config: &Config) -> Option<String> {
+    config.timezone.clone().or_else(local_timezone)
+}
+
 pub fn validate_model(model: &str) -> Result<()> {
     validate_value(model, "model")?;
     let (provider, id) = model
@@ -87,6 +130,9 @@ impl Config {
         }
         if let Some(model) = &self.model {
             validate_model(model)?;
+        }
+        if let Some(timezone) = &self.timezone {
+            validate_timezone(timezone)?;
         }
         Ok(())
     }
@@ -188,6 +234,16 @@ pub fn run(cli: &Cli) -> Result<()> {
     } else {
         Some(model)
     };
+    let timezone = prompt(
+        "Workspace timezone (IANA, e.g. America/Toronto; '-' follows this machine)",
+        config
+            .timezone
+            .clone()
+            .or_else(local_timezone)
+            .as_deref()
+            .unwrap_or("UTC"),
+    )?;
+    config.timezone = (!timezone.is_empty() && timezone != "-").then_some(timezone);
     config.validate()?;
     let install = prompt(
         "Install/update the cluster controller and verify client access? (yes/no)",

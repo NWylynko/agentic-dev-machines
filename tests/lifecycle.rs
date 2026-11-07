@@ -2207,7 +2207,8 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         "operationId":update_operation,
         "kind":"update",
         "workspaceId":runtime_id,
-        "image":"ghcr.io/example/adm-dev:explicit-update"
+        "image":"ghcr.io/example/adm-dev:explicit-update",
+        "timezone":"America/Toronto"
     });
     request_with_token(
         &url,
@@ -2247,6 +2248,8 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         updated_workspace["image"],
         "ghcr.io/example/adm-dev:explicit-update"
     );
+    // An update carries the client's timezone to a workspace made before it.
+    assert_eq!(updated_workspace["timezone"], "America/Toronto");
     assert_eq!(updated_workspace["id"], runtime_workspace["id"]);
     assert_eq!(
         updated_workspace["namespace"],

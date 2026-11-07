@@ -4648,6 +4648,48 @@ fn manifest_delivers_only_referenced_workspace_credentials_to_the_dev_pod() {
 }
 
 #[test]
+fn manifest_sets_the_workspace_timezone_from_the_flag_then_setup() {
+    let tz = |manifest: &Value| {
+        let deployment = manifest["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["kind"] == "Deployment")
+            .unwrap();
+        deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|env| env["name"] == "TZ")
+            .map(|env| env["value"].clone())
+    };
+    let root = tempfile::tempdir().unwrap();
+    let flagged = assert_ok(adm(
+        root.path(),
+        &["manifest", "example", "--timezone", "America/Toronto"],
+    ));
+    assert_eq!(tz(&flagged), Some(Value::from("America/Toronto")));
+    // The zone chosen in adm setup applies when the command line names none.
+    fs::create_dir_all(root.path().join("config/adm")).unwrap();
+    fs::write(
+        root.path().join("config/adm/config.json"),
+        r#"{"timezone":"Europe/Berlin"}"#,
+    )
+    .unwrap();
+    let configured = assert_ok(adm(root.path(), &["manifest", "example"]));
+    assert_eq!(tz(&configured), Some(Value::from("Europe/Berlin")));
+    for invalid in ["Bad Zone", "../etc/passwd", "America//Toronto", "/UTC"] {
+        let output = adm(root.path(), &["manifest", "example", "--timezone", invalid]);
+        assert!(!output.status.success(), "{invalid} accepted");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("IANA zone name"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn manifest_gives_the_workspace_unattended_container_administration() {
     let root = tempfile::tempdir().unwrap();
     let manifest = assert_ok(adm(

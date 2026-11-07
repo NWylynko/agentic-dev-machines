@@ -103,6 +103,9 @@ pub struct Workspace {
     #[serde(default = "default_workspace_cwd")]
     pub cwd: String,
     pub model: Option<Value>,
+    /// IANA timezone for the agent container's TZ; none means UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default)]
     pub credential_env: Vec<CredentialEnvRef>,
     pub herdr_space: Option<String>,
@@ -224,6 +227,9 @@ pub struct CreateOptions {
     /// Provider/model-id; overrides the model chosen in adm setup.
     #[arg(long)]
     pub model: Option<String>,
+    /// IANA timezone for the workspace clock; otherwise the one chosen in adm setup, else this machine's.
+    #[arg(long)]
+    pub timezone: Option<String>,
     /// Inject one key from a Secret created in this workspace's namespace: ENV=SECRET:KEY.
     #[arg(long = "credential-env", value_name = "ENV=SECRET:KEY")]
     pub credential_env: Vec<String>,
@@ -434,6 +440,7 @@ impl CreateOptions {
             base: self.base.clone(),
             cwd,
             model,
+            timezone: self.timezone.clone(),
             credential_env,
             herdr_space: self.herdr_space.clone(),
             created_at: now(),
@@ -662,6 +669,7 @@ impl WorkspaceStore {
                 image,
                 workspace_image,
                 repositories_image,
+                timezone,
                 ..
             } => {
                 let raw: String = transaction
@@ -688,6 +696,9 @@ impl WorkspaceStore {
                 }
                 if let Some(repositories_image) = repositories_image {
                     workspace.repositories_image = repositories_image.clone();
+                }
+                if let Some(timezone) = timezone {
+                    workspace.timezone = Some(timezone.clone());
                 }
                 workspace.last_error = None;
                 let changed = transaction.execute(
@@ -1610,6 +1621,12 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         {"name":"ADM_LIFECYCLE_URL","value":lifecycle_url},
         {"name":"ADM_POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}
     ]);
+    if let Some(timezone) = &w.timezone {
+        dev["env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"TZ","value":timezone}));
+    }
     if w.role == "coding" {
         let env = dev["env"].as_array_mut().unwrap();
         env.push(json!({"name":"DOCKER_HOST","value":DOCKER_SOCKET}));
