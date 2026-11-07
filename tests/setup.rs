@@ -39,7 +39,7 @@ fn setup_saves_defaults_used_by_workspace_commands_and_keeps_them_on_rerun() {
     assert_ok(adm(
         root.path(),
         &["setup"],
-        "registry.example/adm-code:v2\n\nreplicated-work\nopenai/example-model\nn\n",
+        "registry.example/adm-code:v2\n\nreplicated-work\nopenai/example-model\nAmerica/Toronto\nn\n",
     ));
     let config_path = root.path().join("config/adm/config.json");
     let configured: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
@@ -50,7 +50,8 @@ fn setup_saves_defaults_used_by_workspace_commands_and_keeps_them_on_rerun() {
     );
     assert_eq!(configured["storageClass"], "replicated-work");
     assert_eq!(configured["model"], "openai/example-model");
-    assert_eq!(configured.as_object().unwrap().len(), 4);
+    assert_eq!(configured["timezone"], "America/Toronto");
+    assert_eq!(configured.as_object().unwrap().len(), 5);
 
     let output = assert_ok(adm(root.path(), &["manifest", "configured"], ""));
     let manifest: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -68,6 +69,12 @@ fn setup_saves_defaults_used_by_workspace_commands_and_keeps_them_on_rerun() {
         "registry.example/adm-code:v2"
     );
     assert_eq!(claim["spec"]["storageClassName"], "replicated-work");
+    assert!(
+        deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!({"name":"TZ","value":"America/Toronto"}))
+    );
 
     let bot = assert_ok(adm(
         root.path(),
@@ -87,7 +94,7 @@ fn setup_saves_defaults_used_by_workspace_commands_and_keeps_them_on_rerun() {
     );
     assert_eq!(bot_pod["containers"].as_array().unwrap().len(), 1);
 
-    assert_ok(adm(root.path(), &["setup"], "\n\n\n\nn\n"));
+    assert_ok(adm(root.path(), &["setup"], "\n\n\n\n\nn\n"));
     let retained: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     assert_eq!(retained, configured);
     assert!(
@@ -103,17 +110,19 @@ fn saved_setup_image_is_preserved_even_if_release_metadata_is_unavailable() {
     assert_ok(adm(
         root.path(),
         &["setup"],
-        "registry.example/kept:v1\n\n\n\nn\n",
+        "registry.example/kept:v1\n\n\n\n\nn\n",
     ));
     let runtime = root.path().join("runtime");
     fs::create_dir_all(&runtime).unwrap();
     assert_ok(adm(
         root.path(),
         &["--project-dir", runtime.to_str().unwrap(), "setup"],
-        "\n\n\n\nn\n",
+        "\n\n\n\n\nn\n",
     ));
     let configured: Value =
         serde_json::from_slice(&fs::read(root.path().join("config/adm/config.json")).unwrap())
             .unwrap();
     assert_eq!(configured["image"], "registry.example/kept:v1");
+    // Enter at the timezone prompt saves none: workspaces follow the machine.
+    assert!(configured.get("timezone").is_none(), "{configured}");
 }

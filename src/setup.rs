@@ -234,14 +234,14 @@ pub fn run(cli: &Cli) -> Result<()> {
     } else {
         Some(model)
     };
+    // '-' (no saved zone) keeps following this machine, so a client that
+    // moves timezones moves its new workspaces too.
     let timezone = prompt(
-        "Workspace timezone (IANA, e.g. America/Toronto; '-' follows this machine)",
-        config
-            .timezone
-            .clone()
-            .or_else(local_timezone)
-            .as_deref()
-            .unwrap_or("UTC"),
+        &format!(
+            "Workspace timezone (IANA, e.g. America/Toronto; '-' follows this machine, now {})",
+            local_timezone().as_deref().unwrap_or("UTC")
+        ),
+        config.timezone.as_deref().unwrap_or("-"),
     )?;
     config.timezone = (!timezone.is_empty() && timezone != "-").then_some(timezone);
     config.validate()?;

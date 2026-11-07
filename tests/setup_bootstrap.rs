@@ -133,7 +133,7 @@ else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
     let output = assert_ok(invoke(
         root.path(),
         &arguments,
-        "registry.example/adm-code:v2\n\nreplicated-work\n\n\n",
+        "registry.example/adm-code:v2\n\nreplicated-work\n\n\n\n",
     ));
     let config_path = root.path().join("config/adm/config.json");
     let configured: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
@@ -191,7 +191,7 @@ else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
         json!([])
     );
-    assert_ok(invoke(root.path(), &arguments, "\n\n\n\n\n"));
+    assert_ok(invoke(root.path(), &arguments, "\n\n\n\n\n\n"));
     fs::write(root.path().join("client-token"), &token).unwrap();
     let explicit_arguments = [
         "--kubectl",
@@ -202,7 +202,7 @@ else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
         "client-token",
         "setup",
     ];
-    assert_ok(invoke(root.path(), &explicit_arguments, "\n\n\n\n\n"));
+    assert_ok(invoke(root.path(), &explicit_arguments, "\n\n\n\n\n\n"));
     let configured: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     assert_eq!(
         configured["lifecycle"]["tokenFile"],
@@ -218,7 +218,7 @@ else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
     assert!(!calls.contains(token.trim()));
     let saved = fs::read(&config_path).unwrap();
     fs::write(root.path().join("fail-rollout"), "").unwrap();
-    let output = invoke(root.path(), &arguments, "\n\n\n\n\n");
+    let output = invoke(root.path(), &arguments, "\n\n\n\n\n\n");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("ImagePullBackOff"));
     assert!(
@@ -247,7 +247,7 @@ else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
         "{classes:?}"
     );
     fs::write(root.path().join("bases-pending"), "").unwrap();
-    let output = invoke(root.path(), &arguments, "\n\n\n\n\n");
+    let output = invoke(root.path(), &arguments, "\n\n\n\n\n\n");
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -266,7 +266,7 @@ else: print('unexpected kubectl args: '+repr(args),file=sys.stderr);sys.exit(2)
         "synthetic-mismatched-token",
     )
     .unwrap();
-    let output = invoke(root.path(), &explicit_arguments, "\n\n\n\n\n");
+    let output = invoke(root.path(), &explicit_arguments, "\n\n\n\n\n\n");
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("does not match"), "{error}");
