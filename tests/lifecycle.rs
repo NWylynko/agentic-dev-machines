@@ -3978,6 +3978,37 @@ impl MaintenanceFixture {
 /// TASK-93: a runtime renews during a controller maintenance window and acks
 /// it, but the window ends (expires, or the update completes) before the ack
 /// lands. Its lease is still valid, so that is not a fencing event.
+/// Each request opens and closes its own SQLite connection. SQLite 3.51.0-3.51.1
+/// deadlocked when closing the last WAL connection raced another thread opening
+/// one (unixBigLock against pLockMutex). `/health` opens no connection and stayed
+/// green while every other route hung forever (live 2026-11-08).
+#[test]
+fn concurrent_requests_opening_and_closing_the_store_never_wedge_the_lifecycle() {
+    let fixture = start_maintenance_fixture();
+    let clients: Vec<_> = (0..4)
+        .map(|_| {
+            let url = fixture.url.clone();
+            thread::spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(20))
+                    .build()
+                    .unwrap();
+                for _ in 0..300 {
+                    let response = client
+                        .get(format!("{url}/v1/workspaces"))
+                        .bearer_auth("synthetic-lifecycle-token")
+                        .send()
+                        .expect("the lifecycle must answer every request");
+                    assert_eq!(response.status(), 200);
+                }
+            })
+        })
+        .collect();
+    for client in clients {
+        client.join().unwrap();
+    }
+}
+
 #[test]
 fn a_maintenance_ack_after_the_window_ended_is_answered_without_fencing_a_valid_lease() {
     let fixture = start_maintenance_fixture();

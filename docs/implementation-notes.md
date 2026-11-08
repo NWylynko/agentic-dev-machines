@@ -117,3 +117,12 @@ Dated log of what each ticket changed, the gotchas found, and what was still to 
 - Fix: `create_persisted` waits for deployment readiness (Pod Ready = lease held) before `prepare_repository`. The `cli.rs` fake kubectl refuses the clone until the namespace's `available` wait has run.
 - Bots could not name the release's images (the tool required `image`, and `workspace_image`/`repositories_image` defaulted to `:latest`). setup/update now give the lifecycle container `ADM_CODE_IMAGE`, `ADM_WORKSPACE_IMAGE`, `ADM_REPOSITORIES_IMAGE` from the release dir; a bot create fills `image` when omitted and always takes the release's init and repositories images (`apply_release_images_to_bot_create`). An unreleased lifecycle has no image env and requires the bot to name `image`. Test: `bot_created_coding_agents_run_the_cluster_release_images`.
 - Not yet verified live: needs a release and `adm update`.
+
+## 2026-11-08 — lifecycle wedged by a SQLite deadlock
+
+- Live: every lifecycle route except `/health` hung from 14:43 UTC; `adm claude dev` and `adm doctor` Providers timed out, while Pods, probes and `adm doctor`'s Lifecycle section stayed green. Workspace `dev` fenced itself at its lease deadline (~5 min later) and could not reacquire. The process held 1155 threads and 1064 CLOSE_WAIT sockets.
+- Cause: SQLite 3.51.0's broken-POSIX-lock check (`unixIsSharingShmNode`, called from `unixLock`) takes `unixBigLock` while holding `pLockMutex`; `findReusableFd` takes them in the other order. Each request opens and closes its own connection, so closing the last WAL connection races the next open. Read from `/proc/1/mem`: thread A owned `unixBigLock` and waited on `pLockMutex`, thread B the reverse. Fixed upstream in 3.51.2.
+- Fix: `rusqlite` 0.41 (SQLite 3.54.1). `concurrent_requests_opening_and_closing_the_store_never_wedge_the_lifecycle` hung 4/4 on 3.51.1 and passed 12/12 on 3.54.1 (300 requests from each of 4 clients).
+- The `Broken pipe` log lines are from connections closed before a complete request: the handler answers 401 to the empty request and the write fails. A bare connect-and-close reproduced one.
+- Still open: `/health` does not open the store, so liveness cannot see a wedged database.
+- Not yet verified live: needs a release and `adm update`.
