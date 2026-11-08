@@ -184,10 +184,14 @@ spec:
             httpGet:
               path: /health
               port: http
+            # /health opens the database; a 1 s default is shorter than a replicated-volume fsync.
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /health
               port: http
+            # /health opens the database; a 1 s default is shorter than a replicated-volume fsync.
+            timeoutSeconds: 5
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000

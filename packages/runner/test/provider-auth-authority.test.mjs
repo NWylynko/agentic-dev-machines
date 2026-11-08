@@ -1069,6 +1069,66 @@ test("shared auth retries a controller transport failure only after its lease ga
   }
 });
 
+test("provider-auth keeps serving through a lifecycle database outage and exits when the lifecycle owner changes", async (t) => {
+  const freePort = () =>
+    new Promise((resolve) => {
+      const server = createServer().listen(0, "127.0.0.1", () => {
+        const { port } = server.address();
+        server.close(() => resolve(port));
+      });
+    });
+  const port = await freePort();
+  const probePort = await freePort();
+  let health = { status: 200, body: { status: "ok", ownerEpoch: 1 } };
+  const lifecycle = createServer((_request, response) => {
+    response.writeHead(health.status, { "content-type": "application/json" });
+    response.end(JSON.stringify(health.body));
+  });
+  await new Promise((resolve) => lifecycle.listen(0, "127.0.0.1", resolve));
+  t.after(() => lifecycle.close());
+  const directory = await mkdtemp(join(tmpdir(), "adm-provider-auth-owner-"));
+  const child = spawn(
+    process.execPath,
+    [
+      new URL("../src/provider-auth-main.ts", import.meta.url).pathname,
+      "--port", String(port),
+      "--probe-port", String(probePort),
+      "--auth-path", join(directory, "auth.json"),
+      "--lifecycle-url", `http://127.0.0.1:${lifecycle.address().port}`,
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  const exited = once(child, "exit");
+  t.after(async () => {
+    child.kill("SIGKILL");
+    await rm(directory, { recursive: true });
+  });
+  child.stdout.setEncoding("utf8");
+  let output = "";
+  while (!output.includes("provider-auth liveness listening")) {
+    const [chunk] = await once(child.stdout, "data");
+    output += chunk;
+  }
+  const authorityHealth = () => fetch(`http://127.0.0.1:${port}/health`);
+  assert.equal((await authorityHealth()).status, 200);
+
+  // The lifecycle still owns its Lease while its database is failing.
+  health = {
+    status: 503,
+    body: { status: "unavailable", ownerEpoch: 1, error: "lifecycle database unavailable" },
+  };
+  assert.equal((await authorityHealth()).status, 200);
+  health = { status: 200, body: { status: "ok", ownerEpoch: 1 } };
+  assert.equal((await authorityHealth()).status, 200);
+
+  // A restarted lifecycle has a new epoch. Staying up would answer 503 forever
+  // behind a green liveness probe, so the container exits and kubelet restarts it.
+  health = { status: 200, body: { status: "ok", ownerEpoch: 2 } };
+  await authorityHealth().catch(() => undefined);
+  const [code] = await exited;
+  assert.notEqual(code, 0);
+});
+
 test("provider-auth answers kubelet liveness on the Pod IP while credentials stay loopback-only (TASK-94)", async (t) => {
   const podIp = Object.values(networkInterfaces())
     .flat()

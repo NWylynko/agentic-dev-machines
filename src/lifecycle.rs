@@ -905,6 +905,14 @@ fn route(
                 serde_json::json!({"status":"unavailable","service":"adm-lifecycle","error":format!("lifecycle Lease ownership lost: {error:#}")}),
             ));
         }
+        // The same store path as every other route: a database that fails or
+        // hangs here fails or times out the probe, and kubelet restarts the Pod.
+        if let Err(error) = cli.store() {
+            return Ok((
+                503,
+                serde_json::json!({"status":"unavailable","service":"adm-lifecycle","ownerEpoch":cli.lifecycle_fence.as_ref().map(crate::lease::LeaseFence::epoch),"error":format!("lifecycle database unavailable: {error:#}")}),
+            ));
+        }
         return Ok((
             200,
             serde_json::json!({"status":"ok","service":"adm-lifecycle","ownerEpoch":cli.lifecycle_fence.as_ref().map(crate::lease::LeaseFence::epoch)}),

@@ -44,6 +44,20 @@ impl Drop for ServiceProcess {
     }
 }
 
+impl ServiceProcess {
+    /// A Pod crash takes the service and every kubectl it started. Killing only
+    /// the service would leave a Lease renewal in flight, free to overwrite the
+    /// Lease after a test ages it for the restart.
+    fn crash(&mut self) {
+        let group = self.0.id() as i32;
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+        self.0.wait().unwrap();
+        wait_for(|| (unsafe { libc::kill(-group, 0) } == -1).then_some(()));
+    }
+}
+
 fn service_log(root: &Path) -> String {
     fs::read_to_string(root.join("service.log")).unwrap_or_default()
 }
@@ -677,8 +691,7 @@ fn create_retries_recover_only_the_latest_failed_attempt_after_restart() {
     .unwrap()
     .json()
     .unwrap();
-    service.kill().unwrap();
-    service.wait().unwrap();
+    service.crash();
     fs::remove_file(root.path().join("fail-wait")).unwrap();
     let lease_path = root.path().join("lease.json");
     let mut lease: Value = serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
@@ -714,8 +727,7 @@ fn create_retries_recover_only_the_latest_failed_attempt_after_restart() {
         earlier, earlier_failure,
         "restart must not run superseded create attempts"
     );
-    restarted.kill().unwrap();
-    restarted.wait().unwrap();
+    restarted.crash();
     stop_http_stub(runner_port, runner_server);
 }
 
@@ -1015,8 +1027,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         "stale owner must stop before its next Kubernetes mutation"
     );
 
-    service.kill().unwrap();
-    service.wait().unwrap();
+    service.crash();
     let lease_path = root.path().join("lease.json");
     let mut lease: Value = serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
     lease["metadata"]["annotations"]["adm.dev/renew-unix"] = "0".into();
@@ -1232,8 +1243,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     assert!(!conflicting_retry.status.success());
     assert!(String::from_utf8_lossy(&conflicting_retry.stderr).contains(destroy_operation));
 
-    restarted.kill().unwrap();
-    restarted.wait().unwrap();
+    restarted.crash();
     let delete_process = fs::read_to_string(root.path().join("delete-process"))
         .unwrap()
         .parse::<i32>()
@@ -3308,8 +3318,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         .and_then(|response| response.json::<Value>().ok())
         .filter(|receipt| receipt["status"] == "completed")
     });
-    restarted.kill().unwrap();
-    restarted.wait().unwrap();
+    restarted.crash();
     stop_runtime_status_server(status_port, status_server);
     stop_http_stub(runner_port, runner_server);
 }
@@ -3978,6 +3987,62 @@ impl MaintenanceFixture {
 /// TASK-93: a runtime renews during a controller maintenance window and acks
 /// it, but the window ends (expires, or the update completes) before the ack
 /// lands. Its lease is still valid, so that is not a fencing event.
+/// Live 2026-11-08: `/health` stayed 200 for two hours while every other route
+/// hung on the database, so Kubernetes never restarted the Pod and `adm doctor`
+/// said "ok". Health must go through the same store path as real requests.
+#[test]
+fn health_and_doctor_report_a_broken_database_instead_of_ok() {
+    let fixture = start_maintenance_fixture();
+    let healthy = request(&fixture.url, "GET", "/health", None).unwrap();
+    assert_eq!(healthy.status(), 200);
+    assert_eq!(healthy.json::<Value>().unwrap()["status"], "ok");
+
+    let state = fixture.root.path().join("state");
+    for sidecar in ["workspaces.sqlite-wal", "workspaces.sqlite-shm"] {
+        if state.join(sidecar).exists() {
+            fs::remove_file(state.join(sidecar)).unwrap();
+        }
+    }
+    fs::write(
+        state.join("workspaces.sqlite"),
+        "this is not a sqlite database, and it is long enough to be read as a header. ".repeat(64),
+    )
+    .unwrap();
+
+    let broken = request(&fixture.url, "GET", "/health", None).unwrap();
+    assert_eq!(broken.status(), 503);
+    let body = broken.json::<Value>().unwrap();
+    assert_eq!(body["status"], "unavailable");
+    assert!(
+        body["error"].as_str().unwrap().contains("database"),
+        "{body}"
+    );
+    // Still the Lease owner: provider-auth must not read this as an owner change.
+    assert_eq!(body["ownerEpoch"], 1);
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args(["--state-dir"])
+        .arg(fixture.root.path().join("client-state"))
+        .args(["--kubectl"])
+        .arg(fixture.root.path().join("kubectl"))
+        .args(["--lifecycle-url", &fixture.url])
+        .args(["--lifecycle-token-file"])
+        .arg(fixture.root.path().join("token"))
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    let lifecycle_section = report
+        .split("Lifecycle service:")
+        .nth(1)
+        .and_then(|rest| rest.split("Providers:").next())
+        .unwrap_or_else(|| panic!("{report}"));
+    assert!(
+        lifecycle_section.contains("database") && !lifecycle_section.trim().starts_with("ok"),
+        "{report}"
+    );
+}
+
 /// Each request opens and closes its own SQLite connection. SQLite 3.51.0-3.51.1
 /// deadlocked when closing the last WAL connection raced another thread opening
 /// one (unixBigLock against pLockMutex). `/health` opens no connection and stayed

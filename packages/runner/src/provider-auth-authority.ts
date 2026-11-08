@@ -272,9 +272,14 @@ function cleanPrompt(prompt: AuthPrompt): Omit<AuthPrompt, "signal"> {
 
 export function createOwnerEpochGuard(
   readOwnerEpoch: () => Promise<number | undefined>,
+  onOwnerEpochInvalidated: () => void = () => {},
 ): () => Promise<boolean> {
   let ownerEpoch: number | undefined;
   let invalidated = false;
+  const invalidate = () => {
+    invalidated = true;
+    onOwnerEpochInvalidated();
+  };
   return async () => {
     if (invalidated) return false;
     let currentEpoch: number | undefined;
@@ -284,7 +289,7 @@ export function createOwnerEpochGuard(
       currentEpoch = undefined;
     }
     if (!Number.isSafeInteger(currentEpoch) || currentEpoch! <= 0) {
-      if (ownerEpoch !== undefined) invalidated = true;
+      if (ownerEpoch !== undefined) invalidate();
       return false;
     }
     if (ownerEpoch === undefined) {
@@ -292,7 +297,7 @@ export function createOwnerEpochGuard(
       return true;
     }
     if (ownerEpoch !== currentEpoch) {
-      invalidated = true;
+      invalidate();
       return false;
     }
     return true;

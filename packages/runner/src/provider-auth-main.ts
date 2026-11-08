@@ -19,16 +19,25 @@ const { values } = parseArgs({
 });
 const authority = await createProviderAuthAuthority({
   authPath: values["auth-path"]!,
-  ownerGuard: createOwnerEpochGuard(async () => {
-    try {
-      const response = await fetch(`${values["lifecycle-url"]}/health`);
-      if (!response.ok) return undefined;
-      const health = (await response.json()) as { ownerEpoch?: unknown };
-      return typeof health.ownerEpoch === "number" ? health.ownerEpoch : undefined;
-    } catch {
-      return undefined;
-    }
-  }),
+  ownerGuard: createOwnerEpochGuard(
+    async () => {
+      try {
+        // A 503 still names the owner when only the lifecycle's database is
+        // failing; a 503 for a lost Lease names none.
+        const response = await fetch(`${values["lifecycle-url"]}/health`);
+        const health = (await response.json()) as { ownerEpoch?: unknown };
+        return typeof health.ownerEpoch === "number" ? health.ownerEpoch : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    // This authority can never serve again, and its liveness probe stays green,
+    // so exit: kubelet restarts the container against the current owner.
+    () => {
+      console.error("provider-auth exiting: the lifecycle owner changed or stopped answering");
+      process.exit(1);
+    },
+  ),
 });
 authority.server.listen(Number(values.port), values.host);
 // Kubelet probes connect to the Pod IP, but the authority (credentials) is

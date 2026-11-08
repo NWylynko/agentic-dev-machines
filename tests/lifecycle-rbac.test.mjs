@@ -145,6 +145,10 @@ test("lifecycle Pod probes are kubelet HTTP checks and provider-auth cannot take
     port: "auth-liveness",
   });
   assert.equal(authority.livenessProbe.timeoutSeconds, 3);
+  const lifecycleContainer = pod.containers.find((container) => container.name === "lifecycle");
+  // /health opens the database, which takes longer than the default 1 s on a replicated volume.
+  assert.equal(lifecycleContainer.readinessProbe.timeoutSeconds, 5);
+  assert.equal(lifecycleContainer.livenessProbe.timeoutSeconds, 5);
   assert.ok(
     authority.ports.some(
       (port) => port.name === "auth-liveness" && port.containerPort === 7435,

@@ -124,5 +124,17 @@ Dated log of what each ticket changed, the gotchas found, and what was still to 
 - Cause: SQLite 3.51.0's broken-POSIX-lock check (`unixIsSharingShmNode`, called from `unixLock`) takes `unixBigLock` while holding `pLockMutex`; `findReusableFd` takes them in the other order. Each request opens and closes its own connection, so closing the last WAL connection races the next open. Read from `/proc/1/mem`: thread A owned `unixBigLock` and waited on `pLockMutex`, thread B the reverse. Fixed upstream in 3.51.2.
 - Fix: `rusqlite` 0.41 (SQLite 3.54.1). `concurrent_requests_opening_and_closing_the_store_never_wedge_the_lifecycle` hung 4/4 on 3.51.1 and passed 12/12 on 3.54.1 (300 requests from each of 4 clients).
 - The `Broken pipe` log lines are from connections closed before a complete request: the handler answers 401 to the empty request and the write fails. A bare connect-and-close reproduced one.
-- Still open: `/health` does not open the store, so liveness cannot see a wedged database.
+- `/health` now opens the store, so a failing or hung database fails the probe and kubelet restarts the lifecycle container (probe timeout raised from 1 s to 5 s). It writes: `open_fenced` upserts `lifecycle_owner`.
+- provider-auth exits when the lifecycle owner changes or stops answering. A restarted lifecycle container has a new epoch, and the guard used to answer 503 forever behind a green liveness probe, leaving `adm login`, GitHub and Claude credentials dead. The guard reads `ownerEpoch` from a 503 too, so a database outage alone does not trigger this.
 - Not yet verified live: needs a release and `adm update`.
+
+## 2026-11-08 — flaky tests
+
+Found by stressing suites under CPU load (`yes` burners, `taskset -c 0,1`) and reading failed CI runs.
+
+- `admitted_create_survives_service_crash…`: killing only the service left a Lease renewal in flight, which overwrote the Lease after the test aged it, so the restart answered `held by another active owner`. `ServiceProcess::crash` kills the process group and waits for it to empty. Proved by holding a renewal in flight: old kill failed 4/4, `crash` passed 4/4.
+- `herdr_watch_replays…`: `.find().unwrap()` on `adm list` while cleanup ran in the background.
+- Terminal PTY tests: 3-10 s budgets against a ~2.5 s Pi startup. All now use `packages/terminal/test/wait-budget.ts`, with `unref()` so unused timers do not hold the process open.
+- `a root-owned loop delivers…`: the loop came due during `/new` once setup took over 1.5 s, answering `WORKSPACE_BUSY`. It now retries on that code and polls for delivery instead of sleeping 3.5 s.
+- `attach selects a model…` retyped `/model` after 1.5 s, into the selector if its auto-open was merely late. Removed.
+- `attach shows a provider catalog error…` asserted "within 2 s" against a fixture that answers at once, which only measured load. It now asserts the error reaches the screen.
