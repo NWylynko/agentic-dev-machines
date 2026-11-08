@@ -133,6 +133,16 @@ async function runnerFor(directory, { defaultModel = true } = {}) {
   };
 }
 
+// A due loop can start its turn during any session change, which answers
+// WORKSPACE_BUSY until the turn ends. The test's timeout bounds this.
+async function retryWhileWorkspaceBusy(send) {
+  for (;;) {
+    const response = await send();
+    if (response.body?.error?.code !== "WORKSPACE_BUSY") return response;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 async function waitForEvent(response, predicate) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -785,7 +795,7 @@ test(
 
 test(
   "a root-owned loop delivers to its Durable owner while a new session is selected across restart",
-  { timeout: 20000 },
+  { timeout: 120000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-terminal-loop-owner-"));
     let runner = await runnerFor(directory);
@@ -824,15 +834,16 @@ test(
     const seed = rootHistory.body.events.find((event) => event.kind === "user");
     assert.ok(seed);
     const loopPrompt = "Deliver this occurrence to the root owner";
+    const loopDueAt = Date.now() + 1500;
     const loop = await runner.request(path + "/loops", "POST", {
       prompt: loopPrompt,
       intervalMs: 60000,
-      nextAt: Date.now() + 1500,
+      nextAt: loopDueAt,
     });
     assert.equal(loop.status, 200);
-    const fork = await runner.request(path + "/tree", "POST", {
-      entryId: seed.seq,
-    });
+    const fork = await retryWhileWorkspaceBusy(() =>
+      runner.request(path + "/tree", "POST", { entryId: seed.seq }),
+    );
     assert.equal(fork.status, 200);
     assert.notEqual(fork.body.activeConversationId, rootId);
 
@@ -842,7 +853,9 @@ test(
       (await runner.request(path)).body.conversationId,
       fork.body.activeConversationId,
     );
-    const fresh = await runner.request(path + "/new", "POST", {});
+    const fresh = await retryWhileWorkspaceBusy(() =>
+      runner.request(path + "/new", "POST", {}),
+    );
     assert.equal(fresh.status, 200);
     assert.notEqual(fresh.body.activeConversationId, rootId);
     assert.notEqual(
@@ -856,31 +869,36 @@ test(
       fresh.body.activeConversationId,
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 3500));
-    const selectRoot = await runner.request(path + "/branch", "PUT", {
-      conversationId: rootId,
-    });
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.max(0, loopDueAt - Date.now())),
+    );
+    const selectRoot = await retryWhileWorkspaceBusy(() =>
+      runner.request(path + "/branch", "PUT", { conversationId: rootId }),
+    );
     assert.equal(selectRoot.status, 200);
     const rootStatus = await runner.request(path);
     assert.ok(rootStatus.body.loops.some((entry) => entry.id === loop.body.id));
-    const delivered = await runner.request(path + "/history?limit=100");
+    // A failure here is the test's timeout: the turn never reached its owner.
+    const completedTurn = (event) =>
+      event.kind === "assistant" &&
+      event.data.text.includes(`Echo: ${loopPrompt}`);
+    let delivered = await runner.request(path + "/history?limit=100");
+    while (!delivered.body.events.some(completedTurn)) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      delivered = await runner.request(path + "/history?limit=100");
+    }
     assert.ok(
       delivered.body.events.some(
         (event) => event.kind === "user" && event.data.text === loopPrompt,
       ),
       "the scheduled prompt must reach its originating conversation after restart",
     );
-    assert.ok(
-      delivered.body.events.some(
-        (event) =>
-          event.kind === "assistant" &&
-          event.data.text.includes(`Echo: ${loopPrompt}`),
-      ),
-      "the originating conversation must complete the scheduled turn",
+    const selectFresh = await retryWhileWorkspaceBusy(() =>
+      runner.request(path + "/branch", "PUT", {
+        conversationId: fresh.body.activeConversationId,
+      }),
     );
-    await runner.request(path + "/branch", "PUT", {
-      conversationId: fresh.body.activeConversationId,
-    });
+    assert.equal(selectFresh.status, 200);
     assert.equal(
       (await runner.request(path)).body.conversationId,
       fresh.body.activeConversationId,

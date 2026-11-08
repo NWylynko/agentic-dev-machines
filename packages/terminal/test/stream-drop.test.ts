@@ -23,6 +23,8 @@ import { fileURLToPath } from "node:url";
 import xterm from "@xterm/headless";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { WorkspaceTerminal, type WorkspaceEvent } from "../src/terminal.ts";
+import { TERMINAL_TEST_TIMEOUT_MS, TERMINAL_WAIT_MS } from "./wait-budget.ts";
+
 
 // The runner declares this keepalive on its event stream; the attached
 // terminal treats three silent intervals as a dead stream.
@@ -249,8 +251,8 @@ async function attachThroughProxy(t: TestContext, id: string) {
               ),
             ),
           ),
-        10000,
-      );
+        TERMINAL_WAIT_MS,
+      ).unref();
       const done = (settle: () => void) => {
         if (settled) return;
         settled = true;
@@ -338,7 +340,7 @@ async function attachThroughProxy(t: TestContext, id: string) {
 
 test(
   "a native terminal whose event stream is killed mid-turn shows it is disconnected, reconnects on its own, and shows the gap once",
-  { timeout: 40000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async (t) => {
     const attached = await attachThroughProxy(t, "stream-drop-killed");
     await attached.submit(fauxPrompt({ answer: "Reply before the drop" }));
@@ -408,7 +410,7 @@ test(
 
 test(
   "a native terminal notices a silent half-open event stream within its keepalive deadline and reconnects",
-  { timeout: 40000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async (t) => {
     const attached = await attachThroughProxy(t, "stream-drop-silent");
     await attached.submit(fauxPrompt({ answer: "Reply before the silence" }));

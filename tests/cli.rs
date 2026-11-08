@@ -3346,17 +3346,20 @@ fn herdr_watch_replays_a_received_close_after_cleanup_failure() {
     assert!(!first_receipt.exists());
     // --all: a delete that already finished drops out of the default listing.
     let remaining = assert_ok(adm(root.path(), &["list", "--json", "--all"]));
+    // Cleanup runs in the background, so a workspace may be mid-delete, deleted,
+    // or already gone from the list.
     for workspace in [&workspace, &other_workspace] {
-        let entry = remaining
+        if let Some(entry) = remaining
             .as_array()
             .unwrap()
             .iter()
             .find(|entry| entry["id"] == workspace["id"])
-            .unwrap();
-        assert!(matches!(
-            entry["phase"].as_str().unwrap(),
-            "deleting" | "deleted"
-        ));
+        {
+            assert!(matches!(
+                entry["phase"].as_str().unwrap(),
+                "deleting" | "deleted"
+            ));
+        }
     }
 }
 

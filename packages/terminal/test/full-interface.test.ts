@@ -25,6 +25,7 @@ import {
   stripTerminalSequences,
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
+import { TERMINAL_TEST_TIMEOUT_MS, TERMINAL_WAIT_MS } from "./wait-budget.ts";
 
 test("Pi command aliases open their Durable-backed controls and hotkey help", async () => {
   let stream: import("node:http").ServerResponse | undefined;
@@ -858,7 +859,7 @@ test("Pi compact and retry controls call the Durable workspace operations", asyn
 
 test(
   "Pi rendering preserves thinking, provider usage, tool arguments and details",
-  { timeout: 5000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     let stream: import("node:http").ServerResponse | undefined;
     const server = createServer(async (request, response) => {
@@ -978,7 +979,7 @@ test(
 
 test(
   "native Pi keybindings expand tool details and control thinking",
-  { timeout: 5000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     let stream: import("node:http").ServerResponse | undefined;
     const settings: string[] = [];
@@ -1060,8 +1061,8 @@ test(
         const timeout = setTimeout(
           () =>
             reject(new Error(`Timed out waiting for ${label}: ${rendered}`)),
-          1000,
-        );
+          TERMINAL_WAIT_MS,
+        ).unref();
         notify = () => {
           if (predicate()) {
             clearTimeout(timeout);
@@ -1147,7 +1148,7 @@ test(
 
 test(
   "branch selection replays that conversation and reconnect does not duplicate it",
-  { timeout: 5000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     let active = 2;
     let selectedResolve!: () => void;

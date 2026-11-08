@@ -18,6 +18,7 @@ import {
   startPodLifecycle,
   startPodRunner,
 } from "../../runner/test/pod-fixture.ts";
+import { TERMINAL_TEST_TIMEOUT_MS, TERMINAL_WAIT_MS } from "./wait-budget.ts";
 
 // Interpret Pi's main-screen CSI cursor moves/erases and skip SGR/mode/OSC codes.
 // Assertions use the current screen, so a stale spinner or duplicate row fails.
@@ -107,7 +108,7 @@ class BotPtyScreen {
 
 test(
   "native bot attach renders live onboarding, published replies, and private working activity across reconnect",
-  { timeout: 40000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-bot-live-"));
     // A private, gated tool round comes from an installation MCP connector,
@@ -243,8 +244,8 @@ test(
                   `Missing bot screen ${description}: ${screen.text()}; output=${text()}; runner=${errors()}`,
                 ),
               ),
-            5000,
-          );
+            TERMINAL_WAIT_MS,
+          ).unref();
           const check = () => {
             if (predicate(screen.text())) {
               clearTimeout(timer);

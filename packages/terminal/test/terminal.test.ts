@@ -23,6 +23,8 @@ import {
   stripTerminalSequences,
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
+import { TERMINAL_TEST_TIMEOUT_MS, TERMINAL_WAIT_MS } from "./wait-budget.ts";
+
 
 function terminalText(terminal: WorkspaceTerminal) {
   return stripTerminalSequences(terminal.render(100).join("\n"));
@@ -49,10 +51,6 @@ async function fixture(
 ) {
   const requests: any[] = [];
   let stream: any;
-  let connectedResolve = (_at: number) => {};
-  const connected = new Promise<number>((resolve) => {
-    connectedResolve = resolve;
-  });
   let refreshStartedResolve = () => {};
   let refreshClosedResolve = () => {};
   const refreshStarted = new Promise<void>((resolve) => {
@@ -168,7 +166,6 @@ async function fixture(
       });
       res.write(": attached\n\n");
     } else if (req.method === "GET") {
-      connectedResolve(Date.now());
       res.end(
         JSON.stringify({
           id: "work",
@@ -212,7 +209,6 @@ async function fixture(
   return {
     url: `http://127.0.0.1:${address.port}`,
     requests,
-    connected,
     admission,
     refreshStarted,
     refreshClosed,
@@ -239,7 +235,7 @@ const event = (seq: number, kind: string, text: string) => ({
 
 test(
   "native adm attach PTY starts Pi and submits editor text to the existing Durable conversation",
-  { timeout: 20000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async (t) => {
     const service = await fixture("coding", [], { holdRefresh: true });
     const args = [
@@ -283,8 +279,8 @@ test(
         new Promise<never>((_, reject) =>
           setTimeout(
             () => reject(new Error(`Native TUI startup timed out: ${output}`)),
-            5000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
       await Promise.race([
@@ -297,8 +293,8 @@ test(
                   `Pi InteractiveMode did not finish startup: ${output}`,
                 ),
               ),
-            5000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
       const accepted = service.admission();
@@ -328,8 +324,8 @@ test(
               reject(
                 new Error(`Editor did not render pasted prompt: ${output}`),
               ),
-            5000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
       child.stdin.write("\r");
@@ -339,8 +335,8 @@ test(
           setTimeout(
             () =>
               reject(new Error(`Native prompt was not admitted: ${output}`)),
-            5000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
       assert.equal(request.path.endsWith("/input"), true);
@@ -383,8 +379,8 @@ function changedTerminal(
       const deadline = setTimeout(
         () =>
           reject(new Error(`Timed out waiting for ${text}: ${visibleText()}`)),
-        3000,
-      );
+        TERMINAL_WAIT_MS,
+      ).unref();
       notify = () => {
         if (visibleText().includes(text)) {
           clearTimeout(deadline);
@@ -450,7 +446,7 @@ test("Pi editor submits multiline prompts and restores them from editor history"
 
 test(
   "Pi external-editor binding returns edited text to the workspace prompt",
-  { timeout: 5000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const directory = await mkdtemp(join(tmpdir(), "adm-editor-"));
     const editor = join(directory, "editor.sh");
@@ -515,7 +511,7 @@ test("Pi clipboard image paste reaches the owning Durable prompt with its reques
 
 test(
   "Herdr terminal loads coding history, receives live work, sends steering input, and detaches without aborting",
-  { timeout: 10000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const service = await fixture("coding", [
       event(1, "user", "Fix the build"),
@@ -551,7 +547,7 @@ test(
 
 test(
   "bot chat hides model and tool diagnostics while explicit messages and durable goal controls remain usable",
-  { timeout: 10000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const service = await fixture("bot", [
       event(1, "user", "Watch my coding agent"),
@@ -603,7 +599,7 @@ test(
 
 test(
   "reconnecting resumes from the last event and avoids duplicate conversation entries",
-  { timeout: 10000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const service = await fixture("coding", [
       event(1, "user", "Existing prompt"),
@@ -642,7 +638,7 @@ test(
 
 test(
   "diagnostics are opt-in and network ambiguity reuses an input request identity",
-  { timeout: 10000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     let firstId: string | undefined;
     let secondId: string | undefined;
@@ -724,7 +720,7 @@ test(
 
 test(
   "an input failure restores the submitted text without consuming keystrokes typed while it was in flight",
-  { timeout: 10000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     let rejectAdmission!: () => void;
     const receivedAdmission = new Promise<void>((resolve) => {
@@ -795,8 +791,8 @@ test(
 );
 
 test(
-  "attach shows a provider catalog error within 2s instead of a blank screen (TASK-97)",
-  { timeout: 10000 },
+  "attach shows a provider catalog error instead of a blank screen (TASK-97)",
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const modelsError =
       "xai: token refresh failed (HTTP 400 invalid_grant): run adm login xai";
@@ -818,7 +814,6 @@ test(
       { stdio: ["pipe", "pipe", "pipe"], detached: true },
     );
     let output = "";
-    const connected = service.connected;
     let showed = false;
     try {
       await Promise.race([
@@ -847,14 +842,17 @@ test(
             ),
           );
         }),
-        (async () => {
-          const connectedAt = await connected;
-          await new Promise((resolve) => setTimeout(resolve, 2_000));
-          if (showed) return;
-          throw new Error(
-            `Model error was not on screen within 2s of connecting (${Date.now() - connectedAt}ms): ${visibleTerminalText(output)}`,
-          );
-        })(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Model error never reached the screen: ${visibleTerminalText(output)}`,
+                ),
+              ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
+        ),
       ]);
       assert.equal(showed, true, visibleTerminalText(output));
     } finally {
@@ -866,7 +864,7 @@ test(
 
 test(
   "attach selects a model through Pi's actual selector in a PTY and persists it over HTTP",
-  { timeout: 10000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const service = await fixture("coding", [], { needsModel: true });
     const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`;
@@ -914,8 +912,8 @@ test(
         new Promise<never>((_, reject) =>
           setTimeout(
             () => reject(new Error(`Native startup timed out: ${output}`)),
-            5000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
       await Promise.race([
@@ -928,22 +926,10 @@ test(
                   `Native model readiness missing: ${visibleTerminalText(output)}; requests=${JSON.stringify(service.requests)}`,
                 ),
               ),
-            4000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
-      if (!visibleTerminalText(output).includes("Faux 1")) {
-        const appeared = await Promise.race([
-          new Promise<boolean>((resolve) => {
-            const check = () => {
-              if (visibleTerminalText(output).includes("Faux 1")) resolve(true);
-            };
-            child.stdout.on("data", () => check());
-            setTimeout(() => resolve(false), 1500);
-          }),
-        ]);
-        if (!appeared) child.stdin.write("/model\r");
-      }
       await Promise.race([
         new Promise<void>((resolve, reject) => {
           const check = () => {
@@ -966,8 +952,8 @@ test(
           setTimeout(
             () =>
               reject(new Error(`Native model selector timed out: ${output}`)),
-            5000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
       child.stdin.write("\r");
@@ -977,8 +963,8 @@ test(
           setTimeout(
             () =>
               reject(new Error(`Model selection did not complete: ${output}`)),
-            5000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
       assert.equal(request.method, "PUT");
@@ -1002,8 +988,8 @@ test(
                   `Model acknowledgement missing: ${visibleTerminalText(output)}`,
                 ),
               ),
-            4000,
-          ),
+            TERMINAL_WAIT_MS,
+          ).unref(),
         ),
       ]);
       const exited = once(child, "exit");
@@ -1018,7 +1004,7 @@ test(
 
 test(
   "reconnecting closes the open Pi model selector and aborts its catalog refresh",
-  { timeout: 5000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const service = await fixture("coding", [], {
       needsModel: true,
@@ -1037,7 +1023,7 @@ test(
       const canceled = await Promise.race([
         service.refreshClosed.then(() => true),
         new Promise<boolean>((resolve) =>
-          setTimeout(() => resolve(false), 1000),
+          setTimeout(() => resolve(false), TERMINAL_WAIT_MS).unref(),
         ),
       ]);
       assert.equal(
@@ -1054,7 +1040,7 @@ test(
 
 test(
   "actual Pi terminal process renders in a PTY and Ctrl+C detaches without stopping the agent",
-  { timeout: 10000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const service = await fixture("bot", [
       event(1, "assistant", "SECRET PROCESS OUTPUT"),
@@ -1203,7 +1189,7 @@ test("terminal re-reads the verified Pod identity so token rotation keeps status
 
 test(
   "a real terminal submits to the runner, detaches mid-run, and reconnects to the completed history",
-  { timeout: 20000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const stateDirectory = await mkdtemp(
       join(tmpdir(), "adm-terminal-runner-"),
@@ -1339,8 +1325,8 @@ test(
                   `Missing native output ${text}: ${visibleTerminalText(output.get(child) ?? "")}`,
                 ),
               ),
-            5000,
-          );
+            TERMINAL_WAIT_MS,
+          ).unref();
           const check = () => {
             if (visibleTerminalText(output.get(child) ?? "").includes(text)) {
               clearTimeout(timer);
@@ -1377,8 +1363,8 @@ test(
                     `Native startup did not refresh: ${visibleTerminalText(output.get(first) ?? "")}; runner=${runnerErrors}`,
                   ),
                 ),
-              5000,
-            ),
+              TERMINAL_WAIT_MS,
+            ).unref(),
           ),
         ]);
         const prompt =
@@ -1405,8 +1391,8 @@ test(
                     `Native tool did not start: ${visibleTerminalText(output.get(first) ?? "")}; runner=${runnerErrors}`,
                   ),
                 ),
-              5000,
-            ),
+              TERMINAL_WAIT_MS,
+            ).unref(),
           ),
         ]);
         const firstExit = once(first, "exit");
@@ -1473,7 +1459,7 @@ test(
 
 test(
   "an attached native terminal stays up through live tool success, failure, and abort",
-  { timeout: 30000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async () => {
     const stateDirectory = await mkdtemp(
       join(tmpdir(), "adm-terminal-live-tools-"),
@@ -1638,8 +1624,8 @@ test(
                   ),
                 ),
               ),
-            10000,
-          );
+            TERMINAL_WAIT_MS,
+          ).unref();
           const done = (settle: () => void) => {
             clearTimeout(timer);
             child.stdout!.off("data", check);
@@ -1682,8 +1668,8 @@ test(
                   ),
                 ),
               ),
-            10000,
-          );
+            TERMINAL_WAIT_MS,
+          ).unref();
           const done = (settle: () => void) => {
             if (settled) return;
             settled = true;

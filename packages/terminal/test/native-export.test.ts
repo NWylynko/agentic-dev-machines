@@ -8,10 +8,11 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { DurableInteractiveRuntime } from "../src/native-runtime.ts";
 import { WorkspaceTerminal } from "../src/terminal.ts";
+import { TERMINAL_TEST_TIMEOUT_MS } from "./wait-budget.ts";
 
 test(
   "native exports preserve the Durable transcript and bot public-message boundary",
-  { timeout: 30000 },
+  { timeout: TERMINAL_TEST_TIMEOUT_MS },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-native-export-"));
     const child = spawn(
