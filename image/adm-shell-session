@@ -1,0 +1,211 @@
+#!/bin/sh
+# adm shell sessions (TASK-106): interactive shells that outlive their connection,
+# one dtach per session. State is in the container's /tmp, so sessions end with the
+# Pod and nothing stale survives a replacement.
+#
+# A dropped `kubectl exec` leaves its remote dtach client running on a PTY nobody
+# reads, and dtach then keeps marking the socket as attached. So each session records
+# which `adm shell` owns it (a token) and when that client last sent a heartbeat. A new
+# attach ends the previous client. Attached means dtach has a client and the heartbeat
+# is recent.
+#
+#   reserve NAME TOKEN             claim a new session name for this client
+#   take NAME TOKEN                make this client the owner of a live session
+#   attach NAME TOKEN [-- CMD...]  connect this terminal; start CMD if never started
+#   status NAME TOKEN              exit 0 if live and still owned by TOKEN
+#   beat NAME TOKEN                record a heartbeat from the owner
+#   list                           print the live sessions
+#
+# Exit codes the client acts on: 64 no such session, 73 name in use, 75 owned by
+# another client.
+set -eu
+root=${ADM_SHELL_SESSION_DIR:-/tmp/adm-shell-sessions}
+stale_after=${ADM_SHELL_SESSION_STALE_SECONDS:-90}
+# -z keeps Ctrl-Z for the shell's job control; dtach would otherwise suspend itself.
+# WINCH makes full-screen programs redraw on reattach. dtach replays no output.
+dtach_options="-r winch -z"
+
+usage() {
+  echo "usage: adm-shell-session reserve|take|attach|status|beat NAME TOKEN | list" >&2
+  exit 2
+}
+
+valid_name() {
+  case "$1" in
+    "" | .* | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+select_session() {
+  session=$1
+  valid_name "$session" || { echo "adm: invalid shell session name: $session" >&2; exit 64; }
+  dir=$root/$session
+  socket=$dir/socket
+}
+
+# proc_field PID N: field N of /proc/PID/stat counted after the parenthesised name,
+# which may hold spaces: 1 state, 2 ppid, 6 the terminal's foreground process group.
+# /proc rather than ps, which the slim workspace image does not ship.
+proc_field() {
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  printf '%s\n' "${stat##*) }" | cut -d' ' -f"$2"
+}
+
+shell_alive() {
+  # A master killed outright leaves its socket behind, so the shell decides. A shell
+  # that died while a background job still holds the terminal stays a zombie: dtach
+  # reaps it only at the terminal's EOF, and kill -0 would call it alive.
+  [ -s "$1/shell.pid" ] || return 0
+  state=$(proc_field "$(cat "$1/shell.pid")" 1) || return 1
+  [ "$state" != Z ]
+}
+
+# The dtach master of a session whose shell is gone, which would otherwise wait for
+# the background jobs to let go of the terminal.
+end_master() {
+  [ -s "$1/shell.pid" ] || return 0
+  shell=$(cat "$1/shell.pid")
+  [ "$(proc_field "$shell" 1)" = Z ] || return 0
+  master=$(proc_field "$shell" 2) || return 0
+  if grep -qa dtach "/proc/$master/cmdline" 2>/dev/null; then
+    kill "$master" 2>/dev/null || true
+  fi
+}
+
+session_live() {
+  [ -f "$1/started" ] || return 1
+  if [ ! -S "$1/socket" ]; then
+    # dtach creates the socket just after `started` is written.
+    [ $(($(date +%s) - $(stat -c %Y "$1/started"))) -lt 5 ] || return 1
+  fi
+  shell_alive "$1"
+}
+
+reserved() {
+  [ -f "$1/owner" ] && [ ! -f "$1/started" ]
+}
+
+end_client() {
+  [ -s "$1/client.pid" ] || return 0
+  client=$(cat "$1/client.pid")
+  # The pid may have been reused by now; only ever signal a dtach.
+  if grep -qa dtach "/proc/$client/cmdline" 2>/dev/null; then
+    kill "$client" 2>/dev/null || true
+  fi
+  rm -f "$1/client.pid"
+}
+
+heartbeat_fresh() {
+  [ -f "$1/beat" ] && [ $(($(date +%s) - $(stat -c %Y "$1/beat"))) -lt "$stale_after" ]
+}
+
+# Forget ended sessions and end clients whose connection is gone.
+sweep() {
+  for candidate in "$root"/*/; do
+    candidate=${candidate%/}
+    [ -d "$candidate" ] || continue
+    reserved "$candidate" && continue
+    if ! session_live "$candidate"; then
+      end_client "$candidate"
+      end_master "$candidate"
+      rm -rf -- "$candidate"
+    elif [ -x "$candidate/socket" ] && ! heartbeat_fresh "$candidate"; then
+      end_client "$candidate"
+      # dtach clears the socket's attached mark once the client has gone.
+      wait_count=0
+      while [ -x "$candidate/socket" ] && [ "$wait_count" -lt 10 ]; do
+        sleep 0.1
+        wait_count=$((wait_count + 1))
+      done
+    fi
+  done
+}
+
+print_sessions() {
+  found=
+  for candidate in "$root"/*/; do
+    candidate=${candidate%/}
+    [ -f "$candidate/started" ] || continue
+    if [ -z "$found" ]; then
+      printf '%-16s %-17s %-9s %s\n' SESSION STARTED STATE COMMAND
+      found=1
+    fi
+    state=detached
+    if [ -x "$candidate/socket" ] && heartbeat_fresh "$candidate"; then state=attached; fi
+    current=-
+    if [ -s "$candidate/shell.pid" ]; then
+      shell=$(cat "$candidate/shell.pid")
+      # The terminal's foreground process group is what the session is running now.
+      foreground=$(proc_field "$shell" 6) || foreground=
+      [ "${foreground:-0}" -gt 0 ] 2>/dev/null || foreground=$shell
+      current=$(tr '\0' ' ' < "/proc/$foreground/cmdline" 2>/dev/null | cut -c1-60) || current=
+      current=${current% }
+      [ -n "$current" ] || current=-
+    fi
+    printf '%-16s %-17s %-9s %s\n' "${candidate##*/}" \
+      "$(date -d "@$(cat "$candidate/started")" '+%Y-%m-%d %H:%M')" "$state" "$current"
+  done
+  [ -n "$found" ] || echo "No live shell sessions."
+}
+
+action=${1:-}
+case "$action" in
+  reserve | take | attach | status | beat)
+    [ $# -ge 3 ] || usage
+    select_session "$2"
+    token=$3
+    shift 3
+    ;;
+  list) ;;
+  *) usage ;;
+esac
+
+mkdir -p "$root"
+chmod 700 "$root"
+
+case "$action" in
+  reserve)
+    sweep
+    mkdir "$dir" 2>/dev/null || { echo "adm: shell session $session already exists" >&2; exit 73; }
+    printf '%s\n' "$token" > "$dir/owner"
+    ;;
+  take)
+    sweep
+    if ! session_live "$dir"; then
+      echo "adm: no live shell session named $session" >&2
+      print_sessions >&2
+      exit 64
+    fi
+    end_client "$dir"
+    printf '%s\n' "$token" > "$dir/owner"
+    ;;
+  status)
+    if ! session_live "$dir" && ! reserved "$dir"; then exit 64; fi
+    [ "$(cat "$dir/owner" 2>/dev/null)" = "$token" ] || exit 75
+    ;;
+  beat)
+    [ "$(cat "$dir/owner" 2>/dev/null)" = "$token" ] || exit 75
+    : > "$dir/beat"
+    ;;
+  attach)
+    if [ ! -f "$dir/owner" ]; then exit 64; fi
+    [ "$(cat "$dir/owner")" = "$token" ] || exit 75
+    end_client "$dir"
+    printf '%s\n' "$$" > "$dir/client.pid"
+    : > "$dir/beat"
+    if reserved "$dir"; then
+      [ "${1:-}" = "--" ] || usage
+      shift
+      date +%s > "$dir/started"
+      # shellcheck disable=SC2086 # word splitting is how the options are passed
+      exec dtach -c "$socket" $dtach_options /bin/sh -c 'echo "$$" > "$0"; exec "$@"' "$dir/shell.pid" "$@"
+    fi
+    session_live "$dir" || exit 64
+    # shellcheck disable=SC2086
+    exec dtach -a "$socket" $dtach_options
+    ;;
+  list)
+    sweep
+    print_sessions
+    ;;
+esac

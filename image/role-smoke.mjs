@@ -171,6 +171,13 @@ const smokeFnmSwitchesNodePerProject = async () => {
   }
 };
 
+// `adm shell` (TASK-106) runs this tool as UID 1000 for every interactive shell; without
+// it or dtach the client tells the user to run `adm update --workspace`.
+const smokeShellSessionTool = async () => {
+  const { stdout } = await execute("docker", ["run", "--rm", "--user", "1000:1000", "--entrypoint", "/bin/sh", image, "-ec", "command -v dtach >/dev/null && adm-shell-session list"]);
+  if (stdout.trim() !== "No live shell sessions.") throw new Error(`adm-shell-session list printed ${JSON.stringify(stdout)}`);
+};
+
 // The bundled Playwright MCP, as the runner starts it (packages/runner/src/browser.ts): over stdio as
 // UID 1000 with the Pod's dropped capabilities, driving system chromium to a data: page.
 const smokeBrowserMcp = async () => {
@@ -223,6 +230,7 @@ if (role === "adm-dev") {
   // The everyday build tools the node:bookworm base used to bring; npm needs python3, make and g++ for native modules.
   await run(["curl", "make", "gcc", "g++", "python3", "pkg-config", "ssh", "unzip", "xz", "bzip2", "file", "patch", "gpg"].map((command) => `command -v ${command} >/dev/null`).join(" && "));
   await smokeWorkspaceShellLocaleAndSudo();
+  await smokeShellSessionTool();
   await smokeClaudeCodeRunsAsTheWorkspaceUser();
   await smokeClaudeSessionSurvivesDetachAndRestart();
   await smokeBrowserMcp();

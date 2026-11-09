@@ -346,6 +346,7 @@ fn all_top_level_help_entry_points_are_grouped_offline_and_preserve_command_help
         "reconnect",
         "attach",
         "shell",
+        "shells",
         "exec",
         "port",
         "prompt",
@@ -2304,6 +2305,56 @@ fn interactive_create_failure_does_not_launch_the_terminal() {
     assert!(
         !root.path().join("herdr-bin/calls").exists(),
         "failed creation must not query or create a Herdr space"
+    );
+}
+
+#[test]
+fn shell_sessions_survive_a_dropped_connection_and_can_be_reattached() {
+    let root = fixture();
+    assert_ok(adm(
+        root.path(),
+        &["create", "sessions", "--no-repositories"],
+    ));
+    let output = Command::new("python3")
+        .arg("tests/shell-sessions-e2e.py")
+        .arg(env!("CARGO_BIN_EXE_adm"))
+        .arg(root.path())
+        .arg("sessions")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run the shell sessions scenario");
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("shell sessions e2e passed"),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_sessions_are_not_offered_to_bots_or_mixed_with_one_shot_options() {
+    let root = fixture();
+    assert_ok(adm(
+        root.path(),
+        &["create", "one-shot", "--no-repositories"],
+    ));
+    for conflicting in [
+        vec!["shell", "one-shot", "name", "--manage"],
+        vec!["shell", "one-shot", "name", "--", "echo", "hi"],
+    ] {
+        let output = adm(root.path(), &conflicting);
+        assert!(!output.status.success(), "{conflicting:?}: {output:?}");
+    }
+    assert_ok(adm(
+        root.path(),
+        &["create", "helper", "--role", "bot", "--no-repositories"],
+    ));
+    let output = adm(root.path(), &["shells", "helper"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("bots have no development shell"),
+        "{output:?}"
     );
 }
 

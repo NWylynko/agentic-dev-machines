@@ -14,6 +14,7 @@ mod runtime_access;
 mod setup;
 mod setup_connection;
 mod setup_control_plane;
+mod shell_sessions;
 mod system_log;
 mod update;
 mod workspaces;
@@ -140,15 +141,20 @@ pub enum Action {
         #[arg(long)]
         diagnostics: bool,
     },
-    /// Open a development shell. Terminal exit does not destroy the space.
+    /// Open a development shell in a new session that survives a dropped connection.
     Shell {
         name: String,
+        /// Reattach to this live session instead of opening a new one (see `adm shells`).
+        #[arg(conflicts_with_all = ["manage", "command"])]
+        session: Option<String>,
         /// Expose current-workspace status, history, prompt, and abort inside this shell.
         #[arg(long)]
         manage: bool,
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// List a workspace's live shell sessions.
+    Shells { name: String },
     /// Run a command inside the development container.
     Exec {
         name: String,
@@ -364,6 +370,7 @@ impl Cli {
             "reconnect",
             "attach",
             "shell",
+            "shells",
             "exec",
             "port",
             "prompt",
@@ -1356,6 +1363,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Action::Shell {
             name,
+            session,
             manage,
             command,
         } => {
@@ -1365,12 +1373,35 @@ fn run(cli: &Cli) -> Result<()> {
                 "bots have no development shell or repository access"
             );
             workspaces::verify_ownership(cli, &workspace)?;
-            if command.is_empty() {
+            let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            anyhow::ensure!(
+                session.is_none() || terminal,
+                "reattaching to a shell session needs a terminal"
+            );
+            if session.is_none() && command.is_empty() {
                 eprintln!("{}", workspaces::navigation_guidance(&workspace, true));
             }
             if *manage {
                 return runtime_access::managed_shell(cli, &workspace, &workspace.cwd, command);
             }
+            let launch = [
+                "env",
+                "ZDOTDIR=/workspace/.adm/zsh",
+                "zsh",
+                "-l",
+                "-c",
+                "cd -- \"$1\" && export PWD=\"$1\" USER=\"$(id -un)\" SHELL=/usr/bin/zsh && exec zsh -l",
+                "adm-shell",
+                &workspace.cwd,
+            ]
+            .map(str::to_owned);
+            if let Some(session) = session {
+                return shell_sessions::open(cli, &workspace, Some(session), &[]);
+            }
+            if command.is_empty() && terminal {
+                return shell_sessions::open(cli, &workspace, None, &launch);
+            }
+            // One-shot: an explicit command, or no terminal to keep a session for.
             let mut child = cli.kubectl_command()?;
             child.args([
                 "exec",
@@ -1382,24 +1413,23 @@ fn run(cli: &Cli) -> Result<()> {
             ]);
             child.arg("-it");
             child.arg("--");
-            if command.is_empty() {
-                let working_directory = &workspace.cwd;
-                child.args([
-                    "env",
-                    "ZDOTDIR=/workspace/.adm/zsh",
-                    "zsh",
-                    "-l",
-                    "-c",
-                    "cd -- \"$1\" && export PWD=\"$1\" USER=\"$(id -un)\" SHELL=/usr/bin/zsh && exec zsh -l",
-                    "adm-shell",
-                    working_directory,
-                ]);
+            child.args(if command.is_empty() {
+                launch.as_slice()
             } else {
-                child.args(command);
-            }
+                command.as_slice()
+            });
             let status = child.status().context("connect to development container")?;
             anyhow::ensure!(status.success(), "remote command exited with {status}");
             Ok(())
+        }
+        Action::Shells { name } => {
+            let workspace = cli.active_workspace(name)?;
+            anyhow::ensure!(
+                workspace.role == "coding",
+                "bots have no development shell or repository access"
+            );
+            workspaces::verify_ownership(cli, &workspace)?;
+            shell_sessions::list(cli, &workspace)
         }
         Action::Exec { name, command } => {
             let workspace = cli.active_workspace(name)?;
