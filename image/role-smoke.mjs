@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 
 const execute = promisify(execFile);
 const [image, role] = process.argv.slice(2);
-if (!image || !role || !["adm-control", "adm-repositories", "adm-workspace", "adm-code", "adm-bot"].includes(role))
+if (!image || !role || !["adm-control", "adm-repositories", "adm-workspace", "adm-code", "adm-bot", "adm-dev"].includes(role))
   throw new Error("usage: node image/role-smoke.mjs IMAGE ROLE");
 const run = async (script) => execute("docker", ["run", "--rm", "--entrypoint", "/bin/sh", image, "-ec", script], { maxBuffer: 1024 * 1024 });
 const absent = (command) => `! command -v ${command} >/dev/null 2>&1`;
@@ -188,7 +188,29 @@ const smokeBrowserMcp = async () => {
   await execute("docker", ["run", "--rm", "--user", "1000:1000", "--cap-drop", "ALL", ...workspaceCapabilities.flatMap((capability) => ["--cap-add", capability]), "-e", "HOME=/tmp", "--entrypoint", "node", image, "--input-type=module", "-e", script], { maxBuffer: 1024 * 1024 });
 };
 
-if (role === "adm-repositories") {
+// adm-dev (a coding workspace for working on ADM itself) builds Rust and Go as UID 1000, with the
+// cargo registry and Go module caches on the work volume so a restarted Pod does not refetch them.
+const smokeDevToolchainsBuildOnTheVolume = async () => {
+  const volume = `adm-dev-${process.pid}`;
+  const onVolume = (user, script) => execute("docker", ["run", "--rm", "--user", user, "--mount", `type=volume,src=${volume},dst=/workspace`, "--entrypoint", "/bin/sh", image, "-ec", script], { maxBuffer: 4 * 1024 * 1024 });
+  await execute("docker", ["volume", "create", volume]);
+  try {
+    await onVolume("0", "/usr/local/bin/adm-init-workspace plain");
+    await onVolume("1000:1000", [
+      "cargo clippy --version >/dev/null && cargo fmt --version >/dev/null && kubectl version --client >/dev/null",
+      "cd /workspace && cargo new -q hello && cd hello && cargo build -q && ./target/debug/hello | grep -q 'Hello, world!'",
+      "mkdir /workspace/gohello && cd /workspace/gohello && go mod init example.com/gohello >/dev/null 2>&1 && printf 'package main\\nfunc main() { println(\"go ok\") }\\n' > main.go && go build && ./gohello 2>&1 | grep -q 'go ok'",
+      'test "$(go env GOPATH)" = /workspace/.adm/go && test "$CARGO_HOME" = /workspace/.adm/cargo && test -d /workspace/.adm/go/pkg && test -d /workspace/.adm/cargo',
+    ].join(" && "));
+  } finally {
+    await execute("docker", ["volume", "rm", "-f", volume]).catch(() => {});
+  }
+};
+
+if (role === "adm-dev") {
+  await execute("docker", ["run", "--rm", image, "/usr/local/bin/adm-dev-entrypoint", "--check"]);
+  await smokeDevToolchainsBuildOnTheVolume();
+} else if (role === "adm-repositories") {
   await smokeImageShipsMtab();
   await run(["test -x /usr/local/bin/adm-repositories", "test -x /usr/local/bin/artifact-fs", "getent passwd 1000 >/dev/null", ...["sudo", "node", "chromium", "gh"].map(absent)].join(" && "));
   await smokeRepositoriesCatalogMount();

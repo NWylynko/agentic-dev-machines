@@ -147,3 +147,10 @@ Found by stressing suites under CPU load (`yes` burners, `taskset -c 0,1`) and r
 - `adm-code` gained back the tools the node base brought (it is `buildpack-deps`): build-essential, curl, python3, pkg-config, openssh-client, unzip, xz-utils, bzip2, file, patch, gnupg. Left out: the `-dev` libraries, imagemagick, mercurial, subversion. adm-code went from 971 MB to 800 MB compressed.
 - Tests: `smokeFnmSwitchesNodePerProject` in `image/role-smoke.mjs` (installs Node 22 from nodejs.org, so it needs network), node/fnm checks in `adm-dev-entrypoint --check`, a build-tools check for adm-code.
 - Not yet verified live: needs a release and `adm update`.
+
+## 2026-11-09 — adm-dev image
+
+- `adm-dev` target (`FROM adm-code`) for coding workspaces that work on ADM: Rust stable (`rust:1-bookworm`, so it tracks stable like CI's `dtolnay/rust-toolchain@stable`) plus clippy and rustfmt, Go from the `go-build` stage (same pin as `packages/repositories`), kubectl from `kubectl-build`. Cargo registry and Go module caches are on the work volume.
+- CI builds, smokes (`smokeDevToolchainsBuildOnTheVolume`) and publishes it with the five roles, and the release notes list it. 1.12 GB compressed.
+- Checked inside the image on a copy of this repo: `npm ci`, `npm run check`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, the adm-repositories Go build and `cargo test` all pass. Not run there: `npm test` (~14 min) and `npm run test:repositories` (workspace Pods have no `/dev/fuse`, so it skips).
+- Not yet verified live: needs a release, then `adm create --image .../adm-dev:sha-<commit>`.

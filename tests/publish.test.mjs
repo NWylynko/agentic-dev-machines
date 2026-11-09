@@ -217,7 +217,7 @@ test("main publishes a complete immutable release and rerunning keeps its existi
   assert.equal(release.prerelease, false);
   assert.equal(release.draft, false);
   assert.deepEqual(Object.keys(release.assets).sort(), [...assetNames].sort());
-  for (const role of ["adm-control", "adm-repositories", "adm-workspace", "adm-code", "adm-bot"])
+  for (const role of ["adm-control", "adm-repositories", "adm-workspace", "adm-code", "adm-bot", "adm-dev"])
     assert.match(release.body, new RegExp(`agentic-dev-machines/${role}:sha-0123456789ab`));
   assert.match(release.body, /releases\/download\/sha-0123456789ab\/install\.sh/);
   await fixture.artifacts("rerun must not replace published bytes");

@@ -140,6 +140,19 @@ RUN chown root:root /usr/local/bin/artifact-fs \
 
 FROM adm-workspace AS adm-bot
 
+# A coding workspace for working on ADM itself: `adm create --role coding --image .../adm-dev:<tag>`.
+# Rust tracks stable like CI; the cargo registry and Go module caches live on the work volume.
+FROM adm-code AS adm-dev
+COPY --from=rust:1-bookworm /usr/local/rustup /usr/local/rustup
+COPY --from=rust:1-bookworm /usr/local/cargo/bin /usr/local/cargo/bin
+COPY --from=go-build /usr/local/go /usr/local/go
+COPY --from=kubectl-build /usr/local/bin/kubectl /usr/local/bin/kubectl
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/workspace/.adm/cargo \
+    GOPATH=/workspace/.adm/go \
+    PATH=/workspace/.adm/cargo/bin:/workspace/.adm/go/bin:/usr/local/cargo/bin:/usr/local/go/bin:$PATH
+RUN rustup component add clippy rustfmt && cargo --version && cargo clippy --version && go version && kubectl version --client
+
 FROM debian:bookworm-slim AS adm-repositories
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates fuse3 git util-linux && rm -rf /var/lib/apt/lists/*
 COPY --from=go-build /out/adm-repositories /usr/local/bin/adm-repositories

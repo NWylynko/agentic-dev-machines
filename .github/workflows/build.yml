@@ -92,7 +92,7 @@ jobs:
       - name: Build, inspect and smoke test role images
         run: |
           set -eu
-          for role in adm-control adm-repositories adm-workspace adm-code adm-bot; do
+          for role in adm-control adm-repositories adm-workspace adm-code adm-bot adm-dev; do
             docker build --platform linux/amd64 --target "$role" -f image/Dockerfile -t "$role:ci" .
             id=$(docker create "$role:ci")
             mkdir -p "/tmp/$role-root"
@@ -130,7 +130,7 @@ jobs:
             echo
           } >> "$GITHUB_STEP_SUMMARY"
           for tag in $tags; do
-            for role in adm-control adm-repositories adm-workspace adm-code adm-bot; do
+            for role in adm-control adm-repositories adm-workspace adm-code adm-bot adm-dev; do
               image="$repo/$role"
               docker tag "$role:ci" "$image:$tag"
               docker push "$image:$tag"
@@ -334,6 +334,7 @@ jobs:
           - Shared workspace base: \`${image}/adm-workspace:${sha_tag}\`
           - Coding agents: \`${image}/adm-code:${sha_tag}\`
           - Bots: \`${image}/adm-bot:${sha_tag}\`
+          - Coding agents working on ADM itself (adds Rust, Go, kubectl): \`${image}/adm-dev:${sha_tag}\`
 
           linux/amd64.
 
