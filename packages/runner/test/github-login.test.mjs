@@ -178,6 +178,15 @@ test(
     const other = await adm(["repos", "login", "gitlab"], { allowFailure: true });
     assert.notEqual(other.code, 0);
 
+    // Beyond gh's defaults (repo, read:org, gist), the login asks for workflow
+    // (push .github/workflows changes) and read:packages (pull private GHCR).
+    const logins = (await readFile(join(fakeDir, "argv.log"), "utf8"))
+      .split("\n")
+      .filter((line) => line.startsWith("auth login"));
+    assert.ok(logins.length > 0);
+    for (const line of logins)
+      assert.match(line, / --scopes workflow,read:packages( |$)/);
+
     // Logs record login and logout without any token; argv never carries one.
     const everything = [
       ...logs,

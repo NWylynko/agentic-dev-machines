@@ -168,6 +168,10 @@ export async function createGithubAuthority({
           "--git-protocol", "https",
           "--insecure-storage",
           "--skip-ssh-key",
+          // Added to gh's defaults (repo, read:org, gist): workflow lets
+          // agents push .github/workflows changes; read:packages pulls
+          // private GHCR packages.
+          "--scopes", "workflow,read:packages",
         ],
         {
           env: ghEnv(configDir),

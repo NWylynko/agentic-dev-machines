@@ -5283,3 +5283,100 @@ fn bot_created_coding_agents_run_the_cluster_release_images() {
     );
     stop_http_stub(runner_port, runner);
 }
+
+// A GitHub device-flow login waits on `/v1/repos/login/<id>/events` until the
+// user enters the code, which takes longer than any request timeout. The stub
+// authority answers that wait after 35s; `adm repos login github` must still
+// finish, through both the CLI and the lifecycle's forward to the authority.
+#[test]
+fn repository_login_survives_a_user_slower_than_thirty_seconds() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, _runner_port, _runner_server) = start_runner_stub();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let authority_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    thread::spawn(move || {
+        let operation = "6f1c2f9e-3a52-4c55-9d43-1d5b0e7f2a10";
+        let mut events = 0;
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let line = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let body = if line.starts_with("POST /v1/repos/login ") {
+                json!({"operationId": operation})
+            } else if line.starts_with(&format!("GET /v1/repos/login/{operation}/events ")) {
+                events += 1;
+                if events == 1 {
+                    json!({"event":{"type":"device_code","verificationUri":"https://github.com/login/device","userCode":"SLOW-USER"},"done":false})
+                } else {
+                    // The user takes a while to enter the code.
+                    thread::sleep(Duration::from_secs(35));
+                    json!({"event":{"type":"complete","account":"nwylynko","repositories":3},"done":true})
+                }
+            } else {
+                json!({})
+            }
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(
+        root.path().join("service-env.json"),
+        json!([["ADM_PROVIDER_AUTH_URL", authority_url]]).to_string(),
+    )
+    .unwrap();
+    let (url, port) = lifecycle_url();
+    let _service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+
+    let login = Command::new(env!("CARGO_BIN_EXE_adm"))
+        .args([
+            "repos",
+            "login",
+            "github",
+            "--lifecycle-url",
+            &url,
+            "--lifecycle-token-file",
+        ])
+        .arg(root.path().join("token"))
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&login.stdout);
+    let stderr = String::from_utf8_lossy(&login.stderr);
+    assert!(
+        login.status.success(),
+        "{stdout}{stderr}\n{}",
+        service_log(root.path())
+    );
+    assert!(stdout.contains("enter SLOW-USER"), "{stdout}");
+    assert!(
+        stdout.contains("GitHub connected as nwylynko: 3 repositories available"),
+        "{stdout}"
+    );
+}
