@@ -6,7 +6,7 @@ Tickets live in Linear (team `TASK`, project `P-TASK-2`). Read [LINEAR.md](LINEA
 
 Most global skills, the claude.ai connectors, and the `executor`/`playwright` MCP servers are switched off for this project in `.claude/settings.local.json` (gitignored, Nick's machine only). Nothing was deleted: remove an entry there to turn it back on.
 
-Docs: `README.md` (quick start; its images are in `docs/images/` — diagrams are HTML in `docs/diagrams/` rendered by `node scripts/render-doc-diagrams.mjs`, terminal shots by `scripts/render-terminal-screenshot.mjs` from a transcript or, with `--ansi COLSxROWS`, raw PTY output), `docs/installation.md`, `docs/operations.md` (commands, Herdr, verification), `docs/product-requirements.md` (requirements and open decisions), `docs/node-failover.md` (node failover design and the live power-off test), `docs/implementation-contract.md` (implemented API), `deploy/storage.md` (storage and repository bases).
+Docs: `README.md` (quick start; its images are in `docs/images/` — diagrams are HTML in `docs/diagrams/` rendered by `node scripts/render-doc-diagrams.mjs`, terminal shots by `scripts/render-terminal-screenshot.mjs` from a transcript or, with `--ansi COLSxROWS`, raw PTY output), `docs/installation.md`, `docs/operations.md` (commands, Herdr, verification), `docs/product-requirements.md` (requirements and open decisions), `docs/node-failover.md` (node failover design and the live power-off test), `docs/custom-images.md` (building a project image on `adm-code`; `adm update --workspace` resets a custom image to stock `adm-code`), `docs/implementation-contract.md` (implemented API), `deploy/storage.md` (storage and repository bases).
 
 # Layout
 
