@@ -854,11 +854,9 @@ fn request_with_token_timeout(
 ) -> Result<Value> {
     let client =
         reqwest::blocking::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
-    let client = if let Some(timeout) = timeout {
-        client.timeout(timeout).build()?
-    } else {
-        client.build()?
-    };
+    // No timeout means none: reqwest's own default would cut waits, such as a
+    // login waiting for the user to enter a device code, at 30s.
+    let client = client.timeout(timeout).build()?;
     let method = reqwest::Method::from_bytes(method.as_bytes())?;
     let mut request = client.request(method, format!("{}{path}", url.trim_end_matches('/')));
     if let Some(token) = token {
@@ -1373,7 +1371,13 @@ pub(crate) fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Resu
             || (method == "PUT" && path == "/v1/agents-file"),
         "unsupported provider auth method"
     );
-    let client = reqwest::blocking::Client::new();
+    // A login's events request waits for the user (device code, OAuth page),
+    // so it has no timeout; reqwest's default would end it at 30s.
+    let client = if path.ends_with("/events") {
+        reqwest::blocking::Client::builder().timeout(None).build()?
+    } else {
+        reqwest::blocking::Client::new()
+    };
     let response = client
         .request(
             reqwest::Method::from_bytes(method.as_bytes())?,
