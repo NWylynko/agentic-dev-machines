@@ -138,3 +138,12 @@ Found by stressing suites under CPU load (`yes` burners, `taskset -c 0,1`) and r
 - `a root-owned loop delivers…`: the loop came due during `/new` once setup took over 1.5 s, answering `WORKSPACE_BUSY`. It now retries on that code and polls for delivery instead of sleeping 3.5 s.
 - `attach selects a model…` retyped `/model` after 1.5 s, into the selector if its auto-open was merely late. Removed.
 - `attach shows a provider catalog error…` asserted "within 2 s" against a fixture that answers at once, which only measured load. It now asserts the error reaches the screen.
+
+## 2026-11-09 — workspace image on Debian with fnm
+
+- `adm-workspace` is `debian:bookworm-slim` instead of `node:24.18.0-bookworm`. Node is copied from the official node image into `/usr/local` (same layout, so `npm install -g` and Claude Code stay where they were); the image no longer has yarn 1 (use corepack). User `node` (1000) is created explicitly.
+- fnm 1.39.0 (sha256-pinned per arch) with `FNM_DIR=/workspace/.adm/fnm`, so Node versions installed in a workspace survive Pod restarts and moves. Loaded from `zsh-identity.zsh`, which `/etc/zsh/zshrc` sources, so existing workspaces pick it up on their next image without a new `.zshrc`.
+- fnm makes the first installed version the interactive default (it treats `default -> system` as missing). Pointing `default` at `/usr/local` was tried: `cd` out of a project then fails with `Requested version usr is not currently installed`. Kept fnm's own behaviour.
+- `adm-code` gained back the tools the node base brought (it is `buildpack-deps`): build-essential, curl, python3, pkg-config, openssh-client, unzip, xz-utils, bzip2, file, patch, gnupg. Left out: the `-dev` libraries, imagemagick, mercurial, subversion. adm-code went from 971 MB to 800 MB compressed.
+- Tests: `smokeFnmSwitchesNodePerProject` in `image/role-smoke.mjs` (installs Node 22 from nodejs.org, so it needs network), node/fnm checks in `adm-dev-entrypoint --check`, a build-tools check for adm-code.
+- Not yet verified live: needs a release and `adm update`.

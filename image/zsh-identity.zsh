@@ -29,3 +29,10 @@ case ":${PATH}:" in
 esac
 unset adm_local_bin
 export PATH
+
+# fnm: entering a directory with .node-version or .nvmrc (here or in a parent)
+# switches to that Node, installed with `fnm install` onto the work volume
+# (FNM_DIR). Elsewhere, and in non-interactive shells, node is the image's.
+if [ -x /usr/local/bin/fnm ] && (( ! ${+functions[_fnm_autoload_hook]} )); then
+  eval "$(/usr/local/bin/fnm env --use-on-cd --version-file-strategy recursive --shell zsh)"
+fi

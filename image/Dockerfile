@@ -1,6 +1,9 @@
 # Build all ADM runtime roles from shared, pinned build stages.
 # Build from the repository root: docker build -f image/Dockerfile --target adm-code .
 
+# ADM's own Node: the build, the control plane, and the workspaces' runner and helpers.
+ARG NODE_VERSION=24.18.0
+
 FROM golang:1.26.5-bookworm AS go-build
 WORKDIR /src/repositories
 COPY packages/repositories/go.mod packages/repositories/go.sum ./
@@ -10,7 +13,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/adm-repositories .
 COPY packages/repositories/ARTIFACTFS /tmp/ARTIFACTFS
 RUN go install "github.com/cloudflare/artifact-fs/cmd/artifact-fs@$(tr -d '\n' < /tmp/ARTIFACTFS)"
 
-FROM node:24.18.0-bookworm AS js-build
+FROM node:${NODE_VERSION}-bookworm AS js-build
 WORKDIR /src
 COPY package.json package-lock.json ./
 COPY packages/runner/package.json packages/runner/package.json
@@ -39,12 +42,41 @@ RUN set -eux; arch="${TARGETARCH:-amd64}"; \
     curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl.sha256"; \
     echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum --check; chmod 0755 /usr/local/bin/kubectl
 
-FROM node:24.18.0-bookworm AS adm-workspace
+FROM node:${NODE_VERSION}-bookworm AS node-dist
+
+# fnm installs the Node versions a project asks for (.node-version, .nvmrc) onto the work volume.
+FROM debian:bookworm-slim AS fnm-build
+ARG TARGETARCH
+ARG FNM_VERSION=1.39.0
+ARG FNM_SHA256_AMD64=7807664f39d39fc518da1c35ba0181e4b3267603c4b1dedeb4b5fc6ae440a224
+ARG FNM_SHA256_ARM64=4eaff58b2c5bf30d0934027572dd0b5bbb60d2a1af309230b53662d4b1d45599
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip && rm -rf /var/lib/apt/lists/*
+RUN set -eux; case "${TARGETARCH:-amd64}" in \
+      amd64) asset=fnm-linux; sha="$FNM_SHA256_AMD64" ;; \
+      arm64) asset=fnm-arm64; sha="$FNM_SHA256_ARM64" ;; \
+      *) echo "no fnm build for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLo /tmp/fnm.zip "https://github.com/Schniz/fnm/releases/download/v${FNM_VERSION}/${asset}.zip"; \
+    echo "$sha  /tmp/fnm.zip" | sha256sum --check; \
+    unzip /tmp/fnm.zip -d /usr/local/bin; chmod 0755 /usr/local/bin/fnm; /usr/local/bin/fnm --version
+
+FROM debian:bookworm-slim AS adm-workspace
+ARG NODE_VERSION
 ARG OH_MY_ZSH_REVISION=4d4cfc287e9d887b81242c0e431b5f49f9cec5c1
 COPY LICENSE /usr/share/licenses/adm/LICENSE
 RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates git tini nano sudo wget zsh \
  && printf '#1000 ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/adm && chmod 0440 /etc/sudoers.d/adm \
+ && groupadd --gid 1000 node && useradd --uid 1000 --gid 1000 --create-home --shell /usr/bin/zsh node \
  && rm -rf /var/lib/apt/lists/*
+# The official Node build, laid out as in the node image so `npm install -g` lands on PATH.
+COPY --from=node-dist /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-dist /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=node-dist /usr/local/include/node /usr/local/include/node
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+ && ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
+ && node --version && npm --version
+COPY --from=fnm-build /usr/local/bin/fnm /usr/local/bin/fnm
 RUN git init /opt/adm/oh-my-zsh \
  && git -C /opt/adm/oh-my-zsh remote add origin https://github.com/ohmyzsh/ohmyzsh.git \
  && git -C /opt/adm/oh-my-zsh fetch --depth=1 origin "$OH_MY_ZSH_REVISION" \
@@ -61,9 +93,10 @@ RUN chown root:root /usr/local/bin/adm-dev-entrypoint /usr/local/bin/adm-init-wo
  && chmod 755 /usr/local/bin/adm-dev-entrypoint /usr/local/bin/adm-init-workspace \
  && ln -sfn /workspace/.adm/catalog /repos \
  && ln -sfn /workspace/.adm/zsh/.zshrc /home/node/.zshrc \
- && usermod -s /usr/bin/zsh node \
  && printf '\n# ADM interactive workspace shells.\n. /usr/local/share/adm/zsh-identity.zsh\n' >> /etc/zsh/zshrc
 ENV NODE_PATH=/opt/adm/node_modules \
+    ADM_NODE_VERSION=${NODE_VERSION} \
+    FNM_DIR=/workspace/.adm/fnm \
     LANG=C.UTF-8
 WORKDIR /
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/adm-dev-entrypoint"]
@@ -71,7 +104,9 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/adm-dev-entrypoint"]
 FROM adm-workspace AS adm-code
 # Claude Code for `adm claude` (TASK-90); pinned, since the Pod cannot auto-update a root-owned install.
 ARG CLAUDE_CODE_VERSION=2.1.316
+# Everyday build tools a coding agent expects; npm needs python3, make and g++ for native modules.
 RUN apt-get update && apt-get install -y --no-install-recommends git chromium nano wget ca-certificates tmux \
+    build-essential curl python3 pkg-config openssh-client unzip xz-utils bzip2 file patch gnupg \
  && install -d -m 0755 /etc/apt/keyrings \
  && wget -qO /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -117,7 +152,7 @@ RUN chown root:root /usr/local/bin/adm-repositories /usr/local/bin/artifact-fs /
 RUN ln -s /proc/self/mounts /etc/mtab \
  && groupadd --gid 1000 node && useradd --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin node
 
-FROM node:24.18.0-bookworm AS adm-control
+FROM node:${NODE_VERSION}-bookworm AS adm-control
 COPY --from=adm-build /src/target/release/adm /usr/local/bin/adm
 COPY --from=kubectl-build /usr/local/bin/kubectl /usr/local/bin/kubectl
 # gh runs `gh auth login --web` for `adm repos login github` (TASK-111).

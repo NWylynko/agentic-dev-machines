@@ -145,6 +145,32 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
   }
 };
 
+// fnm keeps the Node versions a project asks for on the work volume, so they survive a Pod
+// restart (a second container on the same volume stands in for it). Interactive zsh switches to
+// a repo's .node-version on cd. Non-interactive shells, like the runner, always use the image's
+// Node, and so do interactive ones until a version is installed (fnm then defaults to the first).
+const smokeFnmSwitchesNodePerProject = async () => {
+  const volume = `adm-fnm-${process.pid}`;
+  const onVolume = async (script) => (await execute("docker", ["run", "--rm", "--user", "1000:1000", "--mount", `type=volume,src=${volume},dst=/workspace`, "--entrypoint", "/bin/sh", image, "-ec", script], { maxBuffer: 1024 * 1024 })).stdout.trim();
+  await execute("docker", ["volume", "create", volume]);
+  try {
+    await execute("docker", ["run", "--rm", "--mount", `type=volume,src=${volume},dst=/workspace`, "--entrypoint", "/usr/local/bin/adm-init-workspace", image, "plain"]);
+    const own = `v${await onVolume('echo "$ADM_NODE_VERSION"')}`;
+    const fresh = await onVolume("zsh -ic 'node --version' 2>/dev/null");
+    await onVolume("mkdir -p /workspace/project && echo 22 > /workspace/project/.node-version && fnm install 22 >/dev/null 2>&1");
+    const [startedIn, cdInto, nonInteractive, claude] = (await onVolume([
+      "cd /workspace/project && zsh -ic 'node --version' 2>/dev/null",
+      "zsh -ic 'cd /workspace/project && node --version' 2>/dev/null",
+      "cd /workspace/project && node --version",
+      "cd /workspace/project && zsh -ic 'claude --version' 2>/dev/null | grep -c 'Claude Code'",
+    ].join(" && "))).split("\n");
+    if (fresh !== own || nonInteractive !== own || !/^v22\./.test(startedIn) || !/^v22\./.test(cdInto) || claude !== "1")
+      throw new Error(`fnm: before any install ${fresh}, started in project ${startedIn}, cd into project ${cdInto}, non-interactive ${nonInteractive}, claude ${claude}; image Node ${own}`);
+  } finally {
+    await execute("docker", ["volume", "rm", "-f", volume]).catch(() => {});
+  }
+};
+
 // The bundled Playwright MCP, as the runner starts it (packages/runner/src/browser.ts): over stdio as
 // UID 1000 with the Pod's dropped capabilities, driving system chromium to a data: page.
 const smokeBrowserMcp = async () => {
@@ -172,14 +198,17 @@ if (role === "adm-repositories") {
   await execute("docker", ["run", "--rm", image, "/usr/local/bin/adm-dev-entrypoint", "--check"]);
   // The fsmonitor hook ArtifactFS writes into each shared git dir execs this path.
   await run(["test -x /usr/local/bin/artifact-fs", "/usr/local/bin/artifact-fs --help >/dev/null"].join(" && "));
+  // The everyday build tools the node:bookworm base used to bring; npm needs python3, make and g++ for native modules.
+  await run(["curl", "make", "gcc", "g++", "python3", "pkg-config", "ssh", "unzip", "xz", "bzip2", "file", "patch", "gpg"].map((command) => `command -v ${command} >/dev/null`).join(" && "));
   await smokeWorkspaceShellLocaleAndSudo();
   await smokeClaudeCodeRunsAsTheWorkspaceUser();
   await smokeClaudeSessionSurvivesDetachAndRestart();
   await smokeBrowserMcp();
+  await smokeFnmSwitchesNodePerProject();
   await smokeDockerCliDrivesTheEngine();
   await smokeInitLeavesDockerDataAlone();
 } else if (role === "adm-bot") {
-  await run(["test -x /usr/local/bin/adm-dev-entrypoint", 'test "$(locale charmap)" = UTF-8', "! command -v gh >/dev/null 2>&1", "! command -v chromium >/dev/null 2>&1", "test -x /usr/bin/zsh", "test -f /opt/adm/runner.mjs"].join(" && "));
+  await run(["test -x /usr/local/bin/adm-dev-entrypoint", 'test "$(locale charmap)" = UTF-8', "! command -v gh >/dev/null 2>&1", "! command -v chromium >/dev/null 2>&1", "test -x /usr/bin/zsh", "test -f /opt/adm/runner.mjs", 'test "$(node --version)" = "v$ADM_NODE_VERSION"', "fnm --version >/dev/null"].join(" && "));
 } else {
   await execute("docker", ["run", "--rm", image, "/usr/local/bin/adm-dev-entrypoint", "--check", "bot"]);
 }
