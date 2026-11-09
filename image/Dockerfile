@@ -64,7 +64,7 @@ FROM debian:bookworm-slim AS adm-workspace
 ARG NODE_VERSION
 ARG OH_MY_ZSH_REVISION=4d4cfc287e9d887b81242c0e431b5f49f9cec5c1
 COPY LICENSE /usr/share/licenses/adm/LICENSE
-RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates git tini nano sudo wget zsh \
+RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates dtach git tini nano sudo wget zsh \
  && printf '#1000 ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/adm && chmod 0440 /etc/sudoers.d/adm \
  && groupadd --gid 1000 node && useradd --uid 1000 --gid 1000 --create-home --shell /usr/bin/zsh node \
  && rm -rf /var/lib/apt/lists/*
@@ -89,8 +89,9 @@ COPY --from=js-build /out/workspace-env.mjs /opt/adm/workspace-env.mjs
 COPY --from=js-build /src/node_modules /opt/adm/node_modules
 COPY image/adm-dev-entrypoint /usr/local/bin/adm-dev-entrypoint
 COPY image/adm-init-workspace /usr/local/bin/adm-init-workspace
-RUN chown root:root /usr/local/bin/adm-dev-entrypoint /usr/local/bin/adm-init-workspace /usr/local/share/adm/zshrc /usr/local/share/adm/zsh-identity.zsh \
- && chmod 755 /usr/local/bin/adm-dev-entrypoint /usr/local/bin/adm-init-workspace \
+COPY image/adm-shell-session /usr/local/bin/adm-shell-session
+RUN chown root:root /usr/local/bin/adm-dev-entrypoint /usr/local/bin/adm-init-workspace /usr/local/bin/adm-shell-session /usr/local/share/adm/zshrc /usr/local/share/adm/zsh-identity.zsh \
+ && chmod 755 /usr/local/bin/adm-dev-entrypoint /usr/local/bin/adm-init-workspace /usr/local/bin/adm-shell-session \
  && ln -sfn /workspace/.adm/catalog /repos \
  && ln -sfn /workspace/.adm/zsh/.zshrc /home/node/.zshrc \
  && printf '\n# ADM interactive workspace shells.\n. /usr/local/share/adm/zsh-identity.zsh\n' >> /etc/zsh/zshrc
