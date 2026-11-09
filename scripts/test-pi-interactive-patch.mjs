@@ -39,6 +39,11 @@ try {
     "utf8",
   );
   assert.match(source, /remotePorts\?\.projectTrust/);
+  assert.doesNotMatch(
+    source,
+    /this\.settingsManager\.isProjectTrusted\(\)/,
+    "remote trust checks must never read the client's Pi settings",
+  );
   assert.match(source, /authMetadata\.isAnthropicSubscription\(\)/);
   assert.match(source, /remotePorts\?\.isRemote \? \[undefined\]/);
   const remoteAuthBranch = source.match(

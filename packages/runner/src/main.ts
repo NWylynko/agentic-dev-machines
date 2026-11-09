@@ -32,7 +32,11 @@ import {
 import { botAgentManagementFromEnvironment } from "./bot-management.ts";
 import { connectorLifecycleFromEnvironment } from "./connectors.ts";
 import { ApiError, workspaceIdPattern, type WorkspaceConfig } from "./types.ts";
-import { watchEvents, type AgentEvent } from "@earendil-works/pi-durable";
+import {
+  attachEntriesPage,
+  attachWindow,
+  publicBotView,
+} from "./attach-view.ts";
 import type { Message } from "@earendil-works/pi-ai";
 import {
   BACKGROUND_CONTEXT,
@@ -1234,7 +1238,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|history|goals|loops|resume|retry|kubernetes-connection|model|models|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|tools|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|entries|history|goals|loops|resume|retry|kubernetes-connection|model|models|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|tools|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1323,20 +1327,6 @@ const server = createServer(async (request, response) => {
             `id: ${cursor}\nevent: output\ndata: ${JSON.stringify(chunk)}\n\n`,
           );
         };
-        const finish = async () => {
-          const result = await workspace.bashResult(operationId);
-          if (result && !closed) {
-            closed = true;
-            if (result.output && cursor === 0)
-              response.write(
-                `event: output\ndata: ${JSON.stringify({ operationId, text: result.output, stream: "stdout" })}\n\n`,
-              );
-            response.end(`event: result\ndata: ${JSON.stringify(result)}\n\n`);
-          }
-        };
-        const onChange = () => {
-          void finish();
-        };
         const onOutput = (chunk: {
           operationId: string;
           text: string;
@@ -1344,26 +1334,32 @@ const server = createServer(async (request, response) => {
         }) => {
           sendChunk(chunk as typeof chunk & { sequence: number });
         };
-        workspace.events.on("change", onChange);
+        const waiting = new AbortController();
         workspace.events.on("bash", onOutput);
         response.once("close", () => {
           closed = true;
-          workspace.events.off("change", onChange);
+          waiting.abort();
           workspace.events.off("bash", onOutput);
         });
         const replay = await workspace.bashReplay(operationId, cursor);
         for (const chunk of replay.chunks) sendChunk(chunk);
-        if (replay.result) {
-          if (replay.result.output && cursor === 0)
-            response.write(
-              `event: output\ndata: ${JSON.stringify({ operationId, text: replay.result.output, stream: "stdout" })}\n\n`,
-            );
-          closed = true;
-          response.end(
-            `event: result\ndata: ${JSON.stringify(replay.result)}\n\n`,
+        const result =
+          replay.result ??
+          (await workspace.waitForBash(operationId, waiting.signal));
+        if (closed) return;
+        closed = true;
+        workspace.events.off("bash", onOutput);
+        if (!result)
+          throw new ApiError(
+            404,
+            "BASH_NOT_FOUND",
+            "No bash operation with this ID ran in this conversation",
           );
-        }
-        void finish();
+        if (result.output && cursor === 0)
+          response.write(
+            `event: output\ndata: ${JSON.stringify({ operationId, text: result.output, stream: "stdout" })}\n\n`,
+          );
+        response.end(`event: result\ndata: ${JSON.stringify(result)}\n\n`);
         return;
       }
     }
@@ -2108,12 +2104,23 @@ const server = createServer(async (request, response) => {
         return json(response, 202, await workspace.resume());
       });
     }
-    if (request.method === "GET" && action === "events") {
-      let after = Number(
-        url.searchParams.get("after") ?? request.headers["last-event-id"] ?? 0,
+    if (request.method === "GET" && action === "entries")
+      return json(
+        response,
+        200,
+        await attachEntriesPage(
+          workspace.conversation,
+          url,
+          workspace.config.role === "bot" &&
+            url.searchParams.get("diagnostics") !== "true",
+        ),
       );
-      const limit = Number(url.searchParams.get("limit") ?? 200),
-        diagnostics = url.searchParams.get("diagnostics") === "true";
+    // Attach: the selected conversation's Durable view, then the Chord ops of
+    // every commit that changes it. A bot's users get only its public view.
+    if (request.method === "GET" && action === "events") {
+      const diagnostics = url.searchParams.get("diagnostics") === "true";
+      const publicOnly = workspace.config.role === "bot" && !diagnostics;
+      const window = attachWindow(url);
       const conversationIdParam = url.searchParams.get("conversationId");
       const requestedConversationId = Number(conversationIdParam ?? 0);
       if (
@@ -2126,27 +2133,21 @@ const server = createServer(async (request, response) => {
           "INVALID_CONVERSATION_ID",
           "conversationId must be a positive Durable conversation ID",
         );
+      const streamConversation = workspace.conversation;
       if (
         requestedConversationId &&
-        requestedConversationId !== Number(workspace.conversation.id)
+        requestedConversationId !== Number(streamConversation.id)
       )
         throw new ApiError(
           409,
           "WORKSPACE_SESSION_CHANGED",
-          "The selected workspace session changed; reconnect to load its history",
+          "The selected workspace session changed; reconnect to load it",
         );
-      if (
-        !Number.isSafeInteger(after) ||
-        after < 0 ||
-        !Number.isInteger(limit) ||
-        limit < 1 ||
-        limit > 1000
-      )
-        throw new ApiError(
-          400,
-          "INVALID_CURSOR",
-          "after must be nonnegative; limit must be 1..1000",
-        );
+      const watching = new AbortController();
+      const watch = await streamConversation.watch(
+        withAbortSignal(watching.signal, BACKGROUND_CONTEXT),
+        window,
+      );
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
@@ -2158,18 +2159,12 @@ const server = createServer(async (request, response) => {
       const eventsKeepalive = setInterval(() => {
         if (!response.destroyed) response.write(": keepalive\n\n");
       }, eventsKeepaliveMs);
-      const streamConversation = workspace.conversation;
-      let pumping = false,
-        dirty = false,
-        ended = false;
-      const includeLiveEvents = workspace.config.role !== "bot" || diagnostics;
-      const watcherController = new AbortController();
-      let watcher: Awaited<ReturnType<typeof watchEvents>> | undefined;
-      let pump = () => {};
-      const notify = () => {
-        pump();
+      let ended = false;
+      const send = (event: "view" | "ops" | "error", data: unknown) => {
+        if (!ended && !response.destroyed)
+          response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
       };
-      const close = (cause: "client" | "branch" | "workspace") => {
+      const close = (cause: "client" | "branch" | "workspace" | "watch") => {
         if (ended) return;
         ended = true;
         clearInterval(eventsKeepalive);
@@ -2177,106 +2172,51 @@ const server = createServer(async (request, response) => {
           `${JSON.stringify({
             event: "workspace_events_closed",
             workspaceId: id,
+            conversationId: Number(streamConversation.id),
             cause,
             upMs: Date.now() - streamOpenedAt,
-            cursor: after,
           })}\n`,
         );
-        watcherController.abort();
-        if (watcher) void watcher.stop();
-        workspace.events.off("change", notify);
+        watching.abort();
+        void watch.stop();
         workspace.events.off("branch", closeOnBranch);
         workspace.events.off("close", closeOnWorkspace);
         response.end();
       };
       const closeOnBranch = () => close("branch"),
         closeOnWorkspace = () => close("workspace");
-      workspace.events.on("change", notify);
       workspace.events.once("branch", closeOnBranch);
       workspace.events.once("close", closeOnWorkspace);
       response.once("close", () => close("client"));
-      const watcherContext = withAbortSignal(
-        watcherController.signal,
-        BACKGROUND_CONTEXT,
-      );
-      watcher = await watchEvents(
-        workspace.harness,
-        streamConversation.id,
-        watcherContext,
-      );
-      if (ended) {
-        watcherController.abort();
-        void watcher.stop();
-        return;
-      }
-      const writeLive = (event: AgentEvent) => {
-        const write = (data: unknown) => {
-          if (!ended && !response.destroyed)
-            response.write(
-              `event: live\ndata: ${JSON.stringify({ workspaceId: id, kind: "live", data })}\n\n`,
-            );
-        };
-        // Bot activity spans the whole run, including private tools and retries.
-        // Publish only this boolean; never redact a copy of a private event.
-        if (workspace.config.role === "bot") {
-          if (event.type === "snapshot")
-            write({ type: "activity", active: !!event.run });
-          else if (event.type === "run_start" || event.type === "run_end")
-            write({ type: "activity", active: event.type === "run_start" });
-        }
-        if (includeLiveEvents) write(event);
-      };
-      writeLive(watcher.snapshot);
-      watcher.start(async (batch) => {
-        for (const event of batch) writeLive(event);
+      let shown = publicOnly ? publicBotView(watch.value) : watch.value;
+      send("view", {
+        workspaceId: id,
+        conversationId: Number(streamConversation.id),
+        value: shown,
       });
-      pump = async () => {
-        dirty = true;
-        if (pumping || ended) return;
-        pumping = true;
-        try {
-          while (dirty && !ended) {
-            dirty = false;
-            let more = true;
-            while (more && !ended) {
-              const page = await workspace.history(
-                after,
-                200,
-                diagnostics,
-                streamConversation,
-              );
-              after = page.nextAfter;
-              for (const event of page.events) {
-                response.write(
-                  `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`,
-                );
-              }
-              more = page.hasMore;
-            }
-          }
-        } catch (error) {
+      watch.start(async (call) => {
+        if (call.kind !== "value") return;
+        if (!publicOnly) return send("ops", { ops: call.ops });
+        const next = publicBotView(call.value);
+        if (JSON.stringify(next) === JSON.stringify(shown)) return;
+        shown = next;
+        send("ops", { ops: [["r", next]] });
+      });
+      void watch.closed.then((end) => {
+        if (ended) return;
+        if (end.kind === "failed" || end.kind === "listener_error") {
           process.stderr.write(
             `${JSON.stringify({
               event: "workspace_events_failed",
               workspaceId: id,
-              cursor: after,
-              error: (error instanceof Error
-                ? `${error.name}: ${error.message}`
-                : String(error)
-              ).slice(0, 2000),
+              end: end.kind,
+              error: String(end.error).slice(0, 2000),
             })}\n`,
           );
-          if (!ended && !response.destroyed) {
-            response.write(
-              'event: error\ndata: {"error":"Unable to read workspace event history"}\n\n',
-            );
-            response.end();
-          }
-        } finally {
-          pumping = false;
+          send("error", { error: "The workspace conversation view failed" });
         }
-      };
-      void pump();
+        close("watch");
+      });
       return;
     }
     throw new ApiError(404, "NOT_FOUND", "Endpoint is not implemented");

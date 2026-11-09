@@ -1,8 +1,8 @@
 # Pi terminal parity audit
 
-Pinned packages: Pi Coding Agent, Pi TUI, and Pi Durable 1.2.0.
+Pinned packages: Pi Coding Agent, Pi TUI, and Pi Durable 1.5.0.
 
-`adm attach` now runs upstream `InteractiveMode` with a reproducible patch for remote services. Its runtime projects the existing workspace Pod's Durable conversation. It creates no ordinary Pi agent session, local transcript owner, or client-side coding executor. The dependency patch is applied during installation, image assembly, and release packaging and checked for idempotence and TypeScript compatibility.
+`adm attach` now runs upstream `InteractiveMode` with a reproducible patch for remote services. Its runtime projects the existing workspace Pod's Durable conversation: it holds a replica of the conversation view the runner streams, and turns each change of it into the Pi events that show it. It creates no ordinary Pi agent session, local transcript owner, or client-side coding executor. The dependency patch is applied during installation, image assembly, and release packaging and checked for idempotence and TypeScript compatibility.
 
 | Interaction                           | Implemented behavior                                                                                                                                                                                                                                                                                           |
 | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

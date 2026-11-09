@@ -11,6 +11,7 @@ import type { AddressInfo } from "node:net";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { nextHistoryEvent } from "./attach-stream.ts";
 
 const main = new URL("../src/main.ts", import.meta.url).pathname;
 
@@ -232,40 +233,15 @@ export async function startPodRunner(
       return { status: response.status, body: await response.json() };
     },
     /** Wait for a history event after `after` that satisfies `predicate`. */
-    async event(
+    event(
       predicate: (event: RunnerEvent) => boolean,
       after = 0,
     ): Promise<RunnerEvent> {
-      const controller = new AbortController();
-      const response = await fetch(
-        `${url}${path}/events?after=${after}&diagnostics=true`,
-        {
-          signal: controller.signal,
-          headers: { authorization: `Bearer ${token}` },
-        },
-      );
-      let buffer = "";
-      try {
-        for await (const bytes of response.body!) {
-          buffer += Buffer.from(bytes).toString();
-          for (;;) {
-            const end = buffer.indexOf("\n\n");
-            if (end < 0) break;
-            const data = buffer
-              .slice(0, end)
-              .split("\n")
-              .find((line) => line.startsWith("data: "));
-            buffer = buffer.slice(end + 2);
-            if (data) {
-              const event = JSON.parse(data.slice(6));
-              if (predicate(event)) return event;
-            }
-          }
-        }
-        throw new Error("Event stream ended before the expected event");
-      } finally {
-        controller.abort();
-      }
+      return nextHistoryEvent(url, path, predicate, {
+        after,
+        diagnostics: true,
+        headers: { authorization: `Bearer ${token}` },
+      });
     },
     async stop() {
       if (child.exitCode === null && child.signalCode === null) {

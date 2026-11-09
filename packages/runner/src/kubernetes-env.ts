@@ -16,7 +16,7 @@ import {
   type ShellExecResult,
   type TextLine,
   type TextLineReader,
-  type WatchChange,
+  type FileChange,
   type WatchTarget,
 } from "@earendil-works/pi-durable/env";
 import { decode, encode } from "./env-protocol.ts";
@@ -39,7 +39,7 @@ type Envelope = {
   text?: string;
   stream?: "stdout" | "stderr";
   skipped?: { bytes: number; newlines: number; endsWithNewline: boolean };
-  change?: WatchChange;
+  change?: FileChange;
   handle?: number;
 };
 
@@ -47,7 +47,7 @@ type Pending = {
   resolve: (message: Envelope) => void;
   reject: (error: Error) => void;
   onOutput?: ShellExecOptions["onOutput"];
-  onWatch?: (change: WatchChange) => void;
+  onWatch?: (change: FileChange) => void;
   signal?: AbortSignal;
   abort?: () => void;
 };
@@ -79,7 +79,7 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
   private readonly script: string;
   private child?: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<number, Pending>();
-  private readonly watches = new Map<number, (change: WatchChange) => void>();
+  private readonly watches = new Map<number, (change: FileChange) => void>();
   private nextId = 1;
   private buffer = "";
   private stderr = "";
@@ -122,7 +122,15 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
       const listener =
         (message.handle ? this.watches.get(message.handle) : undefined) ??
         pending?.onWatch;
-      listener?.(message.change ?? { paths: [] });
+      listener?.(
+        message.change ?? {
+          kind: "failed",
+          error: new FileError(
+            "invalid",
+            "Remote environment sent a watch event without a change",
+          ),
+        },
+      );
       return;
     }
     if (!pending) return;
@@ -464,7 +472,7 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
 
   async watch(
     targets: readonly WatchTarget[],
-    onChange: (change: WatchChange) => void,
+    onChange: (change: FileChange) => void,
     context: Context,
   ): Promise<Result<FileWatcher, FileError>> {
     const opened = await this.invoke<
@@ -475,9 +483,9 @@ export class KubernetesExecutionEnv implements ExecutionEnv {
     const handle = opened.value.handle;
     return ok({
       mode: opened.value.mode,
-      close: async (call) => {
+      stop: async (call) => {
         this.watches.delete(handle);
-        await this.invoke<void, FileError>("watch.close", [handle], call);
+        await this.invoke<void, FileError>("watch.stop", [handle], call);
       },
     });
   }

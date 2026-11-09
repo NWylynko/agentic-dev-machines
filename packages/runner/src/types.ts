@@ -21,6 +21,16 @@ export type RunnerEvent = {
   data: Record<string, unknown>;
   timestamp: string;
 };
+/**
+ * Storage policy shared by every ADM Durable document: store a change as a
+ * delta, and a complete base once 32 deltas follow the newest one, so a read
+ * replays at most 32 changes however long the document lives.
+ */
+export const admDocCheckpointWhen = (
+  _value: unknown,
+  _ops: unknown,
+  info: { deltasSinceBase: number },
+) => info.deltasSinceBase >= 32;
 export class ApiError extends Error {
   status: number;
   code: string;

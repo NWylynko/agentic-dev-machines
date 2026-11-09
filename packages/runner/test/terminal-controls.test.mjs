@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { applyImmutable } from "@earendil-works/chord/delta";
+import { entryRole } from "./attach-stream.ts";
 import { createWorkspaceImportedTree } from "../src/navigation.ts";
 
 const main = new URL("../src/main.ts", import.meta.url);
@@ -49,28 +51,26 @@ test("failed imported branch publication keeps the old conversation active and r
     },
   };
   await assert.rejects(
-    createWorkspaceImportedTree(
-      harness,
-      1,
-      {},
-      "selected-leaf",
-      [
-        {
-          leafId: "selected-leaf",
-          entries: [
-            { id: "root", parentId: null, message: { role: "user" } },
-            { id: "selected-leaf", parentId: "root", message: { role: "assistant" } },
-          ],
-        },
-        {
-          leafId: "alternate-leaf",
-          entries: [
-            { id: "root", parentId: null, message: { role: "user" } },
-            { id: "alternate-leaf", parentId: "root", message: { role: "user" } },
-          ],
-        },
-      ],
-    ),
+    createWorkspaceImportedTree(harness, 1, {}, "selected-leaf", [
+      {
+        leafId: "selected-leaf",
+        entries: [
+          { id: "root", parentId: null, message: { role: "user" } },
+          {
+            id: "selected-leaf",
+            parentId: "root",
+            message: { role: "assistant" },
+          },
+        ],
+      },
+      {
+        leafId: "alternate-leaf",
+        entries: [
+          { id: "root", parentId: null, message: { role: "user" } },
+          { id: "alternate-leaf", parentId: "root", message: { role: "user" } },
+        ],
+      },
+    ]),
     /previous selection is unchanged by this import; staged conversation 2 is recorded as incomplete/,
   );
   assert.equal(navigation.activeConversationId, 1);
@@ -143,38 +143,46 @@ async function retryWhileWorkspaceBusy(send) {
   }
 }
 
-async function waitForEvent(response, predicate) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const part = await reader.read();
-    if (part.done) throw new Error("event stream ended before expected event");
-    buffer += decoder.decode(part.value, { stream: true });
-    let newline;
-    while ((newline = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, newline).replace(/\r$/, "");
-      buffer = buffer.slice(newline + 1);
-      if (!line.startsWith("data: ")) continue;
-      const event = JSON.parse(line.slice(6));
-      if (predicate(event)) return event;
-    }
-  }
-}
+const entryText = (entry) => {
+  if (entry.kind === "adm.message") return entry.data.text;
+  const content = entry.model?.[0]?.content;
+  if (typeof content === "string") return content;
+  return (content ?? [])
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+};
+// role is a model role, or "message" for what a bot published.
+const hasEntry = (view, role, text) =>
+  view.entries.some(
+    (entry) =>
+      (role === "message"
+        ? entry.kind === "adm.message"
+        : entryRole(entry) === role) &&
+      (text === undefined || entryText(entry).includes(text)),
+  );
+const working = (view) => view.docs["pi.live"]?.run !== undefined;
+const runningTool = (view, name) =>
+  (view.docs["pi.live"]?.tools ?? []).some((slot) => slot.name === name);
+// What a bot's users may see: their messages, published messages, status
+// lines, and whether it is working.
+const isPublicBotView = (view) =>
+  JSON.stringify(Object.keys(view.docs)) === '["pi.live"]' &&
+  Object.keys(view.docs["pi.live"]).every((key) => key === "run") &&
+  view.entries.every(
+    (entry) =>
+      entryRole(entry) === "user" ||
+      entry.kind === "adm.message" ||
+      entry.kind === "adm.status",
+  );
 
+// Every revision of the attached view, as an attach client holds it.
 function observeEvents(response) {
-  const frames = [];
+  const views = [];
   const waiters = [];
-  const publish = (frame) => {
-    frames.push(frame);
-    for (let index = waiters.length - 1; index >= 0; index--) {
-      if (waiters[index].predicate(frame)) {
-        waiters[index].resolve(frame);
-        waiters.splice(index, 1);
-      }
-    }
-  };
   const done = (async () => {
+    assert.equal(response.status, 200);
+    let view;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -186,34 +194,37 @@ function observeEvents(response) {
       while ((end = buffer.indexOf("\n\n")) >= 0) {
         const lines = buffer.slice(0, end).split("\n");
         buffer = buffer.slice(end + 2);
-        const type =
-          lines
-            .find((line) => line.startsWith("event:"))
-            ?.slice(6)
-            .trim() ?? "message";
+        const type = lines
+          .find((line) => line.startsWith("event:"))
+          ?.slice(6)
+          .trim();
         const data = lines
           .filter((line) => line.startsWith("data:"))
           .map((line) => line.slice(5).trimStart())
           .join("\n");
-        if (data) publish({ type, data: JSON.parse(data) });
+        if (!data) continue;
+        const payload = JSON.parse(data);
+        if (type === "view") view = payload.value;
+        else if (type === "ops") view = applyImmutable(view, payload.ops);
+        else throw new Error(`Unexpected attach frame ${type}: ${data}`);
+        views.push(view);
+        for (let index = waiters.length - 1; index >= 0; index--)
+          if (waiters[index].predicate(view)) {
+            waiters[index].resolve(view);
+            waiters.splice(index, 1);
+          }
       }
     }
   })().catch((error) => {
     if (error?.name !== "AbortError") throw error;
   });
   const waitForAfter = (index, predicate) => {
-    const existing = frames.slice(index).find(predicate);
+    const existing = views.slice(index).find(predicate);
     if (existing) return Promise.resolve(existing);
-    return new Promise((resolve) =>
-      waiters.push({
-        predicate: (frame) =>
-          frames.indexOf(frame) >= index && predicate(frame),
-        resolve,
-      }),
-    );
+    return new Promise((resolve) => waiters.push({ predicate, resolve }));
   };
   return {
-    frames,
+    views,
     done,
     waitFor(predicate) {
       return waitForAfter(0, predicate);
@@ -270,17 +281,13 @@ test(
     ]);
     const firstClient = observeEvents(firstResponse);
     const secondClient = observeEvents(secondResponse);
-    const answer = firstClient.waitFor(
-      (frame) => frame.type === "message" && frame.data.kind === "assistant",
-    );
+    const answer = firstClient.waitFor((view) => hasEntry(view, "assistant"));
     await runner.request(path + "/input", "POST", {
       requestId: "branch-seed",
       message: "Write one concise greeting",
     });
     await answer;
-    await secondClient.waitFor(
-      (frame) => frame.type === "message" && frame.data.kind === "assistant",
-    );
+    await secondClient.waitFor((view) => hasEntry(view, "assistant"));
     const history = await runner.request(path + "/history?limit=100");
     const seedEntry = history.body.events.find(
       (event) => event.kind === "user",
@@ -352,9 +359,7 @@ test(
       { signal: reconnectController.signal },
     );
     const reconnectClient = observeEvents(reconnected);
-    await reconnectClient.waitFor(
-      (frame) => frame.type === "message" && frame.data.kind === "user",
-    );
+    await reconnectClient.waitFor((view) => hasEntry(view, "user"));
     reconnectController.abort();
     await reconnectClient.done;
     const branch = await runner.request(path + "/branches");
@@ -391,11 +396,8 @@ test(
       { signal: selectedController.signal },
     );
     const selectedClient = observeEvents(selectedResponse);
-    const followup = selectedClient.waitFor(
-      (frame) =>
-        frame.type === "message" &&
-        frame.data.kind === "assistant" &&
-        frame.data.data.text.includes("Echo: Continue on the restored branch"),
+    const followup = selectedClient.waitFor((view) =>
+      hasEntry(view, "assistant", "Echo: Continue on the restored branch"),
     );
     await runner.request(path + "/input", "POST", {
       requestId: "restored-branch-followup",
@@ -408,11 +410,8 @@ test(
         (event) => event.data.text === "Continue on the restored branch",
       ),
     );
-    await selectedClient.waitFor(
-      (frame) =>
-        frame.type === "message" &&
-        frame.data.kind === "assistant" &&
-        frame.data.data.text.includes("Echo: Continue on the restored branch"),
+    await selectedClient.waitFor((view) =>
+      hasEntry(view, "assistant", "Echo: Continue on the restored branch"),
     );
     selectedController.abort();
     await selectedClient.done;
@@ -493,9 +492,13 @@ test(
       [],
     );
     const persistedSessionInfo = persistedNewSession.body.branches.find(
-      (branch) => branch.conversationId === newSession.body.activeConversationId,
+      (branch) =>
+        branch.conversationId === newSession.body.activeConversationId,
     ).sessionInfo;
-    assert.equal(persistedSessionInfo.id, `branch-demo:${newSession.body.activeConversationId}`);
+    assert.equal(
+      persistedSessionInfo.id,
+      `branch-demo:${newSession.body.activeConversationId}`,
+    );
     assert.equal(persistedSessionInfo.path, persistedSessionInfo.id);
     assert.equal(persistedSessionInfo.cwd, directory);
     assert.equal(persistedSessionInfo.messageCount, 0);
@@ -507,8 +510,14 @@ test(
     ).sessionInfo;
     assert.ok(persistedRootInfo.messageCount >= 2);
     assert.equal(persistedRootInfo.firstMessage, "Write one concise greeting");
-    assert.match(persistedRootInfo.allMessagesText, /Write one concise greeting/);
-    assert.match(persistedRootInfo.allMessagesText, /Echo: Write one concise greeting/);
+    assert.match(
+      persistedRootInfo.allMessagesText,
+      /Write one concise greeting/,
+    );
+    assert.match(
+      persistedRootInfo.allMessagesText,
+      /Echo: Write one concise greeting/,
+    );
     const newSessionStatus = await runner.request(path);
     assert.deepEqual(newSessionStatus.body.model, previousSession.body.model);
     assert.deepEqual(newSessionStatus.body.tools, previousSession.body.tools);
@@ -518,14 +527,11 @@ test(
       { signal: newSessionController.signal },
     );
     const newSessionClient = observeEvents(newSessionResponse);
-    const newSessionTool = newSessionClient.waitFor(
-      (frame) => frame.type === "message" && frame.data.kind === "tool",
+    const newSessionTool = newSessionClient.waitFor((view) =>
+      hasEntry(view, "toolResult"),
     );
-    const newSessionAnswer = newSessionClient.waitFor(
-      (frame) =>
-        frame.type === "message" &&
-        frame.data.kind === "assistant" &&
-        frame.data.data.text.includes("Synthetic task complete."),
+    const newSessionAnswer = newSessionClient.waitFor((view) =>
+      hasEntry(view, "assistant", "Synthetic task complete."),
     );
     const newTurn = await runner.request(path + "/input", "POST", {
       requestId: "new-session-turn",
@@ -537,9 +543,11 @@ test(
         }),
     });
     assert.equal(newTurn.status, 202);
-    const toolEvent = await newSessionTool;
-    assert.equal(toolEvent.data.data.name, "bash");
-    assert.equal(toolEvent.data.data.message.isError, false);
+    const toolResult = (await newSessionTool).entries.find(
+      (entry) => entryRole(entry) === "toolResult",
+    ).model[0];
+    assert.equal(toolResult.toolName, "bash");
+    assert.equal(toolResult.isError, false);
     await newSessionAnswer;
     newSessionController.abort();
     await newSessionClient.done;
@@ -724,7 +732,12 @@ test(
     const history = await runner.request(path + "/history?limit=100");
     assert.deepEqual(
       history.body.events.map((event) => event.data.text),
-      ["Imported question", "Source answer", "Selected follow-up", "Selected answer"],
+      [
+        "Imported question",
+        "Source answer",
+        "Selected follow-up",
+        "Selected answer",
+      ],
     );
     const alternate = navigation.body.branches.at(-1).conversationId;
     const selectedAlternate = await runner.request(path + "/branch", "PUT", {
@@ -749,7 +762,12 @@ test(
     const restoredHistory = await runner.request(path + "/history?limit=100");
     assert.deepEqual(
       restoredHistory.body.events.map((event) => event.data.text),
-      ["Imported question", "Source answer", "Selected follow-up", "Selected answer"],
+      [
+        "Imported question",
+        "Source answer",
+        "Selected follow-up",
+        "Selected answer",
+      ],
     );
     const toolImport = await runner.request(path + "/import", "POST", {
       selectedLeafId: "tool-result",
@@ -817,11 +835,8 @@ test(
       { signal: seedController.signal },
     );
     const seedEvents = observeEvents(seedResponse);
-    const seedAnswer = seedEvents.waitFor(
-      (frame) =>
-        frame.type === "message" &&
-        frame.data.kind === "assistant" &&
-        frame.data.data.text.includes("Echo: Seed the root conversation"),
+    const seedAnswer = seedEvents.waitFor((view) =>
+      hasEntry(view, "assistant", "Echo: Seed the root conversation"),
     );
     await runner.request(path + "/input", "POST", {
       requestId: "loop-fork-seed",
@@ -944,30 +959,16 @@ test(
       publicAbort.abort();
       diagnosticAbort.abort();
     });
-    const initialActivity = await publicEvents.waitFor(
-      (frame) => frame.type === "live" && frame.data.data.type === "activity",
-    );
+    const initialView = await publicEvents.waitFor(() => true);
     assert.deepEqual(
-      initialActivity.data,
-      {
-        workspaceId: "private-bot",
-        kind: "live",
-        data: { type: "activity", active: false },
-      },
-      "public bot attachment must receive a content-free current activity snapshot",
+      { entries: initialView.entries, docs: initialView.docs },
+      { entries: [], docs: { "pi.live": {} } },
+      "public bot attachment must start from a content-free idle view",
     );
 
-    const published = publicEvents.waitFor(
-      (frame) =>
-        frame.type === "message" &&
-        frame.data.kind === "message" &&
-        frame.data.data?.text,
-    );
-    const inspected = diagnosticEvents.waitFor(
-      (frame) =>
-        frame.type === "message" &&
-        frame.data.kind === "assistant" &&
-        frame.data.data?.text?.includes("I am ready for setup details."),
+    const published = publicEvents.waitFor((view) => hasEntry(view, "message"));
+    const inspected = diagnosticEvents.waitFor((view) =>
+      hasEntry(view, "assistant", "I am ready for setup details."),
     );
     const selected = await runner.request(path + "/model", "PUT", {
       provider: "faux",
@@ -977,22 +978,13 @@ test(
     await published;
     await inspected;
 
-    const publicFrames = JSON.stringify(publicEvents.frames);
+    const publicFrames = JSON.stringify(publicEvents.views);
     assert.match(
       publicFrames,
       /What identity and purpose would you like me to have/,
     );
     assert.doesNotMatch(publicFrames, /I am ready for setup details\./);
-    assert.ok(
-      publicEvents.frames.every(
-        (frame) =>
-          (frame.type === "message" &&
-            ["user", "message", "status"].includes(frame.data.kind)) ||
-          (frame.type === "live" &&
-            frame.data.data.type === "activity" &&
-            Object.keys(frame.data.data).sort().join(",") === "active,type"),
-      ),
-    );
+    assert.ok(publicEvents.views.every(isPublicBotView));
     const publicBranch = (await runner.request(path + "/branches")).body
       .branches[0];
     assert.match(
@@ -1003,28 +995,31 @@ test(
       publicBranch.sessionInfo.allMessagesText,
       /I am ready for setup details\./,
     );
-    const diagnosticFrames = JSON.stringify(diagnosticEvents.frames);
+    const diagnosticFrames = JSON.stringify(diagnosticEvents.views);
     assert.match(diagnosticFrames, /I am ready for setup details\./);
     await diagnosticEvents.waitFor(
-      (frame) => frame.type === "live" && frame.data.data.type === "run_end",
+      (view) =>
+        !working(view) &&
+        hasEntry(view, "assistant", "I am ready for setup details."),
     );
     await publicEvents.waitForAfter(
       1,
-      (frame) =>
-        frame.type === "live" &&
-        frame.data.data.type === "activity" &&
-        !frame.data.data.active,
+      (view) => !working(view) && hasEntry(view, "message"),
     );
     assert.deepEqual(
-      publicEvents.frames
-        .filter((frame) => frame.type === "live")
-        .map((frame) => frame.data.data.active),
+      publicEvents.views
+        .map(working)
+        .filter(
+          (active, index, all) => index === 0 || active !== all[index - 1],
+        ),
       [false, true, false],
     );
 
     const nextRun = diagnosticEvents.waitForAfter(
-      diagnosticEvents.frames.length,
-      (frame) => frame.type === "live" && frame.data.data.type === "run_end",
+      diagnosticEvents.views.length,
+      (view) =>
+        !working(view) &&
+        hasEntry(view, "assistant", "Private profile update complete."),
     );
     await runner.request(path + "/input", "POST", {
       requestId: "save-profile",
@@ -1112,17 +1107,11 @@ test(
     );
     const newPublicClient = observeEvents(newPublicResponse);
     const newDiagnosticClient = observeEvents(newDiagnosticResponse);
-    const explicitMessage = newPublicClient.waitFor(
-      (frame) =>
-        frame.type === "message" &&
-        frame.data.kind === "message" &&
-        frame.data.data.text === "Explicit message survives a new session.",
+    const explicitMessage = newPublicClient.waitFor((view) =>
+      hasEntry(view, "message", "Explicit message survives a new session."),
     );
-    const privateOutput = newDiagnosticClient.waitFor(
-      (frame) =>
-        frame.type === "message" &&
-        frame.data.kind === "assistant" &&
-        frame.data.data.text === "Private model output after new session.",
+    const privateOutput = newDiagnosticClient.waitFor((view) =>
+      hasEntry(view, "assistant", "Private model output after new session."),
     );
     await runner.request(path + "/input", "POST", {
       requestId: "new-bot-session-visibility",
@@ -1140,22 +1129,12 @@ test(
     });
     await Promise.all([explicitMessage, privateOutput]);
     assert.ok(
-      newPublicClient.frames.every(
-        (frame) =>
-          (frame.type === "message" &&
-            !["assistant", "tool"].includes(frame.data.kind)) ||
-          (frame.type === "live" &&
-            frame.data.data.type === "activity" &&
-            Object.keys(frame.data.data).sort().join(",") === "active,type"),
-      ),
+      newPublicClient.views.every(isPublicBotView),
       "bot streams may publish explicit messages only",
     );
     assert.ok(
-      newDiagnosticClient.frames.some(
-        (frame) =>
-          frame.type === "message" &&
-          frame.data.kind === "assistant" &&
-          frame.data.data.text === "Private model output after new session.",
+      newDiagnosticClient.views.some((view) =>
+        hasEntry(view, "assistant", "Private model output after new session."),
       ),
     );
     publicController.abort();
@@ -1209,14 +1188,10 @@ test(
       { signal: controller.signal },
     );
     const events = observeEvents(response);
-    const toolStarted = events.waitFor(
-      (frame) =>
-        frame.type === "live" &&
-        frame.data.data.type === "tool_execution_start" &&
-        frame.data.data.toolName === "bash",
-    );
+    const toolStarted = events.waitFor((view) => runningTool(view, "bash"));
     const complete = events.waitFor(
-      (frame) => frame.type === "live" && frame.data.data.type === "run_end",
+      (view) =>
+        !working(view) && hasEntry(view, "assistant", "The command completed."),
     );
     await runner.request(path + "/input", "POST", {
       requestId: "hold-active-tool",

@@ -13,9 +13,15 @@ if (!cwd || !cwd.startsWith("/")) {
 }
 
 const env = new NodeExecutionEnv({ cwd });
+// Each open reader or watcher, with how to release it: readers close(),
+// watchers stop().
 const handles = new Map<
   number,
-  { kind: string; value: { close(call: Context): Promise<void> } }
+  {
+    kind: string;
+    value: Record<string, unknown>;
+    release(call: Context): Promise<void>;
+  }
 >();
 const cancels = new Map<number, (reason?: unknown) => void>();
 let nextHandle = 0;
@@ -84,7 +90,7 @@ function encodeResult(result: {
 function handleOf(id: unknown, kind: string) {
   const handle = handles.get(Number(id));
   if (!handle || handle.kind !== kind) return undefined;
-  return handle.value;
+  return handle;
 }
 
 async function perform(
@@ -114,7 +120,7 @@ async function perform(
   }
   if (method === "cleanup") {
     for (const handle of handles.values())
-      await handle.value.close(call).catch(() => undefined);
+      await handle.release(call).catch(() => undefined);
     handles.clear();
     await env.cleanup(call);
     return { ok: true, value: null };
@@ -167,7 +173,12 @@ async function perform(
         : method === "openTextLineReader"
           ? "text"
           : "dir";
-    handles.set(handle, { kind, value: opened.value });
+    const reader = opened.value;
+    handles.set(handle, {
+      kind,
+      value: reader as unknown as Record<string, unknown>,
+      release: (releasing) => reader.close(releasing),
+    });
     return { ok: true, value: { handle, kind } };
   }
   if (method === "watch") {
@@ -185,14 +196,17 @@ async function perform(
     );
     if (!opened.ok) return encodeResult(opened);
     handle = ++nextHandle;
-    handles.set(handle, { kind: "watch", value: opened.value });
+    const watcher = opened.value;
+    handles.set(handle, {
+      kind: "watch",
+      value: watcher as unknown as Record<string, unknown>,
+      release: (releasing) => watcher.stop(releasing),
+    });
     return { ok: true, value: { handle, mode: opened.value.mode } };
   }
   const [kind, name] = method.split(".");
-  const resource = handleOf(decoded[0], kind ?? "") as
-    | { close(call: Context): Promise<void>; [key: string]: unknown }
-    | undefined;
-  if (!resource || !name)
+  const handle = handleOf(decoded[0], kind ?? "");
+  if (!handle || !name)
     return {
       ok: false,
       error: {
@@ -201,12 +215,14 @@ async function perform(
         message: `Unknown environment call ${method}`,
       },
     };
-  if (name === "close") {
-    await resource.close(call);
+  // Readers end with close(), watchers with stop(); either releases the handle.
+  if (name === "close" || name === "stop") {
+    await handle.release(call);
     handles.delete(Number(decoded[0]));
     return { ok: true, value: null };
   }
-  const operation = resource[name as keyof typeof resource];
+  const resource = handle.value;
+  const operation = resource[name];
   if (typeof operation !== "function")
     return {
       ok: false,
@@ -271,7 +287,7 @@ function shutdown(closeInput: boolean) {
     await env.cleanup(BACKGROUND_CONTEXT).catch(() => undefined);
     while (activeCalls.size > 0) await Promise.allSettled([...activeCalls]);
     for (const handle of handles.values())
-      await handle.value.close(BACKGROUND_CONTEXT).catch(() => undefined);
+      await handle.release(BACKGROUND_CONTEXT).catch(() => undefined);
     handles.clear();
     await env.cleanup(BACKGROUND_CONTEXT).catch(() => undefined);
     process.exitCode = 0;

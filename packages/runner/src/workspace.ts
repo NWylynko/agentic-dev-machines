@@ -2,7 +2,10 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import {
+  BACKGROUND_CONTEXT as context,
+  withAbortSignal,
+} from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
 import {
   createRegistry,
@@ -153,18 +156,10 @@ export function entryEvent(
   return undefined;
 }
 
+// A sleeping task (a loop waiting for its next occurrence) holds no work.
 function agentIsBusy(task: TaskInspection) {
-  const state = task.record.state;
-  if (state.status === "terminal" || state.status === "completing")
-    return state.status !== "terminal";
-  if (
-    task.record.kind !== "adm.loop" ||
-    !state.checkpoint ||
-    typeof state.checkpoint !== "object" ||
-    Array.isArray(state.checkpoint)
-  )
-    return true;
-  return state.checkpoint.phase !== "wait";
+  const status = task.record.state.status;
+  return status !== "terminal" && status !== "sleeping";
 }
 
 export class Workspace {
@@ -212,7 +207,7 @@ export class Workspace {
   private readonly loopTask: ReturnType<
     typeof createScheduleExtension
   >["loopTask"];
-  private unsubscribe: () => void;
+  private commitObservation: { detach(): void };
   private sandbox?: CodemodeSandbox;
   private connectors?: WorkspaceConnectors;
   browser?: WorkspaceBrowser;
@@ -238,13 +233,11 @@ export class Workspace {
     this.assertActive = assertActive;
     this.loopTask = loopTask;
     this.connectors = connectors;
-    this.unsubscribe = harness.subscribeCommits((publication) => {
-      this.cacheWarming.observeCommit(publication);
-      this.events.emit("change");
-      for (const operationId of this.bashStreams.keys())
-        void this.bashResult(operationId).then((result) => {
-          if (result) this.bashStreams.delete(operationId);
-        });
+    this.commitObservation = harness.observeCommits({
+      advance: (publication) => this.cacheWarming.observeCommit(publication),
+      // The Session ended: close() is already under way or the storage failed,
+      // which closes the Harness and fails every later call loudly.
+      end: () => {},
     });
   }
 
@@ -1718,6 +1711,23 @@ export class Workspace {
     return { status: "aborted" as const };
   }
 
+  /** Resolve once bash operation `operationId` has a result, or at once when it has no running task. */
+  async waitForBash(operationId: string, signal: AbortSignal) {
+    const inspection = await this.harness.inspect(context);
+    const task = inspection.tasks.find(
+      (item) =>
+        item.record.kind === "adm.user-bash" &&
+        (item.record.input as BashInput).operationId === operationId,
+    );
+    if (task)
+      await this.harness.waitForTask(
+        task.record.id,
+        withAbortSignal(signal, context),
+      );
+    this.bashStreams.delete(operationId);
+    return this.bashResult(operationId);
+  }
+
   async bashResult(operationId: string): Promise<BashResult | undefined> {
     return (
       await this.findBashEntry((data) => data.operationId === operationId)
@@ -1879,7 +1889,7 @@ export class Workspace {
     this.closed = true;
     await attempt(() => this.cacheWarming.cancel());
     try {
-      this.unsubscribe();
+      this.commitObservation.detach();
     } catch (error) {
       errors.push(error);
     }

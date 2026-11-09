@@ -9,6 +9,7 @@ import {
   type Harness,
 } from "@earendil-works/pi-durable";
 import type { Message } from "@earendil-works/pi-ai";
+import { admDocCheckpointWhen } from "./types.ts";
 
 type Branch = {
   conversationId: number;
@@ -26,6 +27,7 @@ type WorkspaceNavigation = {
 
 const navigationDocument = defineDoc<WorkspaceNavigation>({
   kind: "adm.workspace-navigation",
+  checkpointWhen: admDocCheckpointWhen,
   version: 1,
   scope: "session",
   initial: () => ({ activeConversationId: 0, branches: [] }),

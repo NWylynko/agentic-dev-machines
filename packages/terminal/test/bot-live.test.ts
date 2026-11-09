@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { WorkspaceTerminal } from "../src/terminal.ts";
+import { WorkspaceConnection } from "../src/workspace-connection.ts";
 import { DurableInteractiveRuntime } from "../src/native-runtime.ts";
 import { createProviderAuthAuthority } from "../../runner/src/provider-auth-authority.ts";
 import {
@@ -284,10 +284,9 @@ test(
     await first.waitFor(question);
     assert.doesNotMatch(first.text(), /I am ready for setup details\./);
 
-    const transport = new WorkspaceTerminal({
+    const transport = new WorkspaceConnection({
       url,
       workspaceId: "live-bot",
-      autoModelSelector: false,
       tokenFile: bot.tokenFile,
     });
     const runtime = new DurableInteractiveRuntime(transport);
@@ -297,6 +296,8 @@ test(
     });
     await transport.connect();
     await runtime.initialize();
+    // No Pi renders here: it would have rendered the session just now.
+    runtime.rendered();
     const delivered: string[] = [];
     let complete = () => {};
     const published = new Promise<void>((resolve) => (complete = resolve));

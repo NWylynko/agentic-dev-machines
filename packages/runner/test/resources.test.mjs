@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { entryRole, followView, nextHistoryEvent } from "./attach-stream.ts";
 
 async function startRunner(directory) {
   const child = spawn(
@@ -51,43 +52,31 @@ async function startRunner(directory) {
   });
   return {
     url,
+    // The prompt sections and messages the model sees on the next turn.
     async inspectPrompt(path) {
-      const controller = new AbortController();
-      const stream = await fetch(url + path + "/events", {
-        signal: AbortSignal.any([
-          controller.signal,
-          AbortSignal.timeout(10000),
-        ]),
-      });
-      const reader = stream.body.getReader();
-      try {
-        const admitted = await this.request(path + "/input", "POST", {
-          message: "/faux-inspect-system-prompt",
-          requestId: "resource-prompt-inspection",
-        });
-        assert.equal(admitted.status, 202);
-        let buffer = "";
-        const decoder = new TextDecoder();
-        for (;;) {
-          const part = await reader.read();
-          if (part.done)
-            throw new Error("Runner events closed before prompt inspection");
-          buffer += decoder.decode(part.value, { stream: true });
-          let newline;
-          while ((newline = buffer.indexOf("\n")) >= 0) {
-            const line = buffer.slice(0, newline).trimEnd();
-            buffer = buffer.slice(newline + 1);
-            if (line.startsWith("data: ")) {
-              const event = JSON.parse(line.slice(6));
-              if (event.kind === "assistant")
-                return JSON.parse(event.data.text);
-            }
-          }
+      let newestBefore = 0;
+      return followView(url, path, async (view, frame) => {
+        if (frame === "view") {
+          newestBefore = Number(view.entries.at(-1)?.id ?? 0);
+          const admitted = await this.request(path + "/input", "POST", {
+            message: "/faux-inspect-system-prompt",
+            requestId: "resource-prompt-inspection",
+          });
+          assert.equal(admitted.status, 202);
+          return;
         }
-      } finally {
-        controller.abort();
-        await reader.cancel().catch(() => {});
-      }
+        const answer = view.entries.find(
+          (entry) =>
+            Number(entry.id) > newestBefore && entryRole(entry) === "assistant",
+        );
+        if (answer)
+          return JSON.parse(
+            answer.model[0].content
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join(""),
+          );
+      });
     },
     async request(path, method = "GET", data) {
       const response = await fetch(url + path, {
@@ -330,7 +319,11 @@ test(
       ["trust", "PUT", { trusted: true }],
       ["resources/reload", "POST", {}],
       ["extensions", "GET"],
-      ["extensions/commands", "POST", { name: "example", args: "", requestId: "bot-denied" }],
+      [
+        "extensions/commands",
+        "POST",
+        { name: "example", args: "", requestId: "bot-denied" },
+      ],
     ]) {
       const response = await runner.request(
         path + "/" + endpoint,
@@ -355,7 +348,7 @@ test(
     await writeFile(
       join(project, ".pi/extensions/fixture.js"),
       `import { appendFileSync } from "node:fs";
-import { Type } from "typebox";
+import { Type } from "@earendil-works/pi-ai";
 appendFileSync(${JSON.stringify(sentinel)}, "loaded\\n");
 export default (pi) => {
   pi.on("session_start", async () => {});
@@ -450,39 +443,65 @@ export default (pi) => {
         ),
       ),
     );
-    assert.ok(discovered.body.extensions.some((extension) =>
-      extension.shortcuts.some((shortcut) =>
-        shortcut.name === extension.path + ":ctrl+x" && shortcut.key === "ctrl+x",
+    assert.ok(
+      discovered.body.extensions.some((extension) =>
+        extension.shortcuts.some(
+          (shortcut) =>
+            shortcut.name === extension.path + ":ctrl+x" &&
+            shortcut.key === "ctrl+x",
+        ),
       ),
-    ));
+    );
     assert.ok(
       discovered.body.diagnostics.some((diagnostic) =>
-        /unsupported capabilities: hooks \(session_start\)/.test(diagnostic.message),
+        /unsupported capabilities: hooks \(session_start\)/.test(
+          diagnostic.message,
+        ),
       ),
     );
     const [command, concurrentDuplicate] = await Promise.all([
       runner.request(path + "/extensions/commands", "POST", {
-        name: "extension-hello", args: "Nick", requestId: "hello-request-1",
+        name: "extension-hello",
+        args: "Nick",
+        requestId: "hello-request-1",
       }),
       runner.request(path + "/extensions/commands", "POST", {
-        name: "extension-hello", args: "Nick", requestId: "hello-request-1",
+        name: "extension-hello",
+        args: "Nick",
+        requestId: "hello-request-1",
       }),
     ]);
     assert.equal(command.status, 200);
     assert.equal(typeof command.body.operationId, "string");
-    assert.equal(concurrentDuplicate.body.operationId, command.body.operationId);
-    assert.equal((await runner.request(path + "/extensions/commands", "POST", {
-      name: "extension-hello",
-      args: "Nick",
-      requestId: "hello-request-1",
-    })).body.operationId, command.body.operationId);
-    assert.equal((await runner.request(path + "/extensions/commands", "POST", {
-      name: "extension-hello",
-      args: "different",
-      requestId: "hello-request-1",
-    })).status, 409);
+    assert.equal(
+      concurrentDuplicate.body.operationId,
+      command.body.operationId,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/extensions/commands", "POST", {
+          name: "extension-hello",
+          args: "Nick",
+          requestId: "hello-request-1",
+        })
+      ).body.operationId,
+      command.body.operationId,
+    );
+    assert.equal(
+      (
+        await runner.request(path + "/extensions/commands", "POST", {
+          name: "extension-hello",
+          args: "different",
+          requestId: "hello-request-1",
+        })
+      ).status,
+      409,
+    );
     const notifyEvents = await fetch(
-      new URL(path + "/extensions/commands/" + command.body.operationId + "/events", runner.url),
+      new URL(
+        path + "/extensions/commands/" + command.body.operationId + "/events",
+        runner.url,
+      ),
     );
     const notifyReader = notifyEvents.body.getReader();
     let notifyBuffer = "";
@@ -496,7 +515,8 @@ export default (pi) => {
       while ((newline = notifyBuffer.indexOf("\n")) >= 0) {
         const line = notifyBuffer.slice(0, newline).trimEnd();
         notifyBuffer = notifyBuffer.slice(newline + 1);
-        if (line.startsWith("data: ")) notifications.push(JSON.parse(line.slice(6)));
+        if (line.startsWith("data: "))
+          notifications.push(JSON.parse(line.slice(6)));
       }
     }
     assert.deepEqual(notifications, [
@@ -504,16 +524,22 @@ export default (pi) => {
       { type: "result", seq: 2, command: "extension-hello" },
     ]);
     assert.equal((await notifyReader.read()).done, true);
-    assert.equal((await readFile(sentinel, "utf8")).split("command").length - 1, 1);
-    await notifyReader.cancel();
-    const dialog = await runner.request(
-      path + "/extensions/commands",
-      "POST",
-      { name: "extension-dialog", args: "", requestId: "dialog-request-1" },
+    assert.equal(
+      (await readFile(sentinel, "utf8")).split("command").length - 1,
+      1,
     );
+    await notifyReader.cancel();
+    const dialog = await runner.request(path + "/extensions/commands", "POST", {
+      name: "extension-dialog",
+      args: "",
+      requestId: "dialog-request-1",
+    });
     assert.equal(dialog.status, 200);
     const uiEvents = await fetch(
-      new URL(path + "/extensions/commands/" + dialog.body.operationId + "/events", runner.url),
+      new URL(
+        path + "/extensions/commands/" + dialog.body.operationId + "/events",
+        runner.url,
+      ),
     );
     const uiReader = uiEvents.body.getReader();
     const uiDecoder = new TextDecoder();
@@ -559,9 +585,18 @@ export default (pi) => {
     const shortcutName = discovered.body.extensions.find((extension) =>
       extension.shortcuts.some((item) => item.key === "ctrl+x"),
     ).shortcuts[0].name;
-    const shortcut = await runner.request(path + "/extensions/shortcuts", "POST", { name: shortcutName, requestId: "shortcut-request-1" });
+    const shortcut = await runner.request(
+      path + "/extensions/shortcuts",
+      "POST",
+      { name: shortcutName, requestId: "shortcut-request-1" },
+    );
     assert.equal(shortcut.status, 200);
-    const shortcutEvents = await fetch(new URL(path + "/extensions/commands/" + shortcut.body.operationId + "/events", runner.url));
+    const shortcutEvents = await fetch(
+      new URL(
+        path + "/extensions/commands/" + shortcut.body.operationId + "/events",
+        runner.url,
+      ),
+    );
     const shortcutReader = shortcutEvents.body.getReader();
     const shortcutDecoder = new TextDecoder();
     let shortcutBuffer = "";
@@ -574,58 +609,52 @@ export default (pi) => {
       while ((newline = shortcutBuffer.indexOf("\n")) >= 0) {
         const line = shortcutBuffer.slice(0, newline).trimEnd();
         shortcutBuffer = shortcutBuffer.slice(newline + 1);
-        if (line.startsWith("data: ")) shortcutResult.push(JSON.parse(line.slice(6)));
+        if (line.startsWith("data: "))
+          shortcutResult.push(JSON.parse(line.slice(6)));
       }
     }
     assert.equal(shortcutResult[0].message, "shortcut ran");
     assert.equal(shortcutResult[1].type, "result");
     await shortcutReader.cancel();
 
-    const eventsAbort = new AbortController();
-    const eventResponse = await fetch(new URL(path + "/events", runner.url), {
-      signal: AbortSignal.any([eventsAbort.signal, AbortSignal.timeout(10000)]),
+    const input = await runner.request(path + "/input", "POST", {
+      requestId: "trusted-extension-tool",
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [{ tool: "extension_echo", args: { text: "durable" } }],
+          answer: "Extension tool completed.",
+        }),
     });
-    const eventReader = eventResponse.body.getReader();
-    try {
-      const input = await runner.request(path + "/input", "POST", {
-        requestId: "trusted-extension-tool",
-        message:
-          "/faux " +
-          JSON.stringify({
-            calls: [{ tool: "extension_echo", args: { text: "durable" } }],
-            answer: "Extension tool completed.",
-          }),
-      });
-      assert.equal(input.status, 202);
-      let buffer = "";
-      const decoder = new TextDecoder();
-      let toolResult;
-      while (!toolResult) {
-        const chunk = await eventReader.read();
-        assert.equal(chunk.done, false);
-        buffer += decoder.decode(chunk.value, { stream: true });
-        let newline;
-        while ((newline = buffer.indexOf("\n")) >= 0) {
-          const line = buffer.slice(0, newline).trimEnd();
-          buffer = buffer.slice(newline + 1);
-          if (!line.startsWith("data: ")) continue;
-          const event = JSON.parse(line.slice(6));
-          if (event.kind === "tool" && event.data.name === "extension_echo") {
-            toolResult = event.data;
-            break;
-          }
-        }
-      }
-      assert.match(toolResult.text, /extension-hook-result/);
-    } finally {
-      eventsAbort.abort();
-      await eventReader.cancel().catch(() => {});
-    }
-    const interrupted = await runner.request(path + "/extensions/commands", "POST", {
-      name: "extension-blocking", args: "", requestId: "blocked-request-1",
-    });
+    assert.equal(input.status, 202);
+    const toolResult = (
+      await nextHistoryEvent(
+        runner.url,
+        path,
+        (event) =>
+          event.kind === "tool" && event.data.name === "extension_echo",
+      )
+    ).data;
+    assert.match(toolResult.text, /extension-hook-result/);
+    const interrupted = await runner.request(
+      path + "/extensions/commands",
+      "POST",
+      {
+        name: "extension-blocking",
+        args: "",
+        requestId: "blocked-request-1",
+      },
+    );
     assert.equal(interrupted.status, 200);
-    const activeEvents = await fetch(new URL(path + "/extensions/commands/" + interrupted.body.operationId + "/events", runner.url));
+    const activeEvents = await fetch(
+      new URL(
+        path +
+          "/extensions/commands/" +
+          interrupted.body.operationId +
+          "/events",
+        runner.url,
+      ),
+    );
     const activeReader = activeEvents.body.getReader();
     const activeDecoder = new TextDecoder();
     let activeBuffer = "";
@@ -638,7 +667,11 @@ export default (pi) => {
       while ((newline = activeBuffer.indexOf("\n")) >= 0) {
         const line = activeBuffer.slice(0, newline).trimEnd();
         activeBuffer = activeBuffer.slice(newline + 1);
-        if (line.startsWith("data: ") && JSON.parse(line.slice(6)).message === "blocking command started") started = true;
+        if (
+          line.startsWith("data: ") &&
+          JSON.parse(line.slice(6)).message === "blocking command started"
+        )
+          started = true;
       }
     }
     await activeReader.cancel();
@@ -652,17 +685,39 @@ export default (pi) => {
       ),
     );
     const replay = await runner.request(path + "/extensions/commands", "POST", {
-      name: "extension-hello", args: "Nick", requestId: "hello-request-1",
+      name: "extension-hello",
+      args: "Nick",
+      requestId: "hello-request-1",
     });
     assert.equal(replay.status, 200);
     assert.equal(replay.body.operationId, command.body.operationId);
-    assert.equal((await readFile(sentinel, "utf8")).split("command").length - 1, 1);
+    assert.equal(
+      (await readFile(sentinel, "utf8")).split("command").length - 1,
+      1,
+    );
     assert.equal((await readFile(blockedMarker, "utf8")).trim(), "started");
-    const interruptedReplay = await runner.request(path + "/extensions/commands", "POST", {
-      name: "extension-blocking", args: "", requestId: "blocked-request-1",
-    });
-    assert.equal(interruptedReplay.body.operationId, interrupted.body.operationId);
-    const interruptedEvents = await fetch(new URL(path + "/extensions/commands/" + interrupted.body.operationId + "/events", runner.url));
+    const interruptedReplay = await runner.request(
+      path + "/extensions/commands",
+      "POST",
+      {
+        name: "extension-blocking",
+        args: "",
+        requestId: "blocked-request-1",
+      },
+    );
+    assert.equal(
+      interruptedReplay.body.operationId,
+      interrupted.body.operationId,
+    );
+    const interruptedEvents = await fetch(
+      new URL(
+        path +
+          "/extensions/commands/" +
+          interrupted.body.operationId +
+          "/events",
+        runner.url,
+      ),
+    );
     const interruptedBody = await interruptedEvents.text();
     assert.match(interruptedBody, /EXTENSION_COMMAND_INTERRUPTED/);
     assert.equal((await readFile(blockedMarker, "utf8")).trim(), "started");

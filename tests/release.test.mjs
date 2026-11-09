@@ -17,6 +17,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import YAML from "yaml";
+import { applyImmutable } from "@earendil-works/chord/delta";
 
 const execute = promisify(execFile);
 const project = fileURLToPath(new URL("../", import.meta.url));
@@ -146,7 +147,10 @@ test(
       lifecyclePod.initContainers[0].image,
       "ghcr.io/example/adm-control:9.8.7",
     );
-    assert.equal(lifecyclePod.containers[0].image, "ghcr.io/example/adm-control:9.8.7");
+    assert.equal(
+      lifecyclePod.containers[0].image,
+      "ghcr.io/example/adm-control:9.8.7",
+    );
     assert.equal(
       lifecyclePod.volumes.find((volume) => volume.name === "token").secret
         .defaultMode,
@@ -197,33 +201,46 @@ test(
       "ghcr.io/example/adm-code:9.8.7",
     );
     await assert.rejects(
-      execute(
-        adm,
-        ["update", "--workspace", "same", "--workspace", "same"],
-        { cwd: unrelated, env: environment },
-      ),
+      execute(adm, ["update", "--workspace", "same", "--workspace", "same"], {
+        cwd: unrelated,
+        env: environment,
+      }),
       /a workspace was selected more than once/,
     );
-    assert.equal(await readFile(join(installed, "VERSION"), "utf8"), "v9.8.7\n");
+    assert.equal(
+      await readFile(join(installed, "VERSION"), "utf8"),
+      "v9.8.7\n",
+    );
 
     const lifecycleTokenFile = join(directory, "lifecycle-token");
-    await writeFile(lifecycleTokenFile, "synthetic-lifecycle-token\n", { mode: 0o600 });
+    await writeFile(lifecycleTokenFile, "synthetic-lifecycle-token\n", {
+      mode: 0o600,
+    });
     const applied = join(directory, "controller-applied");
     const kubectlLog = join(directory, "kubectl.log");
     const targetImage = "ghcr.io/example/adm-code:9.8.7";
     const targetControlImage = "ghcr.io/example/adm-control:9.8.7";
     const fixtureResources = YAML.parseAllDocuments(
-      await readFile(join(installed, "deploy/lifecycle/control-plane.yaml"), "utf8"),
+      await readFile(
+        join(installed, "deploy/lifecycle/control-plane.yaml"),
+        "utf8",
+      ),
     ).map((document) => document.toJSON());
     const deploymentResource = fixtureResources.find(
-      (resource) => resource.kind === "Deployment" && resource.metadata.name === "adm-lifecycle",
+      (resource) =>
+        resource.kind === "Deployment" &&
+        resource.metadata.name === "adm-lifecycle",
     );
     for (const container of [
       ...deploymentResource.spec.template.spec.initContainers,
       ...deploymentResource.spec.template.spec.containers,
-    ]) container.image = targetControlImage;
+    ])
+      container.image = targetControlImage;
     const resourcesFile = join(directory, "lifecycle-resources.json");
-    await writeFile(resourcesFile, fixtureResources.map(JSON.stringify).join("\n"));
+    await writeFile(
+      resourcesFile,
+      fixtureResources.map(JSON.stringify).join("\n"),
+    );
     const fakeKubectl = join(hostTools, "kubectl");
     await writeFile(
       fakeKubectl,
@@ -256,9 +273,15 @@ esac
       const chunks = [];
       for await (const chunk of request) chunks.push(chunk);
       const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : {};
-      if (request.headers.authorization !== "Bearer synthetic-lifecycle-token") {
+      if (
+        request.headers.authorization !== "Bearer synthetic-lifecycle-token"
+      ) {
         response.writeHead(401, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { message: "selected token file was not forwarded" } }));
+        response.end(
+          JSON.stringify({
+            error: { message: "selected token file was not forwarded" },
+          }),
+        );
         return;
       }
       if (request.url.startsWith("/v1/runtime/maintenance/")) {
@@ -304,34 +327,49 @@ esac
       if (request.method === "POST" && request.url === "/v1/operations") {
         assert.equal(body.kind, "update");
         assert.equal(body.workspaceId, selectedId);
-        if (failSelectedWorkspace) failedWorkspaceOperations.add(body.operationId);
+        if (failSelectedWorkspace)
+          failedWorkspaceOperations.add(body.operationId);
         response.writeHead(202, { "content-type": "application/json" });
-        response.end(JSON.stringify({
-          operationId: body.operationId,
-          workspaceId: body.workspaceId,
-          kind: "update",
-          status: failSelectedWorkspace ? "accepted" : "completed",
-          stage: failSelectedWorkspace ? "accepted" : "completed",
-        }));
+        response.end(
+          JSON.stringify({
+            operationId: body.operationId,
+            workspaceId: body.workspaceId,
+            kind: "update",
+            status: failSelectedWorkspace ? "accepted" : "completed",
+            stage: failSelectedWorkspace ? "accepted" : "completed",
+          }),
+        );
         return;
       }
-      if (request.method === "GET" && request.url?.startsWith("/v1/operations/")) {
+      if (
+        request.method === "GET" &&
+        request.url?.startsWith("/v1/operations/")
+      ) {
         const operationId = request.url.split("/").at(-1);
         const failed = failedWorkspaceOperations.has(operationId);
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({
-          status: failed ? "failed" : "completed",
-          stage: failed ? "failed" : "completed",
-          lastError: failed ? "injected selected workspace update failure" : null,
-        }));
+        response.end(
+          JSON.stringify({
+            status: failed ? "failed" : "completed",
+            stage: failed ? "failed" : "completed",
+            lastError: failed
+              ? "injected selected workspace update failure"
+              : null,
+          }),
+        );
         return;
       }
-      if (request.method === "GET" && request.url === `/v1/workspaces/${selectedId}`) {
+      if (
+        request.method === "GET" &&
+        request.url === `/v1/workspaces/${selectedId}`
+      ) {
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({
-          ...selectedWorkspace,
-          image: targetImage,
-        }));
+        response.end(
+          JSON.stringify({
+            ...selectedWorkspace,
+            image: targetImage,
+          }),
+        );
         return;
       }
       const maintenanceResponse = request.url.endsWith("/extend")
@@ -385,17 +423,25 @@ esac
       "/v1/runtime/maintenance/await",
       "/v1/runtime/maintenance/complete",
     ]);
-    assert.equal(await readFile(applied, "utf8"), `image=${targetControlImage}\n`);
+    assert.equal(
+      await readFile(applied, "utf8"),
+      `image=${targetControlImage}\n`,
+    );
     const appliedCalls = (await readFile(kubectlLog, "utf8"))
       .split("\n")
       .filter((call) => call.startsWith("apply "));
-    assert.equal(appliedCalls.length, 2, "default update applies only the controller namespace and resources");
+    assert.equal(
+      appliedCalls.length,
+      2,
+      "default update applies only the controller namespace and resources",
+    );
     const appliedManifest = await readFile(`${applied}.manifest`, "utf8");
     assert.match(appliedManifest, /installed-lifecycle-class/);
     assert.doesNotMatch(appliedManifest, /stale-workspace-storage/);
     assert.doesNotMatch(appliedManifest, /stale-workspace-image/);
     assert.equal(
-      (await execute(adm, ["--version"], { cwd: unrelated, env: environment })).stdout,
+      (await execute(adm, ["--version"], { cwd: unrelated, env: environment }))
+        .stdout,
       "adm 0.1.0\n",
     );
     const configPath = join(environment.XDG_CONFIG_HOME, "adm", "config.json");
@@ -410,7 +456,10 @@ esac
     // (TASK-62: fixes shipped, but fresh workspaces still ran the old release).
     await writeFile(
       configPath,
-      JSON.stringify({ ...savedConfig, image: "ghcr.io/example/adm-code:sha-setup-time-release" }),
+      JSON.stringify({
+        ...savedConfig,
+        image: "ghcr.io/example/adm-code:sha-setup-time-release",
+      }),
     );
     await execute(
       adm,
@@ -431,14 +480,18 @@ esac
       ...savedConfig,
       image: targetImage,
     });
-    const freshManifest = await execute(adm, ["manifest", "fresh-after-update"], {
-      cwd: unrelated,
-      env: environment,
-    });
+    const freshManifest = await execute(
+      adm,
+      ["manifest", "fresh-after-update"],
+      {
+        cwd: unrelated,
+        env: environment,
+      },
+    );
     assert.equal(
-      JSON.parse(freshManifest.stdout)
-        .items.find((resource) => resource.kind === "Deployment")
-        .spec.template.spec.containers[0].image,
+      JSON.parse(freshManifest.stdout).items.find(
+        (resource) => resource.kind === "Deployment",
+      ).spec.template.spec.containers[0].image,
       targetImage,
       "a workspace created after `adm update` runs the updated release",
     );
@@ -460,8 +513,14 @@ esac
       ],
       { cwd: unrelated, env: updateEnvironment, maxBuffer: 1024 * 1024 },
     );
-    assert.match(selectedUpdate.stderr, /selected workspace selected-workspace/);
-    assert.match(selectedUpdate.stderr, /targets immutable ID 55f9ea63-5506-4b39-bab8-49c2fadd0e73/);
+    assert.match(
+      selectedUpdate.stderr,
+      /selected workspace selected-workspace/,
+    );
+    assert.match(
+      selectedUpdate.stderr,
+      /targets immutable ID 55f9ea63-5506-4b39-bab8-49c2fadd0e73/,
+    );
     failSelectedWorkspace = true;
     await assert.rejects(
       execute(
@@ -667,7 +726,9 @@ esac
       signal: AbortSignal.any([controller.signal, t.signal]),
     });
     assert.equal(response.status, 200);
+    // The attach stream: the conversation view, then the ops of each change.
     let buffer = "",
+      view,
       delivered = false;
     try {
       for await (const bytes of response.body) {
@@ -675,20 +736,23 @@ esac
         for (;;) {
           const end = buffer.indexOf("\n\n");
           if (end < 0) break;
-          const frame = buffer.slice(0, end);
+          const frame = buffer.slice(0, end).split("\n");
           buffer = buffer.slice(end + 2);
-          const data = frame
-            .split("\n")
-            .find((line) => line.startsWith("data: "));
+          const name = frame
+            .find((line) => line.startsWith("event: "))
+            ?.slice(7);
+          const data = frame.find((line) => line.startsWith("data: "));
           if (!data) continue;
-          const event = JSON.parse(data.slice(6));
-          if (
-            event.kind === "message" &&
-            event.data.text === "Packaged worker delivered this."
-          ) {
-            delivered = true;
-            break;
-          }
+          const payload = JSON.parse(data.slice(6));
+          if (name === "view") view = payload.value;
+          else if (name === "ops") view = applyImmutable(view, payload.ops);
+          else continue;
+          delivered = view.entries.some(
+            (entry) =>
+              entry.kind === "adm.message" &&
+              entry.data.text === "Packaged worker delivered this.",
+          );
+          if (delivered) break;
         }
         if (delivered) break;
       }

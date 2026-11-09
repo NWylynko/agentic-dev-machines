@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { nextHistoryEvent } from "./attach-stream.ts";
 
 const main = new URL("../src/main.ts", import.meta.url);
 const remoteEnv = fileURLToPath(
@@ -75,34 +76,8 @@ async function startRunner(directory) {
   };
 }
 
-async function nextEvent(runner, id, predicate) {
-  const controller = new AbortController();
-  const response = await fetch(
-    `${runner.url}/v1/workspaces/${id}/events?after=0`,
-    { signal: controller.signal },
-  );
-  let buffer = "";
-  try {
-    for await (const bytes of response.body) {
-      buffer += Buffer.from(bytes).toString();
-      for (;;) {
-        const end = buffer.indexOf("\n\n");
-        if (end < 0) break;
-        const frame = buffer.slice(0, end);
-        buffer = buffer.slice(end + 2);
-        const data = frame
-          .split("\n")
-          .find((line) => line.startsWith("data: "));
-        if (!data) continue;
-        const event = JSON.parse(data.slice(6));
-        if (predicate(event)) return event;
-      }
-    }
-    throw new Error("Event stream ended before the workspace finished");
-  } finally {
-    controller.abort();
-  }
-}
+const nextEvent = (runner, id, predicate) =>
+  nextHistoryEvent(runner.url, `/v1/workspaces/${id}`, predicate);
 
 test(
   "coding tools execute in the workspace runtime and do not write the management host",

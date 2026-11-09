@@ -29,22 +29,22 @@
     "runner": "node --import tsx packages/runner/src/main.ts"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.2.0",
-    "@earendil-works/pi-ai": "1.2.0",
-    "@earendil-works/pi-codemode": "1.2.0",
-    "@earendil-works/pi-coding-agent": "1.2.0",
-    "@earendil-works/pi-durable": "1.2.0",
-    "@earendil-works/pi-mcp": "1.2.0",
-    "@earendil-works/pi-tui": "1.2.0",
+    "@earendil-works/chord": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-codemode": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-durable": "1.5.0",
+    "@earendil-works/pi-mcp": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
     "@playwright/mcp": "0.0.84",
-    "typebox": "1.3.27"
+    "@earendil-works/pi-schema": "1.5.0"
   },
   "devDependencies": {
     "@types/node": "24.10.1",
     "@xterm/headless": "6.0.0",
     "esbuild": "0.28.2",
     "prettier": "3.8.2",
-    "tsx": "4.21.0",
+    "tsx": "4.23.15",
     "typescript": "5.9.3",
     "yaml": "2.9.0"
   }

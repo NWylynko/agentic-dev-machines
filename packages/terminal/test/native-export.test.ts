@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { DurableInteractiveRuntime } from "../src/native-runtime.ts";
-import { WorkspaceTerminal } from "../src/terminal.ts";
+import { viewEntries } from "../src/pi-view-events.ts";
+import { WorkspaceConnection } from "../src/workspace-connection.ts";
 import { TERMINAL_TEST_TIMEOUT_MS } from "./wait-budget.ts";
 
 test(
@@ -82,11 +83,12 @@ test(
         ...(role === "coding" ? { localRoot: join(directory, "repo") } : {}),
         model: { provider: "faux", id: "faux-1" },
       });
-      const controller = new AbortController();
-      const events = await fetch(url + path + "/events?diagnostics=true", {
-        signal: controller.signal,
+      const transport = new WorkspaceConnection({
+        url,
+        workspaceId: id,
+        diagnostics: true,
       });
-      const reader = events.body!.getReader();
+      await transport.connect();
       const answer =
         role === "bot" ? "PRIVATE_BOT_REASONING" : "Coding export answer";
       const message =
@@ -107,35 +109,23 @@ test(
         message,
         requestId: `export-${role}-turn`,
       });
-      let buffer = "";
-      const decoder = new TextDecoder();
-      try {
-        finished: for (;;) {
-          const part = await reader.read();
-          assert.equal(part.done, false);
-          buffer += decoder.decode(part.value, { stream: true });
-          let newline;
-          while ((newline = buffer.indexOf("\n")) >= 0) {
-            const line = buffer.slice(0, newline).trimEnd();
-            buffer = buffer.slice(newline + 1);
-            if (!line.startsWith("data: ")) continue;
-            const event = JSON.parse(line.slice(6));
-            if (event.kind === "assistant" && event.data.text === answer)
-              break finished;
-          }
-        }
-      } finally {
-        controller.abort();
-        await reader.cancel().catch(() => {});
-      }
-      const transport = new WorkspaceTerminal({
-        url,
-        workspaceId: id,
-        diagnostics: true,
+      // The turn is over once its answer is in the attached transcript.
+      await new Promise<void>((resolve) => {
+        const answered = () =>
+          viewEntries(transport.view).some(
+            (entry) =>
+              entry.model?.[0]?.role === "assistant" &&
+              JSON.stringify(entry.model[0].content).includes(answer),
+          );
+        if (answered()) return resolve();
+        const stop = transport.subscribeView(() => {
+          if (!answered()) return;
+          stop();
+          resolve();
+        });
       });
       const runtime = new DurableInteractiveRuntime(transport);
       try {
-        await transport.connect();
         await runtime.initialize();
         const session = runtime.sessionProjection();
         if (role === "coding") {

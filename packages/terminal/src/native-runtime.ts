@@ -11,10 +11,7 @@ import type {
   Model,
   TextContent,
 } from "@earendil-works/pi-ai";
-import type {
-  AgentEvent as DurableAgentEvent,
-  NestedToolExecutionResult,
-} from "@earendil-works/pi-durable";
+import type { InboxState, UsageState } from "@earendil-works/pi-durable";
 import {
   createExtensionRuntime,
   SettingsManager,
@@ -41,13 +38,21 @@ import {
   exportDurableSessionHtml,
   exportDurableSessionJsonl,
 } from "./native-export.ts";
+import { importedPiSession } from "./pi-session-import.ts";
+import {
+  liveOf,
+  piMessage,
+  PiViewEvents,
+  viewEntries,
+} from "./pi-view-events.ts";
 import {
   eventStreamDropText,
-  importedPiSession,
-  WorkspaceTerminal,
+  WorkspaceConnection,
   type EventStreamDrop,
-  type WorkspaceEvent,
-} from "./terminal.ts";
+  type ModelCatalog,
+  type ProviderMetadata,
+  type ViewChange,
+} from "./workspace-connection.ts";
 
 // A failed automatic reconnect is retried after this long; Ctrl+R retries at once.
 const eventStreamReconnectRetryMs = 2000;
@@ -204,110 +209,9 @@ function isKeyId(value: string): value is KeyId {
 function isQueueMode(value: string): value is "all" | "one-at-a-time" {
   return value === "all" || value === "one-at-a-time";
 }
-type DurableToolExecutionEnd = Extract<
-  DurableAgentEvent,
-  { type: "tool_execution_end" }
->;
-function isToolContentBlock(
-  value: unknown,
-): value is TextContent | ImageContent {
-  const block = value as Record<string, unknown> | null;
-  return (
-    typeof block === "object" &&
-    block !== null &&
-    ((block.type === "text" && typeof block.text === "string") ||
-      (block.type === "image" &&
-        typeof block.data === "string" &&
-        typeof block.mimeType === "string"))
-  );
-}
-// Durable's nested output is a string for one text item, an image, "" for
-// none, a content list, or a tool's structured value; diagnostics explain an
-// error result the Harness wrote itself.
-function nestedToolResultContent(
-  result: NestedToolExecutionResult,
-): (TextContent | ImageContent)[] {
-  const output = result.structuredOutput;
-  if (output === undefined)
-    return result.diagnostics.map(({ message }) => ({
-      type: "text",
-      text: message,
-    }));
-  if (typeof output === "string")
-    return output ? [{ type: "text", text: output }] : [];
-  const blocks: unknown[] = Array.isArray(output) ? output : [output];
-  if (blocks.every(isToolContentBlock)) return blocks;
-  return [{ type: "text", text: JSON.stringify(output, null, 2) }];
-}
-// Pi's tool row renders `result.content`. Durable ends a model-issued call
-// with its toolResult entry, a nested call with its result, and a faulted or
-// orphaned call with neither.
-function piToolExecutionEnd(event: DurableToolExecutionEnd) {
-  const call = {
-    type: "tool_execution_end" as const,
-    toolCallId: event.toolCallId,
-    toolName: event.toolName,
-    ...(event.parentToolCallId
-      ? { parentToolCallId: event.parentToolCallId }
-      : {}),
-  };
-  const message = event.entry?.model?.find(
-    (candidate) =>
-      candidate.role === "toolResult" &&
-      candidate.toolCallId === event.toolCallId,
-  );
-  if (message?.role === "toolResult")
-    return {
-      ...call,
-      result: { content: message.content, details: message.details },
-      isError: message.isError,
-      durationMs: message.durationMs,
-    };
-  if (event.result)
-    return {
-      ...call,
-      result: {
-        content: nestedToolResultContent(event.result),
-        details: event.result.details,
-      },
-      isError: event.result.isError,
-      durationMs: event.result.durationMs,
-    };
-  return {
-    ...call,
-    result: {
-      content: [
-        {
-          type: "text" as const,
-          text: event.entry
-            ? "Durable ended this tool call with an entry that has no tool result."
-            : "Tool call ended without a result: its task faulted or was orphaned, or its run ended first.",
-        },
-      ],
-    },
-    isError: true,
-  };
-}
-type WorkspaceSnapshot = ReturnType<WorkspaceTerminal["getRemoteSnapshot"]>;
 type DurablePiEventListener = (
   event: AgentSessionEvent,
 ) => void | Promise<void>;
-type ProviderMetadata = {
-  id: string;
-  authenticated?: boolean;
-  authType?: "api_key" | "oauth";
-  subscription?: boolean;
-};
-type ModelCatalog = {
-  models?: SessionModel[];
-  providers?: ProviderMetadata[];
-  selected?: { provider: string; id: string };
-  error?: string;
-  refresh?: {
-    aborted?: boolean;
-    errors?: { provider: string; message: string }[];
-  };
-};
 type WorkspaceResourceSnapshot = {
   cwd: string;
   trust: { trusted: boolean; trustRequired: boolean; source: string | null };
@@ -346,39 +250,22 @@ const createThemeFromJson = (
   PiCodingAgent as typeof PiCodingAgent & { createThemeFromJson?: ThemeFactory }
 ).createThemeFromJson;
 
-const entryMessages = (snapshot: WorkspaceSnapshot): SessionEntry[] => {
+// Pi's session records: the attached transcript's entries Pi shows, as one
+// linear branch.
+const sessionEntries = (connection: WorkspaceConnection): SessionEntry[] => {
   const entries: SessionEntry[] = [];
   let parentId: string | null = null;
-  for (const event of snapshot.events) {
-    if (snapshot.role === "bot" && !["user", "message"].includes(event.kind))
-      continue;
-    const message = event.data?.message as AgentMessage | undefined;
-    const publicBotMessage: AgentMessage | undefined =
-      snapshot.role === "bot" && event.kind === "message"
-        ? {
-            role: "custom",
-            customType: "adm.message",
-            content:
-              typeof event.data?.text === "string" ? event.data.text : "",
-            display: true,
-            details: event.data,
-            timestamp: event.timestamp,
-          }
-        : undefined;
-    const visibleMessage = publicBotMessage ?? message;
-    if (
-      !visibleMessage ||
-      !["user", "assistant", "toolResult", "custom", "bashExecution"].includes(
-        visibleMessage.role,
-      )
-    )
-      continue;
+  for (const record of viewEntries(connection.view)) {
+    const message = piMessage(record, connection.role);
+    if (!message) continue;
     const entry: SessionEntry = {
       type: "message",
-      id: String(event.seq),
+      id: String(record.id),
       parentId,
-      timestamp: new Date(event.timestamp).toISOString(),
-      message: visibleMessage,
+      timestamp: new Date(
+        typeof message.timestamp === "number" ? message.timestamp : 0,
+      ).toISOString(),
+      message,
     };
     entries.push(entry);
     parentId = entry.id;
@@ -389,7 +276,7 @@ const entryMessages = (snapshot: WorkspaceSnapshot): SessionEntry[] => {
 class DurableSessionManagerProjection {
   constructor(private readonly runtime: DurableInteractiveRuntime) {}
   getCwd() {
-    return this.runtime.snapshot().cwd;
+    return this.runtime.connection.cwd;
   }
   getSessionName() {
     return this.runtime.sessionName();
@@ -407,14 +294,14 @@ class DurableSessionManagerProjection {
     return false;
   }
   getSessionId() {
-    const snapshot = this.runtime.snapshot();
-    return `${snapshot.workspaceId}:${snapshot.conversationId ?? "pending"}`;
+    const connection = this.runtime.connection;
+    return `${connection.workspaceId}:${connection.conversationId ?? "pending"}`;
   }
   getSessionNameValue() {
     return this.getSessionName();
   }
   getEntries() {
-    return entryMessages(this.runtime.snapshot());
+    return sessionEntries(this.runtime.connection);
   }
   getEntryCount() {
     return this.getEntries().length;
@@ -449,41 +336,36 @@ class DurableSessionManagerProjection {
   }
 }
 
+// Pi's model runtime over the workspace's model catalog, which the
+// connection holds.
 class DurableModelRuntimeProjection {
-  private models: SessionModel[] = [];
-  private selected?: { provider: string; id: string };
-  private error?: string;
-  constructor(private readonly runtime: DurableInteractiveRuntime) {
-    this.refreshSnapshot();
+  constructor(private readonly runtime: DurableInteractiveRuntime) {}
+  private get catalog() {
+    return this.runtime.connection.catalog;
   }
-  refreshSnapshot() {
-    const snapshot = this.runtime.snapshot();
-    this.models = [...snapshot.models];
-    this.selected = snapshot.selectedModel;
-  }
-  getAvailableSnapshot() {
-    return this.models;
+  getAvailableSnapshot(): SessionModel[] {
+    return this.catalog?.models ?? [];
   }
   getAvailable() {
-    return Promise.resolve(this.models);
+    return Promise.resolve(this.getAvailableSnapshot());
   }
   getModel(provider: string, id: string) {
-    return this.models.find(
+    return this.getAvailableSnapshot().find(
       (model) => model.provider === provider && model.id === id,
     );
   }
   getError() {
-    return this.error;
+    return this.catalog?.error || undefined;
   }
   getProviders(): ProviderMetadata[] {
-    return this.runtime.snapshot().catalog?.providers ?? [];
+    return this.catalog?.providers ?? [];
   }
   getProvider(providerId: string) {
     return this.getProviders().find((provider) => provider.id === providerId);
   }
   async logout(providerId: string, options?: { signal?: AbortSignal }) {
     if (options?.signal?.aborted) throw new Error("Logout cancelled");
-    await this.runtime.transport.runProviderAuth("logout", providerId);
+    await this.runtime.connection.runAdminCommand("logout", [providerId]);
     if (!options?.signal?.aborted) await this.refresh(options);
   }
   getProviderAuthStatus(providerId: string) {
@@ -504,28 +386,19 @@ class DurableModelRuntimeProjection {
       : undefined;
   }
   async refresh(options: { signal?: AbortSignal } = {}) {
-    const catalog = await this.runtime.transport.request<ModelCatalog>(
-      "/models?refresh=true",
-      undefined,
+    const catalog = await this.runtime.connection.loadModelCatalog(
       options.signal,
+      true,
     );
-    this.runtime.updateCatalog(catalog);
-    this.refreshSnapshot();
-    this.error = typeof catalog.error === "string" ? catalog.error : undefined;
     return {
       aborted: catalog.refresh?.aborted === true,
       errors: new Map<string, Error>(
-        (catalog.refresh?.errors ?? []).map(
-          (entry: { provider: string; message: string }) => [
-            entry.provider,
-            new Error(entry.message),
-          ],
-        ),
+        (catalog.refresh?.errors ?? []).map((entry) => [
+          entry.provider,
+          new Error(entry.message),
+        ]),
       ),
     };
-  }
-  select(provider: string, id: string) {
-    this.selected = { provider, id };
   }
 }
 
@@ -562,14 +435,14 @@ export class DurableInteractiveRuntime {
           : null;
       },
       set: async (cwd: string, decision: ProjectTrustDecision) => {
-        if (this.snapshot().role === "bot")
+        if (this.connection.role === "bot")
           throw new Error(
             "Project trust controls are unavailable to bot workspaces",
           );
         await this.setTrustUpdates([{ path: cwd, decision }]);
       },
       setMany: async (updates: ProjectTrustUpdate[]) => {
-        if (this.snapshot().role === "bot")
+        if (this.connection.role === "bot")
           throw new Error(
             "Project trust controls are unavailable to bot workspaces",
           );
@@ -580,7 +453,7 @@ export class DurableInteractiveRuntime {
     },
     authMetadata: {
       isAnthropicSubscription: async () => {
-        const provider = this.snapshot().catalog?.providers?.find(
+        const provider = this.connection.catalog?.providers?.find(
           (item) => item.id === "anthropic",
         );
         return provider?.subscription === true;
@@ -589,17 +462,15 @@ export class DurableInteractiveRuntime {
     admModelGate: { openSelector: false },
     authActions: {
       login: async () => {
-        if (this.snapshot().role !== "coding")
+        if (this.connection.role !== "coding")
           throw new Error(
             "Provider authentication is unavailable to bot workspaces",
           );
-        await this.transport.runProviderAuth("login");
+        await this.connection.runAdminCommand("login", []);
         await this.modelRuntime.refresh();
       },
     },
   };
-  private current: WorkspaceSnapshot;
-  private catalog?: ModelCatalog;
   private resources?: WorkspaceResourceSnapshot;
   private settings: WorkspaceSettings = {
     thinkingLevel: "off",
@@ -609,7 +480,6 @@ export class DurableInteractiveRuntime {
     scopedModels: [],
     cacheWarmingMode: "off",
   };
-  private queue: WorkspaceQueue = { steering: [], followUp: [] };
   private extensions: RemoteExtensions = { extensions: [], diagnostics: [] };
   private extensionUi?: ExtensionUIContext;
   private remoteCommands: ResolvedCommand[] = [];
@@ -628,18 +498,17 @@ export class DurableInteractiveRuntime {
   private agent: DurableAgentProjection;
   private beforeSessionInvalidate?: () => void;
   private rebindSession?: (session: RemoteDurableSession) => Promise<void>;
-  private streaming = false;
-  // Pi has a streaming assistant component: a live partial it was given.
-  private piStreamingAssistant = false;
-  // Saved entries shown in Pi's chat by an event since Pi last rendered the
-  // session's records. Live `message_end` and history both carry each saved
-  // message, in no guaranteed order; whichever arrives first shows it.
-  private savedEntriesShown = new Set<number>();
+  // What Pi shows of the attached conversation, so each view change becomes
+  // only the Pi events for what changed.
+  private piView = new PiViewEvents(() => this.connection.role);
+  // A view that skipped entries (gaps) is shown by rendering the session again.
+  private rerenderPending = false;
+  // Pi shows this conversation: view changes become Pi events.
+  private piRendered = false;
+  // A conversation switch this terminal started, which reattaches itself.
+  private sessionChange?: Promise<void>;
+  private runFailureShown?: number;
   private compacting = false;
-  private promptCount = 0;
-  private tokens = 0;
-  private cost = 0;
-  private lastUsage?: Record<string, number>;
   private activeBashOperationId?: string;
   private extensionRunner = {
     getRegisteredCommands: () => this.remoteCommands,
@@ -745,11 +614,10 @@ export class DurableInteractiveRuntime {
     },
   };
 
-  constructor(readonly transport: WorkspaceTerminal) {
-    this.current = transport.getRemoteSnapshot();
+  constructor(readonly connection: WorkspaceConnection) {
     Object.defineProperty(this.remotePorts, "supportsBash", {
       enumerable: true,
-      get: () => this.snapshot().role === "coding",
+      get: () => this.connection.role === "coding",
     });
     this.settingsManager = SettingsManager.create(
       process.cwd(),
@@ -759,10 +627,10 @@ export class DurableInteractiveRuntime {
     this.sessionManager = new DurableSessionManagerProjection(this);
     this.agent = new DurableAgentProjection(this);
     this.session = this.sessionProjection();
-    this.unlisten = transport.subscribeWorkspaceEvents((event) =>
-      this.onWorkspaceEvent(event),
+    this.unlisten = connection.subscribeView((change) =>
+      this.onViewChange(change),
     );
-    this.unlistenEventStreamDrops = transport.subscribeEventStreamDrops(
+    this.unlistenEventStreamDrops = connection.subscribeEventStreamDrops(
       (drop) => void this.recoverDroppedEventStream(drop),
     );
   }
@@ -771,13 +639,12 @@ export class DurableInteractiveRuntime {
   // picker or the provider error. A hung catalog must not leave this blank.
   private async presentModelCatalog() {
     const ui = this.extensionUi;
-    if (this.transport.modelCatalogLoaded()) return;
+    if (this.connection.catalog) return;
     ui?.setWidget("adm.models", ["Loading models…"]);
     ui?.setStatus("adm.models", "Loading models…");
     ui?.notify("Loading models…", "info");
     try {
-      const catalog = await this.transport.loadModelCatalog();
-      this.modelRuntime.refreshSnapshot();
+      const catalog = await this.connection.loadModelCatalog();
       const error =
         typeof catalog.error === "string" && catalog.error
           ? catalog.error
@@ -790,8 +657,7 @@ export class DurableInteractiveRuntime {
       }
       ui?.setWidget("adm.models", undefined);
       ui?.setStatus("adm.models", undefined);
-      if (!catalog.selected)
-        this.remotePorts.admModelGate.openSelector = true;
+      if (!catalog.selected) this.remotePorts.admModelGate.openSelector = true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ui?.setWidget("adm.models", [message]);
@@ -800,26 +666,24 @@ export class DurableInteractiveRuntime {
     }
   }
   async initialize() {
-    this.current = this.transport.getRemoteSnapshot();
-    if (!this.current.connected)
+    const role = this.connection.role;
+    if (!this.connection.connected)
       throw new Error(
-        `Connect to the workspace before starting Pi InteractiveMode: ${this.current.status}`,
+        `Connect to the workspace before starting Pi InteractiveMode: ${this.connection.status}`,
       );
     const settingsRequest =
-      this.transport.request<Partial<WorkspaceSettings>>("/settings");
-    const queueRequest =
-      this.transport.request<Partial<WorkspaceQueue>>("/queue");
+      this.connection.request<Partial<WorkspaceSettings>>("/settings");
     const extensionsRequest =
-      this.current.role === "coding"
-        ? this.transport.request<RemoteExtensions>("/extensions")
+      role === "coding"
+        ? this.connection.request<RemoteExtensions>("/extensions")
         : Promise.resolve<RemoteExtensions>({
             extensions: [],
             diagnostics: [],
           });
     const resourcesRequest =
-      this.current.role === "bot"
+      role === "bot"
         ? Promise.resolve<WorkspaceResourceSnapshot>({
-            cwd: this.current.cwd,
+            cwd: this.connection.cwd,
             trust: { trusted: false, trustRequired: false, source: null },
             themes: [],
             prompts: [],
@@ -829,17 +693,16 @@ export class DurableInteractiveRuntime {
             diagnostics: [],
             appendSystemPrompt: [],
           })
-        : this.transport.request<WorkspaceResourceSnapshot>("/resources");
-    const [data, queue, extensions, resources] = await Promise.all([
+        : this.connection.request<WorkspaceResourceSnapshot>("/resources");
+    const [data, extensions, resources] = await Promise.all([
       settingsRequest,
-      queueRequest,
       extensionsRequest,
       resourcesRequest,
     ]);
     this.resources = resources;
     const tools =
-      this.current.role === "coding"
-        ? await this.transport.request<{
+      role === "coding"
+        ? await this.connection.request<{
             tools: Pick<
               ToolDefinition,
               "name" | "label" | "description" | "parameters"
@@ -856,25 +719,9 @@ export class DurableInteractiveRuntime {
       ...this.settings,
       ...parseWorkspaceSettings(data),
     };
-    this.queue = parseWorkspaceQueue(queue);
     this.configureExtensions(extensions);
-    this.current = this.transport.getRemoteSnapshot();
-    this.modelRuntime.refreshSnapshot();
   }
 
-  snapshot(): WorkspaceSnapshot & { catalog?: ModelCatalog } {
-    this.current = this.transport.getRemoteSnapshot();
-    return {
-      ...this.current,
-      catalog: this.catalog,
-      ...(this.catalog
-        ? {
-            models: this.catalog.models ?? this.current.models,
-            selectedModel: this.catalog.selected,
-          }
-        : {}),
-    };
-  }
   settingsValue() {
     return this.settings;
   }
@@ -883,11 +730,31 @@ export class DurableInteractiveRuntime {
   }
   isBashRunning() {
     return Boolean(
-      this.activeBashOperationId || this.snapshot().activeBash.length,
+      this.activeBashOperationId || this.connection.activeBash.length,
     );
   }
-  updateCatalog(catalog: ModelCatalog) {
-    this.catalog = catalog;
+  /** Queued input, from the conversation's inbox. */
+  queue() {
+    const steering: string[] = [];
+    const followUp: string[] = [];
+    const inbox = this.connection.view?.docs["pi.inbox"] as
+      | InboxState
+      | undefined;
+    for (const item of inbox?.items ?? []) {
+      if (item.mode === "write") continue;
+      const content = item.content as
+        | string
+        | { type: string; text?: string }[];
+      const text =
+        typeof content === "string"
+          ? content
+          : content
+              .filter((part) => part.type === "text")
+              .map((part) => part.text ?? "")
+              .join("\n");
+      (item.mode === "steer" ? steering : followUp).push(text);
+    }
+    return { steering, followUp };
   }
   private configureExtensions(catalog: RemoteExtensions) {
     this.extensions = catalog;
@@ -911,12 +778,17 @@ export class DurableInteractiveRuntime {
           baseDir: "adm",
         },
         handler: async (args) => {
-          if (name === "reconnect") await this.refreshSessionView();
-          else {
-            await this.transport.submit(`/${name}${args ? " " + args : ""}`);
-            this.current = this.transport.getRemoteSnapshot();
+          try {
+            this.extensionUi?.notify(
+              await this.admCommand(name, args.trim()),
+              "info",
+            );
+          } catch (error) {
+            this.extensionUi?.notify(
+              error instanceof Error ? error.message : String(error),
+              "error",
+            );
           }
-          this.extensionUi?.notify(this.snapshot().status, "info");
         },
       });
     }
@@ -958,6 +830,48 @@ export class DurableInteractiveRuntime {
     this.remoteCommands = commands;
     this.remoteShortcuts = shortcuts;
   }
+  // ADM's own commands: what each did, for Pi to show.
+  private async admCommand(name: string, args: string) {
+    if (name === "reconnect") {
+      await this.refreshSessionView();
+      return this.connection.status;
+    }
+    if (name === "goal") {
+      if (!args) throw new Error("Usage: /goal DESCRIPTION");
+      await this.connection.request("/goals", { description: args });
+      return "Goal saved";
+    }
+    if (name === "loop") {
+      const match = /^(\d+)\s+([\s\S]+)$/.exec(args);
+      if (!match || Number(match[1]) < 1)
+        throw new Error("Usage: /loop SECONDS PROMPT");
+      await this.connection.request("/loops", {
+        intervalMs: Number(match[1]) * 1000,
+        prompt: match[2],
+      });
+      return "Loop saved";
+    }
+    if (name === "abort") {
+      if (args && args !== "all") throw new Error("Usage: /abort [all]");
+      await this.connection.request("/abort", { background: args === "all" });
+      return "Abort requested";
+    }
+    if (name === "retry") {
+      await this.connection.request("/retry", {});
+      return "Provider retry queued";
+    }
+    const workspace = await this.connection.request<{
+      status: string;
+      error?: string;
+      goals?: unknown[];
+      loops?: unknown[];
+    }>("");
+    const status =
+      workspace.status === "error"
+        ? `Provider error · ${workspace.error ?? "The provider request failed"}`
+        : workspace.status;
+    return `${status} · ${workspace.goals?.length ?? 0} goals · ${workspace.loops?.length ?? 0} loops`;
+  }
   private async runExtensionOperation(
     kind: "command" | "shortcut",
     name: string,
@@ -971,12 +885,12 @@ export class DurableInteractiveRuntime {
     const requestId = randomUUID();
     const route =
       kind === "command" ? "/extensions/commands" : "/extensions/shortcuts";
-    const admission = await this.transport.request<{ operationId: string }>(
+    const admission = await this.connection.request<{ operationId: string }>(
       route,
       kind === "command" ? { name, args, requestId } : { name, requestId },
     );
     let after = 0;
-    for await (const event of this.transport.subscribeOperationEvents<ExtensionOperationEvent>(
+    for await (const event of this.connection.subscribeOperationEvents<ExtensionOperationEvent>(
       `/extensions/commands/${encodeURIComponent(admission.operationId)}/events?after=${after}`,
     )) {
       if (!Number.isSafeInteger(event.seq) || event.seq <= after)
@@ -1014,7 +928,7 @@ export class DurableInteractiveRuntime {
           result =
             (await ui.editor(event.title ?? "Edit", event.prefill)) ?? null;
         else result = ui.getEditorText();
-        await this.transport.request(
+        await this.connection.request(
           `/extensions/commands/${encodeURIComponent(admission.operationId)}/ui`,
           { requestId: event.requestId, result },
         );
@@ -1045,6 +959,10 @@ export class DurableInteractiveRuntime {
     }
     throw new Error("Extension operation stream ended before a result");
   }
+  /** Whether Pi shows a run working: the run it was last shown. */
+  get streaming() {
+    return this.piView.working;
+  }
   agentState() {
     const model = this.session.model;
     return {
@@ -1054,8 +972,8 @@ export class DurableInteractiveRuntime {
       tools: this.toolDefinitions,
       messages: this.session.messages,
       isStreaming: this.streaming,
-      ...(this.snapshot().liveMessage
-        ? { streamingMessage: this.snapshot().liveMessage }
+      ...(liveOf(this.connection.view).generation?.message
+        ? { streamingMessage: liveOf(this.connection.view).generation!.message }
         : {}),
       pendingToolCalls: new Set<string>(),
     };
@@ -1099,7 +1017,7 @@ export class DurableInteractiveRuntime {
           );
       },
       get model() {
-        const selected = runtime.snapshot().selectedModel;
+        const selected = runtime.connection.catalog?.selected;
         return selected
           ? modelRuntime.getModel(selected.provider, selected.id)
           : undefined;
@@ -1141,7 +1059,7 @@ export class DurableInteractiveRuntime {
         return runtime.resourceLoader.getSystemPrompt() ?? "";
       },
       get cacheWarmingStatus() {
-        return runtime.snapshot().cacheWarming;
+        return runtime.connection.cacheWarming;
       },
       get sessionId() {
         return manager.getSessionId();
@@ -1154,8 +1072,8 @@ export class DurableInteractiveRuntime {
       getSessionStats: () => runtime.sessionStats(),
       getLastAssistantText: () => runtime.lastAssistantText(),
       getUserMessagesForForking: () => runtime.userMessagesForForking(),
-      getSteeringMessages: () => [...runtime.queue.steering],
-      getFollowUpMessages: () => [...runtime.queue.followUp],
+      getSteeringMessages: () => runtime.queue().steering,
+      getFollowUpMessages: () => runtime.queue().followUp,
       getToolDefinition: (name: string) =>
         runtime.toolDefinitions.find((tool) => tool.name === name),
       getToolDefinitions: () => runtime.toolDefinitions,
@@ -1173,12 +1091,12 @@ export class DurableInteractiveRuntime {
       ) =>
         exportDurableSessionHtml(
           {
-            role: runtime.snapshot().role,
+            role: runtime.connection.role,
             id: manager.getSessionId(),
             cwd: manager.getCwd(),
             name: runtime.sessionName(),
             entries: manager.getBranch(),
-            ...(runtime.snapshot().role === "coding"
+            ...(runtime.connection.role === "coding"
               ? {
                   systemPrompt: resources.getSystemPrompt() ?? "",
                   tools: runtime.toolDefinitions.map(
@@ -1197,12 +1115,12 @@ export class DurableInteractiveRuntime {
       exportToJsonl: (outputPath?: string) =>
         exportDurableSessionJsonl(
           {
-            role: runtime.snapshot().role,
+            role: runtime.connection.role,
             id: manager.getSessionId(),
             cwd: manager.getCwd(),
             name: runtime.sessionName(),
             entries: manager.getBranch(),
-            ...(runtime.snapshot().role === "coding"
+            ...(runtime.connection.role === "coding"
               ? { systemPrompt: resources.getSystemPrompt() ?? "" }
               : {}),
           },
@@ -1283,7 +1201,7 @@ export class DurableInteractiveRuntime {
     return this.requireResources();
   }
   private async reloadResources() {
-    this.resources = await this.transport.request<WorkspaceResourceSnapshot>(
+    this.resources = await this.connection.request<WorkspaceResourceSnapshot>(
       "/resources/reload",
       {},
       undefined,
@@ -1291,7 +1209,7 @@ export class DurableInteractiveRuntime {
     );
   }
   private async setTrustUpdates(updates: ProjectTrustUpdate[]) {
-    const response = await this.transport.request<WorkspaceResourceSnapshot>(
+    const response = await this.connection.request<WorkspaceResourceSnapshot>(
       "/trust",
       { updates },
       undefined,
@@ -1307,14 +1225,25 @@ export class DurableInteractiveRuntime {
       : ["off"];
   }
   private contextUsage() {
-    const selected = this.snapshot().selectedModel;
+    const selected = this.connection.catalog?.selected;
     const model = selected
       ? this.modelRuntime.getModel(selected.provider, selected.id)
       : undefined;
-    const tokens = this.lastUsage
-      ? Number(this.lastUsage.input ?? 0) +
-        Number(this.lastUsage.cacheRead ?? 0) +
-        Number(this.lastUsage.cacheWrite ?? 0)
+    // The context the newest reply was answered with.
+    const reply = this.sessionManager
+      .getEntries()
+      .findLast(
+        (entry) =>
+          entry.type === "message" &&
+          entry.message.role === "assistant" &&
+          entry.message.usage !== undefined,
+      );
+    const usage =
+      reply?.type === "message" && reply.message.role === "assistant"
+        ? reply.message.usage
+        : undefined;
+    const tokens = usage
+      ? usage.input + usage.cacheRead + usage.cacheWrite
       : null;
     return model
       ? {
@@ -1325,8 +1254,35 @@ export class DurableInteractiveRuntime {
         }
       : undefined;
   }
+  // Spend of the attached conversation, every model and tool, from pi.usage.
+  private usageTotals() {
+    const totals = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+      cost: 0,
+    };
+    const state = this.connection.view?.docs["pi.usage"] as
+      | UsageState
+      | undefined;
+    for (const usage of [
+      ...Object.values(state?.models ?? {}),
+      ...Object.values(state?.tools ?? {}),
+    ]) {
+      totals.input += usage.input;
+      totals.output += usage.output;
+      totals.cacheRead += usage.cacheRead;
+      totals.cacheWrite += usage.cacheWrite;
+      totals.total += usage.totalTokens;
+      totals.cost += usage.cost.total;
+    }
+    return totals;
+  }
   private sessionStats() {
     const entries = this.sessionManager.getEntries();
+    const { cost, ...tokens } = this.usageTotals();
     return {
       sessionFile: undefined,
       sessionId: this.sessionManager.getSessionId(),
@@ -1348,14 +1304,8 @@ export class DurableInteractiveRuntime {
           entry.type === "message" && entry.message.role === "toolResult",
       ).length,
       totalMessages: entries.length,
-      tokens: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        total: this.tokens,
-      },
-      cost: this.cost,
+      tokens,
+      cost,
       contextUsage: this.contextUsage(),
     };
   }
@@ -1404,43 +1354,38 @@ export class DurableInteractiveRuntime {
       }
     }
     const images = options?.images;
-    await this.transport.request("/input", {
+    await this.connection.request("/input", {
       message,
       ...(images?.length ? { images } : {}),
       requestId: randomUUID(),
       whenBusy:
         options?.streamingBehavior === "followUp" ? "followUp" : "steer",
     });
-    await this.refreshQueue();
-  }
-  private async refreshQueue() {
-    this.queue = parseWorkspaceQueue(
-      await this.transport.request<WorkspaceQueue>("/queue"),
-    );
   }
   private async clearQueue() {
-    const withdrawn = await this.transport.request<WorkspaceQueue>(
+    const withdrawn = await this.connection.request<WorkspaceQueue>(
       "/queue/clear",
       {},
       undefined,
       "POST",
     );
-    this.queue = parseWorkspaceQueue(withdrawn);
-    return this.queue;
+    // The inbox in the view empties with the commit; Pi wants what was withdrawn.
+    return parseWorkspaceQueue(withdrawn);
   }
   private async abort() {
-    await this.transport.request("/abort", { background: false });
+    await this.connection.request("/abort", { background: false });
   }
   private async executeBash(
     command: string,
     onChunk?: (chunk: string) => void,
     options?: { excludeFromContext?: boolean; id?: string },
   ) {
-    if (this.snapshot().role !== "coding")
+    if (this.connection.role !== "coding")
       throw new Error("Bash is unavailable to bot workspaces");
     try {
-      return await this.transport.executeBash(command, onChunk ?? (() => {}), {
-        ...(options ?? {}),
+      return await this.connection.executeBash(command, onChunk ?? (() => {}), {
+        ...(options?.excludeFromContext ? { excludeFromContext: true } : {}),
+        id: options?.id ?? randomUUID(),
         onAdmitted: (operationId) => {
           this.activeBashOperationId = operationId;
         },
@@ -1451,28 +1396,26 @@ export class DurableInteractiveRuntime {
   }
   private async abortBash() {
     const operationId =
-      this.activeBashOperationId ?? this.snapshot().activeBash[0]?.operationId;
+      this.activeBashOperationId ?? this.connection.activeBash[0]?.operationId;
     if (!operationId) return;
-    await this.transport.abortBash(operationId);
+    await this.connection.abortBash(operationId);
   }
   private async setModel(model: SessionModel) {
-    const result = await this.transport.request(
+    const result = await this.connection.request(
       "/model",
       { provider: model.provider, modelId: model.id },
       undefined,
       "PUT",
     );
-    this.modelRuntime.select(result.selected.provider, result.selected.id);
-    this.updateCatalog({
-      ...this.catalog,
-      models: this.modelRuntime.getAvailableSnapshot(),
+    this.connection.catalog = {
+      ...this.connection.catalog,
       selected: result.selected,
-    });
+    };
   }
   private async cycleModel(direction: "forward" | "backward") {
     const models = this.modelRuntime.getAvailableSnapshot();
     if (models.length < 2) return undefined;
-    const selected = this.snapshot().selectedModel;
+    const selected = this.connection.catalog?.selected;
     const at = selected
       ? models.findIndex(
           (model) =>
@@ -1497,7 +1440,7 @@ export class DurableInteractiveRuntime {
     await this.updateSettings({ thinkingLevel: level });
   }
   private async updateSettings(patch: Partial<WorkspaceSettings>) {
-    const saved = await this.transport.request<Partial<WorkspaceSettings>>(
+    const saved = await this.connection.request<Partial<WorkspaceSettings>>(
       "/settings",
       patch,
       undefined,
@@ -1506,7 +1449,7 @@ export class DurableInteractiveRuntime {
     this.settings = { ...this.settings, ...parseWorkspaceSettings(saved) };
   }
   async listSessions(): Promise<SessionInfo[]> {
-    const navigation = await this.transport.request<{
+    const navigation = await this.connection.request<{
       branches?: {
         sessionInfo?: Omit<SessionInfo, "created" | "modified"> & {
           created: string;
@@ -1547,219 +1490,68 @@ export class DurableInteractiveRuntime {
   private async compact(instructions?: string) {
     this.compacting = true;
     try {
-      await this.transport.request("/compact", { instructions });
+      await this.connection.request("/compact", { instructions });
     } finally {
       this.compacting = false;
     }
     return undefined;
   }
   private async reset(handoff?: string) {
-    await this.transport.request("/reset", { handoff });
+    await this.connection.request("/reset", { handoff });
   }
   private async forkEntry(entryId: string) {
-    const result = await this.transport.request("/tree", {
+    const result = await this.connection.request("/tree", {
       entryId: Number(entryId),
     });
     return { cancelled: false, editorText: result.selectedText };
   }
   private subscribe(listener: DurablePiEventListener) {
     this.listeners.add(listener);
-    // The activity snapshot can arrive before InteractiveMode subscribes.
-    if (this.snapshot().role === "bot" && this.streaming) {
-      void listener({ type: "agent_start" } as AgentSessionEvent);
-      void listener({ type: "turn_start" } as AgentSessionEvent);
-    }
     return () => this.listeners.delete(listener);
   }
-  private onWorkspaceEvent(event: WorkspaceEvent) {
-    const snapshot = this.snapshot();
-    if (snapshot.role === "bot") {
-      if (event.kind === "live" && event.data?.type === "activity") {
-        const active = event.data.active === true;
-        if (active === this.streaming) return;
-        this.streaming = active;
-        if (active) {
-          void this.emit({ type: "agent_start" } as AgentSessionEvent);
-          void this.emit({ type: "turn_start" } as AgentSessionEvent);
-        } else {
-          void this.emit({
-            type: "agent_end",
-            messages: this.session.messages,
-            willRetry: false,
-          } as AgentSessionEvent);
-          void this.emit({
-            type: "agent_settled",
-            aborted: false,
-          } as AgentSessionEvent);
-        }
-        return;
-      }
-      const allowed =
-        event.kind === "user" ||
-        event.kind === "message" ||
-        (event.kind === "status" && snapshot.diagnostics);
-      if (!allowed) return;
-    }
-    if (event.kind === "live") {
-      const data = event.data;
-      if (data?.type === "snapshot") {
-        // A stream's first event. After a reconnect it may find the run that
-        // Pi still shows as working already over.
-        const wasStreaming = this.streaming;
-        this.streaming = !!data.run;
-        const message = data.generation?.message;
-        if (message) {
-          this.piStreamingAssistant = true;
-          void this.emit({
-            type: "message_start",
-            message,
-          } as AgentSessionEvent);
-        }
-        if (this.streaming)
-          void this.emit({ type: "agent_start" } as AgentSessionEvent);
-        else if (wasStreaming) {
-          void this.emit({
-            type: "agent_end",
-            messages: this.session.messages,
-            willRetry: false,
-          } as AgentSessionEvent);
-          void this.emit({
-            type: "agent_settled",
-            aborted: false,
-          } as AgentSessionEvent);
-        }
-      } else if (data?.type === "message_start") {
-        this.streaming = true;
-        void this.emit({ type: "agent_start" } as AgentSessionEvent);
-        // Durable also starts each saved message it did not stream, directly
-        // before its `message_end`; those are shown from their entry.
-        if (
-          data.message?.role === "assistant" &&
-          !this.savedMessageShown(data.message)
-        ) {
-          this.piStreamingAssistant = true;
-          void this.emit({
-            type: "message_start",
-            message: data.message,
-          } as AgentSessionEvent);
-        }
-      } else if (data?.type === "message_end") {
-        const message = data.entry?.model?.[0] as AgentMessage | undefined;
-        const entryId = Number(data.entry?.id);
-        // An entry already among the session's records is already shown.
-        if (
-          (message?.role === "assistant" || message?.role === "user") &&
-          !this.snapshot().events.some((record) => record.seq === entryId)
-        )
-          this.showSavedMessage(entryId, message);
-      } else if (data?.type === "message_update") {
-        const message = this.snapshot().liveMessage;
-        if (message)
-          void this.emit({
-            type: "message_update",
-            message,
-          } as AgentSessionEvent);
-      } else if (data?.type === "tool_execution_start") {
-        void this.emit(data as AgentSessionEvent);
-      } else if (data?.type === "tool_execution_update") {
-        const tool = this.snapshot().liveTools.get(data.toolCallId);
-        void this.emit({
-          type: "tool_execution_update",
-          toolCallId: data.toolCallId,
-          toolName: data.toolName,
-          partialResult: tool?.result ?? { content: [] },
-        } as AgentSessionEvent);
-      } else if (data?.type === "tool_execution_end") {
-        void this.emit(piToolExecutionEnd(data) as AgentSessionEvent);
-      } else if (data?.type === "turn_start") {
-        this.streaming = true;
-        void this.emit({ type: "turn_start" } as AgentSessionEvent);
-      } else if (data?.type === "turn_end") {
-        this.streaming = false;
-        // Pi drops a streaming component its turn did not finish; a saved
-        // reply still on its way is shown from its entry.
-        this.piStreamingAssistant = false;
-        void this.emit({
-          type: "agent_end",
-          messages: this.session.messages,
-          willRetry: false,
-        } as AgentSessionEvent);
-        void this.emit({
-          type: "agent_settled",
-          aborted: false,
-        } as AgentSessionEvent);
-      }
+  /**
+   * Pi has just rendered the session's records itself (attach, reconnect, or a
+   * re-render): from here each view change is shown as Pi events, starting
+   * with the run still working, its streamed reply and its open tool rows.
+   */
+  rendered() {
+    this.piRendered = true;
+    this.piView.rendered(this.connection.view);
+    this.runFailureShown = liveOf(this.connection.view).runFailure?.taskId;
+    this.showViewChange();
+  }
+  private onViewChange({ previous, next }: ViewChange) {
+    // Until Pi renders this conversation, what it renders includes the change.
+    if (!previous || !this.piRendered) return;
+    // A window that skipped entries: shown whole once the gap is loaded.
+    if (next.items.some((item) => item.kind !== "entry")) {
+      this.rerenderPending = true;
       return;
     }
-    const message = event.data?.message as AgentMessage | undefined;
-    if (event.kind === "assistant" && message?.role === "assistant") {
-      this.accumulateUsage(message);
-      this.showSavedMessage(event.seq!, message);
-    } else if (event.kind === "user" && message?.role === "user") {
-      this.promptCount++;
-      this.showSavedMessage(event.seq!, message);
-    } else if (event.kind === "tool" && message?.role === "toolResult") {
-      void this.emit({ type: "message_end", message } as AgentSessionEvent);
-    } else if (event.kind === "message" && message?.role === "bashExecution") {
-      void this.emit({ type: "message_end", message } as AgentSessionEvent);
-    } else if (event.kind === "message" && this.snapshot().role === "bot") {
-      const publicMessage: AgentMessage = {
-        role: "custom",
-        customType: "adm.message",
-        content: typeof event.data?.text === "string" ? event.data.text : "",
-        display: true,
-        details: event.data,
-        timestamp: event.timestamp,
-      };
-      void this.emit({
-        type: "message_start",
-        message: publicMessage,
-      } as AgentSessionEvent);
-      void this.emit({
-        type: "message_end",
-        message: publicMessage,
-      } as AgentSessionEvent);
-    } else if (event.kind === "status") {
-      void this.emit({
-        type: "entry_appended",
-        entry: {
-          type: "custom",
-          id: String(event.seq),
-          parentId: null,
-          timestamp: new Date(event.timestamp).toISOString(),
-          customType: "adm.status",
-          data: event.data,
-        },
-      } as AgentSessionEvent);
+    if (this.rerenderPending) {
+      this.rerenderPending = false;
+      void this.rerender();
+      return;
     }
+    this.showViewChange();
   }
-  // Show a saved message once, whichever of live and history brings it first.
-  // It finishes Pi's streaming assistant component when there is one: that is
-  // this message, because live events arrive in order and a later partial only
-  // starts after this message's live `message_end`. Otherwise it starts its own
-  // component, e.g. after Pi's `agent_end` dropped the streamed one.
-  private showSavedMessage(entryId: number, message: AgentMessage) {
-    if (this.savedEntriesShown.has(entryId)) return;
-    this.savedEntriesShown.add(entryId);
-    if (!(message.role === "assistant" && this.piStreamingAssistant))
-      void this.emit({ type: "message_start", message } as AgentSessionEvent);
-    void this.emit({ type: "message_end", message } as AgentSessionEvent);
-    if (message.role === "assistant") this.piStreamingAssistant = false;
+  private showViewChange() {
+    const view = this.connection.view;
+    if (!view) return;
+    const failure = liveOf(view).runFailure;
+    if (failure && failure.taskId !== this.runFailureShown) {
+      this.runFailureShown = failure.taskId;
+      this.extensionUi?.notify(
+        `The run ended without an answer: ${failure.reason}${failure.detail ? ` (${failure.detail})` : ""}`,
+        "error",
+      );
+    }
+    for (const event of this.piView.events(view)) void this.emit(event);
   }
-  // A saved assistant message already among the session's records, so shown.
-  private savedMessageShown(message: AgentMessage) {
-    const saved = JSON.stringify(message);
-    return this.snapshot().events.some(
-      (record) =>
-        record.kind === "assistant" &&
-        JSON.stringify(record.data?.message) === saved,
-    );
-  }
-  private accumulateUsage(message: AgentMessage) {
-    if (message.role !== "assistant" || !message.usage) return;
-    this.lastUsage = message.usage as unknown as Record<string, number>;
-    this.tokens += Number(message.usage.totalTokens) || 0;
-    this.cost += Number(message.usage.cost?.total) || 0;
+  private async rerender() {
+    this.piRendered = false;
+    await this.rebindSession?.(this.session);
+    this.rendered();
   }
   private async emit(event: AgentSessionEvent) {
     for (const listener of this.listeners) await listener(event);
@@ -1775,21 +1567,35 @@ export class DurableInteractiveRuntime {
       });
     });
   }
-  async newSession(): Promise<{ cancelled: boolean }> {
+  /**
+   * Select another conversation and show it. The runner ends the attach
+   * stream of the old one, which is no outage: this reattaches anyway.
+   */
+  private changeSession<T>(select: () => Promise<T>) {
     this.beforeSessionInvalidate?.();
-    await this.transport.request("/new", {});
-    await this.refreshSessionView();
+    const change = (async () => {
+      const selected = await select();
+      await this.refreshSessionView();
+      return selected;
+    })();
+    this.sessionChange = change.then(
+      () => {},
+      () => {},
+    );
+    return change;
+  }
+  async newSession(): Promise<{ cancelled: boolean }> {
+    await this.changeSession(() => this.connection.request("/new", {}));
     return { cancelled: false };
   }
   async fork(
     entryId: string,
   ): Promise<{ cancelled: boolean; selectedText?: string }> {
-    this.beforeSessionInvalidate?.();
-    const result = await this.transport.request<{ selectedText?: string }>(
-      "/tree",
-      { entryId: Number(entryId) },
+    const result = await this.changeSession(() =>
+      this.connection.request<{ selectedText?: string }>("/tree", {
+        entryId: Number(entryId),
+      }),
     );
-    await this.refreshSessionView();
     return {
       cancelled: false,
       ...(result.selectedText ? { selectedText: result.selectedText } : {}),
@@ -1802,14 +1608,9 @@ export class DurableInteractiveRuntime {
       throw new Error(
         "Pi session selector returned an invalid Durable conversation ID",
       );
-    this.beforeSessionInvalidate?.();
-    await this.transport.request(
-      "/branch",
-      { conversationId },
-      undefined,
-      "PUT",
+    await this.changeSession(() =>
+      this.connection.request("/branch", { conversationId }, undefined, "PUT"),
     );
-    await this.refreshSessionView();
     return { cancelled: false };
   }
   async importFromJsonl(inputPath: string): Promise<{ cancelled: boolean }> {
@@ -1819,13 +1620,13 @@ export class DurableInteractiveRuntime {
         "Pi transcript must be a regular file no larger than 8 MiB",
       );
     const imported = importedPiSession(await readFile(inputPath, "utf8"));
-    this.beforeSessionInvalidate?.();
-    await this.transport.request("/import", {
-      session: imported.session,
-      selectedLeafId: imported.selectedLeafId,
-      entries: imported.entries,
-    });
-    await this.refreshSessionView();
+    await this.changeSession(() =>
+      this.connection.request("/import", {
+        session: imported.session,
+        selectedLeafId: imported.selectedLeafId,
+        entries: imported.entries,
+      }),
+    );
     return { cancelled: false };
   }
   setBeforeSessionInvalidate(callback?: () => void) {
@@ -1836,23 +1637,24 @@ export class DurableInteractiveRuntime {
   ) {
     this.rebindSession = callback;
   }
+  // Reattach and render the session again: the transcript continues from the
+  // newest entry this terminal has, so only what it missed is loaded.
   private async refreshSessionView() {
-    await this.transport.connect();
+    this.piRendered = false;
+    this.rerenderPending = false;
+    await this.connection.connect();
     await this.initialize();
-    this.current = this.transport.getRemoteSnapshot();
-    this.modelRuntime.refreshSnapshot();
-    // Pi synchronously re-renders exactly the session's records when rebound;
-    // live-shown entries not yet among them are shown again from history.
-    this.savedEntriesShown.clear();
-    this.piStreamingAssistant = false;
     await this.rebindSession?.(this.session);
+    this.rendered();
     this.extensionUi?.setStatus("adm.connection", undefined);
   }
   // The event stream dropped: show it in Pi's footer and reconnect, re-rendering
   // the session from its records exactly as Ctrl+R does, until it is back.
   private async recoverDroppedEventStream(drop: EventStreamDrop) {
+    await this.sessionChange;
+    if (this.connection.connected) return;
     const lost = eventStreamDropText(drop);
-    while (!this.disposed && !this.transport.getRemoteSnapshot().connected) {
+    while (!this.disposed && !this.connection.connected) {
       this.extensionUi?.setStatus(
         "adm.connection",
         `Disconnected (${lost}) · reconnecting…`,
@@ -1861,12 +1663,11 @@ export class DurableInteractiveRuntime {
         await this.refreshSessionView();
         return;
       } catch (error) {
-        const snapshot = this.transport.getRemoteSnapshot();
-        const cause = snapshot.connected
+        const cause = this.connection.connected
           ? error instanceof Error
             ? error.message
             : String(error)
-          : snapshot.status;
+          : this.connection.status;
         this.extensionUi?.setStatus(
           "adm.connection",
           `Disconnected (${lost}) · retrying every ${eventStreamReconnectRetryMs / 1000}s · Ctrl+R to retry now · ${cause}`,

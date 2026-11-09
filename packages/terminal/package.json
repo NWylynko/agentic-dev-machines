@@ -9,6 +9,6 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "1.2.0"
+    "@earendil-works/pi-tui": "1.5.0"
   }
 }

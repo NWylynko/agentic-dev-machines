@@ -1,4 +1,4 @@
-import { Type } from "@earendil-works/pi-ai";
+import { bool, int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import type { Context } from "@earendil-works/chord";
 import {
   defineDoc,
@@ -7,10 +7,11 @@ import {
 } from "@earendil-works/pi-durable";
 import { randomUUID } from "node:crypto";
 import type { BotAgentManagement } from "./bot-management.ts";
-import type { WorkspaceConfig } from "./types.ts";
+import { admDocCheckpointWhen, type WorkspaceConfig } from "./types.ts";
 
 const MessageReceipts = defineDoc<{ receipts: Record<string, number> }>({
   kind: "adm.bot-messages",
+  checkpointWhen: admDocCheckpointWhen,
   version: 1,
   scope: "conversation",
   history: "latest",
@@ -26,6 +27,7 @@ export type BotProfile = {
 
 export const BotProfileDocument = defineDoc<BotProfile>({
   kind: "adm.bot-profile",
+  checkpointWhen: admDocCheckpointWhen,
   version: 1,
   scope: "conversation",
   history: "latest",
@@ -65,9 +67,9 @@ export function botExtension(
         name: "saveProfile",
         description:
           "Save the identity and purpose confirmed by the user during bot setup.",
-        parameters: Type.Object({
-          identity: Type.String({ minLength: 1, maxLength: 160 }),
-          purpose: Type.String({ minLength: 1, maxLength: 2000 }),
+        parameters: obj({
+          identity: str({ minLength: 1, maxLength: 160 }),
+          purpose: str({ minLength: 1, maxLength: 2000 }),
         }),
         replay: "safe",
         execute: async ({ identity, purpose }, api, context) => {
@@ -92,7 +94,7 @@ export function botExtension(
         name: "listAgents",
         description:
           "List live coding agents in this ADM installation, with immutable IDs, names, runtime phase, and agent activity.",
-        parameters: Type.Object({}),
+        parameters: obj({}),
         replay: "safe",
         execute: async (_args, _api, context) => {
           await assertActive();
@@ -126,8 +128,8 @@ export function botExtension(
         name: "sendMessage",
         description:
           "Publish an explicit message to the user in this bot conversation. Ordinary model output stays private.",
-        parameters: Type.Object({
-          text: Type.String({ minLength: 1, maxLength: 100000 }),
+        parameters: obj({
+          text: str({ minLength: 1, maxLength: 100000 }),
         }),
         replay: "safe",
         execute: async (args, api, context) => {
@@ -151,10 +153,10 @@ export function botExtension(
         name: "monitorAgent",
         description:
           "Inspect a coding agent's status and one cursor page of full history, including tool activity. Continue with after=nextAfter while hasMore is true.",
-        parameters: Type.Object({
-          agentId: Type.String(),
-          after: Type.Optional(Type.Integer({ minimum: 0 })),
-          limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+        parameters: obj({
+          agentId: str(),
+          after: opt(int({ minimum: 0 })),
+          limit: opt(int({ minimum: 1, maximum: 1000 })),
         }),
         replay: "safe",
         execute: async ({ agentId, after, limit }, _api, context) => {
@@ -182,16 +184,10 @@ export function botExtension(
         name: "promptAgent",
         description:
           "Prompt a coding agent, steering its current turn or queuing a follow-up. Delivery is deduplicated after a lost acknowledgement.",
-        parameters: Type.Object({
-          agentId: Type.String(),
-          message: Type.String({ minLength: 1, maxLength: 100000 }),
-          whenBusy: Type.Optional(
-            Type.Union([
-              Type.Literal("steer"),
-              Type.Literal("followUp"),
-              Type.Literal("reject"),
-            ]),
-          ),
+        parameters: obj({
+          agentId: str(),
+          message: str({ minLength: 1, maxLength: 100000 }),
+          whenBusy: opt(oneOf(["steer", "followUp", "reject"])),
         }),
         replay: "safe",
         execute: async ({ agentId, message, whenBusy }, api, context) => {
@@ -209,7 +205,7 @@ export function botExtension(
       defineTool({
         name: "resumeAgent",
         description: "Resume a coding agent after a provider failure.",
-        parameters: Type.Object({ agentId: Type.String() }),
+        parameters: obj({ agentId: str() }),
         replay: "safe",
         execute: async ({ agentId }, _api, context) => {
           await assertActive();
@@ -220,9 +216,9 @@ export function botExtension(
       defineTool({
         name: "abortAgent",
         description: "Abort a coding agent's current turn or background task.",
-        parameters: Type.Object({
-          agentId: Type.String(),
-          background: Type.Optional(Type.Boolean()),
+        parameters: obj({
+          agentId: str(),
+          background: opt(bool()),
         }),
         replay: "safe",
         execute: async ({ agentId, background }, _api, context) => {
@@ -239,20 +235,12 @@ export function botExtension(
         name: "saveAgentGoal",
         description:
           "Create or update a coding agent's durable goal. Pass an id and status to update or complete an existing goal.",
-        parameters: Type.Object({
-          agentId: Type.String(),
-          goal: Type.Object({
-            description: Type.Optional(
-              Type.String({ minLength: 1, maxLength: 100000 }),
-            ),
-            id: Type.Optional(Type.String()),
-            status: Type.Optional(
-              Type.Union([
-                Type.Literal("active"),
-                Type.Literal("completed"),
-                Type.Literal("cancelled"),
-              ]),
-            ),
+        parameters: obj({
+          agentId: str(),
+          goal: obj({
+            description: opt(str({ minLength: 1, maxLength: 100000 })),
+            id: opt(str()),
+            status: opt(oneOf(["active", "completed", "cancelled"])),
           }),
         }),
         replay: "safe",
@@ -271,18 +259,14 @@ export function botExtension(
         name: "saveAgentLoop",
         description:
           "Create or update recurring work for a coding agent. Loop creation is durable and deduplicated after a lost acknowledgement.",
-        parameters: Type.Object({
-          agentId: Type.String(),
-          loop: Type.Object({
-            prompt: Type.Optional(
-              Type.String({ minLength: 1, maxLength: 100000 }),
-            ),
-            intervalMs: Type.Optional(Type.Integer({ minimum: 1000 })),
-            nextAt: Type.Optional(Type.Integer()),
-            id: Type.Optional(Type.String()),
-            status: Type.Optional(
-              Type.Union([Type.Literal("active"), Type.Literal("cancelled")]),
-            ),
+        parameters: obj({
+          agentId: str(),
+          loop: obj({
+            prompt: opt(str({ minLength: 1, maxLength: 100000 })),
+            intervalMs: opt(int({ minimum: 1000 })),
+            nextAt: opt(int()),
+            id: opt(str()),
+            status: opt(oneOf(["active", "cancelled"])),
           }),
         }),
         replay: "safe",
@@ -300,10 +284,10 @@ export function botExtension(
       defineTool({
         name: "configureAgentModel",
         description: "Change the selected model for a coding agent.",
-        parameters: Type.Object({
-          agentId: Type.String(),
-          provider: Type.String({ minLength: 1 }),
-          modelId: Type.String({ minLength: 1 }),
+        parameters: obj({
+          agentId: str(),
+          provider: str({ minLength: 1 }),
+          modelId: str({ minLength: 1 }),
         }),
         replay: "safe",
         execute: async ({ agentId, provider, modelId }, _api, context) => {
@@ -321,35 +305,35 @@ export function botExtension(
         name: "createAgent",
         description:
           "Create a coding-agent workspace through the durable lifecycle service. Creation choices are explicit and the operation receipt can be replayed after a lost acknowledgement.",
-        parameters: Type.Object({
-          name: Type.String({ minLength: 1, maxLength: 63 }),
-          image: Type.Optional(
-            Type.String({
+        parameters: obj({
+          name: str({ minLength: 1, maxLength: 63 }),
+          image: opt(
+            str({
               minLength: 1,
               description:
                 "Coding image. Omit it to run the cluster release's coding image.",
             }),
           ),
-          storageClass: Type.String({ minLength: 1 }),
-          storageSize: Type.String({ minLength: 1 }),
-          cpu: Type.String({ minLength: 1 }),
-          memory: Type.String({ minLength: 1 }),
-          model: Type.Optional(
-            Type.Object({
-              provider: Type.String({ minLength: 1 }),
-              id: Type.String({ minLength: 1 }),
+          storageClass: str({ minLength: 1 }),
+          storageSize: str({ minLength: 1 }),
+          cpu: str({ minLength: 1 }),
+          memory: str({ minLength: 1 }),
+          model: opt(
+            obj({
+              provider: str({ minLength: 1 }),
+              id: str({ minLength: 1 }),
             }),
           ),
-          repository: Type.Optional(Type.String({ minLength: 1 })),
-          branch: Type.Optional(
-            Type.String({
+          repository: opt(str({ minLength: 1 })),
+          branch: opt(
+            str({
               minLength: 1,
               description:
                 "Existing remote branch or new local branch; requires repository.",
             }),
           ),
-          base: Type.Optional(
-            Type.String({
+          base: opt(
+            str({
               minLength: 1,
               description:
                 "Git ref for a new branch, such as origin/release; requires repository and branch. Existing remote branches take precedence.",
@@ -395,7 +379,7 @@ export function botExtension(
         name: "destroyAgent",
         description:
           "Durably admit destruction of a coding agent by immutable workspace ID. The receipt remains inspectable and replayable if the acknowledgement is lost.",
-        parameters: Type.Object({ agentId: Type.String() }),
+        parameters: obj({ agentId: str() }),
         replay: "safe",
         execute: async ({ agentId }, api, context: Context) => {
           await assertActive();
@@ -416,7 +400,7 @@ export function botExtension(
         name: "monitorAgentOperation",
         description:
           "Read the durable status, completion, or failure of a coding-agent create or destroy operation by its operation ID.",
-        parameters: Type.Object({ operationId: Type.String() }),
+        parameters: obj({ operationId: str() }),
         replay: "safe",
         execute: async ({ operationId }, _api, context) => {
           await assertActive();

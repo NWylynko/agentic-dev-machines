@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-// Reproducible minimal patch to MIT-licensed @earendil-works/pi-coding-agent 1.2.0.
+// Reproducible minimal patch to MIT-licensed @earendil-works/pi-coding-agent 1.5.0.
 // Its upstream LICENSE is preserved in dependency installs and release archives.
 
 const packageRoot = resolve(
@@ -13,26 +14,32 @@ const manifest = JSON.parse(
 );
 if (
   manifest.name !== "@earendil-works/pi-coding-agent" ||
-  manifest.version !== "1.2.0"
+  manifest.version !== "1.5.0"
 )
   throw new Error(
-    `ADM InteractiveMode patch requires @earendil-works/pi-coding-agent@1.2.0; got ${manifest.name}@${manifest.version}`,
+    `ADM InteractiveMode patch requires @earendil-works/pi-coding-agent@1.5.0; got ${manifest.name}@${manifest.version}`,
   );
 
+// Apply one group of replacements to a file, each matching exactly `expected`
+// times (default once), and stamp the file with the group's hash. npm runs
+// postinstall again on an installed package: a stamped group is skipped.
 async function patch(relativePath, replacements) {
   const path = resolve(packageRoot, relativePath);
   let source = await readFile(path, "utf8");
+  const stamp = `/* adm-pi-patch ${createHash("sha256").update(JSON.stringify(replacements)).digest("hex").slice(0, 16)} */`;
+  if (source.includes(stamp)) return;
   for (const [before, after, expected = 1] of replacements) {
     const count = source.split(before).length - 1;
-    if (source.includes(after)) continue;
-    if (expected === 0 && count === 0) continue;
-    if (count !== (expected === 0 ? 1 : expected))
+    if (count !== expected)
       throw new Error(
-        `Expected ${expected === 0 ? "at most one" : expected} pinned Pi patch points in ${relativePath}, found ${count}: ${before.slice(0, 90)}`,
+        `Expected ${expected} pinned Pi patch points in ${relativePath}, found ${count}: ${before.slice(0, 90)}`,
       );
     source = source.replaceAll(before, after);
   }
-  await writeFile(path, source);
+  await writeFile(
+    path,
+    `${source}${source.endsWith("\n") ? "" : "\n"}${stamp}\n`,
+  );
 }
 
 await patch("dist/modes/interactive/interactive-mode.js", [
@@ -47,27 +54,12 @@ await patch("dist/modes/interactive/interactive-mode.js", [
         ]);`,
   ],
   [
-    '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!", "to run bash")]),',
-    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "to run bash")]),',
-    0,
-  ],
-  [
     'rawKeyHint("!", "to run bash"),',
     '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "to run bash")]),',
   ],
   [
-    '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
-    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
-    0,
-  ],
-  [
     'rawKeyHint("!!", "to run bash (no context)"),',
     '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!!", "to run bash (no context)")]),',
-  ],
-  [
-    '...(this.runtimeHost.remotePorts?.isRemote ? [] : [rawKeyHint("!", "bash")]),',
-    '...(this.runtimeHost.remotePorts?.supportsBash === false ? [] : [rawKeyHint("!", "bash")]),',
-    0,
   ],
   [
     'rawKeyHint("!", "bash"),',
@@ -120,7 +112,6 @@ await patch("dist/modes/interactive/interactive-mode.js", [
   [
     "if (!this.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(cwd)) {",
     "if (!this.settingsManager.isProjectTrusted() || !(await (this.runtimeHost.remotePorts?.projectTrust?.hasTrustRequiringResources(cwd) ?? hasTrustRequiringProjectResources(cwd)))) {",
-    0,
   ],
   ["trustStore.set(cwd, true);", "await trustStore.set(cwd, true);"],
   [
@@ -130,7 +121,6 @@ await patch("dist/modes/interactive/interactive-mode.js", [
   [
     "if (this.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(this.sessionManager.getCwd())) {",
     "if (this.settingsManager.isProjectTrusted() || !(this.runtimeHost.remotePorts?.projectTrust ? this.runtimeHost.remotePorts.projectTrust.hasTrustRequiringResources(this.sessionManager.getCwd()) : hasTrustRequiringProjectResources(this.sessionManager.getCwd()))) {",
-    0,
   ],
   [
     "this.settingsManager.isProjectTrusted()",

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
-import { Type } from "@earendil-works/pi-ai";
+import { bool, int, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import {
   defineDoc,
   defineExtension,
@@ -12,7 +12,7 @@ import {
   type TaskRuntime,
   type Tx,
 } from "@earendil-works/pi-durable";
-import { ApiError } from "./types.ts";
+import { admDocCheckpointWhen, ApiError } from "./types.ts";
 
 /** Shortest recurrence the runner will admit. Terminal commands already speak in whole seconds. */
 export const minimumLoopIntervalMs = 1000;
@@ -48,13 +48,14 @@ type ScheduleReceipts = {
 
 type LoopInput = { loopId: string; generation?: number };
 type LoopState =
-  | { phase: "wait"; epoch: number }
+  | { phase: "wait" }
   | { phase: "arm"; scheduledAt: number }
   | { phase: "deliver"; scheduledAt: number; requestId: string };
 type LoopResult = { scheduledAt: number };
 
 const Schedule = defineDoc<ScheduleState>({
   kind: "adm.schedule",
+  checkpointWhen: admDocCheckpointWhen,
   version: 1,
   scope: "conversation",
   history: "latest",
@@ -64,6 +65,7 @@ const Schedule = defineDoc<ScheduleState>({
 
 const ScheduleRequests = defineDoc<ScheduleReceipts>({
   kind: "adm.schedule-requests",
+  checkpointWhen: admDocCheckpointWhen,
   version: 1,
   scope: "conversation",
   history: "latest",
@@ -164,7 +166,7 @@ async function stopCancelledLoop(
       if (current.status === "active")
         return {
           status: "running",
-          checkpoint: { phase: "wait", epoch: current.nextAt },
+          checkpoint: { phase: "wait" },
         };
       replaceLoop(doc.loops, task.input.loopId, (loop) => ({
         ...loop,
@@ -188,8 +190,10 @@ function createLoopTask(
   return defineTask<LoopInput, LoopState, LoopResult>({
     name: "adm.loop",
     version: 1,
-    initial: () => ({ phase: "wait", epoch: 0 }),
+    initial: () => ({ phase: "wait" }),
     phases: {
+      // Reruns from the top after every stored sleep, so a loop changed or
+      // cancelled while this task slept is seen when it wakes.
       wait: async (task, runtime, call) => {
         const loop = await readLoop(runtime, call, task.input.loopId);
         if (!loop || (loop.generation ?? 1) !== (task.input.generation ?? 1)) {
@@ -214,47 +218,14 @@ function createLoopTask(
           );
           return;
         }
-        await runtime.sleep(loop.nextAt, call);
-        const due = await readLoop(runtime, call, task.input.loopId);
-        if (!due || (due.generation ?? 1) !== (task.input.generation ?? 1)) {
-          await runtime.commit(async () => finish(loop.nextAt), call);
-          return;
-        }
-        if (due.status !== "active") {
-          await stopCancelledLoop(task, runtime, call, loop.nextAt);
-          return;
-        }
-        if (due.pendingRequestId) {
-          await runtime.commit(
-            async () => ({
-              status: "running",
-              checkpoint: {
-                phase: "deliver",
-                scheduledAt: scheduledAtFrom(due.pendingRequestId),
-                requestId: due.pendingRequestId,
-              },
-            }),
-            call,
-          );
-          return;
-        }
-        if (due.nextAt > runtime.now()) {
-          await runtime.commit(
-            async () => ({
-              status: "running",
-              checkpoint: {
-                phase: "wait",
-                epoch: task.state.checkpoint.epoch + 1,
-              },
-            }),
-            call,
-          );
+        if (loop.nextAt > runtime.now()) {
+          await runtime.sleepUntil(loop.nextAt, { phase: "wait" }, call);
           return;
         }
         await runtime.commit(
           async () => ({
             status: "running",
-            checkpoint: { phase: "arm", scheduledAt: due.nextAt },
+            checkpoint: { phase: "arm", scheduledAt: loop.nextAt },
           }),
           call,
         );
@@ -324,7 +295,7 @@ function createLoopTask(
             return finish(scheduledAt);
           return {
             status: "running",
-            checkpoint: { phase: "wait", epoch: scheduledAt },
+            checkpoint: { phase: "wait" },
           };
         }, call);
       },
@@ -584,16 +555,10 @@ export function createScheduleExtension(
         name: "saveGoal",
         description:
           "Create or update a durable goal for this session. Pass an id to revise it.",
-        parameters: Type.Object({
-          description: Type.String({ minLength: 1, maxLength: 100000 }),
-          id: Type.Optional(Type.String()),
-          status: Type.Optional(
-            Type.Union([
-              Type.Literal("active"),
-              Type.Literal("completed"),
-              Type.Literal("cancelled"),
-            ]),
-          ),
+        parameters: obj({
+          description: str({ minLength: 1, maxLength: 100000 }),
+          id: opt(str()),
+          status: opt(oneOf(["active", "completed", "cancelled"])),
         }),
         replay: "safe",
         execute: async (args, api, call) => {
@@ -626,14 +591,14 @@ export function createScheduleExtension(
         name: "saveLoop",
         description:
           "Create durable recurring work. The prompt is delivered with a stable request id and the next trigger is saved before delivery.",
-        parameters: Type.Object({
-          prompt: Type.String({ minLength: 1, maxLength: 100000 }),
-          intervalMs: Type.Integer({
+        parameters: obj({
+          prompt: str({ minLength: 1, maxLength: 100000 }),
+          intervalMs: int({
             minimum: minimumLoopIntervalMs,
             maximum: maximumLoopIntervalMs,
           }),
-          nextAt: Type.Optional(
-            Type.Integer({
+          nextAt: opt(
+            int({
               minimum: Number.MIN_SAFE_INTEGER,
               maximum: Number.MAX_SAFE_INTEGER,
             }),

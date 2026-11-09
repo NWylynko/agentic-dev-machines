@@ -2,7 +2,7 @@
 import { ProcessTerminal } from "@earendil-works/pi-tui";
 import { InteractiveMode } from "@earendil-works/pi-coding-agent";
 import { DurableInteractiveRuntime } from "./native-runtime.ts";
-import { WorkspaceTerminal } from "./terminal.ts";
+import { WorkspaceConnection } from "./workspace-connection.ts";
 async function runTerminal() {
   const args = process.argv.slice(2);
   let url = "http://127.0.0.1:7432",
@@ -55,9 +55,7 @@ async function runTerminal() {
   if (!workspaceId) throw new Error("--workspace ID is required");
   if (!process.stdin.isTTY || !process.stdout.isTTY)
     throw new Error("Attachment requires an interactive terminal");
-  const terminal = new WorkspaceTerminal({
-    autoModelSelector: false,
-    deferModelCatalog: true,
+  const connection = new WorkspaceConnection({
     url,
     workspaceId,
     tokenFile,
@@ -67,17 +65,20 @@ async function runTerminal() {
       : {}),
     diagnostics,
   });
-  const remote = new DurableInteractiveRuntime(terminal);
+  const remote = new DurableInteractiveRuntime(connection);
   try {
-    await terminal.connect();
+    await connection.connect();
     await remote.initialize();
     const mode = new InteractiveMode(remote, {
       terminal: new ProcessTerminal(),
     });
+    // Pi renders the session's records in init(); live changes follow it.
+    await mode.init();
+    remote.rendered();
     await mode.run();
   } finally {
     await remote.dispose();
-    terminal.close();
+    connection.close();
     process.stdin.pause();
   }
 }

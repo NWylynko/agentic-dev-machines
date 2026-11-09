@@ -8,6 +8,7 @@ import {
   defineDoc,
 } from "@earendil-works/pi-durable";
 import type { Extension as DurableExtension } from "@earendil-works/pi-durable";
+import { admDocCheckpointWhen } from "./types.ts";
 import type {
   AgentToolResult,
   Extension as PiExtension,
@@ -100,23 +101,32 @@ export const ExtensionOperationsDocument = defineDoc<{
   requests: ExtensionRequestTombstone[];
 }>({
   kind: "adm.pi-extension-operations",
+  checkpointWhen: admDocCheckpointWhen,
   version: 2,
   scope: "conversation",
   history: "latest",
   fork: "initial",
   initial: () => ({ operations: [], requests: [] }),
   migrate: (value) => {
-    const operations = (value.operations as ExtensionOperationReceipt[] | undefined) ?? [];
+    const operations =
+      (value.operations as ExtensionOperationReceipt[] | undefined) ?? [];
     return {
       operations,
-      requests: (value.requests as ExtensionRequestTombstone[] | undefined) ??
-        operations.flatMap((operation) => operation.requestId ? [{
-          requestId: operation.requestId,
-          fingerprint: operation.fingerprint,
-          operationId: operation.id,
-          command: operation.command,
-          status: operation.status,
-        }] : []),
+      requests:
+        (value.requests as ExtensionRequestTombstone[] | undefined) ??
+        operations.flatMap((operation) =>
+          operation.requestId
+            ? [
+                {
+                  requestId: operation.requestId,
+                  fingerprint: operation.fingerprint,
+                  operationId: operation.id,
+                  command: operation.command,
+                  status: operation.status,
+                },
+              ]
+            : [],
+        ),
     };
   },
 });
@@ -130,19 +140,25 @@ export class ExtensionCommandOperation extends EventEmitter {
   private readonly pending = new Map<string, PendingUi>();
   private sequence = 0;
   private finished = false;
-  private readonly handler?: (context: ExtensionCommandContext) => Promise<void> | void;
+  private readonly handler?: (
+    context: ExtensionCommandContext,
+  ) => Promise<void> | void;
   private readonly cwd: string;
   private readonly assertActive: (signal?: AbortSignal) => Promise<void>;
   private persistence = Promise.resolve();
   private persistenceError?: unknown;
   private persistEvent?: (event: ExtensionCommandEvent) => Promise<void>;
-  private onFinish?: (status: ExtensionOperationReceipt["status"]) => Promise<void>;
+  private onFinish?: (
+    status: ExtensionOperationReceipt["status"],
+  ) => Promise<void>;
   private operationStatus: ExtensionOperationReceipt["status"] = "accepted";
   private state?: ExtensionCommandState;
 
   constructor(
     command: string,
-    handler: ((context: ExtensionCommandContext) => Promise<void> | void) | undefined,
+    handler:
+      | ((context: ExtensionCommandContext) => Promise<void> | void)
+      | undefined,
     cwd: string,
     assertActive: (signal?: AbortSignal) => Promise<void>,
     options: {
@@ -163,7 +179,8 @@ export class ExtensionCommandOperation extends EventEmitter {
     this.history = options.history ?? [];
     this.sequence = this.history.at(-1)?.seq ?? 0;
     this.operationStatus = options.status ?? "accepted";
-    this.finished = options.status !== undefined && options.status !== "accepted";
+    this.finished =
+      options.status !== undefined && options.status !== "accepted";
     this.persistEvent = options.persistEvent;
     this.onFinish = options.onFinish;
     this.state = options.state;
@@ -204,7 +221,7 @@ export class ExtensionCommandOperation extends EventEmitter {
     if (!pending || !validUiResult(pending.method, pending.options, result))
       return false;
     this.pending.delete(requestId);
-    pending.resolve(result === null ? undefined : result as UiResult);
+    pending.resolve(result === null ? undefined : (result as UiResult));
     return true;
   }
 
@@ -231,7 +248,9 @@ export class ExtensionCommandOperation extends EventEmitter {
       this.operationStatus = cancelled ? "cancelled" : "failed";
       this.publish({
         type: "error",
-        code: cancelled ? "EXTENSION_COMMAND_CANCELLED" : "EXTENSION_COMMAND_FAILED",
+        code: cancelled
+          ? "EXTENSION_COMMAND_CANCELLED"
+          : "EXTENSION_COMMAND_FAILED",
         message: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -273,15 +292,21 @@ export class ExtensionCommandOperation extends EventEmitter {
       notify: (message: string, type: "info" | "warning" | "error" = "info") =>
         this.publish({ type: "notification", message, level: type }),
       setStatus: (key: string, text: string | undefined) =>
-        this.publish({ type: "status", key, ...(text === undefined ? {} : { text }) }),
+        this.publish({
+          type: "status",
+          key,
+          ...(text === undefined ? {} : { text }),
+        }),
       setTitle: (title: string) => this.publish({ type: "title", title }),
       setWorkingMessage: (message?: string) =>
         this.publish({ type: "working_message", message }),
       setWorkingVisible: (visible: boolean) =>
         this.publish({ type: "working_visible", visible }),
-      setEditorText: (text: string) => this.publish({ type: "editor_text", text }),
+      setEditorText: (text: string) =>
+        this.publish({ type: "editor_text", text }),
       getEditorText: () => this.request("getEditorText", {}),
-      pasteToEditor: (text: string) => this.publish({ type: "editor_text", text }),
+      pasteToEditor: (text: string) =>
+        this.publish({ type: "editor_text", text }),
       setWorkingIndicator: unsupportedUi("setWorkingIndicator"),
       setHiddenThinkingLabel: unsupportedUi("setHiddenThinkingLabel"),
       setWidget: unsupportedUi("setWidget"),
@@ -293,7 +318,9 @@ export class ExtensionCommandOperation extends EventEmitter {
       setEditorComponent: unsupportedUi("setEditorComponent"),
       getEditorComponent: unsupportedUi("getEditorComponent"),
       get theme() {
-        throw new Error("Pi extension operation ui.theme is not supported by the Durable bridge");
+        throw new Error(
+          "Pi extension operation ui.theme is not supported by the Durable bridge",
+        );
       },
       getAllThemes: unsupportedUi("getAllThemes"),
       getTheme: unsupportedUi("getTheme"),
@@ -327,7 +354,10 @@ export class ExtensionCommandOperation extends EventEmitter {
 
   private request(
     method: "select" | "confirm" | "input" | "editor" | "getEditorText",
-    fields: Omit<Extract<ExtensionCommandEvent, { type: "ui_request" }>, "type" | "seq" | "requestId" | "method">,
+    fields: Omit<
+      Extract<ExtensionCommandEvent, { type: "ui_request" }>,
+      "type" | "seq" | "requestId" | "method"
+    >,
     opts?: ExtensionUIDialogOptions,
   ): Promise<UiResult> {
     const signal = opts?.signal;
@@ -373,20 +403,22 @@ export class ExtensionCommandOperation extends EventEmitter {
     });
   }
 
-  private publish(event: ExtensionCommandEvent extends infer E
-    ? E extends { seq: number }
-      ? Omit<E, "seq">
-      : never
-    : never) {
+  private publish(
+    event: ExtensionCommandEvent extends infer E
+      ? E extends { seq: number }
+        ? Omit<E, "seq">
+        : never
+      : never,
+  ) {
     const current = { ...event, seq: ++this.sequence } as ExtensionCommandEvent;
     this.history.push(current);
     if (this.history.length > 256) this.history.shift();
     if (this.persistEvent) {
-      this.persistence = this.persistence.then(() =>
-        this.persistEvent!(current),
-      ).catch((error) => {
-        this.persistenceError = error;
-      });
+      this.persistence = this.persistence
+        .then(() => this.persistEvent!(current))
+        .catch((error) => {
+          this.persistenceError = error;
+        });
     }
     this.emit("event", current);
   }
@@ -427,7 +459,7 @@ export function createDurableExtensionBridge(
               lastOutput = text;
               if (delta) api.output(delta);
             },
-              unsupportedSurface("tool ctx", {
+            unsupportedSurface("tool ctx", {
               ...(await createContext(context.abortSignal)),
               executeTool: unsupportedUi("executeTool"),
               tools: [],
@@ -505,7 +537,9 @@ export function createDurableExtensionBridge(
             input: { ...call.arguments },
             content: [...(result.output ?? [])] as ToolResultEvent["content"],
             isError: result.isError === true,
-            ...(result.details === undefined ? {} : { details: result.details }),
+            ...(result.details === undefined
+              ? {}
+              : { details: result.details }),
             ...(result.structuredOutput === undefined
               ? {}
               : { structuredContent: result.structuredOutput }),
@@ -523,7 +557,9 @@ export function createDurableExtensionBridge(
           return {
             output: event.content as never,
             isError: event.isError,
-            ...(event.details === undefined ? {} : { details: event.details as never }),
+            ...(event.details === undefined
+              ? {}
+              : { details: event.details as never }),
             ...(event.structuredContent === undefined
               ? {}
               : { structuredOutput: event.structuredContent as never }),
@@ -575,8 +611,9 @@ export function createShortcutOperation(
         name: `${extension.path}:${candidate.shortcut}`,
       })),
     )
-    .find(({ candidate, name }) =>
-      name === shortcut || candidate.shortcut === shortcut,
+    .find(
+      ({ candidate, name }) =>
+        name === shortcut || candidate.shortcut === shortcut,
     )?.candidate;
   return registration
     ? new ExtensionCommandOperation(
@@ -590,17 +627,32 @@ export function createShortcutOperation(
 }
 
 function unsupportedContext(): ExtensionContext {
-  const ui = new Proxy({}, {
-    get: (_target, property) => unsupportedUi(`ui.${String(property)}`),
-  }) as ExtensionUIContext;
+  const ui = new Proxy(
+    {},
+    {
+      get: (_target, property) => unsupportedUi(`ui.${String(property)}`),
+    },
+  ) as ExtensionUIContext;
   return unsupportedSurface("ctx", {
     mode: "rpc" as const,
     hasUI: false,
     cwd: "",
     ui,
     signal: undefined,
-    sessionManager: new Proxy({}, { get: (_target, property) => unsupportedUi(`sessionManager.${String(property)}`) }),
-    modelRegistry: new Proxy({}, { get: (_target, property) => unsupportedUi(`modelRegistry.${String(property)}`) }),
+    sessionManager: new Proxy(
+      {},
+      {
+        get: (_target, property) =>
+          unsupportedUi(`sessionManager.${String(property)}`),
+      },
+    ),
+    modelRegistry: new Proxy(
+      {},
+      {
+        get: (_target, property) =>
+          unsupportedUi(`modelRegistry.${String(property)}`),
+      },
+    ),
     model: undefined,
     scopedModels: [],
     isIdle: () => false,

@@ -17,6 +17,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import {
+  entryRole,
+  followView as followAttachView,
+  nextHistoryEvent,
+} from "./attach-stream.ts";
 
 const main = new URL("../src/main.ts", import.meta.url);
 
@@ -1704,6 +1709,13 @@ test(
   },
 );
 
+const followView = (runner, id, onView, query = "", token) =>
+  followAttachView(runner.url, `/v1/workspaces/${id}`, onView, {
+    query,
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+  });
+
+// The first ADM history event after `after` matching `predicate`.
 async function nextEvent(
   runner,
   id,
@@ -1713,42 +1725,202 @@ async function nextEvent(
   timeoutMs = 0,
   token,
 ) {
-  const controller = new AbortController();
-  const timeout = timeoutMs
-    ? setTimeout(() => controller.abort(), timeoutMs)
-    : undefined;
-  const response = await fetch(
-    `${runner.url}/v1/workspaces/${id}/events?after=${after}&diagnostics=${diagnostics}`,
+  const reading = nextHistoryEvent(
+    runner.url,
+    `/v1/workspaces/${id}`,
+    predicate,
     {
-      signal: controller.signal,
+      after,
+      diagnostics,
       headers: token ? { authorization: `Bearer ${token}` } : {},
     },
   );
-  assert.equal(response.status, 200);
-  let buffer = "";
+  if (!timeoutMs) return reading;
+  let timer;
   try {
-    for await (const bytes of response.body) {
-      buffer += Buffer.from(bytes).toString();
-      for (;;) {
-        const end = buffer.indexOf("\n\n");
-        if (end < 0) break;
-        const frame = buffer.slice(0, end);
-        buffer = buffer.slice(end + 2);
-        const data = frame
-          .split("\n")
-          .find((line) => line.startsWith("data: "));
-        if (data) {
-          const event = JSON.parse(data.slice(6));
-          if (predicate(event)) return event;
-        }
-      }
-    }
-    throw new Error("Event stream ended before the expected event");
+    return await Promise.race([
+      reading,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Timed out waiting for the event")),
+          timeoutMs,
+        );
+      }),
+    ]);
   } finally {
-    if (timeout) clearTimeout(timeout);
-    controller.abort();
+    clearTimeout(timer);
   }
 }
+
+const fauxTurn = (answer, calls = []) =>
+  "/faux " + JSON.stringify({ calls, answer });
+// A short faux turn can start and end within one watch callback. This answer
+// streams over many throttled partial commits, so a client sees the run working.
+const longFauxAnswer = (text) => `${text} ${"streaming ".repeat(2_000)}`;
+
+test(
+  "attach follows the Durable conversation view: its first value, the ops of each commit, and a resume from an entry",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-view-"));
+    const runner = await startRunner(directory);
+    t.after(async () => runner.stop());
+    const id = "workspace-view";
+    const path = `/v1/workspaces/${id}`;
+    assert.equal(
+      (
+        await runner.request(path, "PUT", {
+          id,
+          name: "view",
+          role: "coding",
+          environment: "local",
+          localRoot: join(directory, "repo"),
+          model: { provider: "faux", id: "faux-1" },
+        })
+      ).status,
+      200,
+    );
+    let sawRun = false;
+    const answered = await followView(runner, id, async (view, frame) => {
+      if (frame === "view") {
+        assert.equal(
+          view.conversation.id,
+          (await runner.request(path)).body.conversationId,
+        );
+        assert.deepEqual(view.entries, []);
+        const admitted = await runner.request(path + "/input", "POST", {
+          message: fauxTurn(longFauxAnswer("The view answer")),
+          requestId: "view-input",
+        });
+        assert.equal(admitted.status, 202);
+        return;
+      }
+      if (view.docs["pi.live"]?.run) sawRun = true;
+      const answer = view.entries.find(
+        (entry) =>
+          entryRole(entry) === "assistant" &&
+          JSON.stringify(entry.model).includes("The view answer"),
+      );
+      if (answer && !view.docs["pi.live"]?.run) return { view, answer };
+    });
+    assert.ok(sawRun, "the run shows in pi.live while it works");
+    assert.ok(
+      answered.view.entries.some((entry) => entryRole(entry) === "user"),
+    );
+
+    // A reconnect from just after the newest entry gets only what follows.
+    const newest = answered.view.entries.at(-1).id;
+    const resumed = await followView(
+      runner,
+      id,
+      (view) => view,
+      `?from=${Number(newest) + 1}`,
+    );
+    assert.deepEqual(resumed.entries, []);
+    assert.equal(resumed.before, newest);
+
+    // The transcript loader pages the same entries.
+    const page = await runner.request(
+      path + `/entries?order=descending&limit=1`,
+    );
+    assert.equal(page.status, 200);
+    assert.deepEqual(
+      page.body.items.map((entry) => entry.id),
+      [newest],
+    );
+    const earlier = await runner.request(
+      path +
+        `/entries?order=descending&limit=100&maxEntryId=${Number(newest) - 1}`,
+    );
+    assert.deepEqual(
+      [...earlier.body.items].reverse().map((entry) => entry.id),
+      answered.view.entries.slice(0, -1).map((entry) => entry.id),
+    );
+    assert.equal(
+      (await runner.request(path + "/events?from=nope")).status,
+      400,
+    );
+  },
+);
+
+test(
+  "a bot's attach view is public: its users' messages, published messages and whether it is working, never its private turns",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-view-"));
+    const runner = await startRunner(directory);
+    t.after(async () => runner.stop());
+    const bot = {
+      id: "bot-view",
+      name: "bot view",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    };
+    const path = `/v1/workspaces/${bot.id}`;
+    assert.equal((await runner.request(path, "PUT", bot)).status, 200);
+    let sawWorking = false;
+    const published = await followView(runner, bot.id, async (view, frame) => {
+      assert.deepEqual(Object.keys(view.docs), ["pi.live"]);
+      assert.deepEqual(
+        Object.keys(view.docs["pi.live"]).filter((key) => key !== "run"),
+        [],
+      );
+      for (const entry of view.entries)
+        assert.ok(
+          entryRole(entry) === "user" ||
+            entry.kind === "adm.message" ||
+            entry.kind === "adm.status",
+          `bot view leaked a ${entry.kind} entry`,
+        );
+      if (view.docs["pi.live"].run) sawWorking = true;
+      if (frame === "view") {
+        await runner.request(path + "/input", "POST", {
+          message: fauxTurn(longFauxAnswer("Private reasoning only"), [
+            { tool: "sendMessage", args: { text: "Hello in public" } },
+          ]),
+          requestId: "bot-view-input",
+        });
+        return;
+      }
+      if (
+        !view.docs["pi.live"].run &&
+        view.entries.some(
+          (entry) =>
+            entry.kind === "adm.message" &&
+            entry.data.text === "Hello in public",
+        )
+      )
+        return view;
+    });
+    assert.ok(sawWorking, "a working bot shows a run");
+    assert.ok(published.entries.some((entry) => entryRole(entry) === "user"));
+    const entries = await runner.request(path + "/entries?limit=1000");
+    assert.ok(
+      entries.body.items.every(
+        (entry) =>
+          entryRole(entry) === "user" ||
+          entry.kind === "adm.message" ||
+          entry.kind === "adm.status",
+      ),
+    );
+    // Diagnostics show the whole private view.
+    const diagnostic = await followView(
+      runner,
+      bot.id,
+      (view) => view,
+      "?diagnostics=true",
+    );
+    assert.ok(
+      diagnostic.entries.some(
+        (entry) =>
+          entryRole(entry) === "assistant" &&
+          JSON.stringify(entry.model).includes("Private reasoning only"),
+      ),
+    );
+    assert.ok("pi.usage" in diagnostic.docs);
+  },
+);
 
 test(
   "a client can detach, deduplicate input, recover history after SIGKILL, and permanently delete a named workspace",
