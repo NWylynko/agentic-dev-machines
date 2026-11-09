@@ -140,12 +140,18 @@ RUN chown root:root /usr/local/bin/artifact-fs \
 
 FROM adm-workspace AS adm-bot
 
+# Go without its own tests: they carry private-key fixtures the image credential scan rejects,
+# and building programs never needs them.
+FROM go-build AS go-toolchain
+RUN find /usr/local/go/src \( -name testdata -type d -o -name '*_test.go' \) -prune -exec rm -r {} + \
+ && rm /usr/local/go/src/crypto/x509/platform_root_key.pem
+
 # A coding workspace for working on ADM itself: `adm create --role coding --image .../adm-dev:<tag>`.
 # Rust tracks stable like CI; the cargo registry and Go module caches live on the work volume.
 FROM adm-code AS adm-dev
 COPY --from=rust:1-bookworm /usr/local/rustup /usr/local/rustup
 COPY --from=rust:1-bookworm /usr/local/cargo/bin /usr/local/cargo/bin
-COPY --from=go-build /usr/local/go /usr/local/go
+COPY --from=go-toolchain /usr/local/go /usr/local/go
 COPY --from=kubectl-build /usr/local/bin/kubectl /usr/local/bin/kubectl
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/workspace/.adm/cargo \
