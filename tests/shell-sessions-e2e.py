@@ -214,6 +214,8 @@ def main(adm, root, workspace):
     home, cwd = root / "e2e-home", root / "e2e-cwd"
     home.mkdir()
     cwd.mkdir()
+    # Ubuntu's /etc/zsh/zshrc runs compinit, which stops to ask about the temp dirs.
+    (home / ".zshenv").write_text("skip_global_compinit=1\n")
     (home / ".zshrc").write_text("unsetopt zle prompt_sp\nPROMPT='e2e> '\n")
     kubectl = root / "session-kubectl"
     kubectl.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{__file__}" --fake-kubectl "{root}" "$@"\n')
