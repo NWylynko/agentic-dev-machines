@@ -3,7 +3,7 @@
 // failures and hangs. A run that outlives --deadline is a HANG: its whole process
 // group (test runner plus spawned runtimes) is killed and its TAP log kept.
 //
-//   node scripts/stress-test.mjs packages/runner/test/http.test.mjs \
+//   node scripts/stress-test.mjs packages/runner/test/http-lifecycle.test.mjs \
 //     --name "lifecycle against the caller" --runs 20 --parallel 2 --deadline 40
 import { spawn } from "node:child_process";
 import { once } from "node:events";
