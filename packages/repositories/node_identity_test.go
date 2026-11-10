@@ -114,16 +114,25 @@ func TestRepositoryFoldersSurviveTheRootBeingForgottenFirst(t *testing.T) {
 		t.Errorf("a repository node lost its path:\n%s", logs)
 	}
 
-	// go-fuse's own warnings reach the sidecar log: a node whose path can no
-	// longer be resolved is logged, not just answered with ENOENT.
+	// A node removed while the kernel holds it answers ESTALE (the kernel walks
+	// the path again) and never reaches go-fuse's orphan path.
 	file := lookup(inner2, "box.go")
 	if status := raw.Unlink(nil, &fuse.InHeader{NodeId: inner2}, "box.go"); status != fuse.OK {
 		t.Fatalf("unlink: %v", status)
 	}
-	if status := getattr(file); status != fuse.Status(syscall.ENOENT) {
-		t.Fatalf("getattr on an unlinked node: %v", status)
+	if status := getattr(file); status != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("getattr on an unlinked node: %v, want ESTALE", status)
 	}
-	if !strings.Contains(logs.String(), "orphaned") {
+	if strings.Contains(logs.String(), "orphaned") {
+		t.Errorf("an unlinked node reached go-fuse's orphan path:\n%s", logs)
+	}
+
+	// go-fuse's warnings reach the sidecar log, except the per-getattr notice
+	// that it replaced the backing inode number.
+	logger := catalogFilesystemOptions(config).Logger
+	logger.Printf("warning: Inode.Path: n%d is orphaned, replacing segment with %q", 7, ".go-fuse.1/deleted")
+	logger.Printf("warning: rawBridge.getattr: overriding ino %d with %d", 1, 2)
+	if !strings.Contains(logs.String(), "n7 is orphaned") {
 		t.Errorf("go-fuse warning missing from the log:\n%s", logs)
 	}
 	if strings.Contains(logs.String(), "overriding ino") {
@@ -156,4 +165,95 @@ func captureLogs(t *testing.T) *capturedLogs {
 	slog.SetDefault(slog.New(slog.NewTextHandler(buffer, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	return buffer
+}
+
+// A file, folder or symlink created through /repos must be the same node when
+// it is looked up again. go-fuse's loopback numbered created entries from the
+// backing inode number while lookups used the catalog's path identity, so each
+// new file got a second node on its next lookup; and ArtifactFS reuses small
+// inode numbers, so a new file could be handed another file's node, orphaning
+// it ("Directory nonexistent" for whoever still held it, TASK-125).
+func TestCreatedEntriesKeepTheirNodeWhenLookedUpAgain(t *testing.T) {
+	host, _ := mountGeneratedRepository(t, 1, 1, 1)
+	raw := fs.NewNodeFS(&catalogDirectory{server: host}, catalogFilesystemOptions(host.config))
+	lookup := func(parent uint64, name string) uint64 {
+		t.Helper()
+		var out fuse.EntryOut
+		if status := raw.Lookup(nil, &fuse.InHeader{NodeId: parent}, name, &out); status != fuse.OK {
+			t.Fatalf("lookup %q: %v", name, status)
+		}
+		return out.NodeId
+	}
+	folder := lookup(lookup(lookup(fuse.FUSE_ROOT_ID, "example"), "project"), "d00")
+
+	var created fuse.CreateOut
+	if status := raw.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: folder}, Flags: syscall.O_WRONLY, Mode: 0644}, "new.go", &created); status != fuse.OK {
+		t.Fatalf("create: %v", status)
+	}
+	raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: created.NodeId}, Fh: created.Fh})
+	if again := lookup(folder, "new.go"); again != created.NodeId {
+		t.Errorf("created file is n%d, looked up again it is n%d", created.NodeId, again)
+	}
+	var made fuse.EntryOut
+	if status := raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: folder}, Mode: 0755}, "made", &made); status != fuse.OK {
+		t.Fatalf("mkdir: %v", status)
+	}
+	if again := lookup(folder, "made"); again != made.NodeId {
+		t.Errorf("created folder is n%d, looked up again it is n%d", made.NodeId, again)
+	}
+	var linked fuse.EntryOut
+	if status := raw.Symlink(nil, &fuse.InHeader{NodeId: folder}, "new.go", "link", &linked); status != fuse.OK {
+		t.Fatalf("symlink: %v", status)
+	}
+	if again := lookup(folder, "link"); again != linked.NodeId {
+		t.Errorf("created symlink is n%d, looked up again it is n%d", linked.NodeId, again)
+	}
+}
+
+// A file renamed over (an editor's or agent's atomic save) leaves the old node
+// without a path, and an open, truncate or stat already on its way to that node
+// still arrives. Answering ENOENT failed "printf > f" with "Directory
+// nonexistent" while another process saved f (TASK-125). ESTALE makes the
+// kernel walk the path again and reach the new file, as it does for NFS.
+func TestReplacedFileAnswersStaleSoTheKernelRetries(t *testing.T) {
+	logs := captureLogs(t)
+	host, _ := mountGeneratedRepository(t, 1, 1, 1)
+	raw := fs.NewNodeFS(&catalogDirectory{server: host}, catalogFilesystemOptions(host.config))
+	lookup := func(parent uint64, name string) uint64 {
+		t.Helper()
+		var out fuse.EntryOut
+		if status := raw.Lookup(nil, &fuse.InHeader{NodeId: parent}, name, &out); status != fuse.OK {
+			t.Fatalf("lookup %q: %v", name, status)
+		}
+		return out.NodeId
+	}
+	folder := lookup(lookup(lookup(lookup(fuse.FUSE_ROOT_ID, "example"), "project"), "d00"), "s0")
+	old := lookup(folder, "f0.go")
+	var created fuse.CreateOut
+	if status := raw.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: folder}, Flags: syscall.O_WRONLY, Mode: 0644}, "f0.go.tmp", &created); status != fuse.OK {
+		t.Fatalf("create: %v", status)
+	}
+	raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: created.NodeId}, Fh: created.Fh})
+	if status := raw.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: folder}, Newdir: folder}, "f0.go.tmp", "f0.go"); status != fuse.OK {
+		t.Fatalf("rename over: %v", status)
+	}
+
+	stale := fuse.Status(syscall.ESTALE)
+	var open fuse.OpenOut
+	if status := raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: old}, Flags: syscall.O_RDONLY}, &open); status != stale {
+		t.Errorf("open of the replaced file: %v, want ESTALE", status)
+	}
+	var attr fuse.AttrOut
+	if status := raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: old}}, &attr); status != stale {
+		t.Errorf("getattr of the replaced file: %v, want ESTALE", status)
+	}
+	if status := raw.SetAttr(nil, &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: old}, Valid: fuse.FATTR_SIZE}}, &attr); status != stale {
+		t.Errorf("truncate of the replaced file: %v, want ESTALE", status)
+	}
+	if again := lookup(folder, "f0.go"); again != created.NodeId {
+		t.Errorf("after the rename f0.go is n%d, want the renamed file n%d", again, created.NodeId)
+	}
+	if strings.Contains(logs.String(), "orphaned") {
+		t.Errorf("a replaced file reached go-fuse's orphan path:\n%s", logs)
+	}
 }

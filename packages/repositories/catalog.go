@@ -221,8 +221,13 @@ func (node *catalogDirectory) Getattr(_ context.Context, _ fs.FileHandle, out *f
 
 // owners reads the current catalog grouped by owner. A failure is logged and
 // reported as an I/O error: a stale or empty /repos would hide the cause.
-func (server *catalogServer) owners(ctx context.Context) (map[string][]Repository, syscall.Errno) {
-	catalog, err := server.source(ctx)
+//
+// The fetch runs on the server's context, not the FUSE request's: the kernel
+// cancels a request whenever its caller gets a signal, and Go programs (go vet,
+// gopls) are signalled constantly by their own runtime, so a request context
+// turned ordinary lookups into EIO ("context canceled", TASK-125).
+func (server *catalogServer) owners() (map[string][]Repository, syscall.Errno) {
+	catalog, err := server.source(server.ctx)
 	if err != nil {
 		slog.Error("repository catalog unavailable", "error", err)
 		return nil, syscall.EIO
@@ -234,8 +239,43 @@ func (server *catalogServer) owners(ctx context.Context) (map[string][]Repositor
 	return owners, 0
 }
 
+// openedRepository is the repository's view if this workspace has already
+// opened it. An opened repository is local work, so finding it again needs no
+// registry: a lifecycle restart must not make every file in it fail (TASK-125).
+func (server *catalogServer) openedRepository(owner, name string) *repositoryView {
+	server.mu.Lock()
+	view := server.views[owner+"/"+name]
+	server.mu.Unlock()
+	if view == nil {
+		return nil
+	}
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	if !view.ready {
+		return nil
+	}
+	return view
+}
+
+func (server *catalogServer) hasOpenedRepositoryOf(owner string) bool {
+	server.mu.Lock()
+	var candidates []*repositoryView
+	for _, view := range server.views {
+		if view.repo.Owner == owner {
+			candidates = append(candidates, view)
+		}
+	}
+	server.mu.Unlock()
+	for _, view := range candidates {
+		if server.openedRepository(view.repo.Owner, view.repo.Name) != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (node *catalogDirectory) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	owners, errno := node.server.owners(ctx)
+	owners, errno := node.server.owners()
 	if errno != 0 {
 		return nil, errno
 	}
@@ -254,32 +294,40 @@ func (node *catalogDirectory) Readdir(ctx context.Context) (fs.DirStream, syscal
 }
 
 func (node *catalogDirectory) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	owners, errno := node.server.owners(ctx)
-	if errno != 0 {
-		return nil, errno
-	}
+	out.Uid = node.server.config.UID
+	out.Gid = node.server.config.GID
 	if node.owner == "" {
-		if _, exists := owners[name]; !exists {
-			return nil, syscall.ENOENT
+		if !node.server.hasOpenedRepositoryOf(name) {
+			owners, errno := node.server.owners()
+			if errno != 0 {
+				return nil, errno
+			}
+			if _, exists := owners[name]; !exists {
+				return nil, syscall.ENOENT
+			}
 		}
-		child := &catalogDirectory{server: node.server, owner: name}
 		out.Mode = syscall.S_IFDIR | 0555
-		out.Uid = node.server.config.UID
-		out.Gid = node.server.config.GID
-		return node.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-owner:"+name, nil)}), 0
+		return node.NewInode(ctx, &catalogDirectory{server: node.server, owner: name}, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-owner:" + name)}), 0
 	}
-	for _, repo := range owners[node.owner] {
-		if repo.Name != name {
-			continue
+	view := node.server.openedRepository(node.owner, name)
+	if view == nil {
+		owners, errno := node.server.owners()
+		if errno != 0 {
+			return nil, errno
 		}
-		// The name is visible before any Git data exists. Acquisition starts from
-		// the first operation that needs the working tree, not from this lookup.
-		out.Mode = syscall.S_IFDIR | 0755
-		out.Uid = node.server.config.UID
-		out.Gid = node.server.config.GID
-		return node.NewInode(ctx, node.server.repositoryView(repo), fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-repository:"+repo.Owner+"/"+repo.Name, nil)}), 0
+		for _, repo := range owners[node.owner] {
+			if repo.Name == name {
+				view = node.server.repositoryView(repo)
+			}
+		}
 	}
-	return nil, syscall.ENOENT
+	if view == nil {
+		return nil, syscall.ENOENT
+	}
+	// The name is visible before any Git data exists. Acquisition starts from
+	// the first operation that needs the working tree, not from this lookup.
+	out.Mode = syscall.S_IFDIR | 0755
+	return node.NewInode(ctx, view, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-repository:" + node.owner + "/" + name)}), 0
 }
 
 func (server *catalogServer) repositoryView(repo Repository) *repositoryView {
@@ -308,11 +356,142 @@ type repositoryLoopbackNode struct {
 	fs.LoopbackNode
 }
 
+// replaced reports whether this node has lost its path: its file or folder
+// was renamed over or removed while the kernel still held the node, so an
+// operation already on its way can arrive. Every path-based operation answers
+// such a node with ESTALE, which makes the kernel walk the path again and
+// reach whatever is there now, as it does for NFS (open, stat, truncate,
+// unlink, mkdir and the rest retry once with revalidation). ENOENT failed the
+// caller instead, e.g. "printf > f" while another process saved f (TASK-125).
+// Operations on an open file handle use its descriptor and never ask.
+func (node *repositoryLoopbackNode) replaced() bool {
+	root := node.RootData.RootNode.EmbeddedInode()
+	for current := node.EmbeddedInode(); current != root; {
+		_, parent := current.Parent()
+		if parent == nil {
+			return true
+		}
+		current = parent
+	}
+	return false
+}
+
 func (node *repositoryLoopbackNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if node.replaced() {
+		return nil, syscall.ESTALE
+	}
 	return lookupRepositoryChild(ctx, node, node.RootData, name, out)
 }
 
+func (node *repositoryLoopbackNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	if node.replaced() {
+		return nil, nil, 0, syscall.ESTALE
+	}
+	return createRepositoryFile(ctx, node, node.RootData, name, flags, mode, out)
+}
+
+func (node *repositoryLoopbackNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if node.replaced() {
+		return nil, syscall.ESTALE
+	}
+	return makeRepositoryDirectory(ctx, node, node.RootData, name, mode, out)
+}
+
+func (node *repositoryLoopbackNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if node.replaced() {
+		return nil, syscall.ESTALE
+	}
+	return makeRepositorySymlink(ctx, node, node.RootData, target, name, out)
+}
+
+func (node *repositoryLoopbackNode) Mknod(ctx context.Context, name string, mode, rdev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if node.replaced() {
+		return nil, syscall.ESTALE
+	}
+	return node.LoopbackNode.Mknod(ctx, name, mode, rdev, out)
+}
+
+func (node *repositoryLoopbackNode) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if node.replaced() {
+		return nil, syscall.ESTALE
+	}
+	return node.LoopbackNode.Link(ctx, target, name, out)
+}
+
+func (node *repositoryLoopbackNode) Unlink(ctx context.Context, name string) syscall.Errno {
+	if node.replaced() {
+		return syscall.ESTALE
+	}
+	return node.LoopbackNode.Unlink(ctx, name)
+}
+
+func (node *repositoryLoopbackNode) Rmdir(ctx context.Context, name string) syscall.Errno {
+	if node.replaced() {
+		return syscall.ESTALE
+	}
+	return node.LoopbackNode.Rmdir(ctx, name)
+}
+
+func (node *repositoryLoopbackNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	if target, ok := newParent.(*repositoryLoopbackNode); node.replaced() || ok && target.replaced() {
+		return syscall.ESTALE
+	}
+	return node.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
+}
+
+func (node *repositoryLoopbackNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	if node.replaced() {
+		return nil, syscall.ESTALE
+	}
+	return node.LoopbackNode.Readlink(ctx)
+}
+
+func (node *repositoryLoopbackNode) OpendirHandle(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	if node.replaced() {
+		return nil, 0, syscall.ESTALE
+	}
+	return node.LoopbackNode.OpendirHandle(ctx, flags)
+}
+
+func (node *repositoryLoopbackNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	if node.replaced() {
+		return nil, syscall.ESTALE
+	}
+	return node.LoopbackNode.Readdir(ctx)
+}
+
+func (node *repositoryLoopbackNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	if node.replaced() {
+		return syscall.ESTALE
+	}
+	return node.LoopbackNode.Statfs(ctx, out)
+}
+
+func (node *repositoryLoopbackNode) Getattr(ctx context.Context, handle fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	if handle == nil && node.replaced() {
+		return syscall.ESTALE
+	}
+	return node.LoopbackNode.Getattr(ctx, handle, out)
+}
+
+func (node *repositoryLoopbackNode) Statx(ctx context.Context, handle fs.FileHandle, flags uint32, mask uint32, out *fuse.StatxOut) syscall.Errno {
+	if handle == nil && node.replaced() {
+		return syscall.ESTALE
+	}
+	return node.LoopbackNode.Statx(ctx, handle, flags, mask, out)
+}
+
+func (node *repositoryLoopbackNode) Setattr(ctx context.Context, handle fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	if handle == nil && node.replaced() {
+		return syscall.ESTALE
+	}
+	return node.LoopbackNode.Setattr(ctx, handle, in, out)
+}
+
 func (node *repositoryLoopbackNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	if node.replaced() {
+		return nil, 0, syscall.ESTALE
+	}
 	root := node.RootData.RootNode.EmbeddedInode()
 	relativePath := node.Path(root)
 	baseFD, err := unix.Open(node.RootData.Path, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
@@ -348,38 +527,107 @@ func backingOpenHowFlags(flags uint32) uint64 {
 }
 
 func lookupRepositoryChild(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	parentInode := parent.EmbeddedInode()
-	rootInode := root.RootNode.EmbeddedInode()
-	path := filepath.Join(root.Path, parentInode.Path(rootInode), name)
+	path := repositoryChildPath(parent, root, name)
 	var stat syscall.Stat_t
 	if err := syscall.Lstat(path, &stat); err != nil {
 		return nil, fs.ToErrno(err)
 	}
 	out.Attr.FromStat(&stat)
-	var child fs.InodeEmbedder = &fs.LoopbackNode{RootData: root}
-	if root.NewNode != nil {
-		child = root.NewNode(root, parentInode, name, &stat)
+	// The node already under this name is the one the kernel and every
+	// in-flight operation hold. go-fuse moves nodes on rename, so a renamed
+	// file keeps its node under the new name; handing out a different node for
+	// the same name would orphan the held one (TASK-125).
+	if existing := parent.EmbeddedInode().GetChild(name); existing != nil && existing.StableAttr().Mode == uint32(stat.Mode)&syscall.S_IFMT {
+		return existing, 0
 	}
-	stable := fs.StableAttr{
-		Mode: uint32(stat.Mode) & syscall.S_IFMT,
-		Ino:  stableInodeNumber("backing:"+path, &stat),
-	}
-	return parentInode.NewInode(ctx, child, stable), 0
+	return repositoryChildInode(ctx, parent, root, path, &stat), 0
 }
 
-func stableInodeNumber(identity string, backing *syscall.Stat_t) uint64 {
-	hash := sha256.New()
-	_, _ = hash.Write([]byte(identity))
-	if backing != nil {
-		var statIdentity [16]byte
-		binary.LittleEndian.PutUint64(statIdentity[:8], backing.Dev)
-		binary.LittleEndian.PutUint64(statIdentity[8:], backing.Ino)
-		_, _ = hash.Write(statIdentity[:])
+func repositoryChildPath(parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string) string {
+	return filepath.Join(root.Path, parent.EmbeddedInode().Path(root.RootNode.EmbeddedInode()), name)
+}
+
+// repositoryChildInode makes the node for a backing path that has none under
+// its parent yet. Inside a repository go-fuse's tree is the identity: a lookup
+// returns the node already under the name (lookupRepositoryChild), so a node
+// number only has to be unique, and go-fuse's automatic numbers are. Numbers
+// derived from the path or from ArtifactFS clashed: a renamed file kept its old
+// path's number, ArtifactFS reissues inode numbers whenever it forgets a path,
+// and go-fuse hands an existing node to any lookup with a matching number, so
+// one name got several nodes or two names shared one, orphaning whichever the
+// kernel still held (TASK-125). Created entries use this too, never go-fuse's
+// loopback numbering.
+func repositoryChildInode(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, path string, stat *syscall.Stat_t) *fs.Inode {
+	child := root.NewNode(root, parent.EmbeddedInode(), filepath.Base(path), stat)
+	return parent.EmbeddedInode().NewInode(ctx, child, fs.StableAttr{Mode: uint32(stat.Mode) & syscall.S_IFMT})
+}
+
+// createRepositoryFile, makeRepositoryDirectory and makeRepositorySymlink are
+// go-fuse's loopback Create, Mkdir and Symlink with the catalog's node
+// identity. ArtifactFS refuses hard links and mknod before any node exists,
+// so Link and Mknod keep go-fuse's.
+func createRepositoryFile(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	path := repositoryChildPath(parent, root, name)
+	fd, err := syscall.Open(path, int(flags&^syscall.O_APPEND)|os.O_CREATE, mode)
+	if err != nil {
+		return nil, nil, 0, fs.ToErrno(err)
 	}
-	var digest [32]byte
-	copy(digest[:], hash.Sum(nil))
-	// go-fuse allocates automatic IDs from the high-bit namespace. Keeping
-	// stable path-derived IDs below that range avoids recycled ArtifactFS IDs.
+	preserveCallerOwnership(ctx, path)
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		syscall.Close(fd)
+		return nil, nil, 0, fs.ToErrno(err)
+	}
+	out.FromStat(&stat)
+	return repositoryChildInode(ctx, parent, root, path, &stat), fs.NewLoopbackFile(fd), 0, 0
+}
+
+func makeRepositoryDirectory(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	path := repositoryChildPath(parent, root, name)
+	if err := os.Mkdir(path, os.FileMode(mode)); err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	preserveCallerOwnership(ctx, path)
+	var stat syscall.Stat_t
+	if err := syscall.Lstat(path, &stat); err != nil {
+		syscall.Rmdir(path)
+		return nil, fs.ToErrno(err)
+	}
+	out.Attr.FromStat(&stat)
+	return repositoryChildInode(ctx, parent, root, path, &stat), 0
+}
+
+func makeRepositorySymlink(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	path := repositoryChildPath(parent, root, name)
+	if err := syscall.Symlink(target, path); err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	preserveCallerOwnership(ctx, path)
+	var stat syscall.Stat_t
+	if err := syscall.Lstat(path, &stat); err != nil {
+		syscall.Unlink(path)
+		return nil, fs.ToErrno(err)
+	}
+	out.Attr.FromStat(&stat)
+	return repositoryChildInode(ctx, parent, root, path, &stat), 0
+}
+
+// preserveCallerOwnership gives a new entry to the caller, as go-fuse's
+// loopback does, when the sidecar runs as root.
+func preserveCallerOwnership(ctx context.Context, path string) {
+	if os.Getuid() != 0 {
+		return
+	}
+	if caller, ok := fuse.FromContext(ctx); ok {
+		_ = syscall.Lchown(path, int(caller.Uid), int(caller.Gid))
+	}
+}
+
+// stableInodeNumber numbers the catalog's own folders (owners and repository
+// roots), which are never renamed. go-fuse allocates automatic IDs from the
+// high-bit namespace, so these stay below it.
+func stableInodeNumber(identity string) uint64 {
+	digest := sha256.Sum256([]byte(identity))
 	inode := binary.LittleEndian.Uint64(digest[:8]) &^ (uint64(1) << 63)
 	if inode == 0 {
 		return 1
@@ -398,8 +646,6 @@ func (node *repositoryView) activate(ctx context.Context) syscall.Errno {
 		slog.Error("repository acquisition failed", "repository", node.repo.Owner+"/"+node.repo.Name, "error", err)
 		return syscall.EIO
 	}
-	// Keep each backing device in the stable inode id. ArtifactFS mounts reuse
-	// low inode numbers, and a shared root device would alias separate repos.
 	node.RootData = &fs.LoopbackRoot{
 		Path:     path,
 		Dev:      0,
@@ -457,14 +703,14 @@ func (node *repositoryView) Create(ctx context.Context, name string, flags uint3
 	if errno := node.activate(ctx); errno != 0 {
 		return nil, nil, 0, errno
 	}
-	return node.LoopbackNode.Create(ctx, name, flags, mode, out)
+	return createRepositoryFile(ctx, node, node.RootData, name, flags, mode, out)
 }
 
 func (node *repositoryView) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if errno := node.activate(ctx); errno != 0 {
 		return nil, errno
 	}
-	return node.LoopbackNode.Mkdir(ctx, name, mode, out)
+	return makeRepositoryDirectory(ctx, node, node.RootData, name, mode, out)
 }
 
 func (node *repositoryView) Mknod(ctx context.Context, name string, mode, rdev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -499,7 +745,7 @@ func (node *repositoryView) Symlink(ctx context.Context, target, name string, ou
 	if errno := node.activate(ctx); errno != 0 {
 		return nil, errno
 	}
-	return node.LoopbackNode.Symlink(ctx, target, name, out)
+	return makeRepositorySymlink(ctx, node, node.RootData, target, name, out)
 }
 
 func (node *repositoryView) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

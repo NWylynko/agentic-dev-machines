@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -132,6 +133,7 @@ func run(ctx context.Context, arguments []string) error {
 }
 
 func main() {
+	withoutAsyncPreemption()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -139,4 +141,31 @@ func main() {
 		slog.Error("repositories failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// withoutAsyncPreemption re-executes this binary with Go's asynchronous
+// preemption off, once, before it does anything. The sidecar's threads serve
+// /repos by calling into each repository's ArtifactFS mount. The Go runtime
+// preempts goroutines by signalling their threads, the kernel turns a signal
+// that lands during one of those calls into a FUSE INTERRUPT, and ArtifactFS
+// answers an interrupted truncate, write, open or opendir with EIO. Under load
+// that failed edits through /repos and left 0-byte files (TASK-125). The
+// setting is read only at process start, so it cannot be changed in place.
+func withoutAsyncPreemption() {
+	const setting = "asyncpreemptoff=1"
+	current := os.Getenv("GODEBUG")
+	if slices.Contains(strings.Split(current, ","), setting) {
+		return
+	}
+	executable, err := os.Executable()
+	if err == nil {
+		godebug := setting
+		if current != "" {
+			godebug = current + "," + setting
+		}
+		env := slices.DeleteFunc(os.Environ(), func(entry string) bool { return strings.HasPrefix(entry, "GODEBUG=") })
+		err = syscall.Exec(executable, os.Args, append(env, "GODEBUG="+godebug))
+	}
+	fmt.Fprintf(os.Stderr, "adm-repositories: cannot restart without asynchronous preemption: %v\n", err)
+	os.Exit(1)
 }

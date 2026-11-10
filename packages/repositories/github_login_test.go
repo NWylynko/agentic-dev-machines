@@ -17,7 +17,11 @@ import (
 // The sidecar's Git credential helper is this very binary: git runs
 // `<exe> git-credential ... get`. Under `go test` the executable is the test
 // binary, so route that invocation to the real main.
+//
+// The tests run the catalog in this process, so they need the sidecar's
+// runtime settings too (withoutAsyncPreemption).
 func TestMain(m *testing.M) {
+	withoutAsyncPreemption()
 	if len(os.Args) > 1 && os.Args[1] == "git-credential" {
 		main()
 		return
