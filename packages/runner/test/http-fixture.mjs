@@ -104,19 +104,6 @@ async function startRunner(
   };
 }
 
-async function freePort() {
-  const server = createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = server.address().port;
-  await new Promise((resolve, reject) =>
-    server.close((error) => (error ? reject(error) : resolve())),
-  );
-  return port;
-}
-
 async function startPodRunner(
   root,
   lifecycle,
@@ -526,7 +513,6 @@ async function writeLifecycleWorkspace(directory, id) {
 export {
   main,
   startRunner,
-  freePort,
   startPodRunner,
   startBotLifecycle,
   startMaintenanceAckRunner,

@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
+import { unusedFixedPort } from "./fixed-port.mjs";
 import { workspaceProviderMetadata } from "../src/models.ts";
 import {
   createOwnerEpochGuard,
@@ -1070,15 +1071,8 @@ test("shared auth retries a controller transport failure only after its lease ga
 });
 
 test("provider-auth keeps serving through a lifecycle database outage and exits when the lifecycle owner changes", async (t) => {
-  const freePort = () =>
-    new Promise((resolve) => {
-      const server = createServer().listen(0, "127.0.0.1", () => {
-        const { port } = server.address();
-        server.close(() => resolve(port));
-      });
-    });
-  const port = await freePort();
-  const probePort = await freePort();
+  const port = await unusedFixedPort();
+  const probePort = await unusedFixedPort();
   let health = { status: 200, body: { status: "ok", ownerEpoch: 1 } };
   const lifecycle = createServer((_request, response) => {
     response.writeHead(health.status, { "content-type": "application/json" });
@@ -1134,15 +1128,8 @@ test("provider-auth answers kubelet liveness on the Pod IP while credentials sta
     .flat()
     .find((address) => address.family === "IPv4" && !address.internal)?.address;
   assert.ok(podIp, "the test needs a non-loopback IPv4 address to stand in for the Pod IP");
-  const freePort = () =>
-    new Promise((resolve) => {
-      const server = createServer().listen(0, "0.0.0.0", () => {
-        const { port } = server.address();
-        server.close(() => resolve(port));
-      });
-    });
-  const port = await freePort();
-  const probePort = await freePort();
+  const port = await unusedFixedPort();
+  const probePort = await unusedFixedPort();
   // The authority serves only while a lifecycle owner answers; stand one in
   // so the test does not depend on a real lifecycle holding 7433.
   const lifecycle = createServer((_request, response) => {

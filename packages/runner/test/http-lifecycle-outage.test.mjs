@@ -5,9 +5,9 @@ import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { unusedFixedPort } from "./fixed-port.mjs";
 import {
   startRunner,
-  freePort,
   nextEvent,
   writeLifecycleWorkspace,
 } from "./http-fixture.mjs";
@@ -404,7 +404,7 @@ test(
       control.closeAllConnections();
       await new Promise((resolve) => control.close(resolve));
     });
-    const port = await freePort();
+    const port = await unusedFixedPort();
     const url = `http://127.0.0.1:${port}`;
     const starting = startRunner(
       join(directory, "state"),

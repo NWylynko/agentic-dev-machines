@@ -3,9 +3,9 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { unusedFixedPort } from "./fixed-port.mjs";
 import {
   startRunner,
-  freePort,
   startPodRunner,
   startBotLifecycle,
   nextEvent,
@@ -106,7 +106,7 @@ test(
       join(tmpdir(), "adm-runner-agent-directory-"),
     );
     const workspaces = [];
-    const port = await freePort();
+    const port = await unusedFixedPort();
     const lifecycle = await startBotLifecycle(
       join(directory, "management"),
       workspaces,
@@ -446,7 +446,7 @@ test(
   { timeout: 15000 },
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), "adm-runner-bot-cancel-"));
-    const port = await freePort();
+    const port = await unusedFixedPort();
     const lifecycle = await startBotLifecycle(
       join(directory, "management"),
       [],
@@ -500,7 +500,7 @@ test(
     const directory = await mkdtemp(
       join(tmpdir(), "adm-runner-bot-late-agent-"),
     );
-    const port = await freePort();
+    const port = await unusedFixedPort();
     const lifecycle = await startBotLifecycle(
       join(directory, "management"),
       [],
