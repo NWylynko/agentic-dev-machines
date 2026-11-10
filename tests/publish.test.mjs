@@ -188,11 +188,20 @@ else:
   };
 }
 
-test("main and version builds publish only after the image and binaries succeed", () => {
+test("main and version builds publish only after verify, the image and binaries succeed", () => {
   const release = workflow.jobs.release;
   const eligible = new Function("github", "startsWith", `return (${release.if});`);
   const startsWith = (value, prefix) => value.startsWith(prefix);
-  assert.deepEqual(release.needs, ["image", "binaries"]);
+  // Image and binaries build alongside verify; promote, which tags the tested
+  // image digests, waits for verify, and release waits for promote.
+  assert.deepEqual(release.needs, ["promote", "binaries"]);
+  assert.deepEqual(workflow.jobs.promote.needs, ["verify", "image"]);
+  assert.equal(workflow.jobs.promote.if, "github.event_name != 'pull_request'");
+  const imageSteps = workflow.jobs.image.steps.map((entry) => entry.name);
+  assert.ok(
+    imageSteps.indexOf("Inspect and smoke test role images") < imageSteps.indexOf("Push tested role images by digest"),
+    "the image job pushes only images that passed the smoke tests",
+  );
   const platforms = workflow.jobs.binaries.strategy.matrix.include.map((entry) => entry.platform).sort();
   assert.deepEqual(platforms, ["darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64"]);
   assert.ok(release.steps.some((entry) => entry.name === "Assemble all platform assets and checksums"));
