@@ -22,7 +22,7 @@ docker run --rm --user 1000:1000 --entrypoint sh ghcr.io/nwylynko/agentic-dev-ma
 - Start `FROM ghcr.io/nwylynko/agentic-dev-machines/adm-code:latest`. `latest` is the newest release, which is what `adm update` installs.
 - Only if your cluster is deliberately held on an older release, build from that release's tag instead (`adm-code:sha-<commit>`). The installed client records its release: `cat "$(dirname "$(dirname "$(readlink -f "$(command -v adm)")")")/VERSION"` prints e.g. `sha-1b6ed3a97cc5`.
 - Rebuild on every `adm update`, with `docker build --pull` so Docker fetches the new `latest` rather than reusing its cached copy. Your image includes the agent runtime, Claude Code and the Docker CLI from the release you built on. Workspaces created from an old build keep running that old runtime.
-- Push the image to a registry that every cluster node can pull from. ttl.sh images expire (24 h at most), and a private GHCR package needs a pull secret.
+- Push the image to a registry that every cluster node can pull from. ttl.sh images expire (24 h at most). A private GHCR package pulls with the cluster GitHub login: run `adm repos login github` with an account that can read the package (logins from before the `read:packages` scope was added need logging in again), then create the workspace. Other private registries are not supported.
 
 ### Only `/workspace` survives
 

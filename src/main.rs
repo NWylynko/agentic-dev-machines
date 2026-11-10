@@ -7,6 +7,7 @@ mod herdr;
 mod lease;
 mod lifecycle;
 mod provider_auth;
+mod registry_pull;
 mod repo_registry;
 mod repos;
 mod runner;

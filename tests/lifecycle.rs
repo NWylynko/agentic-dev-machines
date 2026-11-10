@@ -62,6 +62,47 @@ fn service_log(root: &Path) -> String {
     fs::read_to_string(root.join("service.log")).unwrap_or_default()
 }
 
+/// A cluster with no GitHub login. Every test lifecycle asks it for image pull
+/// credentials unless the test names its own authority in `service-env.json`.
+fn logged_out_authority_url() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        serve_logged_out_github(listener);
+        url
+    })
+}
+
+fn serve_logged_out_github(listener: TcpListener) {
+    use std::io::{Read, Write};
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => request.extend_from_slice(&chunk[..count]),
+                }
+            }
+            let (status, body) = if request.starts_with(b"GET /v1/runtime/repos/token ") {
+                (
+                    "409 Conflict",
+                    r#"{"error":{"code":"GITHUB_NOT_LOGGED_IN","message":"not logged in"}}"#,
+                )
+            } else {
+                ("404 Not Found", r#"{"error":{"code":"NOT_FOUND"}}"#)
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+}
+
 fn start_service(root: &Path, port: u16) -> ServiceProcess {
     use std::os::unix::process::CommandExt;
     let status_port =
@@ -80,6 +121,7 @@ fn start_service(root: &Path, port: u16) -> ServiceProcess {
     ServiceProcess(
         Command::new(env!("CARGO_BIN_EXE_adm"))
             .process_group(0)
+            .env("ADM_PROVIDER_AUTH_URL", logged_out_authority_url())
             .envs(env)
             .args(["--state-dir"])
             .arg(root.join("state"))
@@ -503,6 +545,9 @@ elif args[:2] == ['delete','namespace']:
 elif args[:2] == ['get','nodes']:
     nodes=root/'nodes.json'
     print(nodes.read_text() if nodes.exists() else json.dumps({'kind':'NodeList','items':[{'metadata':{'name':'test-node'},'status':{'conditions':[{'type':'Ready','status':'True','lastTransitionTime':'2026-01-01T00:00:00Z'}]}}]}))
+elif args[:2] == ['delete','secret']:
+    with locked():
+        with (root/'deleted-secrets').open('a') as deleted: deleted.write(' '.join(args[2:])+'\n')
 elif args[:2] == ['delete','pod']:
     with locked():
         with (root/'deleted-pods').open('a') as deleted: deleted.write(' '.join(args[2:])+'\n')
@@ -733,7 +778,64 @@ fn create_retries_recover_only_the_latest_failed_attempt_after_restart() {
 
 #[test]
 fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
     let root = tempfile::tempdir().unwrap();
+    // The shared authority. Until `GET /record` it is a logged-out GitHub
+    // login for workspace creation; afterwards it records what Pods reach.
+    let authority = TcpListener::bind("127.0.0.1:0").unwrap();
+    let authority_address = authority.local_addr().unwrap();
+    fs::write(
+        root.path().join("service-env.json"),
+        json!([[
+            "ADM_PROVIDER_AUTH_URL",
+            format!("http://{authority_address}")
+        ]])
+        .to_string(),
+    )
+    .unwrap();
+    let authority_thread = thread::spawn(move || {
+        let mut received = Vec::new();
+        let mut recording = false;
+        for mut stream in authority.incoming().flatten() {
+            let mut bytes = [0; 4096];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            let headers = String::from_utf8_lossy(&request).into_owned();
+            if headers.starts_with("GET /stop ") {
+                break;
+            }
+            if !recording {
+                recording = headers.starts_with("GET /record ");
+                let (status, body) = if recording {
+                    ("200 OK", "{}")
+                } else {
+                    assert!(
+                        headers.starts_with("GET /v1/runtime/repos/token "),
+                        "{headers}"
+                    );
+                    (
+                        "409 Conflict",
+                        r#"{"error":{"code":"GITHUB_NOT_LOGGED_IN","message":"not logged in"}}"#,
+                    )
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                continue;
+            }
+            let body = if headers.starts_with("POST /v1/provider-auth/catalog ") {
+                r#"{"synthetic":{"auth":{"source":"OAuth","type":"oauth"},"models":["allowed"],"allModels":["allowed"]}}"#
+            } else {
+                r#"{"auth":{"apiKey":"synthetic-shared-access"},"source":"OAuth"}"#
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            received.push(headers);
+        }
+        received
+    });
     let (runner_url, runner_port, runner_server) = start_runner_stub();
     fs::write(root.path().join("runner-url"), &runner_url).unwrap();
     fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
@@ -1619,36 +1721,11 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
     // A newly booting Pod can start a bot's initial provider turn before its
     // Deployment becomes Ready. Its current Pod-bound lease is authoritative.
     {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-        let _authority_port = PROVIDER_AUTHORITY_PORT
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let authority = TcpListener::bind("127.0.0.1:7434").unwrap();
-        let authority_thread = thread::spawn(move || {
-            let mut received = Vec::new();
-            for mut stream in authority.incoming().flatten() {
-                let mut bytes = [0; 4096];
-                let mut request = Vec::new();
-                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    let count = stream.read(&mut bytes).unwrap();
-                    assert!(count > 0);
-                    request.extend_from_slice(&bytes[..count]);
-                }
-                let headers = String::from_utf8_lossy(&request).into_owned();
-                if headers.starts_with("GET /stop ") {
-                    break;
-                }
-                let body = if headers.starts_with("POST /v1/provider-auth/catalog ") {
-                    r#"{"synthetic":{"auth":{"source":"OAuth","type":"oauth"},"models":["allowed"],"allModels":["allowed"]}}"#
-                } else {
-                    r#"{"auth":{"apiKey":"synthetic-shared-access"},"source":"OAuth"}"#
-                };
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                received.push(headers);
-            }
-            received
-        });
+        let mut record = TcpStream::connect(authority_address).unwrap();
+        record
+            .write_all(b"GET /record HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        record.read_to_end(&mut Vec::new()).unwrap();
         let database =
             rusqlite::Connection::open(root.path().join("state/workspaces.sqlite")).unwrap();
         database.execute("UPDATE workspaces SET phase='provisioning',spec=json_set(spec,'$.phase','provisioning') WHERE id=?1", [runtime_id]).unwrap();
@@ -1852,7 +1929,7 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             "Pods cannot edit the registry"
         );
         database.execute("UPDATE workspaces SET phase='ready',spec=json_set(spec,'$.phase','ready') WHERE id=?1", [runtime_id]).unwrap();
-        let mut stop = TcpStream::connect("127.0.0.1:7434").unwrap();
+        let mut stop = TcpStream::connect(authority_address).unwrap();
         stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
         let received = authority_thread.join().unwrap();
@@ -1949,6 +2026,8 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             assert!(!request.contains("runtime-token"));
             assert!(!request.contains("synthetic-lifecycle-token"));
         }
+        // The authority is back, logged out of GitHub, for the image update.
+        serve_logged_out_github(TcpListener::bind(authority_address).unwrap());
     }
     let maintenance_id = "c3d48a23-23e6-44ba-98e7-1cd0c1d94d2f";
     let maintenance: Value = request_with_token(
@@ -3589,10 +3668,6 @@ fn the_lifecycle_runs_no_node_failover_sweep() {
     stop_http_stub(runner_port, runner);
 }
 
-/// Tests that serve a fake provider authority on the lifecycle's fixed loopback
-/// port (127.0.0.1:7434) hold this so they never receive each other's requests.
-static PROVIDER_AUTHORITY_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn kubectl_invocations(root: &Path) -> Vec<Vec<String>> {
     fs::read_to_string(root.join("kubectl-invocations"))
         .unwrap_or_default()
@@ -3626,6 +3701,41 @@ fn authenticated_runtime_requests_and_health_start_a_constant_number_of_kubectl_
     .unwrap();
     fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
     fs::write(root.path().join("storage-release"), "go").unwrap();
+    // The shared authority: a logged-out GitHub login, and an empty connector catalog.
+    let authority = TcpListener::bind("127.0.0.1:0").unwrap();
+    let authority_address = authority.local_addr().unwrap();
+    fs::write(
+        root.path().join("service-env.json"),
+        json!([[
+            "ADM_PROVIDER_AUTH_URL",
+            format!("http://{authority_address}")
+        ]])
+        .to_string(),
+    )
+    .unwrap();
+    let authority_thread = thread::spawn(move || {
+        for mut stream in authority.incoming().flatten() {
+            let mut bytes = [0; 4096];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            if request.starts_with(b"GET /stop ") {
+                break;
+            }
+            let (status, body) = if request.starts_with(b"GET /v1/runtime/repos/token ") {
+                (
+                    "409 Conflict",
+                    r#"{"error":{"code":"GITHUB_NOT_LOGGED_IN","message":"not logged in"}}"#,
+                )
+            } else {
+                ("200 OK", r#"{"revision":1,"connectors":[]}"#)
+            };
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
     let (url, port) = lifecycle_url();
     fs::write(root.path().join("lifecycle-url"), &url).unwrap();
     let _service = start_service(root.path(), port);
@@ -3682,27 +3792,6 @@ fn authenticated_runtime_requests_and_health_start_a_constant_number_of_kubectl_
     .json()
     .unwrap();
     let lease_body = json!({"holder":pod_uid,"fencingToken":lease["fencingToken"]});
-
-    let _authority_port = PROVIDER_AUTHORITY_PORT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let authority = TcpListener::bind("127.0.0.1:7434").unwrap();
-    let authority_thread = thread::spawn(move || {
-        for mut stream in authority.incoming().flatten() {
-            let mut bytes = [0; 4096];
-            let mut request = Vec::new();
-            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-                let count = stream.read(&mut bytes).unwrap();
-                assert!(count > 0);
-                request.extend_from_slice(&bytes[..count]);
-            }
-            if request.starts_with(b"GET /stop ") {
-                break;
-            }
-            let body = r#"{"revision":1,"connectors":[]}"#;
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-        }
-    });
 
     let before_health = kubectl_invocations(root.path()).len();
     for _ in 0..100 {
@@ -3784,7 +3873,7 @@ fn authenticated_runtime_requests_and_health_start_a_constant_number_of_kubectl_
         .count();
     assert_eq!(expiring_reviews, 3, "an expired token must not be reused");
 
-    let mut stop = std::net::TcpStream::connect("127.0.0.1:7434").unwrap();
+    let mut stop = std::net::TcpStream::connect(authority_address).unwrap();
     stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .unwrap();
     authority_thread.join().unwrap();
@@ -5379,4 +5468,229 @@ fn repository_login_survives_a_user_slower_than_thirty_seconds() {
         stdout.contains("GitHub connected as nwylynko: 3 repositories available"),
         "{stdout}"
     );
+}
+
+/// A cluster GitHub login for `octo`, until `logged-out` exists in `root`;
+/// `POST /v1/repos/logout` creates it, like the real authority forgetting the token.
+fn start_github_login_authority(root: &Path) -> (String, u16, thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let logged_out = root.join("logged-out");
+    let server = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first_line = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            if first_line.starts_with("GET /shutdown ") {
+                break;
+            }
+            let (status, body) = if first_line.starts_with("GET /v1/runtime/repos/token ") {
+                if logged_out.exists() {
+                    (
+                        "409 Conflict",
+                        json!({"error":{"code":"GITHUB_NOT_LOGGED_IN","message":"not logged in"}}),
+                    )
+                } else {
+                    ("200 OK", json!({"token":"gho_synthetic","account":"octo"}))
+                }
+            } else if first_line.starts_with("POST /v1/repos/logout ") {
+                fs::write(&logged_out, "").unwrap();
+                ("200 OK", json!({"loggedIn":false}))
+            } else {
+                ("404 Not Found", json!({"error":{"code":"NOT_FOUND"}}))
+            };
+            let body = body.to_string();
+            write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), port, server)
+}
+
+// Private GHCR images (a project's own coding image) pull with the cluster
+// GitHub login from `adm repos login github`: each workspace namespace gets a
+// ghcr.io pull Secret, and logging out removes them so no workspace keeps
+// pulling with a login the operator withdrew.
+#[test]
+fn workspaces_pull_private_ghcr_images_with_the_cluster_github_login() {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (authority_url, authority_port, authority) = start_github_login_authority(root.path());
+    fs::write(
+        root.path().join("service-env.json"),
+        json!([["ADM_PROVIDER_AUTH_URL", authority_url]]).to_string(),
+    )
+    .unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("storage-release"), "go").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let _service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    let operator = |method: &str, path: &str, body: Option<&Value>| {
+        request_with_token(&url, method, path, body, Some("synthetic-lifecycle-token")).unwrap()
+    };
+    let create = |name: &str, operation: &str| -> (Value, Vec<Value>) {
+        let mut spec = workspace_spec(name);
+        spec["image"] = json!("ghcr.io/octo/private-coding:latest");
+        operator(
+            "POST",
+            "/v1/operations",
+            Some(&json!({"operationId":operation,"kind":"create","spec":spec})),
+        );
+        let receipt: Value = wait_for(|| {
+            operator("GET", &format!("/v1/operations/{operation}"), None)
+                .json::<Value>()
+                .ok()
+                .filter(|receipt| receipt["status"] == "completed" || receipt["status"] == "failed")
+        });
+        assert_eq!(
+            receipt["status"],
+            "completed",
+            "{receipt}\n{}",
+            service_log(root.path())
+        );
+        let workspace: Value = operator(
+            "GET",
+            &format!(
+                "/v1/workspaces/{}",
+                receipt["workspaceId"].as_str().unwrap()
+            ),
+            None,
+        )
+        .json()
+        .unwrap();
+        let applied: Value =
+            serde_json::from_slice(&fs::read(root.path().join("applied")).unwrap()).unwrap();
+        (workspace, applied["items"].as_array().unwrap().clone())
+    };
+    let workspace_deployment = |items: &[Value]| -> Value {
+        items
+            .iter()
+            .find(|item| item["kind"] == "Deployment" && item["metadata"]["name"] == "workspace")
+            .unwrap()
+            .clone()
+    };
+
+    let (first, items) = create("private-image", "5b1c2d3e-0000-4000-8000-000000000001");
+    let secret = items
+        .iter()
+        .find(|item| item["kind"] == "Secret")
+        .expect("a logged-in cluster gives the workspace a pull Secret");
+    assert_eq!(secret["metadata"]["name"], "adm-registry");
+    assert_eq!(secret["metadata"]["namespace"], first["namespace"]);
+    assert_eq!(
+        secret["metadata"]["labels"]["adm.dev/workspace-id"],
+        first["id"]
+    );
+    assert_eq!(secret["type"], "kubernetes.io/dockerconfigjson");
+    let config: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(secret["data"][".dockerconfigjson"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        config,
+        json!({"auths":{"ghcr.io":{
+            "username":"octo",
+            "password":"gho_synthetic",
+            "auth":base64::engine::general_purpose::STANDARD.encode("octo:gho_synthetic"),
+        }}})
+    );
+    assert_eq!(
+        workspace_deployment(&items)["spec"]["template"]["spec"]["imagePullSecrets"],
+        json!([{"name":"adm-registry"}])
+    );
+    assert!(
+        !service_log(root.path()).contains("gho_synthetic"),
+        "the token must never be logged"
+    );
+
+    // `adm update --workspace` rewrites the Secret from the current login.
+    for (file, value) in [
+        ("expected-workspace-id", first["id"].as_str().unwrap()),
+        ("expected-namespace", first["namespace"].as_str().unwrap()),
+        ("expected-pod-uid", "00000000-0000-4000-8000-000000000000"),
+    ] {
+        fs::write(root.path().join(file), value).unwrap();
+    }
+    let update_operation = "5b1c2d3e-0000-4000-8000-000000000003";
+    operator(
+        "POST",
+        "/v1/operations",
+        Some(
+            &json!({"operationId":update_operation,"kind":"update","workspaceId":first["id"],"image":"ghcr.io/octo/private-coding:v2"}),
+        ),
+    );
+    let receipt: Value = wait_for(|| {
+        operator("GET", &format!("/v1/operations/{update_operation}"), None)
+            .json::<Value>()
+            .ok()
+            .filter(|receipt| receipt["status"] == "completed" || receipt["status"] == "failed")
+    });
+    assert_eq!(
+        receipt["status"],
+        "completed",
+        "{receipt}\n{}",
+        service_log(root.path())
+    );
+    let updated: Value =
+        serde_json::from_slice(&fs::read(root.path().join("current-deployment.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        updated["spec"]["template"]["spec"]["containers"][0]["image"],
+        "ghcr.io/octo/private-coding:v2"
+    );
+    assert_eq!(
+        updated["spec"]["template"]["spec"]["imagePullSecrets"],
+        json!([{"name":"adm-registry"}])
+    );
+
+    // Logging out removes the pull Secret from every workspace namespace.
+    let logout = operator(
+        "POST",
+        "/v1/repos/logout",
+        Some(&json!({"provider":"github"})),
+    );
+    assert_eq!(logout.status(), 200);
+    assert_eq!(
+        fs::read_to_string(root.path().join("deleted-secrets")).unwrap(),
+        format!(
+            "adm-registry -n {} --ignore-not-found\n",
+            first["namespace"].as_str().unwrap()
+        )
+    );
+
+    // Logged out, a workspace pulls anonymously and gets no Secret.
+    let (_, items) = create("public-image", "5b1c2d3e-0000-4000-8000-000000000002");
+    assert!(items.iter().all(|item| item["kind"] != "Secret"));
+    assert!(
+        workspace_deployment(&items)["spec"]["template"]["spec"]
+            .get("imagePullSecrets")
+            .is_none()
+    );
+
+    stop_http_stub(runner_port, runner);
+    stop_http_stub(authority_port, authority);
 }

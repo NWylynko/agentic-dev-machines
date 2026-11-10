@@ -1555,7 +1555,7 @@ fn docker_engine_items(w: &Workspace) -> Vec<Value> {
     vec![ids, deployment, service, ingress, egress]
 }
 
-fn labels(w: &Workspace) -> Value {
+pub(crate) fn labels(w: &Workspace) -> Value {
     json!({"app.kubernetes.io/managed-by":MANAGED_BY,"adm.dev/workspace-id":w.id,"adm.dev/role":w.role})
 }
 fn metadata(w: &Workspace, name: &str) -> Value {
@@ -1924,7 +1924,8 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
         store.insert(&w)?;
     }
     let provision = (|| -> Result<()> {
-        let manifest = manifest(&w)?;
+        let mut manifest = manifest(&w)?;
+        crate::registry_pull::add_registry_pull_secret(&w, &mut manifest)?;
         lifecycle_stage(
             cli,
             "create",
@@ -2013,6 +2014,33 @@ pub fn upgrade_persisted(cli: &Cli, workspace_id: &str) -> Result<Workspace> {
         })
         .context("workspace manifest has no workspace Deployment")?;
     let mut deployment = deployment.clone();
+    // A fresh pull Secret from the current GitHub login, or none when logged out.
+    match crate::registry_pull::registry_pull_secret(&workspace)? {
+        Some(secret) => {
+            kubectl(
+                cli,
+                &["apply", "-f", "-"],
+                Some(&serde_json::to_vec(&secret)?),
+            )
+            .context("apply workspace image pull Secret")?;
+            crate::registry_pull::use_registry_pull_secret(&mut deployment);
+        }
+        None => {
+            kubectl(
+                cli,
+                &[
+                    "delete",
+                    "secret",
+                    crate::registry_pull::REGISTRY_PULL_SECRET,
+                    "-n",
+                    &workspace.namespace,
+                    "--ignore-not-found",
+                ],
+                None,
+            )
+            .context("delete workspace image pull Secret of a logged-out GitHub login")?;
+        }
+    }
     let annotations = deployment
         .pointer_mut("/spec/template/metadata/annotations")
         .and_then(Value::as_object_mut);

@@ -54,7 +54,7 @@ The client and the cluster must run the same release, because the client picks a
 
 The installer preserves settings and leaves services running on updates. Rerun `adm setup` and select the desired image to update the controller and its management connection. Setup retains its existing credential and PVC; its StorageClass cannot be changed in place. Existing workspace Pods keep their own image and storage settings.
 
-The workflow token needs package write access; the first push creates the GHCR package. If that package is private, the cluster needs a pull credential. A node that cannot pull from GHCR still needs the image imported locally.
+The workflow token needs package write access; the first push creates the GHCR package. If that package is private, coding workspaces pull it with the cluster GitHub login (`adm repos login github`); see [custom images](custom-images.md). A node that cannot pull from GHCR still needs the image imported locally.
 
 ## Workspace image and storage
 

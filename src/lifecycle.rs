@@ -1080,7 +1080,11 @@ fn route(
         || path == "/v1/agents-file"
         || path.starts_with("/v1/repos/")
     {
-        return proxy_provider_auth(method, path, body);
+        let (status, response) = proxy_provider_auth(method, path, body)?;
+        if method == "POST" && path == "/v1/repos/logout" && status == 200 {
+            crate::registry_pull::remove_registry_pull_secrets(cli)?;
+        }
+        return Ok((status, response));
     }
     if method == "GET" && path == "/v1/runtime/workspaces" {
         cli.check_lifecycle_fence()?;

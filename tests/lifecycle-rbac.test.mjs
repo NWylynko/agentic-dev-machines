@@ -49,6 +49,17 @@ test("lifecycle may request tokens only for workspace runtime service accounts",
     ),
     "repository preparation needs only the Pod exec subresource",
   );
+  const secretRules = role.rules.filter((rule) =>
+    rule.resources.includes("secrets"),
+  );
+  assert.deepEqual(
+    secretRules.map(({ resourceNames, verbs }) => ({ resourceNames, verbs })),
+    [
+      { resourceNames: ["adm-registry"], verbs: ["get", "patch", "delete"] },
+      { resourceNames: undefined, verbs: ["create"] },
+    ],
+    "the lifecycle reads and changes only workspace image pull Secrets",
+  );
   assert.ok(
     role.rules.every(
       (rule) =>
