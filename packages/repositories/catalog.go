@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -44,6 +45,13 @@ type catalogServer struct {
 	// on every listing of the root and owner directories, so a repository
 	// registered later appears without restarting the sidecar (TASK-112).
 	source func(context.Context) (Catalog, error)
+	// views holds the one root node of each repository for the life of the
+	// mount. Every node inside a repository resolves its path from that root,
+	// so the root must never be replaced: when the kernel forgot the root
+	// before its folders (go-fuse handles FORGETs concurrently), a fresh root
+	// left every folder resolving to go-fuse's orphan placeholder, and all of
+	// them answered ENOENT until the kernel evicted them (TASK-125).
+	views map[string]*repositoryView
 }
 
 type repositoryRuntime struct {
@@ -141,16 +149,35 @@ func mountSource(parent context.Context, config Config, source func(context.Cont
 		return nil, fmt.Errorf("repository store already has an owner: %w", err)
 	}
 	ctx, cancel := context.WithCancel(parent)
-	host := &catalogServer{config: config, ctx: ctx, cancel: cancel, lock: lock, repos: map[string]*repositoryRuntime{}, daemons: map[string]*artifactDaemon{}, failures: make(chan error, 1), source: source}
+	host := &catalogServer{config: config, ctx: ctx, cancel: cancel, lock: lock, repos: map[string]*repositoryRuntime{}, views: map[string]*repositoryView{}, daemons: map[string]*artifactDaemon{}, failures: make(chan error, 1), source: source}
 	root := &catalogDirectory{server: host}
-	zero := time.Duration(0)
-	host.server, err = fs.Mount(config.Mount, root, &fs.Options{UID: config.UID, GID: config.GID, EntryTimeout: &zero, AttrTimeout: &zero, MountOptions: fuse.MountOptions{FsName: "adm-repositories", Name: "adm-repositories", AllowOther: false, DisableXAttrs: true}})
+	host.server, err = fs.Mount(config.Mount, root, catalogFilesystemOptions(config))
 	if err != nil {
 		cancel()
 		lock.Close()
 		return nil, fmt.Errorf("mount repository catalog (FUSE required; no eager-clone fallback): %w", err)
 	}
 	return host, nil
+}
+
+func catalogFilesystemOptions(config Config) *fs.Options {
+	zero := time.Duration(0)
+	return &fs.Options{UID: config.UID, GID: config.GID, EntryTimeout: &zero, AttrTimeout: &zero, Logger: log.New(goFuseWarnings{}, "", 0), MountOptions: fuse.MountOptions{FsName: "adm-repositories", Name: "adm-repositories", AllowOther: false, DisableXAttrs: true}}
+}
+
+// goFuseWarnings puts go-fuse's warnings in the sidecar log. An orphaned node
+// ("Inode.Path: nN is orphaned") answers ENOENT with no other trace, so these
+// must be seen. go-fuse also warns on every getattr that it replaced the
+// backing inode number with the catalog's stable one, which is expected here
+// and would bury everything else, so that one is dropped.
+type goFuseWarnings struct{}
+
+func (goFuseWarnings) Write(line []byte) (int, error) {
+	text := strings.TrimSpace(string(line))
+	if !strings.Contains(text, "rawBridge.getattr: overriding ino") {
+		slog.Error("go-fuse", "warning", text)
+	}
+	return len(line), nil
 }
 
 func (server *catalogServer) Close() error {
@@ -250,9 +277,21 @@ func (node *catalogDirectory) Lookup(ctx context.Context, name string, out *fuse
 		out.Mode = syscall.S_IFDIR | 0755
 		out.Uid = node.server.config.UID
 		out.Gid = node.server.config.GID
-		return node.NewInode(ctx, &repositoryView{server: node.server, repo: repo}, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-repository:"+repo.Owner+"/"+repo.Name, nil)}), 0
+		return node.NewInode(ctx, node.server.repositoryView(repo), fs.StableAttr{Mode: syscall.S_IFDIR, Ino: stableInodeNumber("catalog-repository:"+repo.Owner+"/"+repo.Name, nil)}), 0
 	}
 	return nil, syscall.ENOENT
+}
+
+func (server *catalogServer) repositoryView(repo Repository) *repositoryView {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	key := repo.Owner + "/" + repo.Name
+	view := server.views[key]
+	if view == nil {
+		view = &repositoryView{server: server, repo: repo}
+		server.views[key] = view
+	}
+	return view
 }
 
 // repositoryView is the catalog entry for one repository. Listing it does not
