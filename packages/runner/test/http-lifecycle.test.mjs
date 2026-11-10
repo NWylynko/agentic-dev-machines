@@ -4,6 +4,7 @@ import { access, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { workspaceCredentialRuntime } from "../src/credentials.ts";
 import {
   startRunner,
   startBotLifecycle,
@@ -142,7 +143,6 @@ test(
       await runner.stop();
       await lifecycle.close();
     });
-    const catalogueRequestsBefore = lifecycle.providerCatalogRequests.length;
     const statuses = await Promise.all(
       [1, 2, 3].map(() =>
         runner.request(`/v1/workspaces/${id}/runtime-status`),
@@ -159,10 +159,19 @@ test(
         selectedModel: { provider: "anthropic", id: "claude-sonnet-4-5" },
       });
     }
-    assert.equal(
-      lifecycle.providerCatalogRequests.length,
-      catalogueRequestsBefore,
-      "runtime status makes no shared provider catalogue requests",
+    // Startup model resolution checks each provider once against the held
+    // catalogue, and some of those checks can still be in flight after the
+    // runner is ready, so a before/after count races on a loaded host. A
+    // status that read the catalogue would add another check per provider.
+    const providers = (
+      await workspaceCredentialRuntime(join(directory, "provider-count"), {
+        authPath: join(directory, "provider-count", "auth.json"),
+        modelsStorePath: join(directory, "provider-count", "models.json"),
+      })
+    ).getProviders().length;
+    assert.ok(
+      lifecycle.providerCatalogRequests.length <= providers,
+      `runtime status makes no shared provider catalogue requests: ${lifecycle.providerCatalogRequests.length} catalogue requests for ${providers} providers`,
     );
   },
 );
