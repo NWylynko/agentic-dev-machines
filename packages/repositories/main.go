@@ -31,6 +31,8 @@ type Catalog struct {
 
 type Config struct {
 	State, GitRoot, Views, Mount, Artifact, GitWrapper string
+	// Node-local folder holding the paths git ignores in each checkout (TASK-81).
+	Ignored string
 	// Where Git credentials for GitHub come from (TASK-111).
 	LifecycleURL, TokenFile, GitCredentialURL string
 	UID, GID                                  uint32
@@ -85,6 +87,7 @@ func run(ctx context.Context, arguments []string) error {
 		flags.StringVar(&config.GitRoot, "git-root", "", "private Git directories, also visible in dev container at this path")
 		flags.StringVar(&config.Views, "views", "", "private ArtifactFS mount directory")
 		flags.StringVar(&config.Mount, "mount", "", "exported catalog mount")
+		flags.StringVar(&config.Ignored, "ignored", "", "node-local folder for the paths git ignores in each checkout (TASK-81); empty keeps them in ArtifactFS")
 		flags.StringVar(&config.Artifact, "artifact-fs", "artifact-fs", "pinned ArtifactFS executable")
 		flags.StringVar(&config.GitWrapper, "git-wrapper", "/usr/local/lib/adm-repositories/git", "image-owned no-new-privileges Git wrapper")
 		flags.StringVar(&config.LifecycleURL, "lifecycle-url", os.Getenv("ADM_LIFECYCLE_URL"), "lifecycle controller that hands out the cluster GitHub login")

@@ -191,6 +191,8 @@ git status
 
 Use names shown by `adm repos list`. The root and owner listings are read-only; files and Git state inside acquired repositories are private and writable. Listing or reading within a repository triggers acquisition, which can take time or report an upstream/authentication error.
 
+Files git ignores inside a `/repos` checkout (`node_modules`, build output, `.env`, local databases) are kept on the node's local disk instead of the workspace volume, so installs and builds run at close to local-disk speed: a 17,000-file `npm ci` took 9.7 s in `/repos` (5.7 s on plain disk, 314 s before). They are deleted whenever the workspace's Pod is replaced (`adm update --workspace`, a move to another node, eviction), and a workspace may hold 8 GiB of them; going over that evicts the Pod, which deletes them. Coding agents and Claude Code are told, so they reinstall dependencies and recreate `.env` when it's missing. Put anything that must survive in a file git doesn't ignore. Whether a path is ignored is decided when it is created, from `.gitignore` files and `.git/info/exclude` (not your global excludes file); tracked files never move. A `node_modules` written before this existed stays on the volume until you delete it.
+
 `/workspace/.adm/catalog`, `.adm/git`, `.adm/repositories`, and `.adm/views` hold backing state. Normal work belongs under `/repos`. If you ran `ls .*` in `/workspace`, the shell expanded `.*` to the hidden `.adm` directory and `ls` showed its contents. Those names are children of `.adm`, so `cd repositories` from `/workspace` fails. Use `ls -la /workspace` to see the directory itself, then return to `/repos`.
 
 ## Bot workspaces

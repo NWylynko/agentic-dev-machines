@@ -1594,6 +1594,7 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         "role":w.role,
         "environment":"pod",
         "model":w.model,
+        "repositories":w.repositories,
     });
     if w.role == "coding" {
         workspace_config["localRoot"] = json!("/workspace");
@@ -1658,7 +1659,11 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     }
     let mut containers = vec![dev];
     if w.repositories {
-        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"env":[{"name":"ADM_LIFECYCLE_URL","value":lifecycle_url}],"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":sidecar_mounts}));
+        // Paths git ignores in /repos checkouts (node_modules, build output,
+        // .env) live on node-local disk, wiped with the Pod (TASK-81).
+        volumes.push(json!({"name":"ignored","emptyDir":{"sizeLimit":IGNORED_PATHS_SIZE_LIMIT}}));
+        sidecar_mounts.push(json!({"name":"ignored","mountPath":IGNORED_PATHS_MOUNT}));
+        containers.push(json!({"name":"repositories","image":w.repositories_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-repositories","serve","--state","/workspace/.adm/repositories","--git-root","/workspace/.adm/git","--views","/workspace/.adm/views","--mount","/workspace/.adm/catalog","--ignored",IGNORED_PATHS_MOUNT,"--uid","1000","--gid","1000","--artifact-fs","/usr/local/bin/artifact-fs"],"securityContext":{"privileged":true,"runAsUser":1000,"runAsGroup":1000,"runAsNonRoot":true},"env":[{"name":"ADM_LIFECYCLE_URL","value":lifecycle_url}],"resources":{"requests":{"cpu":"50m","memory":"128Mi"},"limits":{"memory":"512Mi"}},"volumeMounts":sidecar_mounts}));
     }
     let init = json!({"name":"initialize","image":w.workspace_image,"imagePullPolicy":"IfNotPresent","command":["/usr/local/bin/adm-init-workspace",if w.repositories{"repositories"}else{"plain"}],"securityContext":{"runAsUser":0},"volumeMounts":[{"name":"work","mountPath":"/workspace"}]});
     let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":metadata(w,"workspace"),"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels},"spec":{"serviceAccountName":"adm-runtime","automountServiceAccountToken":false,"terminationGracePeriodSeconds":30,"initContainers":[init],"containers":containers,"volumes":volumes}}}});
@@ -1689,6 +1694,9 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     }
     Ok(json!({"apiVersion":"v1","kind":"List","items":items}))
 }
+
+const IGNORED_PATHS_MOUNT: &str = "/var/lib/adm-ignored";
+const IGNORED_PATHS_SIZE_LIMIT: &str = "8Gi";
 
 pub fn workspace_security_context() -> Value {
     json!({

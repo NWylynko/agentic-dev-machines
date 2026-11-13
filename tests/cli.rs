@@ -4331,6 +4331,41 @@ fn repository_sidecar_runs_as_the_development_user_and_catalog_is_the_repos_view
     assert!(command.iter().any(|part| part == "/workspace/.adm/catalog"));
     assert!(command.iter().any(|part| part == "--uid"));
     assert!(command.iter().any(|part| part == "1000"));
+    // Paths git ignores live on an 8Gi node-local emptyDir that only the
+    // sidecar mounts; the dev container reaches them through /repos (TASK-81).
+    let ignored_flag = command
+        .iter()
+        .position(|part| part == "--ignored")
+        .expect("--ignored");
+    assert_eq!(command[ignored_flag + 1], "/var/lib/adm-ignored");
+    let volume = pod["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|volume| volume["name"] == "ignored")
+        .expect("ignored volume");
+    assert_eq!(volume["emptyDir"]["sizeLimit"], "8Gi");
+    // The agents are told about it, so the runtime config says /repos is on.
+    let runtime: Value = serde_json::from_str(
+        items
+            .iter()
+            .find(|item| item["kind"] == "ConfigMap" && item["metadata"]["name"] == "workspace-runtime")
+            .unwrap()["data"]["workspace.json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(runtime["repositories"], true);
+    assert!(sidecar["volumeMounts"].as_array().unwrap().iter().any(|mount| {
+        mount["name"] == "ignored" && mount["mountPath"] == "/var/lib/adm-ignored"
+    }));
+    assert!(
+        !dev["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mount| mount["name"] == "ignored")
+    );
     // The sidecar opens private repositories with the cluster GitHub login,
     // fetched from the lifecycle controller with the Pod identity (TASK-111).
     // It is given no Secret and no token value.

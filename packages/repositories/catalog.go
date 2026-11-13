@@ -350,6 +350,10 @@ type repositoryView struct {
 	repo   Repository
 	mu     sync.Mutex
 	ready  bool
+	// local is the node-local root for paths git ignores, and ignore decides
+	// which those are (TASK-81). Both nil without Config.Ignored.
+	local  *fs.LoopbackRoot
+	ignore *ignoredPaths
 }
 
 type repositoryLoopbackNode struct {
@@ -408,35 +412,35 @@ func (node *repositoryLoopbackNode) Mknod(ctx context.Context, name string, mode
 	if node.replaced() {
 		return nil, syscall.ESTALE
 	}
-	return node.LoopbackNode.Mknod(ctx, name, mode, rdev, out)
+	return makeRepositoryNode(ctx, node, node.RootData, name, mode, rdev, out)
 }
 
 func (node *repositoryLoopbackNode) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if node.replaced() {
 		return nil, syscall.ESTALE
 	}
-	return node.LoopbackNode.Link(ctx, target, name, out)
+	return linkRepositoryEntry(ctx, node, node.RootData, target, name, out)
 }
 
 func (node *repositoryLoopbackNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	if node.replaced() {
 		return syscall.ESTALE
 	}
-	return node.LoopbackNode.Unlink(ctx, name)
+	return removeRepositoryEntry(node, node.RootData, name, false)
 }
 
 func (node *repositoryLoopbackNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if node.replaced() {
 		return syscall.ESTALE
 	}
-	return node.LoopbackNode.Rmdir(ctx, name)
+	return removeRepositoryEntry(node, node.RootData, name, true)
 }
 
 func (node *repositoryLoopbackNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	if target, ok := newParent.(*repositoryLoopbackNode); node.replaced() || ok && target.replaced() {
 		return syscall.ESTALE
 	}
-	return node.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
+	return renameRepositoryEntry(node, node.RootData, name, newParent, newName, flags)
 }
 
 func (node *repositoryLoopbackNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
@@ -450,7 +454,7 @@ func (node *repositoryLoopbackNode) OpendirHandle(ctx context.Context, flags uin
 	if node.replaced() {
 		return nil, 0, syscall.ESTALE
 	}
-	return node.LoopbackNode.OpendirHandle(ctx, flags)
+	return openRepositoryDirectory(node, node.RootData)
 }
 
 func (node *repositoryLoopbackNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -471,7 +475,11 @@ func (node *repositoryLoopbackNode) Getattr(ctx context.Context, handle fs.FileH
 	if handle == nil && node.replaced() {
 		return syscall.ESTALE
 	}
-	return node.LoopbackNode.Getattr(ctx, handle, out)
+	errno := node.LoopbackNode.Getattr(ctx, handle, out)
+	if errno == 0 && isLocal(node.RootData) {
+		out.SetTimeout(localCacheTimeout)
+	}
+	return errno
 }
 
 func (node *repositoryLoopbackNode) Statx(ctx context.Context, handle fs.FileHandle, flags uint32, mask uint32, out *fuse.StatxOut) syscall.Errno {
@@ -527,18 +535,22 @@ func backingOpenHowFlags(flags uint32) uint64 {
 }
 
 func lookupRepositoryChild(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	root = residence(parent, root, name)
 	path := repositoryChildPath(parent, root, name)
 	var stat syscall.Stat_t
 	if err := syscall.Lstat(path, &stat); err != nil {
 		return nil, fs.ToErrno(err)
 	}
 	out.Attr.FromStat(&stat)
+	cacheLocalEntry(root, out)
 	// The node already under this name is the one the kernel and every
 	// in-flight operation hold. go-fuse moves nodes on rename, so a renamed
 	// file keeps its node under the new name; handing out a different node for
 	// the same name would orphan the held one (TASK-125).
 	if existing := parent.EmbeddedInode().GetChild(name); existing != nil && existing.StableAttr().Mode == uint32(stat.Mode)&syscall.S_IFMT {
-		return existing, 0
+		if node, ok := existing.Operations().(*repositoryLoopbackNode); !ok || node.RootData == root {
+			return existing, 0
+		}
 	}
 	return repositoryChildInode(ctx, parent, root, path, &stat), 0
 }
@@ -567,6 +579,10 @@ func repositoryChildInode(ctx context.Context, parent fs.InodeEmbedder, root *fs
 // identity. ArtifactFS refuses hard links and mknod before any node exists,
 // so Link and Mknod keep go-fuse's.
 func createRepositoryFile(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	root, errno := placement(parent, root, name, false)
+	if errno != 0 {
+		return nil, nil, 0, errno
+	}
 	path := repositoryChildPath(parent, root, name)
 	fd, err := syscall.Open(path, int(flags&^syscall.O_APPEND)|os.O_CREATE, mode)
 	if err != nil {
@@ -579,10 +595,15 @@ func createRepositoryFile(ctx context.Context, parent fs.InodeEmbedder, root *fs
 		return nil, nil, 0, fs.ToErrno(err)
 	}
 	out.FromStat(&stat)
+	cacheLocalEntry(root, out)
 	return repositoryChildInode(ctx, parent, root, path, &stat), fs.NewLoopbackFile(fd), 0, 0
 }
 
 func makeRepositoryDirectory(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	root, errno := placement(parent, root, name, true)
+	if errno != 0 {
+		return nil, errno
+	}
 	path := repositoryChildPath(parent, root, name)
 	if err := os.Mkdir(path, os.FileMode(mode)); err != nil {
 		return nil, fs.ToErrno(err)
@@ -594,10 +615,15 @@ func makeRepositoryDirectory(ctx context.Context, parent fs.InodeEmbedder, root 
 		return nil, fs.ToErrno(err)
 	}
 	out.Attr.FromStat(&stat)
+	cacheLocalEntry(root, out)
 	return repositoryChildInode(ctx, parent, root, path, &stat), 0
 }
 
 func makeRepositorySymlink(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	root, errno := placement(parent, root, name, false)
+	if errno != 0 {
+		return nil, errno
+	}
 	path := repositoryChildPath(parent, root, name)
 	if err := syscall.Symlink(target, path); err != nil {
 		return nil, fs.ToErrno(err)
@@ -609,6 +635,54 @@ func makeRepositorySymlink(ctx context.Context, parent fs.InodeEmbedder, root *f
 		return nil, fs.ToErrno(err)
 	}
 	out.Attr.FromStat(&stat)
+	cacheLocalEntry(root, out)
+	return repositoryChildInode(ctx, parent, root, path, &stat), 0
+}
+
+func makeRepositoryNode(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, name string, mode, rdev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	root, errno := placement(parent, root, name, false)
+	if errno != 0 {
+		return nil, errno
+	}
+	path := repositoryChildPath(parent, root, name)
+	if err := syscall.Mknod(path, mode, int(rdev)); err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	preserveCallerOwnership(ctx, path)
+	var stat syscall.Stat_t
+	if err := syscall.Lstat(path, &stat); err != nil {
+		syscall.Unlink(path)
+		return nil, fs.ToErrno(err)
+	}
+	out.Attr.FromStat(&stat)
+	cacheLocalEntry(root, out)
+	return repositoryChildInode(ctx, parent, root, path, &stat), 0
+}
+
+// linkRepositoryEntry hard-links within one root; ArtifactFS refuses hard
+// links, and a link can't span the two roots.
+func linkRepositoryEntry(ctx context.Context, parent fs.InodeEmbedder, root *fs.LoopbackRoot, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	source, ok := target.(*repositoryLoopbackNode)
+	if !ok {
+		return nil, syscall.EXDEV
+	}
+	root, errno := placement(parent, root, name, false)
+	if errno != 0 {
+		return nil, errno
+	}
+	if source.RootData != root {
+		return nil, syscall.EXDEV
+	}
+	path := repositoryChildPath(parent, root, name)
+	if err := syscall.Link(filepath.Join(root.Path, source.EmbeddedInode().Path(root.RootNode.EmbeddedInode())), path); err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Lstat(path, &stat); err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	out.Attr.FromStat(&stat)
+	cacheLocalEntry(root, out)
 	return repositoryChildInode(ctx, parent, root, path, &stat), 0
 }
 
@@ -646,14 +720,19 @@ func (node *repositoryView) activate(ctx context.Context) syscall.Errno {
 		slog.Error("repository acquisition failed", "repository", node.repo.Owner+"/"+node.repo.Name, "error", err)
 		return syscall.EIO
 	}
-	node.RootData = &fs.LoopbackRoot{
-		Path:     path,
-		Dev:      0,
-		RootNode: node,
-		NewNode: func(root *fs.LoopbackRoot, _ *fs.Inode, _ string, _ *syscall.Stat_t) fs.InodeEmbedder {
-			return &repositoryLoopbackNode{LoopbackNode: fs.LoopbackNode{RootData: root}}
-		},
+	newNode := func(root *fs.LoopbackRoot, _ *fs.Inode, _ string, _ *syscall.Stat_t) fs.InodeEmbedder {
+		return &repositoryLoopbackNode{LoopbackNode: fs.LoopbackNode{RootData: root}}
 	}
+	if ignored := node.server.config.Ignored; ignored != "" {
+		local := filepath.Join(ignored, node.repo.Owner, node.repo.Name)
+		if err := os.MkdirAll(local, 0755); err != nil {
+			slog.Error("node-local folder for ignored paths failed", "repository", node.repo.Owner+"/"+node.repo.Name, "path", local, "error", err)
+			return syscall.EIO
+		}
+		node.local = &fs.LoopbackRoot{Path: local, RootNode: node, NewNode: newNode}
+		node.ignore = &ignoredPaths{checkout: path, gitDir: filepath.Join(node.server.config.GitRoot, node.repo.Owner, node.repo.Name), patterns: map[string]ignoreFile{}}
+	}
+	node.RootData = &fs.LoopbackRoot{Path: path, Dev: 0, RootNode: node, NewNode: newNode}
 	node.ready = true
 	return 0
 }
@@ -689,7 +768,7 @@ func (node *repositoryView) OpendirHandle(ctx context.Context, flags uint32) (fs
 	if errno := node.activate(ctx); errno != 0 {
 		return nil, 0, errno
 	}
-	return node.LoopbackNode.OpendirHandle(ctx, flags)
+	return openRepositoryDirectory(node, node.RootData)
 }
 
 func (node *repositoryView) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
@@ -717,28 +796,28 @@ func (node *repositoryView) Mknod(ctx context.Context, name string, mode, rdev u
 	if errno := node.activate(ctx); errno != 0 {
 		return nil, errno
 	}
-	return node.LoopbackNode.Mknod(ctx, name, mode, rdev, out)
+	return makeRepositoryNode(ctx, node, node.RootData, name, mode, rdev, out)
 }
 
 func (node *repositoryView) Unlink(ctx context.Context, name string) syscall.Errno {
 	if errno := node.activate(ctx); errno != 0 {
 		return errno
 	}
-	return node.LoopbackNode.Unlink(ctx, name)
+	return removeRepositoryEntry(node, node.RootData, name, false)
 }
 
 func (node *repositoryView) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if errno := node.activate(ctx); errno != 0 {
 		return errno
 	}
-	return node.LoopbackNode.Rmdir(ctx, name)
+	return removeRepositoryEntry(node, node.RootData, name, true)
 }
 
 func (node *repositoryView) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	if errno := node.activate(ctx); errno != 0 {
 		return errno
 	}
-	return node.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
+	return renameRepositoryEntry(node, node.RootData, name, newParent, newName, flags)
 }
 
 func (node *repositoryView) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -752,7 +831,7 @@ func (node *repositoryView) Link(ctx context.Context, target fs.InodeEmbedder, n
 	if errno := node.activate(ctx); errno != 0 {
 		return nil, errno
 	}
-	return node.LoopbackNode.Link(ctx, target, name, out)
+	return linkRepositoryEntry(ctx, node, node.RootData, target, name, out)
 }
 
 func (node *repositoryView) Setattr(ctx context.Context, handle fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
