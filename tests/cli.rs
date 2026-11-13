@@ -4349,16 +4349,24 @@ fn repository_sidecar_runs_as_the_development_user_and_catalog_is_the_repos_view
     let runtime: Value = serde_json::from_str(
         items
             .iter()
-            .find(|item| item["kind"] == "ConfigMap" && item["metadata"]["name"] == "workspace-runtime")
+            .find(|item| {
+                item["kind"] == "ConfigMap" && item["metadata"]["name"] == "workspace-runtime"
+            })
             .unwrap()["data"]["workspace.json"]
             .as_str()
             .unwrap(),
     )
     .unwrap();
     assert_eq!(runtime["repositories"], true);
-    assert!(sidecar["volumeMounts"].as_array().unwrap().iter().any(|mount| {
-        mount["name"] == "ignored" && mount["mountPath"] == "/var/lib/adm-ignored"
-    }));
+    assert!(
+        sidecar["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mount| {
+                mount["name"] == "ignored" && mount["mountPath"] == "/var/lib/adm-ignored"
+            })
+    );
     assert!(
         !dev["volumeMounts"]
             .as_array()
