@@ -172,6 +172,10 @@ test(
     assert.equal(credentials.claudeAiOauth.accessToken, "claude-access-1");
     assert.equal(credentials.claudeAiOauth.refreshToken, null);
     assert.ok(credentials.claudeAiOauth.expiresAt > Date.now() + 50 * 60 * 1000);
+    // stdout is the wait before the next write: 10 min before expiry.
+    const dueSeconds =
+      (credentials.claudeAiOauth.expiresAt - Date.now()) / 1000 - 10 * 60;
+    assert.ok(Math.abs(Number(first.stdout) - dueSeconds) < 5, first.stdout);
     assert.ok(
       credentials.claudeAiOauth.scopes.includes("user:sessions:claude_code"),
     );

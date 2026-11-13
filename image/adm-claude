@@ -5,12 +5,22 @@
 #   start   mark Claude enabled on the workspace volume; start it if not running
 #   attach  start, then attach this terminal
 #   boot    container start: start it only if it was ever enabled here
+#   credentials-loop  the claude-credentials session: rewrite the login when
+#           due. The one timer; a shell + sleep, so it holds ~2 MB, not Node.
 set -eu
 state=/workspace/.adm/claude
 config=/run/adm/workspace.json
 action=${1:-}
 case "$action" in
   start | attach | boot) ;;
+  credentials-loop)
+    while :; do
+      # A failure is logged by the writer; Claude keeps the last token until
+      # it expires, then shows the login as expired. Ask again in a minute.
+      due=$(adm-claude-credentials write "$state/config") || due=60
+      sleep "$due"
+    done
+    ;;
   *) echo "usage: adm-claude start|attach|boot" >&2; exit 2 ;;
 esac
 if [ "$action" = boot ] && [ ! -f "$state/enabled" ]; then exit 0; fi
@@ -25,9 +35,9 @@ adm-claude-mcp config "$state/mcp.json"
 # "=NAME" matches the session exactly: plain "claude" would prefix-match
 # "claude-credentials".
 if ! tmux has-session -t =claude-credentials 2>/dev/null; then
-  adm-claude-credentials write "$state/config"
+  adm-claude-credentials write "$state/config" > /dev/null
   tmux new-session -d -s claude-credentials \
-    "exec adm-claude-credentials loop '$state/config' >> '$state/credentials.log' 2>&1"
+    "exec adm-claude credentials-loop >> '$state/credentials.log' 2>&1"
 fi
 if ! tmux has-session -t =claude 2>/dev/null; then
   name=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).name' "$config")

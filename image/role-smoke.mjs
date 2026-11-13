@@ -128,6 +128,11 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
       `node -e 'const c = require("/workspace/.adm/claude/config/.credentials.json").claudeAiOauth; if (c.accessToken !== "smoke-access" || c.refreshToken !== null) process.exit(1)'`,
       `node -e 'if (require("/workspace/.adm/claude/config/.claude.json").oauthAccount.organizationUuid !== "smoke-organization") process.exit(1)'`,
       "tmux has-session -t claude-credentials",
+      // Between refreshes the session holds only a shell and sleep (~2 MB),
+      // never a resident Node (~65 MB), and logs each write.
+      "i=0; until [ \"$(grep -c claude_credentials_written /workspace/.adm/claude/credentials.log)\" = 1 ] && pgrep -x sleep >/dev/null; do i=$((i+1)); [ $i -lt 100 ] || exit 1; sleep 0.1; done",
+      "pgrep -f 'adm-claude credentials-loop' >/dev/null",
+      "! pgrep -f adm-claude-credentials >/dev/null",
       // Claude replaces tmux's exec of it straight away; wait for it to draw.
       "i=0; until tmux capture-pane -p -t claude | grep -q .; do i=$((i+1)); [ $i -lt 100 ] || exit 1; sleep 0.1; done",
       'test "$(tmux display-message -p -t claude "#{pane_current_command}")" = claude',
