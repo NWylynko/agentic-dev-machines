@@ -138,12 +138,14 @@ export async function startPodRunner(
     role,
     model = true,
     env = {},
+    repositories = false,
   }: {
     id: string;
     name: string;
     role: "coding" | "bot";
     model?: boolean;
     env?: Record<string, string>;
+    repositories?: boolean;
   },
 ) {
   const directory = join(root, id);
@@ -162,6 +164,7 @@ export async function startPodRunner(
       environment: "pod",
       ...(role === "coding" ? { localRoot: join(directory, "repos") } : {}),
       ...(model ? { model: { provider: "faux", id: "faux-1" } } : {}),
+      ...(repositories ? { repositories: true } : {}),
     }),
     { mode: 0o600 },
   );

@@ -11,6 +11,8 @@ export type WorkspaceConfig = {
   kubeconfig?: string;
   remoteEnv?: string;
   model?: { provider: string; id: string };
+  /** /repos shows the registered repositories (set by the lifecycle). */
+  repositories?: boolean;
   /** Runner-managed flag persisted only for newly registered bot conversations. */
   onboardingRequired?: boolean;
 };

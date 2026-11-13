@@ -71,6 +71,7 @@ import type {
 import { BotProfileDocument, botExtension } from "./bot.ts";
 import type { BotAgentManagement } from "./bot-management.ts";
 import { WorkspaceBrowser } from "./browser.ts";
+import { ignoredFilesExtension } from "./ignored-files.ts";
 import { WorkspaceConnectors, type ConnectorLifecycle } from "./connectors.ts";
 import {
   applyGoal,
@@ -463,6 +464,7 @@ export class Workspace {
           assertActive,
         );
         browser.open();
+        if (config.repositories) registry.install(ignoredFilesExtension);
       }
       if (config.role === "bot") {
         sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });

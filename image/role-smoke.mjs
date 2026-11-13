@@ -101,7 +101,7 @@ const smokeClaudeCodeRunsAsTheWorkspaceUser = async () => {
 const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
   const directory = await mkdtemp(join(tmpdir(), "adm-claude-smoke-"));
   try {
-    await writeFile(join(directory, "workspace.json"), JSON.stringify({ id: "smoke", name: "claude-smoke", cwd: "/workspace" }));
+    await writeFile(join(directory, "workspace.json"), JSON.stringify({ id: "smoke", name: "claude-smoke", cwd: "/workspace", repositories: true }));
     await chmod(join(directory, "workspace.json"), 0o644);
     // A lifecycle with no connectors and a shared Claude login (`adm login claude`).
     await writeFile(join(directory, "lifecycle.mjs"), `
@@ -137,6 +137,8 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
       "i=0; until tmux capture-pane -p -t claude | grep -q .; do i=$((i+1)); [ $i -lt 100 ] || exit 1; sleep 0.1; done",
       'test "$(tmux display-message -p -t claude "#{pane_current_command}")" = claude',
       'test "$(tmux show-environment -t claude CLAUDE_CONFIG_DIR)" = CLAUDE_CONFIG_DIR=/workspace/.adm/claude/config',
+      // With /repos, Claude is told ignored files are wiped with the Pod (TASK-81).
+      "tmux display-message -p -t claude '#{pane_start_command}' | grep -q 'deleted whenever this workspace'",
       "adm-claude start",
       'test "$(tmux list-sessions | wc -l)" = 2',
       "tmux kill-server",

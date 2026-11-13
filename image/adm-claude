@@ -42,11 +42,18 @@ fi
 if ! tmux has-session -t =claude 2>/dev/null; then
   name=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).name' "$config")
   cwd=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).cwd' "$config")
+  repositories=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).repositories === true' "$config")
+  # With /repos, ignored files live on node-local disk (TASK-81). Keep this
+  # text identical to packages/runner/src/ignored-files.ts (a test checks).
+  set --
+  if [ "$repositories" = true ]; then
+    set -- --append-system-prompt "Files git ignores inside /repos checkouts (node_modules, build output, .env, local databases) are kept on this machine's local disk, not with the workspace: they are deleted whenever this workspace's Pod is replaced (updates, moves to another node). When they are missing, reinstall dependencies and recreate ignored files such as .env. Put anything that must survive in a file git does not ignore."
+  fi
   # The config dir is on the volume, so login, trust answers and
   # conversations survive Pod restarts and moves.
   tmux new-session -d -s claude -x 200 -y 50 -c "$cwd" \
     -e "CLAUDE_CONFIG_DIR=$state/config" -e DISABLE_AUTOUPDATER=1 \
-    claude --remote-control "$name" --mcp-config "$state/mcp.json"
+    claude --remote-control "$name" --mcp-config "$state/mcp.json" "$@"
 fi
 if [ "$action" = attach ]; then
   # kubectl exec passes no TERM; tmux needs one to draw the client.
