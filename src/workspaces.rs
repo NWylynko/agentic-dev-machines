@@ -206,7 +206,7 @@ pub struct CreateOptions {
     pub storage_size: String,
     #[arg(long, default_value = "2")]
     pub cpu: String,
-    #[arg(long, default_value = "2Gi")]
+    #[arg(long, default_value = "4Gi")]
     pub memory: String,
     /// Leave /repos an ordinary directory instead of showing the registered repositories.
     #[arg(long)]

@@ -5618,6 +5618,11 @@ fn claude_creates_a_missing_workspace_then_attaches_and_reuses_an_existing_one()
         deployment["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["cpu"],
         "3"
     );
+    assert_eq!(
+        deployment["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"],
+        "4Gi",
+        "coding workspaces default to 4Gi: Claude, the runner and a JS install OOMed at 2Gi"
+    );
     let exec = exec_command(root.path());
     assert!(exec.contains(&"-it".to_owned()), "{exec:?}");
     assert!(
