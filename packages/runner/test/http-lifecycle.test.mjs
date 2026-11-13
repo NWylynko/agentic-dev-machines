@@ -150,10 +150,10 @@ test(
     );
     for (const status of statuses) {
       assert.equal(status.status, 200);
-      // Coding Pod runtimes also report the built-in browser (TASK-115); its
-      // state depends on whether this host has the Playwright MCP.
+      // Coding Pod runtimes also report the built-in browser (TASK-115),
+      // idle until the first browser call starts its server.
       const { browser, ...rest } = status.body;
-      assert.match(browser.status, /^(connected|error)$/);
+      assert.deepEqual(browser, { status: "idle" });
       assert.deepEqual(rest, {
         activity: { status: "idle" },
         selectedModel: { provider: "anthropic", id: "claude-sonnet-4-5" },

@@ -6,14 +6,20 @@
 // (npm run test:image) covers the bundled server and system chromium.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, globSync } from "node:fs";
+import { existsSync, globSync, readFileSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { McpClient, StdioTransport } from "@earendil-works/pi-mcp";
 import { startPodLifecycle, startPodRunner } from "./pod-fixture.ts";
+import { browserServerArgs } from "../src/browser.ts";
+
+// The tools the runner offers before the server has started:
+// a snapshot of the pinned @playwright/mcp. UPDATE_BROWSER_TOOLS=1 rewrites it.
+const snapshotFile = new URL("../src/browser-tools.json", import.meta.url);
 
 const mcpCli = new URL(
   "../../../node_modules/@playwright/mcp/cli.js",
@@ -35,8 +41,44 @@ const skip =
 const plan = (calls, answer = "Browser step complete.") =>
   `/faux ${JSON.stringify({ calls, answer })}`;
 
+const browserServerRunning = (directory) =>
+  spawnSync("pgrep", ["-f", join(directory, "repos", ".adm", "browser")])
+    .status === 0;
+
 test(
-  "coding workspaces drive a built-in browser through Playwright MCP tools, bots never get it, and a crashed server restarts on the next turn",
+  "the offered browser tools are exactly the pinned Playwright MCP server's tools",
+  { timeout: 60000, skip },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-browser-tools-"));
+    const client = new McpClient({ name: "adm-browser-test", version: "1" });
+    t.after(async () => {
+      await client.close().catch(() => {});
+      await rm(directory, { recursive: true });
+    });
+    await client.connect(
+      new StdioTransport({
+        command: process.execPath,
+        args: browserServerArgs({
+          cli: mcpCli,
+          chromium: executable,
+          outputDir: directory,
+        }),
+        cwd: directory,
+      }),
+    );
+    const tools = await client.listTools();
+    if (process.env.UPDATE_BROWSER_TOOLS === "1")
+      writeFileSync(snapshotFile, `${JSON.stringify(tools, null, 2)}\n`);
+    assert.deepEqual(
+      JSON.parse(readFileSync(snapshotFile, "utf8")),
+      JSON.parse(JSON.stringify(tools)),
+      "browser-tools.json is stale: rerun this test with UPDATE_BROWSER_TOOLS=1",
+    );
+  },
+);
+
+test(
+  "coding workspaces drive a built-in browser through Playwright MCP tools, started only on the first browser call; bots never get it, and a crashed server restarts on the next call",
   { timeout: 120000, skip },
   async (t) => {
     const holder = {};
@@ -84,12 +126,20 @@ test(
     assert.ok((await browserTools(coding)).includes("browser_navigate"));
     assert.deepEqual(await browserTools(bot), []);
     assert.equal((await bot.request()).body.browser, undefined);
+    // Nothing runs until a browser tool is called: an idle workspace pays
+    // no memory for the server.
     const state = (await coding.request()).body.browser;
-    assert.equal(state.status, "connected");
+    assert.equal(state.status, "idle");
     assert.ok(state.tools > 10);
     assert.deepEqual((await coding.request("/runtime-status")).body.browser, {
-      status: "connected",
+      status: "idle",
     });
+    await coding.request("/input", "POST", {
+      message: "no browser in this turn",
+      requestId: "plain-turn",
+    });
+    await coding.event((event) => event.kind === "assistant");
+    assert.equal(browserServerRunning(coding.directory), false);
 
     // A scripted turn opens a page on this host and reads its title.
     await coding.request("/input", "POST", {
@@ -104,6 +154,10 @@ test(
     );
     assert.equal(navigated.data.isError, false, navigated.data.text);
     assert.match(navigated.data.text, /Page Title: Hello ADM Browser/);
+    assert.equal(browserServerRunning(coding.directory), true);
+    assert.deepEqual((await coding.request("/runtime-status")).body.browser, {
+      status: "connected",
+    });
 
     // Kill the server while a call is in flight: the call fails readably.
     await coding.request("/input", "POST", {
@@ -128,15 +182,15 @@ test(
     assert.equal(crashed.data.isError, true);
     assert.match(
       crashed.data.text,
-      /Browser tools stopped; they restart on the next turn/,
+      /Browser tools stopped; they restart on the next browser call/,
     );
     assert.equal((await coding.request()).body.browser.status, "error");
     assert.match(
       (await coding.request("/runtime-status")).body.browser.error,
-      /restart on the next turn/,
+      /restart on the next browser call/,
     );
 
-    // The next turn restarts the server and the browser works again.
+    // The next browser call restarts the server and the browser works again.
     await coding.request("/input", "POST", {
       message: plan([
         { tool: "browser_navigate", args: { url: `${site}/again` } },

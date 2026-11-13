@@ -976,7 +976,7 @@ fn print_summary_errors(status: &Value) {
         );
     }
     let browser = &workspace["runtime_status"]["browser"];
-    if !browser.is_null() && browser["status"] != "connected" {
+    if browser["status"] == "error" {
         println!(
             "Browser tools unavailable for {identity}: {}",
             browser["error"]

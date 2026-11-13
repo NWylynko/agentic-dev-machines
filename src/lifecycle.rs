@@ -1752,7 +1752,7 @@ fn valid_runtime_status_report(report: &Value) -> bool {
             object
                 .keys()
                 .all(|key| ["status", "error"].contains(&key.as_str()))
-        } && ["connected", "error"].contains(&browser["status"].as_str().unwrap_or(""))
+        } && ["idle", "connected", "error"].contains(&browser["status"].as_str().unwrap_or(""))
             && browser.get("error").is_none_or(|error| {
                 error.as_str().is_some_and(|error| error.len() <= 2000)
             }))

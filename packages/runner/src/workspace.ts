@@ -462,7 +462,7 @@ export class Workspace {
           registry,
           assertActive,
         );
-        await browser.ensureRunning();
+        browser.open();
       }
       if (config.role === "bot") {
         sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });
@@ -758,7 +758,6 @@ export class Workspace {
   ) {
     // Connector changes reach running agents at their next turn.
     await this.connectors?.reconcile();
-    await this.browser?.ensureRunning();
     return this.withAdmission(async () => {
       if (!this.config.model)
         throw new ApiError(
