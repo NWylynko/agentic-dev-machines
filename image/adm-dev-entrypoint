@@ -51,7 +51,11 @@ fi
 if command -v adm-claude >/dev/null 2>&1; then
   adm-claude boot || echo "adm-claude: Claude Code did not start; run adm claude NAME to see why" >&2
 fi
-exec node /opt/adm/runner.mjs \
+# The runner is I/O-bound, so trade JIT speed and a big young generation for
+# memory: measured on the bundled runner after five turns, private memory
+# drops from ~111 MB to ~72 MB (docs/implementation-notes.md, "Workspace
+# memory").
+exec node --max-semi-space-size=1 --optimize-for-size /opt/adm/runner.mjs \
   --host 0.0.0.0 \
   --port 7432 \
   --state-dir /workspace/.adm/runtime \
