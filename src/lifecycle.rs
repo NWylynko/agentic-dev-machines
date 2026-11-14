@@ -720,6 +720,7 @@ fn runtime_http_error_status(error: &anyhow::Error, message: &str) -> (u16, &'st
         || message.contains("project resources are restricted to the owning coding workspace")
         || message.contains("shared agents file is restricted to coding workspaces")
         || message.contains("the GitHub login is restricted to coding workspaces")
+        || message.contains("the Infisical login is restricted to coding workspaces")
         || message.contains("wrong audience")
         || message.contains("not bound to a Pod")
     {
@@ -748,6 +749,7 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
         || (method == "GET" && path == "/v1/runtime/agents-file")
         || is_claude_credentials_route(method, path)
         || (method == "GET" && path == "/v1/runtime/repos/token")
+        || is_runtime_infisical_route(method, path)
         || (method == "GET" && path == "/v1/runtime/repos/registry")
         || (method == "POST" && path == "/v1/runtime/repos/rejected")
         || (method == "POST" && path.starts_with("/v1/runtime/repos/opened/"))
@@ -980,6 +982,8 @@ fn route(
         || path == "/v1/runtime/agents-file"
         || path.starts_with("/v1/repos/")
         || path.starts_with("/v1/runtime/repos/")
+        || path.starts_with("/v1/infisical/")
+        || path.starts_with("/v1/runtime/infisical/")
         || is_claude_credentials_route(method, path)
     {
         cli.check_lifecycle_fence()?;
@@ -1032,6 +1036,20 @@ fn route(
         );
         return proxy_provider_auth(method, path, body);
     }
+    // The installation's Infisical machine identity (TASK-138): short-lived
+    // access tokens for coding Pods' shells; bots run no shells.
+    if is_runtime_infisical_route(method, path) {
+        let caller = authorize_runtime_caller(cli, &store, authorization)?;
+        ensure!(
+            matches!(caller.phase.as_str(), "provisioning" | "ready"),
+            "workspace lifecycle is not active for provider requests"
+        );
+        ensure!(
+            caller.role == "coding",
+            "the Infisical login is restricted to coding workspaces"
+        );
+        return proxy_provider_auth(method, path, body);
+    }
     // Claude Code's shared login (TASK-90): an access token, never the refresh
     // token, and only for coding Pods; bots run no Claude.
     if is_claude_credentials_route(method, path) {
@@ -1079,6 +1097,7 @@ fn route(
         || path.starts_with("/v1/connectors/")
         || path == "/v1/agents-file"
         || path.starts_with("/v1/repos/")
+        || path.starts_with("/v1/infisical/")
     {
         let (status, response) = proxy_provider_auth(method, path, body)?;
         if method == "POST" && path == "/v1/repos/logout" && status == 200 {
@@ -1367,7 +1386,8 @@ pub(crate) fn proxy_provider_auth(method: &str, path: &str, body: &[u8]) -> Resu
             || is_connector_route(method, path)
             || is_agents_file_route(method, path)
             || is_claude_credentials_route(method, path)
-            || is_repos_route(method, path),
+            || is_repos_route(method, path)
+            || is_infisical_route(method, path),
         "unknown provider auth route"
     );
     ensure!(
@@ -1440,6 +1460,21 @@ fn is_repos_route(method: &str, path: &str) -> bool {
                 None => method == "DELETE" && uuid::Uuid::parse_str(tail).is_ok(),
             }),
     }
+}
+
+/// The installation's Infisical machine identity (TASK-138): operator
+/// administration and the coding Pods' token route.
+fn is_runtime_infisical_route(method: &str, path: &str) -> bool {
+    method == "GET" && path == "/v1/runtime/infisical/token"
+}
+
+fn is_infisical_route(method: &str, path: &str) -> bool {
+    is_runtime_infisical_route(method, path)
+        || matches!(
+            (method, path),
+            ("GET", "/v1/infisical/status")
+                | ("POST", "/v1/infisical/login" | "/v1/infisical/logout")
+        )
 }
 
 fn is_claude_credentials_route(method: &str, path: &str) -> bool {

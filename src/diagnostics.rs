@@ -75,7 +75,12 @@ pub fn doctor(cli: &Cli, storage_class: &str, json_output: bool) -> Result<()> {
             "error": format!("{error:#}"),
         }),
     };
-    let report = json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"lifecycle":lifecycle,"providers":providers,"state":cli.state_path()});
+    let infisical = if lifecycle_reachable {
+        crate::infisical::infisical_status(cli)
+    } else {
+        json!({"status":"unavailable","error":"the lifecycle service is unreachable"})
+    };
+    let report = json!({"tools":tools,"cluster":nodes,"clusterError":cluster_error,"storage":storage,"lifecycle":lifecycle,"providers":providers,"infisical":infisical,"state":cli.state_path()});
     if json_output {
         print_json(&report)
     } else {
@@ -166,6 +171,10 @@ fn print_doctor_report(report: &Value) {
         println!("  unavailable: {error}");
     } else {
         println!("  unavailable");
+    }
+    println!("Infisical:");
+    for line in crate::infisical::infisical_status_lines(&report["infisical"]) {
+        println!("  {}", line.trim_start_matches("Infisical: "));
     }
     println!("State: {}", report["state"].as_str().unwrap_or("unknown"));
 }

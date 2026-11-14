@@ -15,6 +15,7 @@ import type {
 import { createAgentsFileAuthority } from "./agents-file-authority.ts";
 import { createConnectorAuthority } from "./connector-authority.ts";
 import { createGithubAuthority } from "./github-authority.ts";
+import { createInfisicalAuthority } from "./infisical-authority.ts";
 
 export type SharedProviderCatalog = Record<
   string,
@@ -461,6 +462,11 @@ export async function createProviderAuthAuthority({
     ownerGuard,
     log,
   });
+  const infisical = await createInfisicalAuthority({
+    statePath: join(authDirectory, "infisical.json"),
+    ownerGuard,
+    log,
+  });
   const operations = new Map<string, LoginOperation>();
   const providerRefreshesInFlight = new Map<string, Promise<unknown>>();
   // Providers whose refresh token the token endpoint rejected; shown as
@@ -878,6 +884,7 @@ export async function createProviderAuthAuthority({
         return send(response, 200, { status: "ok" });
       if (await agentsFile.handle(request, response, url)) return;
       if (await github.handle(request, response, url)) return;
+      if (await infisical.handle(request, response, url)) return;
       if (await connectors.handle(request, response, url)) return;
       if (
         request.method === "POST" &&
@@ -1149,6 +1156,7 @@ export async function createProviderAuthAuthority({
         );
       await agentsFile.close();
       await github.close();
+      await infisical.close();
       await connectors.close();
       await credentialStore.close();
     },

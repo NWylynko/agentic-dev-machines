@@ -1881,6 +1881,47 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             Some("synthetic-lifecycle-token"),
         )
         .unwrap();
+        // The installation's Infisical machine identity (TASK-138).
+        let infisical_runtime = request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/infisical/token",
+            None,
+            Some("runtime-token"),
+        )
+        .unwrap();
+        let infisical_operator_token = request_with_token(
+            &url,
+            "GET",
+            "/v1/runtime/infisical/token",
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
+        let infisical_status = request_with_token(
+            &url,
+            "GET",
+            "/v1/infisical/status",
+            None,
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
+        let infisical_login = request_with_token(
+            &url,
+            "POST",
+            "/v1/infisical/login",
+            Some(&json!({"clientId":"client-1","clientSecret":"ua-LIFECYCLE-secret-0001","domain":"https://app.infisical.com"})),
+            Some("synthetic-lifecycle-token"),
+        )
+        .unwrap();
+        let infisical_pod_admin = request_with_token(
+            &url,
+            "POST",
+            "/v1/infisical/logout",
+            Some(&json!({})),
+            Some("runtime-token"),
+        )
+        .unwrap();
         // The cluster repository registry a coding Pod's sidecar reads (TASK-112).
         database
             .execute(
@@ -2000,8 +2041,35 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
             403,
             "the operator credential is not a Pod identity"
         );
-        assert_eq!(received.len(), 12, "{received:#?}");
+        assert_eq!(
+            infisical_runtime.status(),
+            200,
+            "a coding Pod can fetch an Infisical access token: {}",
+            infisical_runtime.text().unwrap()
+        );
+        assert_eq!(
+            infisical_operator_token.status(),
+            403,
+            "the operator credential is not a Pod identity"
+        );
+        assert_eq!(infisical_status.status(), 200);
+        assert_eq!(infisical_login.status(), 200);
+        assert_eq!(
+            infisical_pod_admin.status(),
+            401,
+            "Pods cannot log the cluster out of Infisical"
+        );
+        assert!(
+            !fs::read_to_string(root.path().join("service.log"))
+                .unwrap_or_default()
+                .contains("ua-LIFECYCLE-secret-0001"),
+            "the lifecycle never logs the Infisical client secret"
+        );
+        assert_eq!(received.len(), 15, "{received:#?}");
         assert!(received[11].starts_with("POST /v1/runtime/claude/credentials "));
+        assert!(received[12].starts_with("GET /v1/runtime/infisical/token "));
+        assert!(received[13].starts_with("GET /v1/infisical/status "));
+        assert!(received[14].starts_with("POST /v1/infisical/login "));
         assert!(received[2].starts_with("POST /v1/runtime/connectors/catalog "));
         assert!(received[5].starts_with("POST /v1/connectors/linear/sign-in "));
         assert!(received[6].starts_with("GET /v1/agents-file "));
@@ -3074,12 +3142,13 @@ fn admitted_create_survives_service_crash_and_replay_keeps_immutable_identity() 
         ("GET", "/v1/runtime/repos/token"),
         ("GET", "/v1/runtime/repos/registry"),
         ("POST", "/v1/runtime/repos/rejected"),
+        ("GET", "/v1/runtime/infisical/token"),
     ] {
         let refused = request_with_token(&url, method, path, None, Some(&fresh_bot_token)).unwrap();
         assert_eq!(
             refused.status(),
             403,
-            "bots never receive the cluster GitHub login ({path})"
+            "bots never receive the cluster GitHub or Infisical login ({path})"
         );
     }
     assert_eq!(

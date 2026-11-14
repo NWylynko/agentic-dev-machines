@@ -220,10 +220,10 @@ fn read_selection(count: usize) -> Result<usize> {
     Ok(selected - 1)
 }
 
-struct SecretEcho;
+pub(crate) struct SecretEcho;
 
 impl SecretEcho {
-    fn hide() -> Result<Self> {
+    pub(crate) fn hide() -> Result<Self> {
         set_echo(false)?;
         Ok(Self)
     }

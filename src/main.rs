@@ -4,6 +4,7 @@ mod connectors;
 mod diagnostics;
 mod failover;
 mod herdr;
+mod infisical;
 mod lease;
 mod lifecycle;
 mod provider_auth;
@@ -281,6 +282,11 @@ pub enum Action {
     Repos {
         #[command(subcommand)]
         command: repos::ReposAction,
+    },
+    /// Give every coding workspace's shells a short-lived Infisical token (INFISICAL_TOKEN) from one machine identity.
+    Infisical {
+        #[command(subcommand)]
+        command: infisical::InfisicalAction,
     },
     /// Edit the installation-wide AGENTS.md shared by every coding agent.
     #[command(name = "agents-file")]
@@ -1584,6 +1590,7 @@ fn run(cli: &Cli) -> Result<()> {
         Action::Logout { provider } => provider_auth::logout(cli, provider),
         Action::Mcp { command } => connectors::run(cli, command),
         Action::Repos { command } => repos::run(cli, command),
+        Action::Infisical { command } => infisical::run(cli, command),
         Action::AgentsFile { show } => agents_file::run(cli, *show),
         Action::Herdr { command } => {
             herdr::run(cli, command.as_ref().unwrap_or(&herdr::HerdrAction::Hook))
