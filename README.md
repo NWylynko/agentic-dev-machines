@@ -32,6 +32,7 @@ You need `kubectl` access to a cluster with a [StorageClass](deploy/storage.md) 
 adm setup                 # pick images, storage class, default model and timezone; install the controller
 adm login                 # sign in to a model provider, once for the whole installation
 adm repos login           # connect GitHub so every workspace can clone, push and use gh
+adm infisical login       # optional: every workspace shell gets INFISICAL_TOKEN (dev secrets)
 adm create my-project --repo OWNER/REPO
 ```
 

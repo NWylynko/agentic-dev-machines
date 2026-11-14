@@ -272,6 +272,31 @@ Every coding workspace gets the login without per-workspace setup: the Pod's `gi
 
 A missing login fails git, `gh` and the sidecar with `run adm repos login github`; a token GitHub rejects (revoked) is reported by the Pod's Git helper with the same instruction. Both leave `github_token_unavailable` / `github_token_rejected` lines in `adm system-log --service provider-auth`, alongside `github_login_started`, `github_login_succeeded`, `github_login_failed` and `github_logout`. The token is never logged.
 
+## Infisical login
+
+```bash
+adm infisical login --client-id 4f1c2a9e-...   # client secret from a hidden prompt (or stdin)
+# ✓ Infisical connected as machine identity 4f1c2a9e-... at https://app.infisical.com: ...
+adm infisical status
+# Infisical: connected as machine identity 4f1c2a9e-... at https://app.infisical.com
+# last token minted 2026-11-14T22:00:00.000Z, valid until 2026-11-15T00:00:00.000Z
+adm infisical logout
+```
+
+One Infisical [Universal Auth machine identity](https://infisical.com/docs/documentation/platform/identities/universal-auth) serves the whole installation: every new shell (zsh or bash, interactive or not, including Claude Code's and Pi's bash tools) in every coding workspace, including ones a bot creates, starts with a short-lived access token for it in `INFISICAL_TOKEN`. So `infisical run --projectId … --env=dev -- …` works with no per-workspace login, including a project's own npm `@infisical/cli` under `pnpm` (which a PATH wrapper could not reach). `--domain URL` points at a self-hosted Infisical; the default is `https://app.infisical.com`.
+
+Set the identity up for development secrets only, because every coding workspace (and so every agent) can read whatever it can read:
+
+1. In Infisical, Organization → Access Control → Identities → Create identity, with Universal Auth. Create a client secret and copy the client ID and secret.
+2. In each project whose dev secrets agents should see, create a custom project role that can only read secrets in the `dev` environment, and add the identity to the project with that role. Never give it `staging`/`prod` access or an admin role.
+3. Run `adm infisical login`. The authority checks the pair with one real login and refuses (storing nothing) if Infisical rejects it.
+
+With a machine token the Infisical CLI does not read the project from `.infisical.json`: scripts must pass `--projectId` (or set `INFISICAL_PROJECT_ID`).
+
+How it works: the pair is kept in `infisical.json` (0600) beside `github.json` on the lifecycle volume. `/etc/zsh/zshenv`, `/etc/bash.bashrc` and `BASH_ENV` in `adm-code` source `/usr/local/share/adm/infisical-env.sh`, which runs `adm-infisical-token`; that asks `GET /v1/runtime/infisical/token` with the Pod's projected identity. Bots are refused (403). The authority caches the access token and logs in to Infisical again only when a request finds less than 10 minutes left on it. An `INFISICAL_TOKEN` you set yourself (or from a `--credential-env` Secret) wins; the hook replaces only a token it exported itself (`ADM_INFISICAL_TOKEN_FROM_ADM=1`). Shells that are already open keep their token until it expires (the Universal Auth access token TTL, 2 h by default); open a new shell to get a fresh one.
+
+Without a login, shells say nothing and get no `INFISICAL_TOKEN`. If Infisical refuses the stored pair (secret revoked or expired), each new shell prints one `adm-infisical-token: Infisical refused machine identity … run adm infisical login` line and still starts; `adm infisical status` and `adm doctor` show `login expired`. Logs in `adm system-log --service provider-auth`: `infisical_login_succeeded`, `infisical_login_refused`, `infisical_token_minted`, `infisical_token_login_expired`, `infisical_token_mint_failed`, `infisical_logout`. The client secret and access tokens are never logged or shown.
+
 ## Shared agents file
 
 `adm agents-file` edits one installation-wide instruction document for every coding agent, the same kind of "how to work" text as a personal `AGENTS.md`. Repository `AGENTS.md` files stay in the project and are not overwritten. Bot agents do not receive the shared document.
