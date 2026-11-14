@@ -134,10 +134,16 @@ COPY --from=docker.io/library/docker:29.9.3-cli@sha256:2357639ad1ea7d0194134bf32
 COPY image/adm-claude /usr/local/bin/adm-claude
 COPY image/adm-claude-mcp /usr/local/bin/adm-claude-mcp
 COPY image/adm-claude-credentials /usr/local/bin/adm-claude-credentials
+# Every new zsh and bash exports a fresh INFISICAL_TOKEN from `adm infisical login` (TASK-138).
+COPY image/adm-infisical-token /usr/local/bin/adm-infisical-token
+COPY image/adm-infisical-env.sh /usr/local/share/adm/infisical-env.sh
 RUN chown root:root /usr/local/bin/artifact-fs \
- && chmod 0755 /usr/local/bin/artifact-fs /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/adm-git-identity /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials \
+ && chmod 0755 /usr/local/bin/artifact-fs /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/adm-git-identity /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials /usr/local/bin/adm-infisical-token \
+ && chmod 0644 /usr/local/share/adm/infisical-env.sh \
+ && printf '\n# ADM: INFISICAL_TOKEN from the cluster login (TASK-138).\n. /usr/local/share/adm/infisical-env.sh\n' | tee -a /etc/zsh/zshenv >> /etc/bash.bashrc \
  && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential' \
  && git config --system include.path /workspace/.adm/gitconfig
+ENV BASH_ENV=/usr/local/share/adm/infisical-env.sh
 
 FROM adm-workspace AS adm-bot
 

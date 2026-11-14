@@ -110,6 +110,10 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
         response.setHeader("content-type", "application/json");
         if (request.url === "/v1/runtime/claude/credentials")
           return response.end(JSON.stringify({ accessToken: "smoke-access", expiresAt: Date.now() + 3600000, scopes: ["user:inference", "user:sessions:claude_code"], subscriptionType: "max", oauthAccount: { accountUuid: "smoke-account", organizationUuid: "smoke-organization" } }));
+        if (request.url === "/v1/runtime/infisical/token") {
+          response.statusCode = 409;
+          return response.end(JSON.stringify({ error: { code: "INFISICAL_NOT_CONFIGURED", message: "not logged in" } }));
+        }
         response.end("[]");
       }).listen(7433, "127.0.0.1");
     `);
@@ -185,6 +189,31 @@ const smokeShellSessionTool = async () => {
   if (stdout.trim() !== "No live shell sessions.") throw new Error(`adm-shell-session list printed ${JSON.stringify(stdout)}`);
 };
 
+// The installed hook (TASK-138): the image's own zshenv, bash.bashrc and BASH_ENV give every new
+// shell a fresh INFISICAL_TOKEN from a stand-in lifecycle, and stay silent when not logged in.
+const smokeInfisicalTokenInEveryShell = async () => {
+  const lifecycle = `require("node:http").createServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (process.env.SMOKE_INFISICAL === "off") { response.statusCode = 409; return response.end(JSON.stringify({ error: { code: "INFISICAL_NOT_CONFIGURED", message: "off" } })); }
+    response.end(JSON.stringify({ token: "smoke-infisical-" + String(request.headers.authorization).slice(7), expiresAt: "2099-01-01T00:00:00Z" }));
+  }).listen(7433, "127.0.0.1")`;
+  const script = (mode) => [
+    `(SMOKE_INFISICAL=${mode} node -e '${lifecycle}' &)`,
+    "echo identity > /tmp/identity",
+    "export ADM_LIFECYCLE_URL=http://127.0.0.1:7433 ADM_LIFECYCLE_TOKEN_FILE=/tmp/identity",
+    "i=0; until node -e 'fetch(\"http://127.0.0.1:7433\").catch(() => process.exit(1))'; do i=$((i+1)); [ $i -lt 100 ] || exit 1; sleep 0.1; done",
+    "zsh -c 'echo zsh=$INFISICAL_TOKEN'",
+    "zsh -i -c 'echo zsh-i=$INFISICAL_TOKEN'",
+    "bash -c 'echo bash=$INFISICAL_TOKEN'",
+    "bash -i -c 'echo bash-i=$INFISICAL_TOKEN' 2>/dev/null",
+  ].join("\n");
+  const on = await execute("docker", ["run", "--rm", "--user", "1000:1000", "-e", "HOME=/tmp", "--entrypoint", "/bin/sh", image, "-ec", script("on")]);
+  const expected = ["zsh", "zsh-i", "bash", "bash-i"].map((shell) => `${shell}=smoke-infisical-identity`).join("\n");
+  if (on.stdout.trim() !== expected || on.stderr !== "") throw new Error(`shells saw ${JSON.stringify(on.stdout)} (stderr ${JSON.stringify(on.stderr)}), expected ${JSON.stringify(expected)}`);
+  const off = await execute("docker", ["run", "--rm", "--user", "1000:1000", "-e", "HOME=/tmp", "--entrypoint", "/bin/sh", image, "-ec", script("off")]);
+  if (off.stdout.trim() !== "zsh=\nzsh-i=\nbash=\nbash-i=" || off.stderr !== "") throw new Error(`not logged in, shells printed ${JSON.stringify(off)}`);
+};
+
 // The bundled Playwright MCP, as the runner starts it (packages/runner/src/browser.ts): over stdio as
 // UID 1000 with the Pod's dropped capabilities, driving system chromium to a data: page.
 const smokeBrowserMcp = async () => {
@@ -238,6 +267,7 @@ if (role === "adm-dev") {
   await run(["curl", "make", "gcc", "g++", "python3", "pkg-config", "ssh", "unzip", "xz", "bzip2", "file", "patch", "gpg"].map((command) => `command -v ${command} >/dev/null`).join(" && "));
   await smokeWorkspaceShellLocaleAndSudo();
   await smokeShellSessionTool();
+  await smokeInfisicalTokenInEveryShell();
   await smokeClaudeCodeRunsAsTheWorkspaceUser();
   await smokeClaudeSessionSurvivesDetachAndRestart();
   await smokeBrowserMcp();

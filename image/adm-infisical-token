@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+// Fetch a short-lived Infisical access token for this Pod from the lifecycle
+// controller (TASK-138), for the shell hook `adm-infisical-env.sh`. Prints the
+// token on stdout and exits 0. Exits 3 silently when the installation has no
+// Infisical login (or this is not a workspace Pod), so shells stay quiet. Any
+// other failure prints one line naming the cause and the fix, and exits 1.
+// The Pod identity is the projected ServiceAccount token; nothing is cached.
+(async () => {
+  const fs = process.getBuiltinModule("node:fs");
+  const base = process.env.ADM_LIFECYCLE_URL;
+  const tokenFile =
+    process.env.ADM_LIFECYCLE_TOKEN_FILE ||
+    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+  const fail = (message) => {
+    process.stderr.write(`adm-infisical-token: ${message}\n`);
+    process.exit(1);
+  };
+  if (!base) process.exit(3);
+  let identity;
+  try {
+    identity = fs.readFileSync(tokenFile, "utf8").trim();
+  } catch (error) {
+    fail(`cannot read the Pod identity token (${error.code ?? error.message}); INFISICAL_TOKEN is not set`);
+  }
+  let response;
+  try {
+    // Every new shell waits on this, so a hung controller must not hang shells for long.
+    response = await fetch(`${base.replace(/\/$/, "")}/v1/runtime/infisical/token`, {
+      headers: { authorization: `Bearer ${identity}` },
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch (error) {
+    fail(`cannot reach the lifecycle controller (${error.message}); INFISICAL_TOKEN is not set`);
+  }
+  const value = await response.json().catch(() => ({}));
+  if (value.error?.code === "INFISICAL_NOT_CONFIGURED") process.exit(3);
+  if (!response.ok)
+    fail(`${value.error?.message ?? `the lifecycle controller answered ${response.status}`}; INFISICAL_TOKEN is not set`);
+  if (typeof value.token !== "string" || !value.token)
+    fail("the lifecycle controller returned no Infisical token; run adm infisical login");
+  process.stdout.write(`${value.token}\n`);
+})();
