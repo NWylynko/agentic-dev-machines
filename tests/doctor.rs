@@ -218,7 +218,7 @@ else: sys.exit(2)
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..6 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
                 let received = stream.read(&mut request).unwrap();
@@ -226,6 +226,11 @@ else: sys.exit(2)
                 let headers = String::from_utf8_lossy(&request[..received]);
                 if headers.starts_with("GET /v1/provider-auth/providers ") {
                     let body = "[]";
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    continue;
+                }
+                if headers.starts_with("GET /v1/infisical/status ") {
+                    let body = r#"{"infisical":{"status":"not_configured"}}"#;
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     continue;
                 }
@@ -340,6 +345,7 @@ else: sys.exit(2)
             "Cluster:",
             "Storage:",
             "Lifecycle service:",
+            "Infisical:",
             "State:",
         ] {
             assert!(human.contains(label), "missing {label:?}: {human}");
