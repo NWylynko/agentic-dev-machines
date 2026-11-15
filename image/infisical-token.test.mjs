@@ -80,7 +80,12 @@ async function setup(t) {
   await writeFile(tokenFile, "pod-identity\n");
   const zdotdir = join(root, "zdotdir");
   await mkdir(zdotdir);
-  await writeFile(join(zdotdir, ".zshenv"), `. ${hook}\n`);
+  // GLOBAL_RCS off: interactive zsh would otherwise read the host's
+  // /etc/zsh/zshrc, which on Ubuntu runs compinit. On the CI runner compinit
+  // finds an insecure fpath directory and, with no terminal, prints
+  // "compinit: initialization aborted" to stderr, so the test was checking the
+  // host's zsh config instead of the hook.
+  await writeFile(join(zdotdir, ".zshenv"), `unsetopt GLOBAL_RCS\n. ${hook}\n`);
   t.after(async () => {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
