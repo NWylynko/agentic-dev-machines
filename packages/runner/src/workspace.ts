@@ -72,6 +72,7 @@ import { BotProfileDocument, botExtension } from "./bot.ts";
 import type { BotAgentManagement } from "./bot-management.ts";
 import { WorkspaceBrowser } from "./browser.ts";
 import { ignoredFilesExtension } from "./ignored-files.ts";
+import { managerMessageExtension } from "./manager-messages.ts";
 import { WorkspaceConnectors, type ConnectorLifecycle } from "./connectors.ts";
 import {
   applyGoal,
@@ -465,6 +466,15 @@ export class Workspace {
         );
         browser.open();
         if (config.repositories) registry.install(ignoredFilesExtension);
+      }
+      if (config.role === "coding" && config.manager && !passive) {
+        if (!connectorLifecycle)
+          throw new Error(
+            `Coding workspace ${config.id} has manager ${config.manager} but no lifecycle to deliver messageManager through`,
+          );
+        registry.install(
+          managerMessageExtension(config, connectorLifecycle, assertActive),
+        );
       }
       if (config.role === "bot") {
         sandbox = new CodemodeSandbox({ memoryLimitBytes: 64 * 1024 * 1024 });

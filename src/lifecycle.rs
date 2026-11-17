@@ -103,6 +103,10 @@ pub struct CreateIntent {
     pub credential_env: Vec<crate::workspaces::CredentialEnvRef>,
     #[serde(default)]
     pub herdr_space: Option<String>,
+    /// The managing bot. Operators may name it; admission stores its immutable
+    /// ID (`resolve_create_manager`), and a bot's createAgent always names itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
 }
 
 fn default_cwd() -> String {
@@ -133,11 +137,16 @@ impl CreateIntent {
             timezone: workspace.timezone.clone(),
             credential_env: workspace.credential_env.clone(),
             herdr_space: workspace.herdr_space.clone(),
+            manager: workspace.manager.clone(),
         }
     }
 
     pub(crate) fn allocate(self, operation_id: &str) -> Result<Workspace> {
         crate::workspaces::validate_name(&self.name)?;
+        ensure!(
+            self.role == "coding" || self.manager.is_none(),
+            "only coding workspaces have a manager bot"
+        );
         ensure!(
             self.role == "coding" || self.role == "bot",
             "role must be coding or bot"
@@ -270,6 +279,7 @@ impl CreateIntent {
             timezone: self.timezone,
             credential_env: self.credential_env,
             herdr_space: self.herdr_space,
+            manager: self.manager,
             created_at: crate::workspaces::now(),
             last_error: None,
         })
@@ -728,6 +738,7 @@ fn runtime_http_error_status(error: &anyhow::Error, message: &str) -> (u16, &'st
     } else if message.contains("deleting")
         || message.contains("lease expired")
         || message.contains("lease is not held")
+        || (message.contains("manager bot") && message.contains("is not running"))
     {
         (410, "WORKSPACE_UNAVAILABLE")
     } else {
@@ -753,6 +764,7 @@ fn is_runtime_auth_route(method: &str, path: &str) -> bool {
         || (method == "GET" && path == "/v1/runtime/repos/registry")
         || (method == "POST" && path == "/v1/runtime/repos/rejected")
         || (method == "POST" && path.starts_with("/v1/runtime/repos/opened/"))
+        || crate::manager_messages::is_agent_message_route(method, path)
         || (method == "POST"
             && path
                 .strip_prefix("/v1/workspaces/")
@@ -991,6 +1003,11 @@ fn route(
     if let Some(result) = crate::repo_registry::operator_route(&mut store, method, path, body) {
         return result;
     }
+    if crate::manager_messages::is_agent_message_route(method, path) {
+        cli.check_lifecycle_fence()?;
+        drop(store);
+        return crate::manager_messages::deliver_agent_message(cli, path, body, authorization);
+    }
     if method == "GET" && path == "/v1/runtime/repos/registry" {
         let caller = authorize_runtime_caller(cli, &store, authorization)?;
         ensure!(
@@ -1147,6 +1164,8 @@ fn route(
         let mut value: Value = serde_json::from_slice(body)?;
         if value["kind"] == "create" {
             crate::client_release::apply_release_images_to_bot_create(&mut value["spec"])?;
+            // The creating bot manages the agent (TASK-140), whatever the spec says.
+            value["spec"]["manager"] = Value::String(caller.id.clone());
         }
         let request = request_from_json(&value)?;
         match &request {
@@ -1193,7 +1212,8 @@ fn route(
     }
     if method == "POST" && path == "/v1/operations" {
         cli.check_lifecycle_fence()?;
-        let value: Value = serde_json::from_slice(body)?;
+        let mut value: Value = serde_json::from_slice(body)?;
+        crate::manager_messages::resolve_create_manager(&store, &mut value)?;
         let request = request_from_json(&value)?;
         let operation_id = request.operation_id().to_owned();
         let receipt = admit(&mut store, &request)?;
@@ -1255,6 +1275,17 @@ fn route(
         cli.check_lifecycle_fence()?;
         if method == "POST" && endpoint == "authorize" {
             let request: RuntimeAuthorizeRequest = serde_json::from_slice(body)?;
+            if let Some(delivery) = crate::manager_messages::authorize_agent_message_delivery(
+                authorization,
+                id,
+                &request.action,
+            ) {
+                return Ok((200, delivery?));
+            }
+            ensure!(
+                request.action != "message",
+                "runtime caller is not authorized for workspace {id}: agent messages arrive only through the lifecycle"
+            );
             authorize_workspace_action(cli, &store, id, &request.action, authorization)?;
             return Ok((200, serde_json::json!({"allowed":true})));
         }

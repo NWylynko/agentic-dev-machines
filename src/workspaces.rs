@@ -109,6 +109,11 @@ pub struct Workspace {
     #[serde(default)]
     pub credential_env: Vec<CredentialEnvRef>,
     pub herdr_space: Option<String>,
+    /// The bot workspace (immutable ID) this coding workspace reports to with
+    /// `messageManager` (TASK-140); set by the bot's createAgent or
+    /// `adm create --manager BOT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
     pub created_at: u64,
     pub last_error: Option<String>,
 }
@@ -237,6 +242,9 @@ pub struct CreateOptions {
     pub allow_node_local_storage: bool,
     #[arg(long, conflicts_with = "herdr")]
     pub herdr_space: Option<String>,
+    /// Bot (name or ID) this coding agent reports to; gives the agent the messageManager tool.
+    #[arg(long, value_name = "BOT")]
+    pub manager: Option<String>,
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -443,6 +451,7 @@ impl CreateOptions {
             timezone: self.timezone.clone(),
             credential_env,
             herdr_space: self.herdr_space.clone(),
+            manager: self.manager.clone(),
             created_at: now(),
             last_error: None,
         })
@@ -1599,6 +1608,9 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
     if w.role == "coding" {
         workspace_config["localRoot"] = json!("/workspace");
         workspace_config["cwd"] = json!(w.cwd);
+        if let Some(manager) = &w.manager {
+            workspace_config["manager"] = json!(manager);
+        }
     }
     let runtime_config = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"workspace-runtime"),"data":{"workspace.json":serde_json::to_string(&workspace_config)?}});
     let service = json!({"apiVersion":"v1","kind":"Service","metadata":metadata(w,"workspace"),"spec":{"selector":labels,"ports":[{"name":"http","port":7432,"targetPort":7432}]}});
@@ -2400,6 +2412,7 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.model == requested.model
         && existing.credential_env == requested.credential_env
         && existing.herdr_space == requested.herdr_space
+        && existing.manager == requested.manager
 }
 
 pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {

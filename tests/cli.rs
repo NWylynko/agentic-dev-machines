@@ -2561,6 +2561,75 @@ fn workspace_lifecycle_retains_tombstones_and_reused_names_get_new_identities() 
 }
 
 #[test]
+fn create_manager_records_the_bot_immutable_id_and_refuses_anything_but_a_live_bot() {
+    let root = fixture();
+    let bot = assert_ok(adm(root.path(), &["create", "boss", "--role", "bot"]));
+    let worker = assert_ok(adm(
+        root.path(),
+        &["create", "worker", "--no-repositories", "--manager", "boss"],
+    ));
+    assert_eq!(worker["manager"], bot["id"], "{worker}");
+    assert_eq!(
+        assert_ok(adm(root.path(), &["status", "worker", "--json"]))["workspace"]["manager"],
+        bot["id"]
+    );
+    let status = adm(root.path(), &["status", "worker"]);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.contains(&format!("Manager: {}", bot["id"].as_str().unwrap())),
+        "{status}"
+    );
+    let by_id = assert_ok(adm(
+        root.path(),
+        &[
+            "create",
+            "worker-two",
+            "--no-repositories",
+            "--manager",
+            bot["id"].as_str().unwrap(),
+        ],
+    ));
+    assert_eq!(by_id["manager"], bot["id"]);
+    let unmanaged = assert_ok(adm(root.path(), &["create", "solo", "--no-repositories"]));
+    assert!(unmanaged.get("manager").is_none(), "{unmanaged}");
+
+    for (manager, expected) in [
+        ("nobody", "workspace not found: nobody"),
+        ("worker", "worker is a coding workspace"),
+    ] {
+        let refused = adm(
+            root.path(),
+            &[
+                "create",
+                "refused",
+                "--no-repositories",
+                "--manager",
+                manager,
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+    let bot_managed = adm(
+        root.path(),
+        &["create", "sub-bot", "--role", "bot", "--manager", "boss"],
+    );
+    assert!(!bot_managed.status.success());
+    assert_eq!(
+        assert_ok(adm(root.path(), &["destroy", "boss", "--wait"]))["phase"],
+        "deleted"
+    );
+    let destroyed = adm(
+        root.path(),
+        &["create", "late", "--no-repositories", "--manager", "boss"],
+    );
+    let stderr = String::from_utf8_lossy(&destroyed.stderr);
+    assert!(!destroyed.status.success(), "{stderr}");
+    assert!(stderr.contains("boss has been deleted"), "{stderr}");
+}
+
+#[test]
 fn list_and_status_render_the_same_core_workspace_observation() {
     let root = fixture();
     let workspace = assert_ok(adm(root.path(), &["create", "demo", "--no-repositories"]));

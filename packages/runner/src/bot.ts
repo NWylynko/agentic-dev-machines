@@ -7,6 +7,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { randomUUID } from "node:crypto";
 import type { BotAgentManagement } from "./bot-management.ts";
+import { agentMessagesBotNote } from "./manager-messages.ts";
 import { admDocCheckpointWhen, type WorkspaceConfig } from "./types.ts";
 
 const MessageReceipts = defineDoc<{ receipts: Record<string, number> }>({
@@ -57,8 +58,8 @@ export function botExtension(
           );
           if (!profile) return undefined;
           if (profile.state !== "ready")
-            return "You are a bot being set up. Ask the user for your identity and purpose. Publish setup questions and confirmations only by calling sendMessage. Save a confirmed identity and purpose with saveProfile before acting on them.";
-          return `You are ${profile.identity}. Your purpose is: ${profile.purpose}\nPublish user-facing messages only with sendMessage.`;
+            return `You are a bot being set up. Ask the user for your identity and purpose. Publish setup questions and confirmations only by calling sendMessage. Save a confirmed identity and purpose with saveProfile before acting on them.\n${agentMessagesBotNote}`;
+          return `You are ${profile.identity}. Your purpose is: ${profile.purpose}\nPublish user-facing messages only with sendMessage.\n${agentMessagesBotNote}`;
         },
       },
     ],

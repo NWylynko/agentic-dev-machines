@@ -31,6 +31,10 @@ import {
 } from "./lifecycle-availability.ts";
 import { botAgentManagementFromEnvironment } from "./bot-management.ts";
 import { connectorLifecycleFromEnvironment } from "./connectors.ts";
+import {
+  agentMessageInput,
+  type AgentMessageAuthorization,
+} from "./manager-messages.ts";
 import { ApiError, workspaceIdPattern, type WorkspaceConfig } from "./types.ts";
 import {
   attachEntriesPage,
@@ -412,6 +416,7 @@ function runtimeAction(method: string, pathname: string): string {
   if (endpoint && /^(resources|trust|extensions|tools)(\/|$)/.test(endpoint))
     return "resources";
   if (endpoint === "bash" || endpoint?.startsWith("bash/")) return "bash";
+  if (endpoint === "agent-messages") return "message";
   if (method === "GET") return "read";
   if (method === "DELETE") return "delete";
   if (method === "PUT" && endpoint === "model") return "model";
@@ -481,7 +486,8 @@ async function authorizeRuntimeRequest(
         }
         throw failure;
       }
-      return;
+      // An agent message's authorization names the speaking agent (TASK-140).
+      return (await response.json()) as AgentMessageAuthorization;
     }
   }
   if (!tokenFile) return;
@@ -717,6 +723,17 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
       400,
       "BOT_ENVIRONMENT_FORBIDDEN",
       "Bots cannot have coding filesystems or runtime namespaces",
+    );
+  if (
+    config.manager !== undefined &&
+    (config.role !== "coding" ||
+      typeof config.manager !== "string" ||
+      !workspaceIdPattern.test(config.manager))
+  )
+    throw new ApiError(
+      400,
+      "INVALID_MANAGER",
+      "manager must be a bot's immutable workspace ID on a coding workspace",
     );
   if (Object.hasOwn(config, "mcpServers"))
     throw new ApiError(
@@ -1226,7 +1243,11 @@ const server = createServer(async (request, response) => {
         throw new ApiError(404, "WORKSPACE_NOT_FOUND", "Unknown workspace");
       return json(response, 200, await runtimeStatusReport(workspace));
     }
-    await authorizeRuntimeRequest(request, url.pathname, requestSignal);
+    const authorization = await authorizeRuntimeRequest(
+      request,
+      url.pathname,
+      requestSignal,
+    );
     if (url.pathname === "/v1/workspaces" && request.method === "GET")
       return json(response, 200, {
         workspaces: await Promise.all(
@@ -1238,7 +1259,7 @@ const server = createServer(async (request, response) => {
         ),
       });
     const match =
-      /^\/v1\/workspaces\/([^/]+)(?:\/(input|abort|events|entries|history|goals|loops|resume|retry|kubernetes-connection|model|models|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|tools|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
+      /^\/v1\/workspaces\/([^/]+)(?:\/(input|agent-messages|abort|events|entries|history|goals|loops|resume|retry|kubernetes-connection|model|models|branches|branch|tree|new|import|compact|reset|settings|queue\/clear|queue|tools|resources\/reload|resources|trust|extensions(?:\/.*)?|bash(?:\/[^/]+(?:\/events|\/abort)?)?))?$/.exec(
         url.pathname,
       );
     if (!match) throw new ApiError(404, "NOT_FOUND", "Unknown endpoint");
@@ -1257,6 +1278,27 @@ const server = createServer(async (request, response) => {
       /^extensions\/commands\/([^/]+)\/(events|ui|cancel)$/.exec(action ?? "");
     if (!workspaceIdPattern.test(id))
       throw new ApiError(400, "INVALID_ID", "Invalid immutable workspace ID");
+    // A managed coding agent's message to this bot (TASK-140): a follow-up
+    // turn after the current one, never a steer.
+    if (action === "agent-messages" && request.method === "POST") {
+      const data = await body(request);
+      const workspace = workspaces.get(id);
+      if (!workspace || workspace.config.role !== "bot")
+        throw new ApiError(
+          404,
+          "WORKSPACE_NOT_FOUND",
+          "Agent messages go to a bot workspace on this runner",
+        );
+      const { content, requestId } = agentMessageInput(authorization, data);
+      return await serialized(async () => {
+        await assertActive(id, requestSignal);
+        return json(
+          response,
+          202,
+          await workspace.input(content, requestId, "followUp"),
+        );
+      });
+    }
     if (action === "bash" && request.method === "POST") {
       const data = await body(request);
       if (

@@ -7,6 +7,7 @@ mod herdr;
 mod infisical;
 mod lease;
 mod lifecycle;
+mod manager_messages;
 mod provider_auth;
 mod registry_pull;
 mod repo_registry;
@@ -902,6 +903,9 @@ fn pod_summary(status: &Value) -> (String, String) {
 fn print_status(status: &Value) {
     let row = workspace_summary(&status["workspace"], &status["activity"]);
     print_workspace_summaries(&[row]);
+    if let Some(manager) = status["workspace"]["manager"].as_str() {
+        println!("Manager: {manager} (bot; the agent reports to it with messageManager)");
+    }
     print_summary_errors(status);
     if let Some(error) = status["cluster"]["error"].as_str() {
         println!("Cluster details unavailable: {error}");
@@ -1015,6 +1019,7 @@ fn print_inspect(status: &Value) -> Result<()> {
         ("Repositories", "repositories"),
         ("Model", "model"),
         ("Herdr space", "herdr_space"),
+        ("Manager", "manager"),
         ("Created at", "created_at"),
         ("Last error", "last_error"),
     ] {

@@ -13,6 +13,8 @@ export type WorkspaceConfig = {
   model?: { provider: string; id: string };
   /** /repos shows the registered repositories (set by the lifecycle). */
   repositories?: boolean;
+  /** The bot (immutable ID) this coding agent reports to with messageManager. */
+  manager?: string;
   /** Runner-managed flag persisted only for newly registered bot conversations. */
   onboardingRequired?: boolean;
 };

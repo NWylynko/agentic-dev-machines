@@ -2,6 +2,7 @@
 // The suites are split so node --test runs them in parallel.
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdir, mkdtemp, watch, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -107,7 +108,7 @@ async function startRunner(
 async function startPodRunner(
   root,
   lifecycle,
-  { id, name, role, host, podUid, port = 7432 },
+  { id, name, role, host, podUid, port = 7432, manager },
 ) {
   const workspace = {
     id,
@@ -115,6 +116,8 @@ async function startPodRunner(
     role,
     phase: "ready",
     namespace: `fixture-${id}`,
+    ...(manager ? { manager } : {}),
+    runtimePort: port,
     runtime_status: {
       podIP: host,
       ready: true,
@@ -132,6 +135,7 @@ async function startPodRunner(
       role,
       environment: "pod",
       ...(role === "coding" ? { localRoot: join(root, id, "repos") } : {}),
+      ...(manager ? { manager } : {}),
       model: { provider: "faux", id: "faux-1" },
     }),
     { mode: 0o600 },
@@ -161,6 +165,7 @@ async function startBotLifecycle(
   const tokenFile = join(directory, "projected-token");
   await writeFile(tokenFile, "fixture-runtime-token\n", { mode: 0o600 });
   const authorizations = [];
+  const agentMessages = [];
   const operations = new Map();
   const tokens = new Map([["fixture-runtime-token", "fixture-source"]]);
   const providerCatalogRequests = [];
@@ -173,11 +178,34 @@ async function startBotLifecycle(
   const directoryAbort = new Promise((resolve) => {
     signalDirectoryAbort = resolve;
   });
+  // One-delivery bearers the lifecycle hands a manager bot with an agent's
+  // message (TASK-140), like src/lifecycle.rs.
+  const agentMessageDeliveries = new Map();
   const server = createServer(async (request, response) => {
     const headers = { "content-type": "application/json" };
-    const sourceId = tokens.get(
-      request.headers.authorization?.replace(/^Bearer /, ""),
-    );
+    const bearer = request.headers.authorization?.replace(/^Bearer /, "");
+    const delivery = agentMessageDeliveries.get(bearer);
+    if (delivery) {
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      const allowed =
+        request.method === "POST" &&
+        request.url ===
+          `/v1/workspaces/${encodeURIComponent(delivery.managerId)}/runtime/authorize` &&
+        JSON.parse(body || "{}").action === "message";
+      agentMessageDeliveries.delete(bearer);
+      response
+        .writeHead(allowed ? 200 : 403, headers)
+        .end(
+          JSON.stringify(
+            allowed
+              ? { allowed: true, agent: delivery.agent }
+              : { error: { message: "not authorized" } },
+          ),
+        );
+      return;
+    }
+    const sourceId = tokens.get(bearer);
     if (!sourceId) {
       response
         .writeHead(403, headers)
@@ -215,6 +243,67 @@ async function startBotLifecycle(
             ),
           ),
         );
+      return;
+    }
+    const managerMessage = /^\/v1\/workspaces\/([^/]+)\/runtime\/message$/.exec(
+      request.url ?? "",
+    );
+    if (request.method === "POST" && managerMessage) {
+      const managerId = decodeURIComponent(managerMessage[1]);
+      const agent = workspaces.find((workspace) => workspace.id === sourceId);
+      const manager = workspaces.find(
+        (workspace) => workspace.id === managerId,
+      );
+      agentMessages.push({ managerId, sourceId, ...value });
+      if (agent?.role !== "coding" || agent.manager !== managerId) {
+        response
+          .writeHead(403, headers)
+          .end(JSON.stringify({ error: { message: "not authorized" } }));
+        return;
+      }
+      if (
+        manager?.role !== "bot" ||
+        ["deleting", "deleted"].includes(manager.phase)
+      ) {
+        response
+          .writeHead(410, headers)
+          .end(JSON.stringify({ error: { message: "manager is deleting" } }));
+        return;
+      }
+      const deliveryBearer = `agent-message-delivery-${randomUUID()}`;
+      agentMessageDeliveries.set(deliveryBearer, {
+        managerId,
+        agent: { id: agent.id, name: agent.name },
+      });
+      try {
+        const forwarded = await fetch(
+          `http://${manager.runtime_status.podIP}:${manager.runtimePort}/v1/workspaces/${encodeURIComponent(managerId)}/agent-messages`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${deliveryBearer}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              text: value.text,
+              requestId: value.requestId,
+            }),
+          },
+        );
+        response
+          .writeHead(forwarded.status, headers)
+          .end(await forwarded.text());
+      } catch (error) {
+        response.writeHead(410, headers).end(
+          JSON.stringify({
+            error: {
+              message: `manager bot ${manager.name} (${managerId}) is not running: ${error.cause?.code ?? error.message}`,
+            },
+          }),
+        );
+      } finally {
+        agentMessageDeliveries.delete(deliveryBearer);
+      }
       return;
     }
     const runtime =
@@ -355,6 +444,7 @@ async function startBotLifecycle(
       });
     },
     authorizations,
+    agentMessages,
     operations,
     providerCatalogRequests,
     directoryRequest,

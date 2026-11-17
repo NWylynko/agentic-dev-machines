@@ -5763,3 +5763,341 @@ fn workspaces_pull_private_ghcr_images_with_the_cluster_github_login() {
     stop_http_stub(runner_port, runner);
     stop_http_stub(authority_port, authority);
 }
+
+/// A bot runner stand-in on the runtime port (TASK-140): it answers each agent
+/// message as the real runner does, by asking the lifecycle to authorize the
+/// delivery with the bearer it was handed, and records that bearer in
+/// `root/agent-message-bearer` so the test can try to reuse it.
+fn start_agent_message_bot_stub(root: &Path, lifecycle: String) -> (u16, thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let root = root.to_owned();
+    let server = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(end + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+            let header = |name: &str| {
+                headers.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_owned())
+                })
+            };
+            let content_length = header("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first_line = headers.lines().next().unwrap_or("").to_owned();
+            if first_line.starts_with("GET /shutdown ") {
+                break;
+            }
+            let (status, body) = if let Some(path) = first_line
+                .strip_prefix("POST ")
+                .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+                .filter(|path| path.ends_with("/agent-messages"))
+            {
+                let workspace = path
+                    .strip_prefix("/v1/workspaces/")
+                    .and_then(|rest| rest.strip_suffix("/agent-messages"))
+                    .unwrap()
+                    .to_owned();
+                let bearer = header("authorization")
+                    .and_then(|value| value.strip_prefix("Bearer ").map(str::to_owned))
+                    .unwrap_or_default();
+                fs::write(root.join("agent-message-bearer"), &bearer).unwrap();
+                let authorized = request_with_token(
+                    &lifecycle,
+                    "POST",
+                    &format!("/v1/workspaces/{workspace}/runtime/authorize"),
+                    Some(&json!({"action":"message"})),
+                    Some(&bearer),
+                )
+                .unwrap();
+                let authorized_status = authorized.status().as_u16();
+                let authorized: Value = authorized.json().unwrap();
+                let message: Value = serde_json::from_slice(&request[header_end..]).unwrap();
+                if authorized_status == 200 {
+                    (
+                        "202 Accepted",
+                        json!({"status":"admitted","workspace":workspace,"authorized":authorized,"message":message}),
+                    )
+                } else {
+                    ("403 Forbidden", authorized)
+                }
+            } else {
+                (
+                    "404 Not Found",
+                    json!({"error":{"code":"NOT_FOUND","message":first_line}}),
+                )
+            };
+            let body = body.to_string();
+            write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    (port, server)
+}
+
+#[test]
+fn a_coding_agent_messages_only_the_bot_that_manages_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("storage-release"), "go").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    // Every workspace Pod answers on 127.0.0.1 at the bot stand-in's port.
+    let (bot_port, bot_runner) = start_agent_message_bot_stub(root.path(), url.clone());
+    fs::write(root.path().join("runtime-ip"), "127.0.0.1").unwrap();
+    fs::write(
+        root.path().join("runtime-status-port"),
+        bot_port.to_string(),
+    )
+    .unwrap();
+    let _service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    let operator = |method: &str, path: &str, body: Option<&Value>| {
+        request_with_token(&url, method, path, body, Some("synthetic-lifecycle-token")).unwrap()
+    };
+    let completed_workspace = |operation_id: &str| -> Value {
+        let receipt: Value = wait_for(|| {
+            operator("GET", &format!("/v1/operations/{operation_id}"), None)
+                .json::<Value>()
+                .ok()
+                .filter(|receipt| receipt["status"] == "completed")
+        });
+        operator(
+            "GET",
+            &format!(
+                "/v1/workspaces/{}",
+                receipt["workspaceId"].as_str().unwrap()
+            ),
+            None,
+        )
+        .json()
+        .unwrap()
+    };
+    let create = |operation_id: &str, spec: Value| -> Value {
+        let admitted = operator(
+            "POST",
+            "/v1/operations",
+            Some(&json!({"operationId":operation_id,"kind":"create","spec":spec})),
+        );
+        assert_eq!(admitted.status(), 202, "{}", admitted.text().unwrap());
+        completed_workspace(operation_id)
+    };
+    // Every coding Pod in the fake cluster has this UID; its namespace tells them apart.
+    let coding_pod_uid = "5c4d3e2f-1a0b-4c9d-8e7f-6a5b4c3d2e1f";
+    fs::write(root.path().join("expected-pod-uid"), coding_pod_uid).unwrap();
+    // The coding Pod's token, once its runner holds the workspace lease.
+    let coding_token = |workspace: &Value| {
+        let token = format!(
+            "target-token:{}:{coding_pod_uid}",
+            workspace["namespace"].as_str().unwrap()
+        );
+        let lease = request_with_token(
+            &url,
+            "POST",
+            &format!(
+                "/v1/workspaces/{}/runtime/lease",
+                workspace["id"].as_str().unwrap()
+            ),
+            Some(&json!({"holder":coding_pod_uid})),
+            Some(&token),
+        )
+        .unwrap();
+        assert_eq!(lease.status(), 200, "{}", lease.text().unwrap());
+        token
+    };
+
+    let mut boss_spec = workspace_spec("boss-bot");
+    boss_spec["role"] = "bot".into();
+    let boss = create("6f1c0a52-58f4-4a39-9d55-0b7f4a1f3b01", boss_spec);
+    let boss_id = boss["id"].as_str().unwrap().to_owned();
+    let mut other_spec = workspace_spec("other-bot");
+    other_spec["role"] = "bot".into();
+    let other_bot = create("6f1c0a52-58f4-4a39-9d55-0b7f4a1f3b02", other_spec);
+    let other_bot_id = other_bot["id"].as_str().unwrap().to_owned();
+    fs::write(
+        root.path().join("expected-bot-namespace"),
+        boss["namespace"].as_str().unwrap(),
+    )
+    .unwrap();
+    let boss_uid = "7a2b3c4d-1e2f-4a5b-8c6d-9e0f1a2b3c4d";
+    fs::write(root.path().join("expected-bot-pod-uid"), boss_uid).unwrap();
+    fs::write(root.path().join("expected-bot-token-uid"), boss_uid).unwrap();
+    fs::write(root.path().join("expected-namespace"), "adm-none").unwrap();
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &format!("/v1/workspaces/{boss_id}/runtime/lease"),
+            Some(&json!({"holder":boss_uid})),
+            Some("bot-token"),
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    let message_path = |id: &str| format!("/v1/workspaces/{id}/runtime/message");
+    let message = json!({"text":"done, PR #12","requestId":"call-1"});
+
+    // A coding workspace a person created without --manager has no manager.
+    let loner = create(
+        "6f1c0a52-58f4-4a39-9d55-0b7f4a1f3b03",
+        workspace_spec("loner"),
+    );
+    assert!(loner.get("manager").is_none(), "{loner}");
+    let loner_token = coding_token(&loner);
+    let refused = request_with_token(
+        &url,
+        "POST",
+        &message_path(&boss_id),
+        Some(&message),
+        Some(&loner_token),
+    )
+    .unwrap();
+    assert_eq!(refused.status(), 403);
+    let refused = refused.text().unwrap();
+    assert!(
+        refused.contains("not this agent's manager"),
+        "a coding agent without a manager messages no bot: {refused}"
+    );
+
+    // The bot's createAgent records the bot itself as manager, whatever the spec says.
+    let mut agent_spec = workspace_spec("emails-131");
+    agent_spec["manager"] = json!(other_bot_id);
+    let agent_operation = "6f1c0a52-58f4-4a39-9d55-0b7f4a1f3b04";
+    let admitted = request_with_token(
+        &url,
+        "POST",
+        "/v1/runtime/operations",
+        Some(&json!({"operationId":agent_operation,"kind":"create","spec":agent_spec})),
+        Some("bot-token"),
+    )
+    .unwrap();
+    assert_eq!(admitted.status(), 202, "{}", admitted.text().unwrap());
+    let agent = completed_workspace(agent_operation);
+    assert_eq!(agent["manager"], json!(boss_id), "{agent}");
+    let agent_token = coding_token(&agent);
+
+    let delivered = request_with_token(
+        &url,
+        "POST",
+        &message_path(&boss_id),
+        Some(&message),
+        Some(&agent_token),
+    )
+    .unwrap();
+    let delivered_status = delivered.status();
+    let delivered: Value = delivered.json().unwrap();
+    assert_eq!(delivered_status, 202, "{delivered}");
+    assert_eq!(delivered["workspace"], json!(boss_id));
+    assert_eq!(delivered["message"], message);
+    assert_eq!(
+        delivered["authorized"]["agent"],
+        json!({"id":agent["id"],"name":"emails-131"}),
+        "the bot learns which agent sent the message from the lifecycle"
+    );
+    let bearer = fs::read_to_string(root.path().join("agent-message-bearer")).unwrap();
+    assert_ne!(
+        bearer, agent_token,
+        "the coding Pod's own token never reaches the bot"
+    );
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &format!("/v1/workspaces/{boss_id}/runtime/authorize"),
+            Some(&json!({"action":"message"})),
+            Some(&bearer),
+        )
+        .unwrap()
+        .status(),
+        403,
+        "a delivery bearer is good for its one delivery only"
+    );
+    for (path, token, why) in [
+        (
+            message_path(&other_bot_id),
+            agent_token.as_str(),
+            "another bot is not this agent's manager",
+        ),
+        (
+            message_path(agent["id"].as_str().unwrap()),
+            agent_token.as_str(),
+            "an agent cannot message itself",
+        ),
+        (
+            message_path(&boss_id),
+            "bot-token",
+            "a bot token is not a coding agent",
+        ),
+    ] {
+        let refused = request_with_token(&url, "POST", &path, Some(&message), Some(token)).unwrap();
+        assert_eq!(refused.status(), 403, "{why}: {}", refused.text().unwrap());
+    }
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &format!("/v1/workspaces/{boss_id}/runtime/authorize"),
+            Some(&json!({"action":"message"})),
+            Some(&agent_token),
+        )
+        .unwrap()
+        .status(),
+        403,
+        "a coding Pod cannot authorize agent messages itself; only the lifecycle delivers them"
+    );
+
+    // A destroyed manager fails delivery loudly.
+    let destroyed = operator(
+        "POST",
+        "/v1/operations",
+        Some(
+            &json!({"operationId":"6f1c0a52-58f4-4a39-9d55-0b7f4a1f3b05","kind":"delete","workspaceId":boss_id}),
+        ),
+    );
+    assert_eq!(destroyed.status(), 202, "{}", destroyed.text().unwrap());
+    let gone = request_with_token(
+        &url,
+        "POST",
+        &message_path(&boss_id),
+        Some(&message),
+        Some(&agent_token),
+    )
+    .unwrap();
+    assert_eq!(gone.status(), 410, "{}", gone.text().unwrap());
+
+    stop_http_stub(bot_port, bot_runner);
+    stop_http_stub(runner_port, runner);
+}

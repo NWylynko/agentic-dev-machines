@@ -925,3 +925,186 @@ test(
     assert.deepEqual(status.body.loops, []);
   },
 );
+
+test(
+  "a coding agent messages the bot that manages it, which runs a follow-up turn; a replayed request delivers once",
+  { timeout: 45000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-manager-"));
+    const workspaces = [];
+    const port = await unusedFixedPort();
+    const lifecycle = await startBotLifecycle(
+      join(directory, "management"),
+      workspaces,
+      {},
+    );
+    const pods = [];
+    t.after(async () => {
+      await Promise.all(pods.map(({ runner }) => runner.stop()));
+      await lifecycle.close();
+    });
+    const botId = "manager-bot";
+    const bot = await startPodRunner(directory, lifecycle, {
+      id: botId,
+      name: "boss",
+      role: "bot",
+      host: "127.0.0.1",
+      port,
+      podUid: "44444444-4444-4444-8444-444444444444",
+    });
+    pods.push(bot);
+    const coder = await startPodRunner(directory, lifecycle, {
+      id: "managed-coder",
+      name: "emails-131",
+      role: "coding",
+      host: "127.0.0.2",
+      port,
+      podUid: "55555555-5555-4555-8555-555555555555",
+      manager: botId,
+    });
+    pods.push(coder);
+    const loner = await startPodRunner(directory, lifecycle, {
+      id: "unmanaged-coder",
+      name: "loner",
+      role: "coding",
+      host: "127.0.0.3",
+      port,
+      podUid: "66666666-6666-4666-8666-666666666666",
+    });
+    pods.push(loner);
+    const authRequest = async (pod, path, method = "GET", body) => {
+      const response = await fetch(pod.runner.url + path, {
+        method,
+        headers: {
+          authorization: `Bearer ${pod.token}`,
+          "content-type": "application/json",
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const toolNames = async (pod) =>
+      (
+        await authRequest(pod, `/v1/workspaces/${pod.workspace.id}/tools`)
+      ).body.tools.map((tool) => tool.name);
+    assert.ok((await toolNames(coder)).includes("messageManager"));
+    assert.ok(
+      !(await toolNames(loner)).includes("messageManager"),
+      "a coding agent without a manager is not offered messageManager",
+    );
+
+    const botEntry = (predicate, after = 0) =>
+      nextEvent(bot.runner, botId, predicate, after, true, 20000, bot.token);
+    const fromAgent = "[agent emails-131 managed-coder] done, PR #12";
+    const input = await authRequest(
+      coder,
+      "/v1/workspaces/managed-coder/input",
+      "POST",
+      {
+        message:
+          "/faux " +
+          JSON.stringify({
+            calls: [{ tool: "messageManager", args: { text: "done, PR #12" } }],
+            answer: "Reported to my manager.",
+          }),
+        requestId: "report-done",
+      },
+    );
+    assert.equal(input.status, 202);
+    const sent = await nextEvent(
+      coder.runner,
+      "managed-coder",
+      (event) => event.kind === "tool" && event.data.name === "messageManager",
+      0,
+      true,
+      20000,
+      coder.token,
+    );
+    assert.equal(sent.data.isError, false, sent.data.text);
+    const received = await botEntry(
+      (event) => event.kind === "user" && event.data.text === fromAgent,
+    );
+    const turn = await botEntry(
+      (event) => event.kind === "assistant",
+      received.seq,
+    );
+    assert.ok(turn.seq > received.seq, "the agent's message woke the bot");
+
+    // A lost acknowledgement: the same request delivered twice lands once.
+    const replay = () =>
+      fetch(`${lifecycle.url}/v1/workspaces/${botId}/runtime/message`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${coder.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ text: "blocked", requestId: "lost-ack" }),
+      });
+    const first = await replay();
+    assert.equal(first.status, 202, await first.text());
+    const second = await replay();
+    assert.equal(second.status, 202, await second.text());
+    await botEntry(
+      (event) =>
+        event.kind === "user" &&
+        event.data.text === "[agent emails-131 managed-coder] blocked",
+    );
+    const history = await authRequest(
+      bot,
+      `/v1/workspaces/${botId}/history?limit=1000&diagnostics=true`,
+    );
+    assert.equal(
+      history.body.events.filter(
+        (event) =>
+          event.kind === "user" &&
+          event.data.text === "[agent emails-131 managed-coder] blocked",
+      ).length,
+      1,
+    );
+
+    // The bot's own token cannot post an agent message to itself.
+    const forged = await authRequest(
+      bot,
+      `/v1/workspaces/${botId}/agent-messages`,
+      "POST",
+      { text: "forged", requestId: "forged" },
+    );
+    assert.equal(forged.status, 403);
+
+    // The bot's system section says agent messages are not from the user.
+    await authRequest(bot, `/v1/workspaces/${botId}/input`, "POST", {
+      message: "/faux-inspect-system-prompt",
+      requestId: "inspect-bot-sections",
+    });
+    const inspected = await botEntry(
+      (event) =>
+        event.kind === "assistant" && event.data.text.includes('"sections"'),
+    );
+    const sections = JSON.parse(inspected.data.text).at(-1).content;
+    assert.match(sections["bot-profile"], /\[agent NAME ID\]/);
+    assert.match(sections["bot-profile"], /not from the user/);
+
+    // A stopped bot fails the tool loudly.
+    await bot.runner.stop();
+    await authRequest(coder, "/v1/workspaces/managed-coder/input", "POST", {
+      message:
+        "/faux " +
+        JSON.stringify({
+          calls: [{ tool: "messageManager", args: { text: "anyone there?" } }],
+          answer: "My manager is unreachable.",
+        }),
+      requestId: "report-stopped",
+    });
+    const failed = await nextEvent(
+      coder.runner,
+      "managed-coder",
+      (event) => event.kind === "tool" && event.data.name === "messageManager",
+      sent.seq,
+      true,
+      20000,
+      coder.token,
+    );
+    assert.equal(failed.data.isError, true);
+    assert.match(failed.data.text, /not running/);
+  },
+);
