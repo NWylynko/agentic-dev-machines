@@ -5,14 +5,38 @@
 #   start   mark Claude enabled on the workspace volume; start it if not running
 #   attach  start, then attach this terminal
 #   boot    container start: start it only if it was ever enabled here
+#   run [CLAUDE ARGS]  exec Claude as the tmux session runs it: the
+#           workspace's config dir, its MCP config, and the diet below
 #   credentials-loop  the claude-credentials session: rewrite the login when
 #           due. The one timer; a shell + sleep, so it holds ~2 MB, not Node.
 set -eu
-state=/workspace/.adm/claude
-config=/run/adm/workspace.json
+state=${ADM_CLAUDE_STATE:-/workspace/.adm/claude}
+config=${ADM_WORKSPACE_CONFIG:-/run/adm/workspace.json}
 action=${1:-}
 case "$action" in
   start | attach | boot) ;;
+  run)
+    shift
+    repositories=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).repositories === true' "$config")
+    if [ "$repositories" = true ]; then
+      # With /repos, ignored files live on node-local disk (TASK-81). Keep this
+      # text identical to packages/runner/src/ignored-files.ts (a test checks).
+      set -- --append-system-prompt "Files git ignores inside /repos checkouts (node_modules, build output, .env, local databases) are kept on this machine's local disk, not with the workspace: they are deleted whenever this workspace's Pod is replaced (updates, moves to another node). When they are missing, reinstall dependencies and recreate ignored files such as .env. Put anything that must survive in a file git does not ignore." "$@"
+    fi
+    # The diet: every turn carries only what a coding agent needs, like Pi.
+    # Built-in tools are the kept set (image/claude-diet.test.mjs); MCP tools
+    # stay behind ToolSearch. Off: bundled skills, the claude.ai account's
+    # connectors and synced skills (skillOverrides; the names it syncs today,
+    # checked live with /context), and Claude in Chrome. The config dir is on
+    # the volume, so login, trust answers and conversations survive Pod
+    # restarts and moves.
+    export CLAUDE_CONFIG_DIR="$state/config" DISABLE_AUTOUPDATER=1 \
+      CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
+    exec claude --mcp-config "$state/mcp.json" --no-chrome \
+      --tools "Bash,Read,Edit,Write,Glob,Grep,ToolSearch,Skill,AskUserQuestion" \
+      --settings '{"skillOverrides":{"built-in-browser":"off","plugin-authoring":"off","chrome-browser":"off","computer-use":"off","deep-research":"off","docs":"off","docx":"off","pdf":"off","pptx":"off","xlsx":"off"}}' \
+      "$@"
+    ;;
   credentials-loop)
     while :; do
       # A failure is logged by the writer; Claude keeps the last token until
@@ -21,7 +45,7 @@ case "$action" in
       sleep "$due"
     done
     ;;
-  *) echo "usage: adm-claude start|attach|boot" >&2; exit 2 ;;
+  *) echo "usage: adm-claude start|attach|boot|run" >&2; exit 2 ;;
 esac
 if [ "$action" = boot ] && [ ! -f "$state/enabled" ]; then exit 0; fi
 mkdir -p "$state/config"
@@ -42,18 +66,8 @@ fi
 if ! tmux has-session -t =claude 2>/dev/null; then
   name=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).name' "$config")
   cwd=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).cwd' "$config")
-  repositories=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).repositories === true' "$config")
-  # With /repos, ignored files live on node-local disk (TASK-81). Keep this
-  # text identical to packages/runner/src/ignored-files.ts (a test checks).
-  set --
-  if [ "$repositories" = true ]; then
-    set -- --append-system-prompt "Files git ignores inside /repos checkouts (node_modules, build output, .env, local databases) are kept on this machine's local disk, not with the workspace: they are deleted whenever this workspace's Pod is replaced (updates, moves to another node). When they are missing, reinstall dependencies and recreate ignored files such as .env. Put anything that must survive in a file git does not ignore."
-  fi
-  # The config dir is on the volume, so login, trust answers and
-  # conversations survive Pod restarts and moves.
   tmux new-session -d -s claude -x 200 -y 50 -c "$cwd" \
-    -e "CLAUDE_CONFIG_DIR=$state/config" -e DISABLE_AUTOUPDATER=1 \
-    claude --remote-control "$name" --mcp-config "$state/mcp.json" "$@"
+    adm-claude run --remote-control "$name"
 fi
 if [ "$action" = attach ]; then
   # kubectl exec passes no TERM; tmux needs one to draw the client.

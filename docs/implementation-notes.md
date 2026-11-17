@@ -178,3 +178,11 @@ Found by stressing suites under CPU load (`yes` burners, `taskset -c 0,1`) and r
 - Loops sleep with `sleepUntil` (a stored sleep; the `wait` phase reruns on waking); busy = a task neither terminal nor sleeping. Documents need `checkpointWhen`: `admDocCheckpointWhen` (a base after 32 deltas). Commits are observed with `observeCommits` (cache warming only); the bash stream waits on its task (`waitForTask`).
 - `scripts/patch-pi-interactive.mjs` stamps each group with its hash, so a rerun skips it; every replacement is strict (the old "at most one" entries upgraded copies an earlier patch version had written).
 - Not yet verified live: needs a release; the one live workspace is to be recreated (Durable 1.5.0 rewrites `pi.live` in a form 1.2.0 cannot read).
+
+## 2026-11-16 — Claude Code on a diet
+
+- `adm-claude run` now owns Claude's command line (the tmux session runs it), so the image test drives exactly what the Pod runs. `ADM_CLAUDE_STATE`/`ADM_WORKSPACE_CONFIG` override the paths for tests and for live measuring.
+- Measured live in a Pod with `/context` (works in `-p` mode): 13.1k tokens per turn before (bundled + claude.ai-synced skills 4.7k, claude.ai connectors, ~16k of deferred built-in tools listed by name), 9k after.
+- `--tools` without `ToolSearch` loads every MCP tool eagerly (Linear alone is 38k), so ToolSearch must stay in the list.
+- `CLAUDE_CODE_SYNC_SKILLS=0` does not stop the claude.ai-synced skills (they land in `$CLAUDE_CONFIG_DIR/skills/synced`); only `skillOverrides` by name does. `plugin-authoring` ignores `CLAUDE_CODE_DISABLE_BUNDLED_SKILLS`.
+- Not verified live: a release with this image (measured by running the new script in a Pod against a copy of the login).

@@ -7,12 +7,12 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { createServer } from "node:http";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { startFakeAnthropic } from "./fake-anthropic.mjs";
 import { createProviderAuthAuthority } from "../packages/runner/src/provider-auth-authority.ts";
 import {
   signInConnector,
@@ -24,16 +24,11 @@ const claude = await promisify(execFile)("sh", ["-c", "command -v claude"])
   .then(({ stdout }) => stdout.trim())
   .catch(() => "");
 
-// A fake Anthropic Messages API: while the fixture tool has not answered, the
-// model calls it; once a tool_result comes back, it records it and finishes.
+// While the fixture tool has not answered, the model calls it; once a
+// tool_result comes back, it records it and finishes.
 function startFakeModel() {
   const results = [];
-  const server = createServer(async (request, response) => {
-    let raw = "";
-    for await (const chunk of request) raw += chunk;
-    if (!request.url.startsWith("/v1/messages") || request.url.includes("count_tokens"))
-      return response.writeHead(404).end();
-    const body = JSON.parse(raw);
+  const { server } = startFakeAnthropic((body) => {
     const last = body.messages.at(-1);
     const toolResult = Array.isArray(last?.content)
       ? last.content.find((part) => part.type === "tool_result")
@@ -41,46 +36,9 @@ function startFakeModel() {
     if (toolResult) results.push(toolResult);
     const wantsTool =
       !toolResult && body.tools?.some((tool) => tool.name === "mcp__fixture__lookup");
-    const content = wantsTool
+    return wantsTool
       ? [{ type: "tool_use", id: "toolu_fixture", name: "mcp__fixture__lookup", input: { query: "ADM-1" } }]
       : [{ type: "text", text: "done" }];
-    const message = {
-      id: "msg_fixture",
-      type: "message",
-      role: "assistant",
-      model: body.model,
-      content,
-      stop_reason: wantsTool ? "tool_use" : "end_turn",
-      stop_sequence: null,
-      usage: { input_tokens: 1, output_tokens: 1 },
-    };
-    if (!body.stream) {
-      response.writeHead(200, { "content-type": "application/json" });
-      return response.end(JSON.stringify(message));
-    }
-    response.writeHead(200, { "content-type": "text/event-stream" });
-    const event = (type, data) =>
-      response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
-    event("message_start", { message: { ...message, content: [], stop_reason: null } });
-    content.forEach((block, index) => {
-      if (block.type === "text") {
-        event("content_block_start", { index, content_block: { type: "text", text: "" } });
-        event("content_block_delta", { index, delta: { type: "text_delta", text: block.text } });
-      } else {
-        event("content_block_start", { index, content_block: { ...block, input: {} } });
-        event("content_block_delta", {
-          index,
-          delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
-        });
-      }
-      event("content_block_stop", { index });
-    });
-    event("message_delta", {
-      delta: { stop_reason: message.stop_reason, stop_sequence: null },
-      usage: { output_tokens: 1 },
-    });
-    event("message_stop", {});
-    response.end();
   });
   return { server, results };
 }
