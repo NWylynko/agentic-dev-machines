@@ -8,7 +8,7 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, globSync } from "node:fs";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -106,11 +106,15 @@ test(
     assert.equal(config.code, 0, config.output);
     assert.deepEqual(Object.keys(JSON.parse(await readFile(join(state, "mcp.json"), "utf8")).mcpServers), ["browser"]);
 
+    // Claude often starts in the read-only /repos catalog (a workspace with
+    // no --repo): the browser must not write where Claude runs.
+    await chmod(checkout, 0o555);
     const turn = await run(join(imageDir, "adm-claude"), ["run", "-p", "open the dev server", "--allowedTools", navigate]);
+    await chmod(checkout, 0o755);
     assert.equal(turn.code, 0, turn.output);
     assert.match(JSON.stringify(results), /Hello ADM Browser/, `${JSON.stringify(results)}\n${turn.output}`);
     const prompt = JSON.stringify(model.requests[0].system);
     assert.match(prompt, /built-in browser/, "Claude is told about the browser");
-    assert.ok(existsSync(join(checkout, ".adm", "browser")), "browser output goes under the checkout's .adm, as Pi's");
+    assert.ok(existsSync(join(state, "browser")), "browser output goes beside Claude's config on the workspace volume");
   },
 );

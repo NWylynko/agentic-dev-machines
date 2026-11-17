@@ -2,7 +2,8 @@
 # The workspace's built-in browser (Pi and Claude Code alike): the pinned
 # Playwright MCP server over stdio, driving the image's chromium. One launcher
 # so both agents get the same browser.
-#   adm-browser-mcp [OUTPUT_DIR]   default: ./.adm/browser (the checkout's)
+#   adm-browser-mcp OUTPUT_DIR   screenshots, snapshots and its config; never
+#   the cwd, which may be the read-only /repos catalog
 #
 # Sites see a person's desktop Chrome, not a headless bot
 # (image/browser-human.test.mjs): Chrome's User-Agent for the installed
@@ -10,7 +11,11 @@
 # around the page, and no automation flag. Still visible: WebGL is
 # SwiftShader (no GPU in a Pod), and CDP-level checks.
 set -eu
-output=${1:-$PWD/.adm/browser}
+if [ -z "${1:-}" ]; then
+  echo "usage: adm-browser-mcp OUTPUT_DIR" >&2
+  exit 2
+fi
+output=$1
 chromium=${ADM_BROWSER_CHROMIUM:-/usr/bin/chromium}
 mkdir -p "$output"
 version=$("$chromium" --version | grep -oE '[0-9]+\.[0-9.]+' | head -n 1 | cut -d . -f 1)

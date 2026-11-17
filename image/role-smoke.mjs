@@ -127,7 +127,7 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
       "! tmux has-session -t =claude 2>/dev/null",
       "adm-claude start",
       "test -f /workspace/.adm/claude/enabled",
-      `test "$(cat /workspace/.adm/claude/mcp.json | tr -d ' \\n')" = '{"mcpServers":{"browser":{"type":"stdio","command":"adm-browser-mcp","args":[]}}}'`,
+      `test "$(cat /workspace/.adm/claude/mcp.json | tr -d ' \\n')" = '{"mcpServers":{"browser":{"type":"stdio","command":"adm-browser-mcp","args":["/workspace/.adm/claude/browser"]}}}'`,
       // Signed in from the installation login before Claude starts, without a refresh token.
       `node -e 'const c = require("/workspace/.adm/claude/config/.credentials.json").claudeAiOauth; if (c.accessToken !== "smoke-access" || c.refreshToken !== null) process.exit(1)'`,
       `node -e 'if (require("/workspace/.adm/claude/config/.claude.json").oauthAccount.organizationUuid !== "smoke-organization") process.exit(1)'`,

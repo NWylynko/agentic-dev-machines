@@ -60,9 +60,11 @@
     // Every connector, signed in or not: one signed in later works on Claude's
     // next connection without rewriting the config.
     // Plus the workspace's built-in browser, the same one Pi gets
-    // (adm-browser-mcp); it starts in Claude's cwd, the checkout.
+    // (adm-browser-mcp). Its output goes beside this config on the volume:
+    // Claude's cwd may be the read-only /repos catalog.
+    const output = `${process.getBuiltinModule("node:path").dirname(file)}/browser`;
     const mcpServers = {
-      browser: { type: "stdio", command: "adm-browser-mcp", args: [] },
+      browser: { type: "stdio", command: "adm-browser-mcp", args: [output] },
       ...Object.fromEntries(
         catalog.map((entry) => [
           entry.name,
