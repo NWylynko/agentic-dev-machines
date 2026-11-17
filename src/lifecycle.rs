@@ -2278,6 +2278,17 @@ mod provider_auth_wait_tests {
     };
 
     #[test]
+    fn a_claude_agent_waiting_on_its_question_is_a_valid_activity() {
+        // TASK-142: adm list and listAgents show a Claude Code agent's question.
+        assert!(valid_runtime_status_report(
+            &serde_json::json!({"activity":{"status":"waiting"}})
+        ));
+        assert!(!valid_runtime_status_report(
+            &serde_json::json!({"activity":{"status":"asking"}})
+        ));
+    }
+
+    #[test]
     fn bash_action_is_limited_to_the_owning_coding_workspace() {
         assert!(bash_action_allowed("code", "coding", "code", "coding"));
         assert!(!bash_action_allowed("bot", "bot", "bot", "bot"));

@@ -154,7 +154,7 @@ export function botExtension(
       defineTool({
         name: "monitorAgent",
         description:
-          "Inspect a coding agent's status and one cursor page of full history, including tool activity. Continue with after=nextAfter while hasMore is true.",
+          "Inspect a coding agent's status and one cursor page of full history, including tool activity (a Claude Code agent's history holds only prompts and final replies; status waiting means it asks a question). Continue with after=nextAfter while hasMore is true.",
         parameters: obj({
           agentId: str(),
           after: opt(int({ minimum: 0 })),
@@ -185,7 +185,7 @@ export function botExtension(
       defineTool({
         name: "promptAgent",
         description:
-          "Prompt a coding agent, steering its current turn or queuing a follow-up. Delivery is deduplicated after a lost acknowledgement.",
+          "Prompt a coding agent, steering its current turn or queuing a follow-up. Delivery is deduplicated after a lost acknowledgement. A Claude Code agent takes steer and followUp alike (Claude decides when it reads the text) and refuses any prompt while it waits on its own question: abort first.",
         parameters: obj({
           agentId: str(),
           message: str({ minLength: 1, maxLength: 100000 }),

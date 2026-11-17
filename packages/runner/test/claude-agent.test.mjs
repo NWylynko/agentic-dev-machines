@@ -267,3 +267,147 @@ test(
     assert.match(gone.error, /Claude Code is not running/);
   },
 );
+
+test(
+  "a bot prompts, watches and aborts its Claude agent through the runner's routes",
+  { skip, timeout: 180000 },
+  async (t) => {
+    const c = await claudeWorkspace(t);
+    const input = (message, requestId, whenBusy) =>
+      c.runner.request(`/v1/workspaces/${id}/input`, "POST", {
+        message,
+        requestId,
+        ...(whenBusy ? { whenBusy } : {}),
+      });
+    const idle = (what) =>
+      c.within(
+        c.activityUntil((a) => a.status === "idle"),
+        what,
+      );
+    const modelSaw = (text, what) =>
+      c.within(
+        c.api.waitFor((line) => line.text === text),
+        what,
+      );
+    await c.admClaude(["start", "--task"], "warm up");
+    await modelSaw("warm up", "the task");
+    await idle("idle after the task");
+
+    // Idle: the prompt is pasted and submitted once, newlines intact; a
+    // replayed request ID is not sent again.
+    const prompt = 'second line one\n\n  "quoted" $HOME `tick`\nlast';
+    const admitted = await input(prompt, "bot:1");
+    assert.equal(admitted.status, 202, JSON.stringify(admitted.body));
+    assert.equal(admitted.body.status, "admitted");
+    await modelSaw(prompt, "the prompt");
+    await idle("idle after the prompt");
+    assert.equal((await input(prompt, "bot:1")).status, 202);
+    assert.equal(
+      c.api.requests.filter((line) => line.text === prompt).length,
+      1,
+      "a replayed requestId is delivered once",
+    );
+
+    // Busy: reject refuses; steer and followUp are typed in, and Claude
+    // takes them after the running turn.
+    assert.equal((await input("long HOLD", "bot:2")).status, 202);
+    await modelSaw("long HOLD", "the long turn streams");
+    const rejected = await input("not now", "bot:3", "reject");
+    assert.equal(rejected.status, 409, JSON.stringify(rejected.body));
+    assert.equal(rejected.body.error.code, "AGENT_BUSY");
+    assert.equal(
+      (await input("queued while busy", "bot:4", "followUp")).status,
+      202,
+    );
+    c.api.release();
+    await modelSaw("queued while busy", "the queued prompt");
+    await idle("idle after the queued prompt");
+    assert.ok(
+      !c.api.requests.some((line) => line.text?.includes("not now")),
+      "a rejected prompt never reaches Claude",
+    );
+
+    // Abort: Escape stops the stream; Claude is idle and takes prompts again.
+    assert.equal((await input("abort me HOLD", "bot:5")).status, 202);
+    await modelSaw("abort me HOLD", "the turn to abort");
+    const aborted = await c.runner.request(
+      `/v1/workspaces/${id}/abort`,
+      "POST",
+      {},
+    );
+    assert.equal(aborted.status, 200, JSON.stringify(aborted.body));
+    assert.equal(aborted.body.status, "idle");
+    await c.within(
+      c.api.waitFor((line) => line.aborted === "abort me HOLD"),
+      "the stream is closed",
+    );
+
+    // Waiting on Claude's own question: input refuses (it would type into
+    // the question); abort cancels the question.
+    assert.equal((await input("please ASK me", "bot:6")).status, 202);
+    await c.within(
+      c.activityUntil((a) => a.status === "waiting"),
+      "waiting on the question",
+    );
+    const answering = await input("Red", "bot:7", "followUp");
+    assert.equal(answering.status, 409, JSON.stringify(answering.body));
+    assert.equal(answering.body.error.code, "CLAUDE_CODE_WAITING");
+    const status = await c.runner.request(`/v1/workspaces/${id}`);
+    assert.equal(status.body.status, "waiting");
+    assert.equal(status.body.waitingFor, "input needed");
+    assert.equal(
+      (await c.runner.request(`/v1/workspaces/${id}/abort`, "POST", {})).body
+        .status,
+      "idle",
+    );
+
+    assert.equal((await input("after the question", "bot:8")).status, 202);
+    await c.within(
+      c.api.waitFor((line) => line.text?.includes("after the question")),
+      "a prompt after the question",
+    );
+    await idle("idle after the question");
+
+    // History: prompts and final replies only, no tool calls or results.
+    const history = await c.runner.request(
+      `/v1/workspaces/${id}/history?after=0&limit=1000`,
+    );
+    assert.equal(history.status, 200, JSON.stringify(history.body));
+    assert.deepEqual(
+      history.body.events.map(({ kind, text }) => ({ kind, text })),
+      [
+        { kind: "user", text: "warm up" },
+        { kind: "assistant", text: "ECHO: warm up" },
+        { kind: "user", text: prompt },
+        { kind: "assistant", text: `ECHO: ${prompt}` },
+        { kind: "user", text: "long HOLD" },
+        { kind: "assistant", text: "working... ECHO: long HOLD" },
+        { kind: "user", text: "queued while busy" },
+        { kind: "assistant", text: "ECHO: queued while busy" },
+        { kind: "user", text: "abort me HOLD" },
+        { kind: "assistant", text: "working... " },
+        { kind: "interrupted", text: undefined },
+        { kind: "user", text: "please ASK me" },
+        { kind: "interrupted", text: undefined },
+        { kind: "user", text: "after the question" },
+        {
+          kind: "assistant",
+          text: "ECHO: [Request interrupted by user for tool use]\n | after the question",
+        },
+      ],
+    );
+    assert.deepEqual(
+      history.body.events.map(({ seq }) => seq),
+      history.body.events.map((_, index) => index + 1),
+    );
+    const page = await c.runner.request(
+      `/v1/workspaces/${id}/history?after=2&limit=2`,
+    );
+    assert.deepEqual(
+      page.body.events.map(({ seq }) => seq),
+      [3, 4],
+    );
+    assert.equal(page.body.nextAfter, 4);
+    assert.equal(page.body.hasMore, true);
+  },
+);

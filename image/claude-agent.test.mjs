@@ -18,6 +18,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { startTuiFake } from "./claude-tui-fake-api.mjs";
+import { ClaudeCodeSession } from "../packages/runner/src/claude-agent.ts";
 
 const run = promisify(execFile);
 const imageDir = new URL(".", import.meta.url).pathname;
@@ -192,5 +193,53 @@ test(
     assert.equal(api.requests.length, requestsBefore, "the task is never sent again");
     assert.match(await screen(), /Fix issue #131/, "the conversation is back on screen");
     assert.equal(existsSync(join(state, "task")), false, "the task leaves the volume once Claude has it");
+
+    // The runner's driver (TASK-142) on this Claude: the session record says
+    // running, waiting and idle; a paste is taken; Escape ends a turn and a
+    // question; the transcript reads back as prompts and final replies. A
+    // Claude release that changes any of it fails here, in the image smoke.
+    Object.assign(process.env, { TMUX_TMPDIR: env.TMUX_TMPDIR, ADM_CLAUDE_STATE: state });
+    const claudeCode = new ClaudeCodeSession({
+      id: agentId,
+      name: "claude-131",
+      role: "coding",
+      environment: "pod",
+      localRoot: directory,
+      cwd: checkout,
+      harness: "claude",
+    });
+    const statusBecomes = async (status) => {
+      for (;;) {
+        const current = await claudeCode.status();
+        if (current.status === status) return current;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    };
+    assert.equal((await claudeCode.status()).status, "idle");
+    await claudeCode.input("hold on HOLD", "r1", "steer");
+    await within(api.waitFor((line) => line.text === "hold on HOLD"), 30000, "the held turn");
+    assert.equal((await claudeCode.status()).status, "running");
+    assert.equal((await claudeCode.abort()).status, "idle");
+    await claudeCode.input("please ASK", "r2", "steer");
+    const waiting = await within(statusBecomes("waiting"), 30000, "Claude asks");
+    assert.equal(waiting.waitingFor, "input needed");
+    assert.equal((await claudeCode.abort()).status, "idle");
+    await claudeCode.input("last one", "r3", "reject");
+    await within(api.waitFor((line) => line.text?.includes("last one")), 30000, "the last prompt");
+    await within(statusBecomes("idle"), 30000, "idle at the end");
+    const history = await claudeCode.history(0, 100);
+    // The fake echoes nothing after a tool result: "ECHO: " is the final
+    // reply after messageManager.
+    assert.deepEqual(history.events.map(({ kind, text }) => [kind, text]), [
+      ["user", task],
+      ["assistant", "ECHO: "],
+      ["user", "hold on HOLD"],
+      ["assistant", "working... "],
+      ["interrupted", undefined],
+      ["user", "please ASK"],
+      ["interrupted", undefined],
+      ["user", "last one"],
+      ["assistant", "ECHO: [Request interrupted by user for tool use]\n | last one"],
+    ]);
   },
 );

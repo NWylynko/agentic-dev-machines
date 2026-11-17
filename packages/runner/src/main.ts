@@ -1337,6 +1337,65 @@ const server = createServer(async (request, response) => {
           harness: "claude",
           ...(await claudeCode.status()),
         });
+      if (request.method === "GET" && action === "history") {
+        const after = Number(url.searchParams.get("after") ?? 0);
+        const limit = Number(url.searchParams.get("limit") ?? 200);
+        if (
+          !Number.isSafeInteger(after) ||
+          after < 0 ||
+          !Number.isInteger(limit) ||
+          limit < 1 ||
+          limit > 1000
+        )
+          throw new ApiError(
+            400,
+            "INVALID_CURSOR",
+            "after must be nonnegative; limit must be 1..1000",
+          );
+        return json(response, 200, await claudeCode.history(after, limit));
+      }
+      if (request.method === "POST" && action === "input") {
+        const data = await body(request);
+        if (typeof data.message !== "string" || data.images !== undefined)
+          throw new ApiError(
+            400,
+            "INVALID_MESSAGE",
+            "A Claude Code agent takes text input only",
+          );
+        if (data.requestId !== undefined && typeof data.requestId !== "string")
+          throw new ApiError(
+            400,
+            "INVALID_REQUEST_ID",
+            "requestId must be a string",
+          );
+        const whenBusy = data.whenBusy ?? "steer";
+        if (!["steer", "followUp", "reject"].includes(whenBusy as string))
+          throw new ApiError(400, "INVALID_QUEUE_MODE", "Invalid whenBusy");
+        return await serialized(async () => {
+          await assertActive(id, requestSignal);
+          return json(
+            response,
+            202,
+            await claudeCode.input(
+              data.message as string,
+              data.requestId as string | undefined,
+              whenBusy as "steer" | "followUp" | "reject",
+            ),
+          );
+        });
+      }
+      if (request.method === "POST" && action === "abort") {
+        await body(request);
+        return await serialized(async () => {
+          await assertActive(id, requestSignal);
+          return json(response, 200, {
+            id,
+            name: claudeCode.config.name,
+            harness: "claude",
+            ...(await claudeCode.abort()),
+          });
+        });
+      }
     }
     if (action === "bash" && request.method === "POST") {
       const data = await body(request);

@@ -162,10 +162,12 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
 // It fails if this Claude version changes the session record or transcript
 // the runner reads, or shows a screen at an unattended start.
 const smokeClaudeAgentOnThePinnedClaude = async () => {
-  const tests = new URL(".", import.meta.url).pathname;
-  await execute("docker", ["run", "--rm", "--user", "1000:1000", "-v", `${tests}:/run/adm-smoke/image:ro`, "--entrypoint", "/bin/sh", image, "-ec", "cd /tmp && node --test /run/adm-smoke/image/claude-agent.test.mjs"], { maxBuffer: 16 * 1024 * 1024 }).catch((error) => {
+  // The test also loads the runner's driver, packages/runner/src/claude-agent.ts.
+  const checkout = new URL("..", import.meta.url).pathname;
+  const { stdout } = await execute("docker", ["run", "--rm", "--user", "1000:1000", "-v", `${checkout}:/run/adm-smoke/repo:ro`, "--entrypoint", "/bin/sh", image, "-ec", "cd /tmp && node --test /run/adm-smoke/repo/image/claude-agent.test.mjs"], { maxBuffer: 16 * 1024 * 1024 }).catch((error) => {
     throw new Error(`claude-agent.test.mjs on the image's Claude failed:\n${error.stdout}\n${error.stderr}`);
   });
+  if (!/ℹ pass [1-9]/.test(stdout) || !/ℹ skipped 0/.test(stdout)) throw new Error(`claude-agent.test.mjs did not run on the image's Claude:\n${stdout}`);
 };
 
 // fnm keeps the Node versions a project asks for on the work volume, so they survive a Pod
