@@ -13,7 +13,7 @@ import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { realpathSync, watch } from "node:fs";
-import { access, readdir, readFile, stat } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { ApiError, type WorkspaceConfig } from "./types.ts";
@@ -125,6 +125,44 @@ export class ClaudeCodeSession {
       .filter((line) => line.trim())
       .slice(-15)
       .join("\n");
+  }
+
+  /**
+   * Resolves once Claude's screen matches `pattern`. A screen change has no
+   * file of its own, so tmux pipe-pane streams the pane's output into one and
+   * each write rechecks the screen.
+   */
+  async whenScreenShows(pattern: RegExp, what: string) {
+    const directory = join(this.state, "screen-watch");
+    await mkdir(directory, { recursive: true });
+    const output = join(directory, "pane-output");
+    await this.tmux(
+      "pipe-pane",
+      "-t",
+      "=claude:",
+      `cat > ${shellQuote(output)}`,
+    );
+    try {
+      await whenDirectoryShows(
+        directory,
+        async () => (pattern.test(await this.screen()) ? true : undefined),
+        async () => {
+          const screen = await this.screen().catch((error) => String(error));
+          return new ApiError(
+            504,
+            "CLAUDE_CODE_SCREEN_UNCONFIRMED",
+            `Claude Code did not show ${what} within ${CLAUDE_INPUT_DEADLINE_MS / 1000} s; its screen:\n${screen}`.slice(
+              0,
+              2000,
+            ),
+          );
+        },
+        CLAUDE_INPUT_DEADLINE_MS,
+      );
+    } finally {
+      // pipe-pane with no command closes the pane's pipe.
+      await this.tmux("pipe-pane", "-t", "=claude:");
+    }
   }
 
   async status(): Promise<ClaudeAgentStatus> {
@@ -308,6 +346,19 @@ export class ClaudeCodeSession {
     // rewind menu: press it only while Claude works or asks.
     if (before.status !== "running" && before.status !== "waiting")
       return before;
+    // Claude ignores answers to a question for its first 250 ms
+    // (`answerGraceMs`/`ignoreAnswersWithinMs` = 250 in 2.1.316 and 2.1.326),
+    // so a keypress meant for the screen before can't answer it. An Escape in
+    // that window is dropped and the question stays open (image smoke,
+    // 2026-11-17: 2.1.316 half the runs, 2.1.326 every run). The window opens
+    // no later than the question reaches the screen, so wait for it there,
+    // then sit out Claude's own timer: there is no event for its end.
+    if (before.status === "waiting") {
+      await this.whenScreenShows(/Esc to cancel/, "its question");
+      await new Promise((resolve) =>
+        setTimeout(resolve, CLAUDE_QUESTION_ANSWER_GRACE_MS),
+      );
+    }
     await this.tmux("send-keys", "-t", "=claude:", "Escape");
     const pane = await this.pane();
     if (!pane) return this.status();
@@ -402,6 +453,8 @@ export class ClaudeCodeSession {
 
 /** How long Claude may take to show a prompt or an Escape in its files. */
 const CLAUDE_INPUT_DEADLINE_MS = 15_000;
+/** Claude's 250 ms answer grace on a new question, plus timer slack. */
+const CLAUDE_QUESTION_ANSWER_GRACE_MS = 300;
 
 type TranscriptEntry = {
   type?: string;
@@ -522,4 +575,9 @@ function whenDirectoryShows<T>(
     watcher.on("error", (error) => finish(() => reject(error)));
     recheck();
   });
+}
+
+/** One POSIX shell word, for the command tmux pipe-pane runs. */
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }

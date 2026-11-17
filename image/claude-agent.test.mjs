@@ -227,7 +227,20 @@ test(
     await claudeCode.input("last one", "r3", "reject");
     await within(api.waitFor((line) => line.text?.includes("last one")), 30000, "the last prompt");
     await within(statusBecomes("idle"), 30000, "idle at the end");
-    const history = await claudeCode.history(0, 100);
+    // The session record can say idle just before Claude writes its final
+    // reply to the transcript (research/claude-code/tui-driving.md), so read
+    // the history until that reply is in it.
+    const history = await within(
+      (async () => {
+        for (;;) {
+          const page = await claudeCode.history(0, 100);
+          if (page.events.at(-1)?.kind === "assistant") return page;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      })(),
+      30000,
+      "the final reply in the transcript",
+    );
     // The fake echoes nothing after a tool result: "ECHO: " is the final
     // reply after messageManager.
     assert.deepEqual(history.events.map(({ kind, text }) => [kind, text]), [

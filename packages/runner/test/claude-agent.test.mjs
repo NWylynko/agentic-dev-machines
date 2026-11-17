@@ -369,8 +369,23 @@ test(
     await idle("idle after the question");
 
     // History: prompts and final replies only, no tool calls or results.
-    const history = await c.runner.request(
-      `/v1/workspaces/${id}/history?after=0&limit=1000`,
+    // The session record can say idle just before Claude writes its final
+    // reply (research/claude-code/tui-driving.md): read until it is there.
+    const history = await c.within(
+      (async () => {
+        for (;;) {
+          const page = await c.runner.request(
+            `/v1/workspaces/${id}/history?after=0&limit=1000`,
+          );
+          if (
+            page.status !== 200 ||
+            page.body.events.at(-1)?.kind === "assistant"
+          )
+            return page;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      })(),
+      "the final reply in the transcript",
     );
     assert.equal(history.status, 200, JSON.stringify(history.body));
     assert.deepEqual(
