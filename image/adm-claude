@@ -17,12 +17,16 @@ case "$action" in
   start | attach | boot) ;;
   run)
     shift
+    prompt="You have a built-in browser in this workspace: headless Chromium driven by the mcp__browser__* tools (browser_navigate, browser_snapshot, browser_click, browser_take_screenshot, ...). It sees the workspace's own network, so use it to open dev servers on localhost. Pages and cookies are discarded when the workspace restarts."
     repositories=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).repositories === true' "$config")
     if [ "$repositories" = true ]; then
       # With /repos, ignored files live on node-local disk (TASK-81). Keep this
       # text identical to packages/runner/src/ignored-files.ts (a test checks).
-      set -- --append-system-prompt "Files git ignores inside /repos checkouts (node_modules, build output, .env, local databases) are kept on this machine's local disk, not with the workspace: they are deleted whenever this workspace's Pod is replaced (updates, moves to another node). When they are missing, reinstall dependencies and recreate ignored files such as .env. Put anything that must survive in a file git does not ignore." "$@"
+      prompt="$prompt
+
+Files git ignores inside /repos checkouts (node_modules, build output, .env, local databases) are kept on this machine's local disk, not with the workspace: they are deleted whenever this workspace's Pod is replaced (updates, moves to another node). When they are missing, reinstall dependencies and recreate ignored files such as .env. Put anything that must survive in a file git does not ignore."
     fi
+    set -- --append-system-prompt "$prompt" "$@"
     # The diet: every turn carries only what a coding agent needs, like Pi.
     # Built-in tools are the kept set (image/claude-diet.test.mjs); MCP tools
     # stay behind ToolSearch. Off: bundled skills, the claude.ai account's

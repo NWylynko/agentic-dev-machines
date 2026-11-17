@@ -121,6 +121,8 @@ COPY image/adm-git-identity /usr/local/bin/adm-git-identity
 # Ahead of /usr/bin/gh on PATH: gives gh the cluster's GitHub login (TASK-111).
 COPY image/adm-gh /usr/local/bin/gh
 COPY image/browser.mjs /opt/adm/browser.mjs
+# The built-in browser for Pi and Claude Code alike.
+COPY image/adm-browser-mcp /usr/local/bin/adm-browser-mcp
 # `artifact-fs add-repo` sets core.fsmonitor in each shared git dir to a hook that
 # execs /usr/local/bin/artifact-fs fsmonitor-hook. The hook only reads ArtifactFS
 # state under /workspace/.adm/repositories, so the same pinned binary at the same
@@ -138,7 +140,7 @@ COPY image/adm-claude-credentials /usr/local/bin/adm-claude-credentials
 COPY image/adm-infisical-token /usr/local/bin/adm-infisical-token
 COPY image/adm-infisical-env.sh /usr/local/share/adm/infisical-env.sh
 RUN chown root:root /usr/local/bin/artifact-fs \
- && chmod 0755 /usr/local/bin/artifact-fs /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/adm-git-identity /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials /usr/local/bin/adm-infisical-token \
+ && chmod 0755 /usr/local/bin/artifact-fs /usr/local/bin/adm-git-credential /usr/local/bin/adm-github-token /usr/local/bin/adm-git-identity /usr/local/bin/gh /usr/local/bin/adm-claude /usr/local/bin/adm-claude-mcp /usr/local/bin/adm-claude-credentials /usr/local/bin/adm-infisical-token /usr/local/bin/adm-browser-mcp \
  && chmod 0644 /usr/local/share/adm/infisical-env.sh \
  && printf '\n# ADM: INFISICAL_TOKEN from the cluster login (TASK-138).\n. /usr/local/share/adm/infisical-env.sh\n' | tee -a /etc/zsh/zshenv >> /etc/bash.bashrc \
  && git config --system --add credential.https://github.com.helper '!/usr/local/bin/adm-git-credential' \

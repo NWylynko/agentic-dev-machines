@@ -26,24 +26,6 @@ export type BrowserStatus = {
 const STOPPED =
   "Browser tools stopped; they restart on the next browser call. If this repeats, tell the user.";
 
-export function browserServerArgs(options: {
-  cli: string;
-  chromium: string;
-  outputDir: string;
-}) {
-  return [
-    options.cli,
-    "--headless",
-    "--isolated",
-    // The Pod drops the capabilities Chromium's sandbox needs (as image/browser.mjs).
-    "--no-sandbox",
-    "--executable-path",
-    options.chromium,
-    "--output-dir",
-    options.outputDir,
-  ];
-}
-
 function message(error: unknown) {
   return (error instanceof Error ? error.message : String(error)).slice(
     0,
@@ -116,20 +98,23 @@ export class WorkspaceBrowser {
       });
       await client.connect(
         new StdioTransport({
-          command: process.execPath,
-          args: browserServerArgs({
-            cli:
-              process.env.ADM_PLAYWRIGHT_MCP_CLI ??
-              "/opt/adm/node_modules/@playwright/mcp/cli.js",
-            chromium: process.env.ADM_BROWSER_CHROMIUM ?? "/usr/bin/chromium",
-            outputDir,
-          }),
+          // image/adm-browser-mcp: one launcher, so Claude Code gets the
+          // same browser (adm-claude-mcp).
+          command:
+            process.env.ADM_BROWSER_MCP ?? "/usr/local/bin/adm-browser-mcp",
+          args: [outputDir],
           cwd: this.workspaceRoot,
           inheritEnv: false,
           env: {
             PATH: process.env.PATH ?? "",
             HOME: process.env.HOME ?? this.workspaceRoot,
             LANG: process.env.LANG ?? "C.UTF-8",
+            ...Object.fromEntries(
+              ["ADM_PLAYWRIGHT_MCP_CLI", "ADM_BROWSER_CHROMIUM"].flatMap(
+                (name) =>
+                  process.env[name] ? [[name, process.env[name]!]] : [],
+              ),
+            ),
           },
         }),
       );

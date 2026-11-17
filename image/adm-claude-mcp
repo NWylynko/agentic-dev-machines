@@ -59,12 +59,17 @@
     if (!Array.isArray(catalog)) fail("the lifecycle returned an invalid catalog");
     // Every connector, signed in or not: one signed in later works on Claude's
     // next connection without rewriting the config.
-    const mcpServers = Object.fromEntries(
-      catalog.map((entry) => [
-        entry.name,
-        { type: "http", url: entry.url, headersHelper: "adm-claude-mcp headers" },
-      ]),
-    );
+    // Plus the workspace's built-in browser, the same one Pi gets
+    // (adm-browser-mcp); it starts in Claude's cwd, the checkout.
+    const mcpServers = {
+      browser: { type: "stdio", command: "adm-browser-mcp", args: [] },
+      ...Object.fromEntries(
+        catalog.map((entry) => [
+          entry.name,
+          { type: "http", url: entry.url, headersHelper: "adm-claude-mcp headers" },
+        ]),
+      ),
+    };
     fs.writeFileSync(`${file}.tmp`, `${JSON.stringify({ mcpServers }, null, 2)}\n`);
     fs.renameSync(`${file}.tmp`, file);
   } else fail("usage: adm-claude-mcp config FILE | headers");

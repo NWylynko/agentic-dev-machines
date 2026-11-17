@@ -15,12 +15,13 @@ import { join } from "node:path";
 import test from "node:test";
 import { McpClient, StdioTransport } from "@earendil-works/pi-mcp";
 import { startPodLifecycle, startPodRunner } from "./pod-fixture.ts";
-import { browserServerArgs } from "../src/browser.ts";
 
 // The tools the runner offers before the server has started:
 // a snapshot of the pinned @playwright/mcp. UPDATE_BROWSER_TOOLS=1 rewrites it.
 const snapshotFile = new URL("../src/browser-tools.json", import.meta.url);
 
+const launcher = new URL("../../../image/adm-browser-mcp", import.meta.url)
+  .pathname;
 const mcpCli = new URL(
   "../../../node_modules/@playwright/mcp/cli.js",
   import.meta.url,
@@ -57,12 +58,13 @@ test(
     });
     await client.connect(
       new StdioTransport({
-        command: process.execPath,
-        args: browserServerArgs({
-          cli: mcpCli,
-          chromium: executable,
-          outputDir: directory,
-        }),
+        command: launcher,
+        args: [directory],
+        env: {
+          ...process.env,
+          ADM_PLAYWRIGHT_MCP_CLI: mcpCli,
+          ADM_BROWSER_CHROMIUM: executable,
+        },
         cwd: directory,
       }),
     );
@@ -105,6 +107,7 @@ test(
     const env = {
       ADM_BROWSER_CHROMIUM: executable,
       ADM_PLAYWRIGHT_MCP_CLI: mcpCli,
+      ADM_BROWSER_MCP: launcher,
     };
     holder.coding = await startPodRunner(holder.directory, holder.lifecycle, {
       id: "coding-agent",

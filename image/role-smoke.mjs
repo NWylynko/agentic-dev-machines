@@ -214,13 +214,13 @@ const smokeInfisicalTokenInEveryShell = async () => {
   if (off.stdout.trim() !== "zsh=\nzsh-i=\nbash=\nbash-i=" || off.stderr !== "") throw new Error(`not logged in, shells printed ${JSON.stringify(off)}`);
 };
 
-// The bundled Playwright MCP, as the runner starts it (packages/runner/src/browser.ts): over stdio as
+// The bundled Playwright MCP, as Pi and Claude start it (image/adm-browser-mcp): over stdio as
 // UID 1000 with the Pod's dropped capabilities, driving system chromium to a data: page.
 const smokeBrowserMcp = async () => {
   const script = `
     import { McpClient, StdioTransport, toLlmContent } from "/opt/adm/node_modules/@earendil-works/pi-mcp/dist/index.js";
     const client = new McpClient({ name: "smoke", version: "1" });
-    await client.connect(new StdioTransport({ command: process.execPath, args: ["/opt/adm/node_modules/@playwright/mcp/cli.js", "--headless", "--isolated", "--no-sandbox", "--executable-path", "/usr/bin/chromium", "--output-dir", "/tmp/browser"] }));
+    await client.connect(new StdioTransport({ command: "/usr/local/bin/adm-browser-mcp", args: ["/tmp/browser"] }));
     const names = (await client.listTools()).map((tool) => tool.name);
     if (!names.includes("browser_navigate")) throw new Error("no browser_navigate in " + names);
     const result = await client.callTool("browser_navigate", { url: "data:text/html,<title>adm-smoke-title</title>" });

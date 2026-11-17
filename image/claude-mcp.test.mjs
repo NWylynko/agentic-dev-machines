@@ -109,7 +109,7 @@ test(
     const text = await readFile(config, "utf8");
     for (const secret of fixture.issuedTokens)
       assert.ok(!text.includes(secret), "the config holds no connector token");
-    assert.deepEqual(Object.keys(JSON.parse(text).mcpServers), ["fixture"]);
+    assert.deepEqual(Object.keys(JSON.parse(text).mcpServers), ["browser", "fixture"]);
 
     const ask = () =>
       run(

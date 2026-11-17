@@ -1,0 +1,14 @@
+#!/bin/sh
+# The workspace's built-in browser (Pi and Claude Code alike): the pinned
+# Playwright MCP server over stdio, driving the image's chromium. One launcher
+# so both agents get the same browser.
+#   adm-browser-mcp [OUTPUT_DIR]   default: ./.adm/browser (the checkout's)
+set -eu
+output=${1:-$PWD/.adm/browser}
+mkdir -p "$output"
+exec node "${ADM_PLAYWRIGHT_MCP_CLI:-/opt/adm/node_modules/@playwright/mcp/cli.js}" \
+  --headless --isolated \
+  `# The Pod drops the capabilities Chromium's sandbox needs (as image/browser.mjs).` \
+  --no-sandbox \
+  --executable-path "${ADM_BROWSER_CHROMIUM:-/usr/bin/chromium}" \
+  --output-dir "$output"
