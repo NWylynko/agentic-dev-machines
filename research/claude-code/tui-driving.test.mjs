@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { startTuiFake } from "./tui-fake-api.mjs";
+import { startTuiFake } from "../../image/claude-tui-fake-api.mjs";
 
 const run = promisify(execFile);
 // CLAUDE_BIN picks another build, e.g. the version the image pins.

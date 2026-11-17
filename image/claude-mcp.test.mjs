@@ -88,6 +88,8 @@ test(
 
     const identity = join(directory, "identity-token");
     await writeFile(identity, "pod-identity\n");
+    const workspace = join(directory, "workspace.json");
+    await writeFile(workspace, JSON.stringify({ name: "mcp", cwd: directory, repositories: false }));
     const config = join(directory, "mcp.json");
     const env = {
       // headersHelper runs `adm-claude-mcp`, installed in /usr/local/bin in the image.
@@ -95,6 +97,7 @@ test(
       HOME: directory,
       ADM_LIFECYCLE_URL: authorityUrl,
       ADM_LIFECYCLE_TOKEN_FILE: identity,
+      ADM_WORKSPACE_CONFIG: workspace,
       CLAUDE_CONFIG_DIR: join(directory, "claude"),
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${model.server.address().port}`,
       ANTHROPIC_API_KEY: "sk-ant-fixture",

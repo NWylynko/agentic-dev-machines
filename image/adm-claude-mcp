@@ -63,8 +63,13 @@
     // (adm-browser-mcp). Its output goes beside this config on the volume:
     // Claude's cwd may be the read-only /repos catalog.
     const output = `${process.getBuiltinModule("node:path").dirname(file)}/browser`;
+    // A managed agent reports to its bot with messageManager (TASK-141).
+    const managed = !!workspaceConfig().manager;
     const mcpServers = {
       browser: { type: "stdio", command: "adm-browser-mcp", args: [output] },
+      ...(managed
+        ? { manager: { type: "stdio", command: "adm-claude-mcp", args: ["manager"] } }
+        : {}),
       ...Object.fromEntries(
         catalog.map((entry) => [
           entry.name,
@@ -74,5 +79,91 @@
     };
     fs.writeFileSync(`${file}.tmp`, `${JSON.stringify({ mcpServers }, null, 2)}\n`);
     fs.renameSync(`${file}.tmp`, file);
-  } else fail("usage: adm-claude-mcp config FILE | headers");
+  } else if (action === "manager") serveManagerMessages();
+  else fail("usage: adm-claude-mcp config FILE | headers | manager");
+
+  function workspaceConfig() {
+    const file = process.env.ADM_WORKSPACE_CONFIG || "/run/adm/workspace.json";
+    try {
+      return JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch (error) {
+      fail(`cannot read the workspace config ${file} (${error.code ?? error.message})`);
+    }
+  }
+
+  // `manager`: a stdio MCP server with one tool, messageManager, the same as
+  // Pi's (packages/runner/src/manager-messages.ts): POST
+  // /v1/workspaces/MANAGER/runtime/message with the Pod's token; the lifecycle
+  // forwards it to the managing bot as a new turn (src/manager_messages.rs).
+  function serveManagerMessages() {
+    const { id, manager } = workspaceConfig();
+    if (!manager) fail("this workspace has no manager bot");
+    const reply = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
+    const tool = {
+      name: "messageManager",
+      description:
+        "Send a short message to the bot that manages you, e.g. a finished result with its PR link, a blocker, or a question. The bot reads it as a new turn after its current one.",
+      inputSchema: {
+        type: "object",
+        properties: { text: { type: "string", minLength: 1, maxLength: 20000 } },
+        required: ["text"],
+        additionalProperties: false,
+      },
+    };
+    const deliver = async (text) => {
+      if (typeof text !== "string" || !text.trim() || text.length > 20000)
+        throw new Error("text must be 1-20000 characters");
+      const identity = fs.readFileSync(tokenFile, "utf8").trim();
+      const response = await fetch(
+        `${base.replace(/\/$/, "")}/v1/workspaces/${encodeURIComponent(manager)}/runtime/message`,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${identity}`, "content-type": "application/json" },
+          body: JSON.stringify({ text, requestId: `${id}:${crypto.randomUUID()}` }),
+          signal: AbortSignal.timeout(30_000),
+        },
+      );
+      const value = await response.json().catch(() => ({}));
+      if (!response.ok)
+        throw new Error(
+          `Message to manager bot ${manager} failed with HTTP ${response.status}: ${value.error?.message ?? "no detail"}`,
+        );
+      return `Delivered to manager bot ${manager}.`;
+    };
+    const handle = async (request) => {
+      if (request.id === undefined) return; // a notification
+      if (request.method === "initialize")
+        return reply({
+          id: request.id,
+          result: {
+            protocolVersion: request.params?.protocolVersion ?? "2025-06-18",
+            capabilities: { tools: {} },
+            serverInfo: { name: "adm-manager", version: "1" },
+          },
+        });
+      if (request.method === "ping") return reply({ id: request.id, result: {} });
+      if (request.method === "tools/list") return reply({ id: request.id, result: { tools: [tool] } });
+      if (request.method === "tools/call" && request.params?.name === tool.name) {
+        try {
+          const text = await deliver(request.params.arguments?.text);
+          return reply({ id: request.id, result: { content: [{ type: "text", text }] } });
+        } catch (error) {
+          process.stderr.write(`adm-claude-mcp manager: ${error.message}\n`);
+          return reply({ id: request.id, result: { isError: true, content: [{ type: "text", text: error.message }] } });
+        }
+      }
+      reply({ id: request.id, error: { code: -32601, message: `unsupported method ${request.method}` } });
+    };
+    const lines = process.getBuiltinModule("node:readline").createInterface({ input: process.stdin });
+    lines.on("line", (line) => {
+      if (!line.trim()) return;
+      let request;
+      try {
+        request = JSON.parse(line);
+      } catch {
+        return reply({ id: null, error: { code: -32700, message: "invalid JSON" } });
+      }
+      handle(request);
+    });
+  }
 })();

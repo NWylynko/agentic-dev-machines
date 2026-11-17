@@ -30,6 +30,10 @@ import {
   waitForLifecycleAvailability,
 } from "./lifecycle-availability.ts";
 import { botAgentManagementFromEnvironment } from "./bot-management.ts";
+import {
+  claudeAgentUnsupported,
+  claudeAgentUnsupportedActions,
+} from "./claude-agent.ts";
 import { connectorLifecycleFromEnvironment } from "./connectors.ts";
 import {
   agentMessageInput,
@@ -735,6 +739,17 @@ function validateConfig(id: string, input: unknown): WorkspaceConfig {
       "INVALID_MANAGER",
       "manager must be a bot's immutable workspace ID on a coding workspace",
     );
+  if (
+    config.harness !== undefined &&
+    (config.harness !== "claude" ||
+      config.role !== "coding" ||
+      !config.localRoot)
+  )
+    throw new ApiError(
+      400,
+      "INVALID_HARNESS",
+      "harness may only be claude, on a coding workspace with a localRoot",
+    );
   if (Object.hasOwn(config, "mcpServers"))
     throw new ApiError(
       400,
@@ -1114,6 +1129,16 @@ function importedPiTree(value: unknown, selectedLeafId: unknown) {
   return { branches, selectedLeafId };
 }
 async function runtimeStatusReport(workspace: Workspace) {
+  // A Claude Code agent's activity is Claude's, not Pi's (TASK-141).
+  if (workspace.claudeCode) {
+    const claude = await workspace.claudeCode.status();
+    return {
+      activity: {
+        status: claude.status,
+        ...(claude.error ? { error: claude.error.slice(0, 2000) } : {}),
+      },
+    };
+  }
   const status = await workspace.status();
   const selectedModel = await workspace.conversationSelectedModel();
   const activity = ["needs_model", "running", "error", "idle"].includes(
@@ -1299,6 +1324,20 @@ const server = createServer(async (request, response) => {
         );
       });
     }
+    // A Claude Code agent (TASK-141/142): Claude in tmux answers status;
+    // routes that would run Pi refuse.
+    const claudeCode = workspaces.get(id)?.claudeCode;
+    if (claudeCode) {
+      if (action && claudeAgentUnsupportedActions.has(action))
+        throw claudeAgentUnsupported(action);
+      if (request.method === "GET" && !action)
+        return json(response, 200, {
+          id,
+          name: claudeCode.config.name,
+          harness: "claude",
+          ...(await claudeCode.status()),
+        });
+    }
     if (action === "bash" && request.method === "POST") {
       const data = await body(request);
       if (
@@ -1412,7 +1451,14 @@ const server = createServer(async (request, response) => {
         const previous = configs.get(id);
         if (
           previous &&
-          ["role", "environment", "namespace", "localRoot", "kubeconfig"].some(
+          [
+            "role",
+            "environment",
+            "namespace",
+            "localRoot",
+            "kubeconfig",
+            "harness",
+          ].some(
             (key) =>
               previous[key as keyof WorkspaceConfig] !==
               config[key as keyof WorkspaceConfig],

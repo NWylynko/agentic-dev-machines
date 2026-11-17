@@ -15,6 +15,8 @@ export type WorkspaceConfig = {
   repositories?: boolean;
   /** The bot (immutable ID) this coding agent reports to with messageManager. */
   manager?: string;
+  /** Claude Code works here instead of Pi (TASK-141, claude-agent.ts). */
+  harness?: "claude";
   /** Runner-managed flag persisted only for newly registered bot conversations. */
   onboardingRequired?: boolean;
 };

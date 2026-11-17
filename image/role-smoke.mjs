@@ -157,6 +157,17 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
   }
 };
 
+// A bot's Claude Code agent (TASK-141/142) against the Claude the image pins:
+// the same test the host runs, on the image's claude, tmux and adm-claude.
+// It fails if this Claude version changes the session record or transcript
+// the runner reads, or shows a screen at an unattended start.
+const smokeClaudeAgentOnThePinnedClaude = async () => {
+  const tests = new URL(".", import.meta.url).pathname;
+  await execute("docker", ["run", "--rm", "--user", "1000:1000", "-v", `${tests}:/run/adm-smoke/image:ro`, "--entrypoint", "/bin/sh", image, "-ec", "cd /tmp && node --test /run/adm-smoke/image/claude-agent.test.mjs"], { maxBuffer: 16 * 1024 * 1024 }).catch((error) => {
+    throw new Error(`claude-agent.test.mjs on the image's Claude failed:\n${error.stdout}\n${error.stderr}`);
+  });
+};
+
 // fnm keeps the Node versions a project asks for on the work volume, so they survive a Pod
 // restart (a second container on the same volume stands in for it). Interactive zsh switches to
 // a repo's .node-version on cd. Non-interactive shells, like the runner, always use the image's
@@ -280,6 +291,7 @@ if (role === "adm-dev") {
   await smokeInfisicalTokenInEveryShell();
   await smokeClaudeCodeRunsAsTheWorkspaceUser();
   await smokeClaudeSessionSurvivesDetachAndRestart();
+  await smokeClaudeAgentOnThePinnedClaude();
   await smokeBrowserMcp();
   await smokeFnmSwitchesNodePerProject();
   await smokeDockerCliDrivesTheEngine();

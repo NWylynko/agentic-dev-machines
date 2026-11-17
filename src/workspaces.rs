@@ -114,6 +114,13 @@ pub struct Workspace {
     /// `adm create --manager BOT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<String>,
+    /// `claude` when Claude Code works here instead of Pi; none is Pi
+    /// (TASK-141, `src/claude_agents.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// A Claude Code agent's initial task, sent to Claude once at create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub created_at: u64,
     pub last_error: Option<String>,
 }
@@ -452,6 +459,8 @@ impl CreateOptions {
             credential_env,
             herdr_space: self.herdr_space.clone(),
             manager: self.manager.clone(),
+            harness: None,
+            prompt: None,
             created_at: now(),
             last_error: None,
         })
@@ -1611,6 +1620,9 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         if let Some(manager) = &w.manager {
             workspace_config["manager"] = json!(manager);
         }
+        if let Some(harness) = &w.harness {
+            workspace_config["harness"] = json!(harness);
+        }
     }
     let runtime_config = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":metadata(w,"workspace-runtime"),"data":{"workspace.json":serde_json::to_string(&workspace_config)?}});
     let service = json!({"apiVersion":"v1","kind":"Service","metadata":metadata(w,"workspace"),"spec":{"selector":labels,"ports":[{"name":"http","port":7432,"targetPort":7432}]}});
@@ -1986,6 +1998,12 @@ pub fn create_persisted(cli: &Cli, requested: Workspace) -> Result<Workspace> {
         // token from the lifecycle only for the lease holder.
         if let Some(repository) = &w.repository {
             prepare_repository(cli, &w, repository)?;
+        }
+        // A Claude Code agent starts in its checkout, so after it exists (TASK-141).
+        if w.harness.is_some() {
+            lifecycle_stage(cli, "create", &w.name, "starting Claude Code", || {
+                crate::claude_agents::start_claude_agent(cli, &w)
+            })?;
         }
         w.phase = "ready".into();
         store.admit_if_provisioning(&w, || Ok(()))?;
@@ -2413,6 +2431,8 @@ fn same_creation_spec(existing: &Workspace, requested: &Workspace) -> bool {
         && existing.credential_env == requested.credential_env
         && existing.herdr_space == requested.herdr_space
         && existing.manager == requested.manager
+        && existing.harness == requested.harness
+        && existing.prompt == requested.prompt
 }
 
 pub fn destroy(cli: &Cli, name: &str) -> Result<Workspace> {

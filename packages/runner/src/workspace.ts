@@ -73,6 +73,7 @@ import type { BotAgentManagement } from "./bot-management.ts";
 import { WorkspaceBrowser } from "./browser.ts";
 import { ignoredFilesExtension } from "./ignored-files.ts";
 import { managerMessageExtension } from "./manager-messages.ts";
+import { ClaudeCodeSession } from "./claude-agent.ts";
 import { WorkspaceConnectors, type ConnectorLifecycle } from "./connectors.ts";
 import {
   applyGoal,
@@ -213,6 +214,8 @@ export class Workspace {
   private sandbox?: CodemodeSandbox;
   private connectors?: WorkspaceConnectors;
   browser?: WorkspaceBrowser;
+  /** Claude Code in tmux, for harness claude: Pi takes no turns (TASK-141). */
+  claudeCode?: ClaudeCodeSession;
   private constructor(
     config: WorkspaceConfig,
     harness: Workspace["harness"],
@@ -226,6 +229,8 @@ export class Workspace {
     connectors?: WorkspaceConnectors,
   ) {
     this.config = config;
+    if (config.harness === "claude")
+      this.claudeCode = new ClaudeCodeSession(config);
     this.harness = harness;
     this.conversation = conversation;
     this.models = models;

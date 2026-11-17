@@ -107,6 +107,12 @@ pub struct CreateIntent {
     /// ID (`resolve_create_manager`), and a bot's createAgent always names itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<String>,
+    /// `pi` (default) or `claude`: which agent works in the workspace (TASK-141).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// A Claude Code agent's initial task (TASK-141).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 fn default_cwd() -> String {
@@ -138,11 +144,14 @@ impl CreateIntent {
             credential_env: workspace.credential_env.clone(),
             herdr_space: workspace.herdr_space.clone(),
             manager: workspace.manager.clone(),
+            harness: workspace.harness.clone(),
+            prompt: workspace.prompt.clone(),
         }
     }
 
     pub(crate) fn allocate(self, operation_id: &str) -> Result<Workspace> {
         crate::workspaces::validate_name(&self.name)?;
+        let harness = crate::claude_agents::admit_harness(&self.role, self.harness, &self.prompt)?;
         ensure!(
             self.role == "coding" || self.manager.is_none(),
             "only coding workspaces have a manager bot"
@@ -280,6 +289,8 @@ impl CreateIntent {
             credential_env: self.credential_env,
             herdr_space: self.herdr_space,
             manager: self.manager,
+            harness,
+            prompt: self.prompt,
             created_at: crate::workspaces::now(),
             last_error: None,
         })
@@ -1148,6 +1159,7 @@ fn route(
                     "role": workspace.role,
                     "phase": workspace.phase,
                     "namespace": workspace.namespace,
+                    "harness": workspace.harness.as_deref().unwrap_or("pi"),
                     "runtime_status": workspace.runtime_status,
                 })
             })
@@ -1169,10 +1181,13 @@ fn route(
         }
         let request = request_from_json(&value)?;
         match &request {
-            OperationRequest::Create { spec, .. } => ensure!(
-                spec.role == "coding",
-                "runtime caller is not authorized to create this workspace role"
-            ),
+            OperationRequest::Create { spec, .. } => {
+                ensure!(
+                    spec.role == "coding",
+                    "runtime caller is not authorized to create this workspace role"
+                );
+                crate::claude_agents::require_claude_login(spec.harness.as_deref())?;
+            }
             OperationRequest::Delete { workspace_id, .. } => {
                 let target = store.find(workspace_id)?;
                 ensure!(
@@ -1215,6 +1230,9 @@ fn route(
         let mut value: Value = serde_json::from_slice(body)?;
         crate::manager_messages::resolve_create_manager(&store, &mut value)?;
         let request = request_from_json(&value)?;
+        if let OperationRequest::Create { spec, .. } = &request {
+            crate::claude_agents::require_claude_login(spec.harness.as_deref())?;
+        }
         let operation_id = request.operation_id().to_owned();
         let receipt = admit(&mut store, &request)?;
         if receipt.status != "completed" {
@@ -1798,7 +1816,16 @@ fn valid_runtime_status_report(report: &Value) -> bool {
             .keys()
             .all(|key| ["status", "error"].contains(&key.as_str()))
     }) || !status.is_some_and(|status| {
-        ["needs_model", "running", "error", "idle", "unavailable"].contains(&status)
+        // `waiting`: a Claude Code agent is asking a question (TASK-141).
+        [
+            "needs_model",
+            "running",
+            "error",
+            "idle",
+            "unavailable",
+            "waiting",
+        ]
+        .contains(&status)
     }) {
         return false;
     }

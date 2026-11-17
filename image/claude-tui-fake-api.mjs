@@ -1,10 +1,13 @@
-// Fake Anthropic API for the Claude Code TUI-driving spike (TASK-141/142).
-//   node tui-fake-api.mjs PORT LOGFILE      (standalone, for poking by hand)
-//   import { startTuiFake } from "./tui-fake-api.mjs"
+// Fake Anthropic API for driving the interactive Claude Code TUI in tmux
+// (TASK-141/142, research/claude-code/tui-driving.md).
+//   node image/claude-tui-fake-api.mjs PORT LOGFILE   (standalone, for poking by hand)
+//   import { startTuiFake } from "./claude-tui-fake-api.mjs"
 // Replies "ECHO: <last user text>". A prompt containing HOLD streams
 // "working... " and then holds the stream open until release() (or GET
-// /release). A prompt containing TOOL:<command> gets one Bash tool call.
-// Every /v1/messages request is kept in `requests` (and appended to LOGFILE).
+// /release). A prompt containing TOOL:<command> gets one Bash tool call,
+// CALL:<tool> <json input> one call of any tool (an MCP tool, say), and ASK
+// an AskUserQuestion. Every /v1/messages request is kept in `requests` (and
+// appended to LOGFILE).
 import { createServer } from "node:http";
 import { appendFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -64,7 +67,7 @@ export function startTuiFake({ log } = {}) {
     // A request carrying a tool result continues a turn (a mid-turn message
     // may ride along with it): it never asks for TOOL/HOLD/ASK.
     const fresh = afterTool ? "" : text;
-    note({ stream: !!body.stream, messages: body.messages.length, roles: body.messages.map((m) => m.role[0]).join(""), afterTool, text });
+    note({ model: body.model, stream: !!body.stream, messages: body.messages.length, roles: body.messages.map((m) => m.role[0]).join(""), afterTool, text });
     const reply = `ECHO: ${text}`;
     const start = { id: `msg_fake_${requests.length}`, type: "message", role: "assistant", model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } };
     if (!body.stream) {
@@ -81,11 +84,14 @@ export function startTuiFake({ log } = {}) {
     };
     event("message_start", { message: start });
     const bash = fresh.match(/TOOL:(.*)$/m);
+    const call = fresh.match(/CALL:(\S+) (.*)$/m);
     const ask = fresh.includes("ASK");
-    if (bash || ask) {
+    if (bash || call || ask) {
       const [name, input] = bash
         ? ["Bash", { command: bash[1], description: "spike tool call" }]
-        : ["AskUserQuestion", { questions: [{ question: "Which colour?", header: "Colour", multiSelect: false, options: [{ label: "Red", description: "red" }, { label: "Blue", description: "blue" }] }] }];
+        : call
+          ? [call[1], JSON.parse(call[2])]
+          : ["AskUserQuestion", { questions: [{ question: "Which colour?", header: "Colour", multiSelect: false, options: [{ label: "Red", description: "red" }, { label: "Blue", description: "blue" }] }] }];
       event("content_block_start", { index: 0, content_block: { type: "tool_use", id: `toolu_${requests.length}`, name, input: {} } });
       event("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
       return finish("tool_use");

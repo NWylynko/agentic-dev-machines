@@ -206,10 +206,10 @@ test(
     }
     const listed = JSON.parse((await call("listAgents", {}, "list")).text);
     assert.deepEqual(
-      listed.agents.map(({ id, name }) => ({ id, name })),
+      listed.agents.map(({ id, name, harness }) => ({ id, name, harness })),
       [
-        { id: "alpha", name: "project-albatross" },
-        { id: "beta", name: "project-bee" },
+        { id: "alpha", name: "project-albatross", harness: "pi" },
+        { id: "beta", name: "project-bee", harness: "pi" },
       ],
     );
     const codeMode = await call("listAgents", {}, "list-code", true);
@@ -370,6 +370,31 @@ test(
     assert.equal(createSpec.cwd, "/repos/owner/project");
     // The lifecycle fills the image from the cluster's release.
     assert.equal("image" in createSpec, false);
+    assert.equal("harness" in createSpec, false, "Pi is the default harness");
+    // A Claude Code agent (TASK-141) starts on its task.
+    const claudeCreated = JSON.parse(
+      (
+        await call(
+          "createAgent",
+          {
+            name: "claude-agent",
+            harness: "claude",
+            prompt: "Fix issue #131 and open a PR.",
+            storageClass: "fast",
+            storageSize: "10Gi",
+            cpu: "2",
+            memory: "4Gi",
+            model: { provider: "claude", id: "sonnet" },
+          },
+          "create-claude",
+        )
+      ).text,
+    );
+    const claudeSpec = lifecycle.operations.get(claudeCreated.operationId)
+      .request.spec;
+    assert.equal(claudeSpec.harness, "claude");
+    assert.equal(claudeSpec.prompt, "Fix issue #131 and open a PR.");
+    assert.deepEqual(claudeSpec.model, { provider: "claude", id: "sonnet" });
     const operation = JSON.parse(
       (
         await call(
@@ -576,6 +601,7 @@ test(
       {
         id: "created-after-bot",
         name: "new-project",
+        harness: "pi",
         status: "idle",
         phase: "ready",
         ready: true,

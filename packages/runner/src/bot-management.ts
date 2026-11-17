@@ -6,6 +6,8 @@ type RuntimeWorkspace = {
   role: "coding";
   phase: string;
   namespace: string;
+  /** pi or claude (TASK-141). */
+  harness?: string;
   runtime_status?: {
     podIP?: string;
     ready?: boolean;

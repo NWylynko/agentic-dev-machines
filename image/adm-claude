@@ -3,6 +3,8 @@
 # Control on, inside the tmux session "claude". It runs whether or not a
 # terminal is attached; detaching (Ctrl-b d) leaves it running.
 #   start   mark Claude enabled on the workspace volume; start it if not running
+#   start --task  a bot's Claude Code agent (harness claude, TASK-141): the
+#           lifecycle passes the task on stdin once the workspace is ready
 #   attach  start, then attach this terminal
 #   boot    container start: start it only if it was ever enabled here
 #   run [CLAUDE ARGS]  exec Claude as the tmux session runs it: the
@@ -36,9 +38,52 @@ Files git ignores inside /repos checkouts (node_modules, build output, .env, loc
     # restarts and moves.
     export CLAUDE_CONFIG_DIR="$state/config" DISABLE_AUTOUPDATER=1 \
       CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
+    harness=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).harness ?? "pi"' "$config")
+    if [ "$harness" = claude ]; then
+      # A bot's Claude Code agent (TASK-141) runs with nobody to answer a
+      # screen: onboarding done, /workspace, /repos and this checkout trusted,
+      # its CLAUDE.md imports approved, and every permission granted like Pi
+      # (TASK-39). research/claude-code/tui-driving.md has the keys. Prints
+      # "yes" when this checkout already has a conversation.
+      conversation=$(node -e '
+        const fs = require("fs"), path = require("path");
+        const directory = process.argv[1], file = path.join(directory, ".claude.json");
+        let settings = {};
+        try { settings = JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) { if (error.code !== "ENOENT") throw error; }
+        // Claude keys projects by the physical cwd (/repos is a symlink).
+        const cwd = fs.realpathSync(process.cwd());
+        const projects = settings.projects ?? {};
+        for (const trusted of ["/workspace", "/repos", cwd])
+          projects[trusted] = { ...projects[trusted], hasTrustDialogAccepted: true };
+        Object.assign(projects[cwd], { hasClaudeMdExternalIncludesApproved: true, hasClaudeMdExternalIncludesWarningShown: true });
+        fs.mkdirSync(directory, { recursive: true });
+        fs.writeFileSync(`${file}.adm-tmp`, JSON.stringify({ ...settings, hasCompletedOnboarding: true, projects }, null, 2));
+        fs.renameSync(`${file}.adm-tmp`, file);
+        let transcripts = [];
+        try { transcripts = fs.readdirSync(path.join(directory, "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"))); } catch (error) { if (error.code !== "ENOENT") throw error; }
+        process.stdout.write(transcripts.some((name) => name.endsWith(".jsonl")) ? "yes" : "no");
+      ' "$CLAUDE_CONFIG_DIR")
+      model=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).model?.id ?? ""' "$config")
+      set -- --dangerously-skip-permissions "$@"
+      if [ -n "$model" ]; then set -- --model "$model" "$@"; fi
+      if [ "$conversation" = yes ]; then
+        # A restarted Pod resumes the conversation; the task was delivered
+        # with it and is never sent again.
+        if [ -f "$state/task" ]; then rm "$state/task"; fi
+        set -- "$@" --continue
+      elif [ -f "$state/task" ]; then
+        # First start: the task is Claude's first prompt, as an argument, so
+        # it is submitted once Claude is ready with no paste race. It stays
+        # on the volume until a conversation exists, so a Pod that dies first
+        # still delivers it.
+        set -- "$@" "$(cat "$state/task")"
+      fi
+    fi
+    # skipDangerousModePermissionPrompt: --dangerously-skip-permissions starts
+    # without its warning screen (harness claude only passes the flag).
     exec claude --mcp-config "$state/mcp.json" --no-chrome \
       --tools "Bash,Read,Edit,Write,Glob,Grep,ToolSearch,Skill,AskUserQuestion" \
-      --settings '{"skillOverrides":{"built-in-browser":"off","plugin-authoring":"off","chrome-browser":"off","computer-use":"off","deep-research":"off","docs":"off","docx":"off","pdf":"off","pptx":"off","xlsx":"off"}}' \
+      --settings '{"skipDangerousModePermissionPrompt":true,"skillOverrides":{"built-in-browser":"off","plugin-authoring":"off","chrome-browser":"off","computer-use":"off","deep-research":"off","docs":"off","docx":"off","pdf":"off","pptx":"off","xlsx":"off"}}' \
       "$@"
     ;;
   credentials-loop)
@@ -54,6 +99,10 @@ esac
 if [ "$action" = boot ] && [ ! -f "$state/enabled" ]; then exit 0; fi
 mkdir -p "$state/config"
 : > "$state/enabled"
+if [ "$action" = start ] && [ "${2:-}" = --task ]; then
+  cat > "$state/task.tmp"
+  mv "$state/task.tmp" "$state/task"
+fi
 # Installation MCP connectors, refreshed on every start and attach. Tokens are
 # fetched per connection by its headersHelper; none are written here.
 adm-claude-mcp config "$state/mcp.json"

@@ -1,4 +1,5 @@
 mod agents_file;
+mod claude_agents;
 mod client_release;
 mod connectors;
 mod diagnostics;
@@ -906,6 +907,12 @@ fn print_status(status: &Value) {
     if let Some(manager) = status["workspace"]["manager"].as_str() {
         println!("Manager: {manager} (bot; the agent reports to it with messageManager)");
     }
+    if status["workspace"]["harness"] == "claude" {
+        println!(
+            "Harness: claude (Claude Code in tmux session claude, not Pi; watch it with adm claude {})",
+            status["workspace"]["name"].as_str().unwrap_or("NAME")
+        );
+    }
     print_summary_errors(status);
     if let Some(error) = status["cluster"]["error"].as_str() {
         println!("Cluster details unavailable: {error}");
@@ -1020,6 +1027,7 @@ fn print_inspect(status: &Value) -> Result<()> {
         ("Model", "model"),
         ("Herdr space", "herdr_space"),
         ("Manager", "manager"),
+        ("Harness", "harness"),
         ("Created at", "created_at"),
         ("Last error", "last_error"),
     ] {

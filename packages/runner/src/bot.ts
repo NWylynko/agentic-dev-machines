@@ -108,6 +108,7 @@ export function botExtension(
                   agents: directory.map((agent) => ({
                     id: agent.id,
                     name: agent.name,
+                    harness: agent.harness ?? "pi",
                     status:
                       agent.runtime_status?.activity?.status ?? agent.phase,
                     phase: agent.phase,
@@ -308,6 +309,20 @@ export function botExtension(
           "Create a coding-agent workspace through the durable lifecycle service. Creation choices are explicit and the operation receipt can be replayed after a lost acknowledgement.",
         parameters: obj({
           name: str({ minLength: 1, maxLength: 63 }),
+          harness: opt(
+            oneOf(["pi", "claude"], {
+              description:
+                "Agent to run: pi (default) or claude, Claude Code on the installation's adm login claude. A claude agent starts on prompt at once and reports back with messageManager; it has no goals, loops or model changes, and model.id picks its Claude model (opus, sonnet or a full ID).",
+            }),
+          ),
+          prompt: opt(
+            str({
+              minLength: 1,
+              maxLength: 100000,
+              description:
+                "The initial task; required for harness claude, not taken for pi (use promptAgent).",
+            }),
+          ),
           image: opt(
             str({
               minLength: 1,
@@ -365,6 +380,11 @@ export function botExtension(
             base: args.base,
             cwd: args.repository ? `/repos/${args.repository}` : "/repos",
             model: args.model,
+            ...(args.harness === "claude"
+              ? { harness: "claude", prompt: args.prompt }
+              : args.prompt === undefined
+                ? {}
+                : { prompt: args.prompt }),
             credential_env: [],
             herdr_space: null,
           };

@@ -551,6 +551,11 @@ elif args[:2] == ['delete','secret']:
 elif args[:2] == ['delete','pod']:
     with locked():
         with (root/'deleted-pods').open('a') as deleted: deleted.write(' '.join(args[2:])+'\n')
+elif args[0] == 'exec':
+    # A command the lifecycle runs in a workspace container, with its stdin (TASK-141).
+    stdin=sys.stdin.read()
+    with locked():
+        with (root/'exec-log').open('a') as log: log.write(json.dumps({'args':args[1:],'stdin':stdin})+'\n')
 else:
     print('unexpected kubectl command: '+repr(args), file=sys.stderr); sys.exit(1)
 "##;
@@ -6100,4 +6105,270 @@ fn a_coding_agent_messages_only_the_bot_that_manages_it() {
 
     stop_http_stub(bot_port, bot_runner);
     stop_http_stub(runner_port, runner);
+}
+
+/// Provider auth for TASK-141: `adm login claude` is reported with the status
+/// in `root/claude-login` (authenticated, unauthenticated or login_expired);
+/// there is no GitHub login.
+fn start_claude_login_authority(root: &Path) -> (String, u16, thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let root = root.to_owned();
+    let server = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first_line = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            if first_line.starts_with("GET /shutdown ") {
+                break;
+            }
+            let (status, body) = if first_line.starts_with("GET /v1/provider-auth/providers ") {
+                let login = fs::read_to_string(root.join("claude-login")).unwrap();
+                (
+                    "200 OK",
+                    json!([
+                        {"provider":"anthropic","name":"Anthropic","authTypes":["oauth"],"authenticated":"oauth","status":"authenticated"},
+                        {"provider":"claude","name":"Claude Code","authTypes":["oauth"],"authenticated":null,"status":login.trim()}
+                    ]),
+                )
+            } else if first_line.starts_with("GET /v1/runtime/repos/token ") {
+                (
+                    "409 Conflict",
+                    json!({"error":{"code":"GITHUB_NOT_LOGGED_IN","message":"not logged in"}}),
+                )
+            } else {
+                ("404 Not Found", json!({"error":{"code":"NOT_FOUND"}}))
+            };
+            let body = body.to_string();
+            write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), port, server)
+}
+
+// TASK-141: a bot's createAgent can start Claude Code instead of Pi. The spec
+// keeps `harness`; without `adm login claude` the create is refused before
+// anything is created; once the workspace is ready the lifecycle starts Claude
+// in it with the task (prefixed with how to report back) on stdin, once.
+#[test]
+fn a_bot_starts_a_claude_code_agent_only_with_the_claude_login() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (authority_url, authority_port, authority) = start_claude_login_authority(root.path());
+    fs::write(root.path().join("claude-login"), "unauthenticated").unwrap();
+    fs::write(
+        root.path().join("service-env.json"),
+        json!([["ADM_PROVIDER_AUTH_URL", authority_url]]).to_string(),
+    )
+    .unwrap();
+    let (runner_url, runner_port, runner) = start_runner_stub();
+    fs::write(root.path().join("runner-url"), &runner_url).unwrap();
+    fs::write(root.path().join("kubectl"), FAKE_KUBECTL).unwrap();
+    fs::set_permissions(
+        root.path().join("kubectl"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(root.path().join("token"), "synthetic-lifecycle-token\n").unwrap();
+    fs::write(root.path().join("storage-release"), "go").unwrap();
+    let (url, port) = lifecycle_url();
+    fs::write(root.path().join("lifecycle-url"), &url).unwrap();
+    let _service = start_service(root.path(), port);
+    wait_for(|| request(&url, "GET", "/health", None).ok());
+    let operator = |method: &str, path: &str, body: Option<&Value>| {
+        request_with_token(&url, method, path, body, Some("synthetic-lifecycle-token")).unwrap()
+    };
+    let completed = |operation_id: &str| -> Value {
+        let receipt: Value = wait_for(|| {
+            operator("GET", &format!("/v1/operations/{operation_id}"), None)
+                .json::<Value>()
+                .ok()
+                .filter(|receipt| receipt["status"] == "completed")
+        });
+        operator(
+            "GET",
+            &format!(
+                "/v1/workspaces/{}",
+                receipt["workspaceId"].as_str().unwrap()
+            ),
+            None,
+        )
+        .json()
+        .unwrap()
+    };
+    let mut bot_spec = workspace_spec("boss-bot");
+    bot_spec["role"] = "bot".into();
+    let admitted = operator(
+        "POST",
+        "/v1/operations",
+        Some(
+            &json!({"operationId":"0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c01","kind":"create","spec":bot_spec}),
+        ),
+    );
+    assert_eq!(admitted.status(), 202, "{}", admitted.text().unwrap());
+    let bot = completed("0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c01");
+    let bot_id = bot["id"].as_str().unwrap().to_owned();
+    let bot_uid = "7a2b3c4d-1e2f-4a5b-8c6d-9e0f1a2b3c4d";
+    fs::write(
+        root.path().join("expected-bot-namespace"),
+        bot["namespace"].as_str().unwrap(),
+    )
+    .unwrap();
+    fs::write(root.path().join("expected-bot-token-uid"), bot_uid).unwrap();
+    fs::write(root.path().join("expected-bot-pod-uid"), bot_uid).unwrap();
+    fs::write(root.path().join("expected-pod-uid"), bot_uid).unwrap();
+    fs::write(root.path().join("expected-namespace"), "adm-none").unwrap();
+    assert_eq!(
+        request_with_token(
+            &url,
+            "POST",
+            &format!("/v1/workspaces/{bot_id}/runtime/lease"),
+            Some(&json!({"holder":bot_uid})),
+            Some("bot-token"),
+        )
+        .unwrap()
+        .status(),
+        200
+    );
+    let bot_create = |operation_id: &str, spec: &Value| {
+        request_with_token(
+            &url,
+            "POST",
+            "/v1/runtime/operations",
+            Some(&json!({"operationId":operation_id,"kind":"create","spec":spec})),
+            Some("bot-token"),
+        )
+        .unwrap()
+    };
+    let mut claude_spec = workspace_spec("claude-131");
+    claude_spec["harness"] = json!("claude");
+    claude_spec["model"] = json!({"provider":"claude","id":"sonnet"});
+    claude_spec["prompt"] = json!("Fix issue #131.\nThen open a PR.");
+
+    // No Claude login, or an expired one: refused with the fix, nothing created.
+    let refused = bot_create("0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c02", &claude_spec);
+    assert_eq!(refused.status(), 400);
+    let refused = refused.text().unwrap();
+    assert!(refused.contains("run adm login claude"), "{refused}");
+    fs::write(root.path().join("claude-login"), "login_expired").unwrap();
+    let refused = bot_create("0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c02", &claude_spec);
+    assert_eq!(refused.status(), 400);
+    let refused = refused.text().unwrap();
+    assert!(
+        refused.contains("expired") && refused.contains("run adm login claude"),
+        "{refused}"
+    );
+    let workspaces: Value = operator("GET", "/v1/workspaces", None).json().unwrap();
+    assert!(
+        !workspaces.to_string().contains("claude-131"),
+        "a refused create leaves no workspace: {workspaces}"
+    );
+    let operation: Value = request_with_token(
+        &url,
+        "GET",
+        "/v1/runtime/operations/0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c02",
+        None,
+        Some("bot-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    assert_eq!(operation["error"]["code"], "OPERATION_NOT_FOUND");
+
+    // A Claude agent needs its task; Pi agents take none; no other harness.
+    fs::write(root.path().join("claude-login"), "authenticated").unwrap();
+    let mut without_task = claude_spec.clone();
+    without_task.as_object_mut().unwrap().remove("prompt");
+    let refused = bot_create("0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c03", &without_task);
+    assert_eq!(refused.status(), 400);
+    assert!(refused.text().unwrap().contains("prompt"));
+    let mut pi_with_task = workspace_spec("pi-131");
+    pi_with_task["prompt"] = json!("do it");
+    let refused = bot_create("0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c04", &pi_with_task);
+    assert_eq!(refused.status(), 400);
+    assert!(refused.text().unwrap().contains("prompt"));
+    let mut unknown = claude_spec.clone();
+    unknown["harness"] = json!("codex");
+    let refused = bot_create("0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c05", &unknown);
+    assert_eq!(refused.status(), 400);
+    assert!(refused.text().unwrap().contains("harness"));
+
+    // With the login: created, the spec keeps the harness, and Claude starts
+    // in the ready workspace with the task on stdin.
+    let admitted = bot_create("0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c06", &claude_spec);
+    assert_eq!(admitted.status(), 202, "{}", admitted.text().unwrap());
+    let agent = completed("0b5c2a41-58f4-4a39-9d55-0b7f4a1f3c06");
+    assert_eq!(agent["harness"], json!("claude"), "{agent}");
+    assert_eq!(agent["manager"], json!(bot_id), "{agent}");
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(root.path().join("applied")).unwrap()).unwrap();
+    let workspace_json: Value = applied["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "ConfigMap" && item["metadata"]["name"] == "workspace-runtime")
+        .map(|item| serde_json::from_str(item["data"]["workspace.json"].as_str().unwrap()).unwrap())
+        .unwrap();
+    assert_eq!(
+        workspace_json["harness"],
+        json!("claude"),
+        "{workspace_json}"
+    );
+    assert!(
+        !workspace_json.to_string().contains("issue #131"),
+        "the task reaches Claude once, never through the Pod's config: {workspace_json}"
+    );
+    let exec_log = fs::read_to_string(root.path().join("exec-log")).unwrap();
+    let starts = exec_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|exec| exec["args"].to_string().contains("adm-claude"))
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1, "{exec_log}");
+    let args = starts[0]["args"].as_array().unwrap();
+    assert!(
+        args.contains(&agent["namespace"])
+            && args.ends_with(&[json!("adm-claude"), json!("start"), json!("--task")]),
+        "{args:?}"
+    );
+    let task = starts[0]["stdin"].as_str().unwrap();
+    assert!(task.ends_with("Fix issue #131.\nThen open a PR."), "{task}");
+    assert!(
+        task.contains("mcp__manager__messageManager"),
+        "Claude is told how to report back: {task}"
+    );
+
+    // The bot's directory shows which agent runs Claude Code.
+    let directory: Value = request_with_token(
+        &url,
+        "GET",
+        "/v1/runtime/workspaces",
+        None,
+        Some("bot-token"),
+    )
+    .unwrap()
+    .json()
+    .unwrap();
+    let listed = directory
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == agent["id"])
+        .unwrap();
+    assert_eq!(listed["harness"], json!("claude"), "{listed}");
+
+    stop_http_stub(runner_port, runner);
+    stop_http_stub(authority_port, authority);
 }

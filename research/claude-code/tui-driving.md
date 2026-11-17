@@ -2,7 +2,7 @@
 
 Question: can the coding runner start `claude` in tmux unattended, paste prompts into it, tell idle/busy/waiting apart, abort it, and read back a small history, all without a person attached?
 
-Evidence: `research/claude-code/tui-driving.test.mjs` runs the real `claude` TUI in a private tmux server against `research/claude-code/tui-fake-api.mjs` (a fake Messages API that also collects hook calls, so hooks and model requests come in one ordered stream), with a scratch `HOME`/`CLAUDE_CONFIG_DIR`. All 16 tests pass on 2.1.326 (host). The image pins 2.1.316, which is not installed on this host. 2.1.314 gives the same results (`CLAUDE_BIN=~/.local/share/claude/versions/2.1.314`), except that a too-early paste fails even worse there (see 2).
+Evidence: `research/claude-code/tui-driving.test.mjs` runs the real `claude` TUI in a private tmux server against `image/claude-tui-fake-api.mjs` (a fake Messages API that also collects hook calls, so hooks and model requests come in one ordered stream), with a scratch `HOME`/`CLAUDE_CONFIG_DIR`. All 16 tests pass on 2.1.326 (host). The image pins 2.1.316, which is not installed on this host. 2.1.314 gives the same results (`CLAUDE_BIN=~/.local/share/claude/versions/2.1.314`), except that a too-early paste fails even worse there (see 2).
 
 ```
 node --test --test-concurrency=1 research/claude-code/tui-driving.test.mjs      # ~40 s
