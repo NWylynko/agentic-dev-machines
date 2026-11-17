@@ -127,7 +127,7 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
       "! tmux has-session -t =claude 2>/dev/null",
       "adm-claude start",
       "test -f /workspace/.adm/claude/enabled",
-      `test "$(cat /workspace/.adm/claude/mcp.json | tr -d ' \\n')" = '{"mcpServers":{}}'`,
+      `test "$(cat /workspace/.adm/claude/mcp.json | tr -d ' \\n')" = '{"mcpServers":{"browser":{"type":"stdio","command":"adm-browser-mcp","args":[]}}}'`,
       // Signed in from the installation login before Claude starts, without a refresh token.
       `node -e 'const c = require("/workspace/.adm/claude/config/.credentials.json").claudeAiOauth; if (c.accessToken !== "smoke-access" || c.refreshToken !== null) process.exit(1)'`,
       `node -e 'if (require("/workspace/.adm/claude/config/.claude.json").oauthAccount.organizationUuid !== "smoke-organization") process.exit(1)'`,
@@ -140,9 +140,10 @@ const smokeClaudeSessionSurvivesDetachAndRestart = async () => {
       // Claude replaces tmux's exec of it straight away; wait for it to draw.
       "i=0; until tmux capture-pane -p -t claude | grep -q .; do i=$((i+1)); [ $i -lt 100 ] || exit 1; sleep 0.1; done",
       'test "$(tmux display-message -p -t claude "#{pane_current_command}")" = claude',
-      'test "$(tmux show-environment -t claude CLAUDE_CONFIG_DIR)" = CLAUDE_CONFIG_DIR=/workspace/.adm/claude/config',
+      // adm-claude run execs claude with the config dir and the diet.
+      'tr "\\0" "\\n" < /proc/$(tmux display-message -p -t claude "#{pane_pid}")/environ | grep -qx CLAUDE_CONFIG_DIR=/workspace/.adm/claude/config',
       // With /repos, Claude is told ignored files are wiped with the Pod (TASK-81).
-      "tmux display-message -p -t claude '#{pane_start_command}' | grep -q 'deleted whenever this workspace'",
+      "tr '\\0' '\\n' < /proc/$(tmux display-message -p -t claude '#{pane_pid}')/cmdline | grep -q 'deleted whenever this workspace'",
       "adm-claude start",
       'test "$(tmux list-sessions | wc -l)" = 2',
       "tmux kill-server",
@@ -225,8 +226,17 @@ const smokeBrowserMcp = async () => {
     if (!names.includes("browser_navigate")) throw new Error("no browser_navigate in " + names);
     const result = await client.callTool("browser_navigate", { url: "data:text/html,<title>adm-smoke-title</title>" });
     const text = toLlmContent(result);
-    await client.close();
     if (!JSON.stringify(text).includes("adm-smoke-title")) throw new Error("navigate returned " + JSON.stringify(text));
+    // Sites see a desktop Chrome, not a headless bot (image/browser-human.test.mjs), with the image's chromium.
+    // A loopback page: a secure context, as real sites are (a data: page has no navigator.deviceMemory).
+    const { createServer } = await import("node:http");
+    const site = createServer((request, response) => response.writeHead(200, { "content-type": "text/html" }).end("<title>human</title>"));
+    await new Promise((resolve) => site.listen(0, "127.0.0.1", resolve));
+    await client.callTool("browser_navigate", { url: "http://127.0.0.1:" + site.address().port + "/" });
+    const page = JSON.stringify(toLlmContent(await client.callTool("browser_evaluate", { function: "() => [navigator.userAgent, navigator.deviceMemory > 0, outerHeight > innerHeight, screen.width].join('|')" })));
+    await client.close();
+    site.close();
+    if (page.includes("Headless") || !page.includes(".0.0.0 Safari") || !page.includes("|true|true|1920")) throw new Error("the browser looks headless: " + page);
   `;
   await execute("docker", ["run", "--rm", "--user", "1000:1000", "--cap-drop", "ALL", ...workspaceCapabilities.flatMap((capability) => ["--cap-add", capability]), "-e", "HOME=/tmp", "--entrypoint", "node", image, "--input-type=module", "-e", script], { maxBuffer: 1024 * 1024 });
 };

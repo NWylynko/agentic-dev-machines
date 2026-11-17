@@ -186,3 +186,9 @@ Found by stressing suites under CPU load (`yes` burners, `taskset -c 0,1`) and r
 - `--tools` without `ToolSearch` loads every MCP tool eagerly (Linear alone is 38k), so ToolSearch must stay in the list.
 - `CLAUDE_CODE_SYNC_SKILLS=0` does not stop the claude.ai-synced skills (they land in `$CLAUDE_CONFIG_DIR/skills/synced`); only `skillOverrides` by name does. `plugin-authoring` ignores `CLAUDE_CODE_DISABLE_BUNDLED_SKILLS`.
 - Not verified live: a release with this image (measured by running the new script in a Pod against a copy of the login).
+
+## 2026-11-16 — one browser for Pi and Claude, passing as a person
+
+- `image/adm-browser-mcp` launches the Playwright MCP server for both agents; Claude gets it as stdio server `browser` in its `mcp.json`. Pi's `browserServerArgs` is gone.
+- bot.sannysoft.com flagged the Pod's browser on `HEADCHR_UA` (User-Agent `HeadlessChrome/156`) and `CHR_MEMORY`. Locally the tells were the UA (header and JS), outer window size equal to the viewport, and screen equal to the viewport. The launcher now passes `--user-agent` (Chrome's reduced form, major version from `chromium --version`), `--window-size=1920,1080`, `--screen-info={1920x1080}`, `viewport: null`, `--disable-blink-features=AutomationControlled` and drops `--enable-automation` (config written to the output dir at launch).
+- Not addressed (Nick chose fingerprint fixes first, 2026-11-16): WebGL is SwiftShader, and the CDP `Runtime.enable` leak that Cloudflare/DataDome look for (would need a headed chromium on Xvfb or a patched driver such as patchright).
