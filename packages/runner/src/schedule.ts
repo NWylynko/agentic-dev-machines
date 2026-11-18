@@ -501,39 +501,54 @@ export async function applyLoop(
       "INVALID_LOOP",
       "Loop status must be active or cancelled",
     );
-  return commitRequest(conversation, "loop", requestId, input, async (tx) => {
-    const doc = await tx.doc(Schedule, conversation.id);
-    const index = doc.loops.findIndex((loop) => loop.id === body.id);
-    const current = doc.loops[index];
-    if (!current) throw new ApiError(404, "LOOP_NOT_FOUND", "Loop not found");
-    const reactivating = current.status === "cancelled" && status === "active";
-    const restartTask = reactivating && current.taskStatus === "stopped";
-    const generation = (current.generation ?? 1) + (restartTask ? 1 : 0);
-    const next: LoopRecord = {
-      ...current,
-      generation,
-      ...(restartTask ? { taskStatus: "running" as const } : {}),
-      ...(status === undefined ? {} : { status }),
-    };
-    doc.loops[index] = next;
-    if (restartTask)
-      await tx.createTask(
-        loopTask,
-        { loopId: next.id, generation },
-        {
-          ownership: { kind: "conversation" },
-          conversationId: conversation.id,
-          background: true,
-        },
-      );
-    return {
-      id: next.id,
-      prompt: next.prompt,
-      intervalMs: next.intervalMs,
-      nextAt: next.nextAt,
-      status: next.status,
-    };
-  });
+  const id = body.id;
+  return commitRequest(conversation, "loop", requestId, input, (tx) =>
+    updateLoopStatus(tx, conversation.id, id, status, loopTask),
+  );
+}
+
+/**
+ * Cancels or reactivates a loop by id, for the HTTP loop route and the
+ * model's own saveLoop tool alike.
+ */
+async function updateLoopStatus(
+  tx: Tx,
+  conversationId: ConversationId,
+  id: string,
+  status: "active" | "cancelled" | undefined,
+  loopTask: ReturnType<typeof createLoopTask>,
+) {
+  const doc = await tx.doc(Schedule, conversationId);
+  const index = doc.loops.findIndex((loop) => loop.id === id);
+  const current = doc.loops[index];
+  if (!current) throw new ApiError(404, "LOOP_NOT_FOUND", "Loop not found");
+  const reactivating = current.status === "cancelled" && status === "active";
+  const restartTask = reactivating && current.taskStatus === "stopped";
+  const generation = (current.generation ?? 1) + (restartTask ? 1 : 0);
+  const next: LoopRecord = {
+    ...current,
+    generation,
+    ...(restartTask ? { taskStatus: "running" as const } : {}),
+    ...(status === undefined ? {} : { status }),
+  };
+  doc.loops[index] = next;
+  if (restartTask)
+    await tx.createTask(
+      loopTask,
+      { loopId: next.id, generation },
+      {
+        ownership: { kind: "conversation" },
+        conversationId: conversationId,
+        background: true,
+      },
+    );
+  return {
+    id: next.id,
+    prompt: next.prompt,
+    intervalMs: next.intervalMs,
+    nextAt: next.nextAt,
+    status: next.status,
+  };
 }
 
 export function createScheduleExtension(
@@ -590,13 +605,17 @@ export function createScheduleExtension(
       defineTool({
         name: "saveLoop",
         description:
-          "Create durable recurring work. The prompt is delivered with a stable request id and the next trigger is saved before delivery.",
+          "Create durable recurring work, or stop it. To create, pass prompt and intervalMs: the prompt is delivered with a stable request id and the next trigger is saved before delivery. To cancel or resume a loop, pass its id with status cancelled or active, and nothing else; calling without id always creates a new loop.",
         parameters: obj({
-          prompt: str({ minLength: 1, maxLength: 100000 }),
-          intervalMs: int({
-            minimum: minimumLoopIntervalMs,
-            maximum: maximumLoopIntervalMs,
-          }),
+          prompt: opt(str({ minLength: 1, maxLength: 100000 })),
+          intervalMs: opt(
+            int({
+              minimum: minimumLoopIntervalMs,
+              maximum: maximumLoopIntervalMs,
+            }),
+          ),
+          id: opt(str({ minLength: 1 })),
+          status: opt(oneOf(["active", "cancelled"])),
           nextAt: opt(
             int({
               minimum: Number.MIN_SAFE_INTEGER,
@@ -606,10 +625,38 @@ export function createScheduleExtension(
         }),
         replay: "safe",
         execute: async (args, api, call) => {
+          if (args.id !== undefined) {
+            if (args.status === undefined)
+              throw new Error("Pass status cancelled or active with a loop id");
+            if (
+              args.prompt !== undefined ||
+              args.intervalMs !== undefined ||
+              args.nextAt !== undefined
+            )
+              throw new Error(
+                "A loop id only changes its status; create a new loop to change its prompt or interval",
+              );
+            const id = args.id,
+              status = args.status;
+            const updated = await api.commit(
+              (tx) =>
+                updateLoopStatus(tx, api.conversationId, id, status, LoopTask),
+              call,
+            );
+            return {
+              output: [{ type: "text", text: JSON.stringify(updated) }],
+            };
+          }
+          if (args.status !== undefined)
+            throw new Error("status needs the id of the loop to change");
+          if (args.prompt === undefined || args.intervalMs === undefined)
+            throw new Error("A new loop needs prompt and intervalMs");
+          const prompt = args.prompt,
+            intervalMs = args.intervalMs;
           if (
             !Number.isSafeInteger(args.intervalMs) ||
-            args.intervalMs < minimumLoopIntervalMs ||
-            args.intervalMs > maximumLoopIntervalMs
+            intervalMs < minimumLoopIntervalMs ||
+            intervalMs > maximumLoopIntervalMs
           )
             throw new Error("intervalMs is outside the supported range");
           if (args.nextAt !== undefined && !Number.isSafeInteger(args.nextAt))
@@ -621,9 +668,9 @@ export function createScheduleExtension(
             if (existing) return existing;
             const created: LoopRecord = {
               id: loopId,
-              prompt: args.prompt,
-              intervalMs: args.intervalMs,
-              nextAt: args.nextAt ?? Date.now() + args.intervalMs,
+              prompt: prompt,
+              intervalMs: intervalMs,
+              nextAt: args.nextAt ?? Date.now() + intervalMs,
               status: "active",
               generation: 1,
               taskStatus: "running",

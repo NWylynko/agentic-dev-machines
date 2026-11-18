@@ -952,6 +952,73 @@ test(
   },
 );
 
+// Live 2026-11-17: emails-dev could not stop its own loop. saveLoop only
+// created loops, so each "cancel" made one more and the bot was woken every
+// few seconds until an operator aborted its background work.
+test(
+  "a model cancels its own loop with saveLoop by id instead of creating another",
+  { timeout: 20000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "adm-runner-loop-cancel-"));
+    const runner = await startRunner(directory);
+    t.after(() => runner.stop());
+    const id = "loop-cancel",
+      path = `/v1/workspaces/${id}`;
+    await runner.request(path, "PUT", {
+      id,
+      name: "loop-cancel",
+      role: "bot",
+      environment: "local",
+      model: { provider: "faux", id: "faux-1" },
+    });
+    const callTool = async (requestId, args) => {
+      await runner.request(path + "/input", "POST", {
+        message:
+          "/faux " +
+          JSON.stringify({ calls: [{ tool: "saveLoop", args }], answer: "ok" }),
+        requestId,
+      });
+      return nextEvent(
+        runner,
+        id,
+        (event) =>
+          event.kind === "tool" &&
+          event.data.name === "saveLoop" &&
+          JSON.stringify(event.data).includes(
+            requestId === "create" ? "check the agent" : "cancelled",
+          ),
+        0,
+        true,
+        5000,
+      );
+    };
+    const created = await callTool("create", {
+      prompt: "check the agent",
+      intervalMs: 60000,
+      nextAt: Date.now() + 60000,
+    });
+    assert.notEqual(created.data.isError, true, JSON.stringify(created.data));
+    const [loop] = (await runner.request(path)).body.loops;
+    assert.equal(loop.status, "active");
+
+    const cancelled = await callTool("cancel", {
+      id: loop.id,
+      status: "cancelled",
+    });
+    assert.notEqual(
+      cancelled.data.isError,
+      true,
+      JSON.stringify(cancelled.data),
+    );
+    const loops = (await runner.request(path)).body.loops;
+    assert.deepEqual(
+      loops.map(({ id, status }) => ({ id, status })),
+      [{ id: loop.id, status: "cancelled" }],
+      "the loop is cancelled and no new loop was created",
+    );
+  },
+);
+
 test(
   "a coding agent messages the bot that manages it, which runs a follow-up turn; a replayed request delivers once",
   { timeout: 45000 },
