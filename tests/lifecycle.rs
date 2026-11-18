@@ -441,12 +441,15 @@ elif args[:2] == ['get','pods']:
         image='ghcr.io/example/adm-dev:fixture'
         if (root/'pod-image').exists(): image=(root/'pod-image').read_text()
         node_name=(root/('pod-node-'+namespace)).read_text() if (root/('pod-node-'+namespace)).exists() else 'test-node'
-        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':node_name,'containers':[{'name':'dev','image':image}]},'status':{'phase':'Running','podIP':runtime_ip,'conditions':[{'type':'Ready','status':'True'}],'containerStatuses':[{'name':'dev','ready':True,'state':{'running':{}}}]}})
+        container_name='bot' if resource['metadata']['labels'].get('adm.dev/role')=='bot' else 'dev'
+        items.append({'kind':'Pod','metadata':{'name':'workspace-pod','namespace':namespace,'uid':pod_uid,'labels':{'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id}},'spec':{'nodeName':node_name,'containers':[{'name':container_name,'image':image}]},'status':{'phase':'Running','podIP':runtime_ip,'conditions':[{'type':'Ready','status':'True'}],'containerStatuses':[{'name':container_name,'ready':True,'state':{'running':{}}}]}})
     print(json.dumps({'kind':'PodList','items':items}))
 elif args[:3] == ['get','deployment','workspace']:
     namespace=args[args.index('-n')+1]
     workspace_id=(root/'expected-workspace-id').read_text()
-    labels={'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id,'adm.dev/role':'coding'}
+    with locked(): state=load_state()
+    role=state.get(namespace,{}).get('metadata',{}).get('labels',{}).get('adm.dev/role','coding')
+    labels={'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id,'adm.dev/role':role}
     print(json.dumps({'kind':'Deployment','metadata':{'name':'workspace','namespace':namespace,'labels':labels},'spec':{'selector':{'matchLabels':labels},'template':{'metadata':{'labels':labels},'spec':{'serviceAccountName':'adm-runtime','volumes':[{'name':'work','persistentVolumeClaim':{'claimName':'work'}}]}}}}))
 # The shared repository bases volume the lifecycle Pod mounts (TASK-113).
 elif args[:3] == ['get','pvc','adm-repository-bases']:
@@ -461,7 +464,9 @@ elif args[:2] == ['delete','pv']:
 elif args[:2] == ['get','pvc'] and args[2] == 'work':
     namespace=args[args.index('-n')+1]
     workspace_id=(root/'expected-workspace-id').read_text()
-    labels={'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id,'adm.dev/role':'coding'}
+    with locked(): state=load_state()
+    role=state.get(namespace,{}).get('metadata',{}).get('labels',{}).get('adm.dev/role','coding')
+    labels={'app.kubernetes.io/managed-by':'adm','adm.dev/workspace-id':workspace_id,'adm.dev/role':role}
     print(json.dumps({'kind':'PersistentVolumeClaim','metadata':{'name':'work','namespace':namespace,'labels':labels}}))
 elif args[:2] == ['get','namespace']:
     with locked(): state=load_state()
@@ -520,9 +525,12 @@ elif args[:3] == ['rollout','status','deployment/workspace']:
     with locked(): deployment=json.loads((root/'current-deployment.json').read_text())
     namespace=args[args.index('-n')+1]
     workspace_id=deployment['metadata']['labels']['adm.dev/workspace-id']
-    put(root/'pod-image', next(container['image'] for container in deployment['spec']['template']['spec']['containers'] if container['name']=='dev'))
+    # A coding workspace's container is dev, a bot's is bot (src/workspaces.rs).
+    put(root/'pod-image', next(container['image'] for container in deployment['spec']['template']['spec']['containers'] if container['name'] in ('dev','bot')))
     pod_uid=str(uuid.uuid4())
     put(root/'expected-pod-uid', pod_uid)
+    if (root/'expected-bot-namespace').exists() and namespace == (root/'expected-bot-namespace').read_text():
+        put(root/'expected-bot-pod-uid', pod_uid)
     payload=json.dumps({'holder':pod_uid}).encode()
     target_token='target-token:'+namespace+':'+pod_uid
     request=urllib.request.Request((root/'lifecycle-url').read_text().strip()+'/v1/workspaces/'+workspace_id+'/runtime/lease',data=payload,headers={'Authorization':'Bearer '+target_token,'Content-Type':'application/json'},method='POST')
@@ -6368,6 +6376,37 @@ fn a_bot_starts_a_claude_code_agent_only_with_the_claude_login() {
         .find(|entry| entry["id"] == agent["id"])
         .unwrap();
     assert_eq!(listed["harness"], json!("claude"), "{listed}");
+
+    // `adm update --workspace` on a bot. A bot's container is named bot, not
+    // dev, and the update's replacement check used to look only for dev, so
+    // every bot update failed (live on emails-dev, 2026-11-18).
+    let bot_update = "5d8e2f10-7c3b-4e6a-9f1d-2b4c6e8a0d13";
+    fs::write(root.path().join("expected-workspace-id"), &bot_id).unwrap();
+    let admitted = operator(
+        "POST",
+        "/v1/operations",
+        Some(&json!({
+            "operationId":bot_update,
+            "kind":"update",
+            "workspaceId":bot_id,
+            "image":"ghcr.io/example/adm-bot:explicit-update"
+        })),
+    );
+    assert_eq!(admitted.status(), 202, "{}", admitted.text().unwrap());
+    let receipt: Value = wait_for(|| {
+        operator("GET", &format!("/v1/operations/{bot_update}"), None)
+            .json::<Value>()
+            .ok()
+            .filter(|receipt| receipt["status"] == "completed" || receipt["status"] == "failed")
+    });
+    assert_eq!(receipt["status"], "completed", "{receipt}");
+    let updated_bot: Value = operator("GET", &format!("/v1/workspaces/{bot_id}"), None)
+        .json()
+        .unwrap();
+    assert_eq!(
+        updated_bot["image"],
+        "ghcr.io/example/adm-bot:explicit-update"
+    );
 
     stop_http_stub(runner_port, runner);
     stop_http_stub(authority_port, authority);

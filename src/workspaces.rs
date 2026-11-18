@@ -1639,7 +1639,7 @@ pub fn manifest(w: &Workspace) -> Result<Value> {
         json!({"name":"runtime-token","projected":{"sources":[{"serviceAccountToken":{"audience":"adm-lifecycle","expirationSeconds":3600,"path":"token"}}]}}),
     ];
     // workingDir is never /repos: runc (root) cannot stat the sidecar's UID 1000 FUSE catalog there.
-    let mut dev = json!({"name":if w.role == "coding" { "dev" } else { "bot" },"image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/workspace","ports":[{"name":"http","containerPort":7432}],"securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"httpGet":{"path":"/ready","port":7432},"initialDelaySeconds":1,"periodSeconds":2},"livenessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":10,"periodSeconds":10,"failureThreshold":3}});
+    let mut dev = json!({"name":workspace_container_name(&w.role),"image":w.image,"imagePullPolicy":"IfNotPresent","workingDir":"/workspace","ports":[{"name":"http","containerPort":7432}],"securityContext":workspace_security_context(),"resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"cpu":w.cpu,"memory":w.memory}},"volumeMounts":mounts,"readinessProbe":{"httpGet":{"path":"/ready","port":7432},"initialDelaySeconds":1,"periodSeconds":2},"livenessProbe":{"httpGet":{"path":"/health","port":7432},"initialDelaySeconds":10,"periodSeconds":10,"failureThreshold":3}});
     let lifecycle_url =
         format!("http://adm-lifecycle.{lifecycle_namespace}.svc.cluster.local:7433");
     dev["env"] = json!([
@@ -2123,6 +2123,13 @@ pub fn upgrade_persisted(cli: &Cli, workspace_id: &str) -> Result<Workspace> {
     Ok(workspace)
 }
 
+/// The workspace Pod's main container: `dev` for coding workspaces, `bot`
+/// for bots. Anything that looks a container up by name must use this; the
+/// update check once looked only for `dev`, so every bot update failed.
+pub(crate) fn workspace_container_name(role: &str) -> &'static str {
+    if role == "coding" { "dev" } else { "bot" }
+}
+
 fn verify_updated_workspace_runtime(
     cli: &Cli,
     workspace: &Workspace,
@@ -2161,7 +2168,8 @@ fn verify_updated_workspace_runtime(
                     .as_array()
                     .is_some_and(|containers| {
                         containers.iter().any(|container| {
-                            container["name"] == "dev" && container["ready"] == true
+                            container["name"] == workspace_container_name(&workspace.role)
+                                && container["ready"] == true
                         })
                     })
         })
@@ -2190,7 +2198,8 @@ fn verify_updated_workspace_runtime(
             .as_array()
             .is_some_and(|containers| {
                 containers.iter().any(|container| {
-                    container["name"] == "dev" && container["image"] == workspace.image
+                    container["name"] == workspace_container_name(&workspace.role)
+                        && container["image"] == workspace.image
                 })
             }),
         "selected workspace replacement Pod is not running image {}",
