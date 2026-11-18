@@ -664,7 +664,12 @@ elif args and args[0] == 'exec':
         if git_bin.exists(): env['PATH']=str(git_bin)+':'+env['PATH']
         fail_after_clone=pathlib.Path(__file__).parent/'fail-after-clone'
         if fail_after_clone.exists(): env['ADM_TEST_FAIL_AFTER_CLONE']=str(fail_after_clone)
-        result = subprocess.run(command, cwd=repos, env=env)
+        # The dev container's workingDir is /workspace, not /repos (78e6b44):
+        # an exec that assumes it starts in /repos must fail here as it does
+        # in a real Pod.
+        workdir = pathlib.Path(exec_root) / namespace / 'workspace'
+        workdir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(command, cwd=workdir, env=env)
         sys.exit(result.returncode)
 elif args and args[0] == 'port-forward':
     (pathlib.Path(__file__).parent / 'port-forward-args.json').write_text(json.dumps(args))
@@ -1921,7 +1926,7 @@ fn workspace_navigation_guidance_keeps_json_and_explicit_shell_argv_intact() {
         .arg("--kubectl")
         .arg(root.path().join("kubectl"));
     configure_lifecycle(&mut populate, root.path());
-    populate.args(["exec", "navigation", "--", "touch", "existing-work"]);
+    populate.args(["exec", "navigation", "--", "touch", "/repos/existing-work"]);
     let populate = populate.output().unwrap();
     assert!(populate.status.success(), "{populate:?}");
     assert!(

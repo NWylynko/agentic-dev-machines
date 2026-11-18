@@ -2275,12 +2275,16 @@ fn verify_workspace_update_target(cli: &Cli, workspace: &Workspace) -> Result<()
 
 fn prepare_repository(cli: &Cli, workspace: &Workspace, repository: &str) -> Result<()> {
     let (owner, name) = validate_repository_ref(repository)?;
+    // The dev container starts in /workspace (78e6b44), but agents run in
+    // /repos/OWNER/REPO: clone there. Until 2026-11-18 checkouts landed in
+    // /workspace/OWNER/REPO and every --repo agent's cwd was missing.
     let script = r#"set -eu
 owner="$1"
 name="$2"
 workspace_id="$3"
 branch="$4"
 base="$5"
+cd /repos
 if [ -n "$branch" ]; then
   git check-ref-format --branch "$branch" >/dev/null || { echo "invalid repository branch: $branch" >&2; exit 1; }
 fi
