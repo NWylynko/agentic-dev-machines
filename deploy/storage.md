@@ -19,6 +19,8 @@ allowVolumeExpansion: true
 
 Point `adm create --storage-class` at a different class when the default name is wrong. Destroying a workspace deletes its namespace and claim; it does not delete the StorageClass.
 
+Size claims for what a provisioner reserves, not for what a workspace writes. Longhorn reserves a volume's full size on every replica's node, whatever has been written. With the default `storage-over-provisioning-percentage` of 100, a node refuses new replicas once its reserved sizes reach its schedulable disk. On homelab (3 nodes, ~116 GiB schedulable each, 3 replicas) four 16 GiB agents used up 105 GiB of reservations while writing 0.4–1.8 GiB each, and the next workspace failed with `precheck new replica failed: insufficient storage`. A typical agent writes ~1.5 GiB, most of it `node_modules`. Bot-created agents now default to 8Gi (`BOT_AGENT_DEFAULTS` in `packages/runner/src/bot.ts`), and homelab runs Longhorn at 200% over-provisioning (set by hand on 2026-11-18 with `kubectl -n longhorn-system patch settings.longhorn.io storage-over-provisioning-percentage --type merge -p '{"value":"200"}'`). The cost is that nodes can run out of real disk if workspaces do fill their claims; watch `storageAvailable` in `kubectl -n longhorn-system get nodes.longhorn.io -o yaml`.
+
 Run `adm doctor` to inspect `adm-replicated`, or `adm doctor --storage-class local-path` to inspect the existing class without creating a workspace. A reported class is not proof of replication; the diagnostic names its provisioner and flags the known node-local provisioner explicitly.
 
 ## Shared repository bases (ReadWriteMany)

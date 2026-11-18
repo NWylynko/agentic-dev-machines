@@ -20,6 +20,20 @@ const MessageReceipts = defineDoc<{ receipts: Record<string, number> }>({
   initial: () => ({ receipts: {} }),
 });
 
+/**
+ * What a bot's createAgent asks for when the bot leaves resources out
+ * (2026-11-18). A bot that had to choose guessed 16Gi disks, which used up
+ * Longhorn's replicated storage after four agents, and 2Gi of memory, which a
+ * dev build ran out of. Disk is 8Gi, not adm create's 4Gi: agents install
+ * dependencies and build.
+ */
+const BOT_AGENT_DEFAULTS = {
+  storageClass: "adm-replicated",
+  storageSize: "8Gi",
+  cpu: "2",
+  memory: "4Gi",
+};
+
 export type BotProfile = {
   state: "needs_setup" | "collecting" | "ready";
   identity: string;
@@ -330,10 +344,30 @@ export function botExtension(
                 "Coding image. Omit it to run the cluster release's coding image.",
             }),
           ),
-          storageClass: str({ minLength: 1 }),
-          storageSize: str({ minLength: 1 }),
-          cpu: str({ minLength: 1 }),
-          memory: str({ minLength: 1 }),
+          storageClass: opt(
+            str({
+              minLength: 1,
+              description: `Omit it for ${BOT_AGENT_DEFAULTS.storageClass}.`,
+            }),
+          ),
+          storageSize: opt(
+            str({
+              minLength: 1,
+              description: `Disk for the checkout, dependencies and builds. Omit it for ${BOT_AGENT_DEFAULTS.storageSize}, which fits a typical repository; every Gi is reserved three times in replicated storage, so only ask for more for a reason.`,
+            }),
+          ),
+          cpu: opt(
+            str({
+              minLength: 1,
+              description: `Omit it for ${BOT_AGENT_DEFAULTS.cpu}.`,
+            }),
+          ),
+          memory: opt(
+            str({
+              minLength: 1,
+              description: `Omit it for ${BOT_AGENT_DEFAULTS.memory}. Less can run out during installs and builds.`,
+            }),
+          ),
           model: opt(
             obj({
               provider: str({ minLength: 1 }),
@@ -368,10 +402,10 @@ export function botExtension(
             name: args.name,
             role: "coding",
             image: args.image,
-            storage_class: args.storageClass,
-            storage_size: args.storageSize,
-            cpu: args.cpu,
-            memory: args.memory,
+            storage_class: args.storageClass ?? BOT_AGENT_DEFAULTS.storageClass,
+            storage_size: args.storageSize ?? BOT_AGENT_DEFAULTS.storageSize,
+            cpu: args.cpu ?? BOT_AGENT_DEFAULTS.cpu,
+            memory: args.memory ?? BOT_AGENT_DEFAULTS.memory,
             agent_enabled: true,
             allow_node_local_storage: false,
             repositories: false,

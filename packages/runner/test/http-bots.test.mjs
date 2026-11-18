@@ -380,10 +380,6 @@ test(
             name: "claude-agent",
             harness: "claude",
             prompt: "Fix issue #131 and open a PR.",
-            storageClass: "fast",
-            storageSize: "10Gi",
-            cpu: "2",
-            memory: "4Gi",
             model: { provider: "claude", id: "sonnet" },
           },
           "create-claude",
@@ -395,6 +391,23 @@ test(
     assert.equal(claudeSpec.harness, "claude");
     assert.equal(claudeSpec.prompt, "Fix issue #131 and open a PR.");
     assert.deepEqual(claudeSpec.model, { provider: "claude", id: "sonnet" });
+    // Resources the bot leaves out get the agent defaults (2026-11-18): a
+    // bot that had to guess picked 16Gi disks, which filled Longhorn after
+    // four agents, and 2Gi of memory, which a dev build ran out of.
+    assert.deepEqual(
+      {
+        storage_class: claudeSpec.storage_class,
+        storage_size: claudeSpec.storage_size,
+        cpu: claudeSpec.cpu,
+        memory: claudeSpec.memory,
+      },
+      {
+        storage_class: "adm-replicated",
+        storage_size: "8Gi",
+        cpu: "2",
+        memory: "4Gi",
+      },
+    );
     const operation = JSON.parse(
       (
         await call(
